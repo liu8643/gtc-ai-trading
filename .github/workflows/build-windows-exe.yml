@@ -20,8 +20,8 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
-      - name: Build EXE
-        run: pyinstaller --onefile main.py
+      - name: Build EXE (Debug Mode)
+        run: pyinstaller --onefile --console main.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
