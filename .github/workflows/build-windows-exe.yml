@@ -8,32 +8,23 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.10'
 
       - name: Install dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Install PyInstaller
-        shell: pwsh
-        run: |
-          pip install pyinstaller
+        run: pip install pyinstaller
 
       - name: Build EXE
-        shell: pwsh
-        run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name GTC_AI_Trading_System main.py
+        run: pyinstaller --onefile main.py
 
-      - name: Upload artifact
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: GTC_AI_Trading_System_EXE
-          path: dist/GTC_AI_Trading_System.exe
+          name: GTC_EXE
+          path: dist/*.exe
