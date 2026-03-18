@@ -1,11 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['matplotlib.backends.backend_tkagg', 'tkinter'],
+    hiddenimports=['tkinter'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -13,7 +12,6 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
-
 exe = EXE(
     pyz,
     a.scripts,
@@ -25,7 +23,6 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
-    icon=None,
 )
 coll = COLLECT(
     exe,
