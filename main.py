@@ -5,7 +5,7 @@ import pandas as pd
 import yfinance as yf
 
 
-APP_TITLE = "GTC AI Trading System Pro"
+APP_TITLE = "GTC AI Trading System Pro 即時版"
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -13,24 +13,18 @@ def normalize_symbol(symbol: str) -> str:
     if not s:
         return s
 
-    # 已有市場尾碼就直接用
     if "." in s:
         return s
 
-    # 台股常見代號自動補 Yahoo 市場尾碼
-    # 4 碼先預設上市 .TW，抓不到再試上櫃 .TWO
     if s.isdigit() and len(s) == 4:
         return s + ".TW"
 
     return s
 
 
-def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
-    """
-    先抓原始 symbol；
-    若是台股 4 碼代號且 .TW 失敗，改抓 .TWO。
-    """
+def download_symbol_data(symbol: str, period: str = "6mo") -> tuple[str, pd.DataFrame]:
     yf_symbol = normalize_symbol(symbol)
+
     df = yf.download(
         yf_symbol,
         period=period,
@@ -55,7 +49,6 @@ def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
     if df is None or df.empty:
         raise ValueError(f"查無資料：{symbol}")
 
-    # 某些版本/情況可能出現多層欄位，這裡壓平
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
 
@@ -68,12 +61,19 @@ def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
     if df.empty:
         raise ValueError(f"無有效收盤資料：{symbol}")
 
+    return yf_symbol, df
+
+
+def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
     df["MA20"] = df["Close"].rolling(20).mean()
     df["MA60"] = df["Close"].rolling(60).mean()
 
     delta = df["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
 
@@ -81,21 +81,39 @@ def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
     df["RSI"] = 100 - (100 / (1 + rs))
     df["RSI"] = df["RSI"].fillna(50)
 
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+
+    low9 = df["Low"].rolling(9).min()
+    high9 = df["High"].rolling(9).max()
+    rsv = (df["Close"] - low9) / (high9 - low9) * 100
+    df["K"] = rsv.ewm(com=2).mean()
+    df["D"] = df["K"].ewm(com=2).mean()
+
     return df
 
 
 def analyze_symbol(symbol: str) -> dict:
-    df = fetch_history(symbol)
+    yf_symbol, df = download_symbol_data(symbol)
+    df = calc_indicators(df)
+
     last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else last
 
     close = round(float(last["Close"]), 2)
-    ma20 = round(float(last["MA20"])) if pd.notna(last["MA20"]) else None
-    ma60 = round(float(last["MA60"])) if pd.notna(last["MA60"]) else None
+    prev_close = round(float(prev["Close"]), 2)
+
+    change = round(close - prev_close, 2)
+    change_pct = round((change / prev_close) * 100, 2) if prev_close != 0 else 0.0
+
+    ma20 = round(float(last["MA20"]), 2) if pd.notna(last["MA20"]) else None
+    ma60 = round(float(last["MA60"]), 2) if pd.notna(last["MA60"]) else None
     rsi = round(float(last["RSI"]), 2) if pd.notna(last["RSI"]) else 50.0
 
-    recent_20 = df.tail(20)
-    support = round(float(recent_20["Low"].min()), 2)
-    resistance = round(float(recent_20["High"].max()), 2)
+    support = round(float(df.tail(20)["Low"].min()), 2)
+    resistance = round(float(df.tail(20)["High"].max()), 2)
 
     score = 50
     comments = []
@@ -116,33 +134,21 @@ def analyze_symbol(symbol: str) -> dict:
             score -= 12
             comments.append("跌破60日線")
 
-    # 簡化版 MACD 趨勢判斷
-    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal_line = macd.ewm(span=9, adjust=False).mean()
-    if float(macd.iloc[-1]) >= float(signal_line.iloc[-1]):
+    if float(last["MACD"]) >= float(last["MACD_SIGNAL"]):
         score += 8
         comments.append("MACD偏多")
     else:
         score -= 6
         comments.append("MACD偏弱")
 
-    # 簡化 KD 趨勢
-    low9 = df["Low"].rolling(9).min()
-    high9 = df["High"].rolling(9).max()
-    rsv = (df["Close"] - low9) / (high9 - low9) * 100
-    k = rsv.ewm(com=2).mean()
-    d = k.ewm(com=2).mean()
-    if pd.notna(k.iloc[-1]) and pd.notna(d.iloc[-1]):
-        if float(k.iloc[-1]) >= float(d.iloc[-1]):
+    if pd.notna(last["K"]) and pd.notna(last["D"]):
+        if float(last["K"]) >= float(last["D"]):
             score += 6
             comments.append("KD偏多")
         else:
             score -= 4
             comments.append("KD偏空")
 
-    # RSI
     if rsi < 30:
         score += 8
         comments.append("RSI超跌")
@@ -150,8 +156,7 @@ def analyze_symbol(symbol: str) -> dict:
         score -= 8
         comments.append("RSI過熱")
 
-    # 量能
-    if len(df) >= 6:
+    if len(df) >= 20:
         vol5 = df["Volume"].tail(5).mean()
         vol20 = df["Volume"].tail(20).mean()
         if pd.notna(vol5) and pd.notna(vol20) and vol5 > vol20:
@@ -171,9 +176,16 @@ def analyze_symbol(symbol: str) -> dict:
     else:
         signal = "弱勢觀望"
 
+    direction_text = "上漲" if change > 0 else "下跌" if change < 0 else "平盤"
+
     return {
-        "symbol": symbol,
+        "input_symbol": symbol,
+        "yf_symbol": yf_symbol,
         "close": close,
+        "prev_close": prev_close,
+        "change": change,
+        "change_pct": change_pct,
+        "direction": direction_text,
         "signal": signal,
         "score": score,
         "support": support,
@@ -187,9 +199,10 @@ class GTCProApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1450x780")
-        self.root.minsize(1180, 680)
+        self.root.geometry("1580x820")
+        self.root.minsize(1260, 700)
         self.results = []
+
         self._build_ui()
 
     def _build_ui(self):
@@ -198,7 +211,7 @@ class GTCProApp:
 
         ttk.Label(top, text="股票代號（逗號分隔）").pack(side="left", padx=(0, 8))
 
-        self.symbol_entry = ttk.Entry(top, width=80)
+        self.symbol_entry = ttk.Entry(top, width=90)
         self.symbol_entry.pack(side="left", padx=(0, 8), fill="x", expand=True)
         self.symbol_entry.insert(0, "2330,2382,3231,2308,3017")
 
@@ -209,23 +222,34 @@ class GTCProApp:
         middle = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         middle.pack(fill="both", expand=True)
 
-        columns = ("代號", "收盤", "訊號", "分數", "支撐", "壓力", "RSI", "說明")
-        self.tree = ttk.Treeview(middle, columns=columns, show="headings", height=24)
+        columns = (
+            "代號", "收盤", "昨收", "漲跌", "漲跌幅%", "訊號", "分數",
+            "支撐", "壓力", "RSI", "說明"
+        )
+
+        self.tree = ttk.Treeview(middle, columns=columns, show="headings", height=25)
 
         widths = {
             "代號": 90,
-            "收盤": 110,
-            "訊號": 130,
+            "收盤": 100,
+            "昨收": 100,
+            "漲跌": 100,
+            "漲跌幅%": 100,
+            "訊號": 120,
             "分數": 80,
             "支撐": 110,
             "壓力": 110,
             "RSI": 90,
-            "說明": 720,
+            "說明": 560,
         }
 
         for c in columns:
             self.tree.heading(c, text=c)
             self.tree.column(c, width=widths[c], anchor="center")
+
+        self.tree.tag_configure("up", foreground="red")
+        self.tree.tag_configure("down", foreground="green")
+        self.tree.tag_configure("flat", foreground="black")
 
         yscroll = ttk.Scrollbar(middle, orient="vertical", command=self.tree.yview)
         xscroll = ttk.Scrollbar(middle, orient="horizontal", command=self.tree.xview)
@@ -269,7 +293,7 @@ class GTCProApp:
             return
 
         self.clear_results()
-        self.set_status("開始抓取真實股票資料...")
+        self.set_status("開始抓取即時股票資料...")
 
         ok_results = []
         errors = []
@@ -285,12 +309,20 @@ class GTCProApp:
         self.results = sorted(ok_results, key=lambda x: x["score"], reverse=True)
 
         for r in self.results:
+            tag = "up" if r["change"] > 0 else "down" if r["change"] < 0 else "flat"
+
+            change_str = f"{r['change']:+.2f}"
+            change_pct_str = f"{r['change_pct']:+.2f}%"
+
             self.tree.insert(
                 "",
                 "end",
                 values=(
-                    r["symbol"],
+                    r["input_symbol"],
                     r["close"],
+                    r["prev_close"],
+                    change_str,
+                    change_pct_str,
                     r["signal"],
                     r["score"],
                     r["support"],
@@ -298,6 +330,7 @@ class GTCProApp:
                     r["rsi"],
                     r["comment"],
                 ),
+                tags=(tag,),
             )
 
         if errors:
@@ -322,19 +355,21 @@ class GTCProApp:
         lines = []
         lines.append(APP_TITLE)
         lines.append(f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append("資料來源：Yahoo Finance / yfinance")
-        lines.append("=" * 100)
+        lines.append("=" * 110)
 
         for idx, r in enumerate(self.results, start=1):
-            lines.append(f"{idx}. 股票代號：{r['symbol']}")
+            lines.append(f"{idx}. 股票代號：{r['input_symbol']}")
             lines.append(f"   收盤：{r['close']}")
+            lines.append(f"   昨收：{r['prev_close']}")
+            lines.append(f"   漲跌：{r['change']:+.2f}")
+            lines.append(f"   漲跌幅：{r['change_pct']:+.2f}%")
             lines.append(f"   訊號：{r['signal']}")
             lines.append(f"   分數：{r['score']}")
             lines.append(f"   支撐：{r['support']}")
             lines.append(f"   壓力：{r['resistance']}")
             lines.append(f"   RSI：{r['rsi']}")
             lines.append(f"   說明：{r['comment']}")
-            lines.append("-" * 100)
+            lines.append("-" * 110)
 
         try:
             with open(file_path, "w", encoding="utf-8-sig") as f:
