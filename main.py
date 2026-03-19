@@ -11,7 +11,7 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v3.0.0-TW"
+APP_VERSION = "v3.1.0-TW"
 
 
 def setup_pdf_font():
@@ -45,6 +45,18 @@ def normalize_symbol(symbol: str) -> list[str]:
         return [s]
 
     return [s]
+
+
+def get_stock_name(yf_symbol: str) -> str:
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        info = ticker.info
+        name = info.get("shortName") or info.get("longName")
+        if name:
+            return str(name)
+    except Exception:
+        pass
+    return yf_symbol
 
 
 def download_symbol_data(symbol: str, period: str = "8mo") -> tuple[str, pd.DataFrame]:
@@ -208,6 +220,7 @@ def build_risk_note(close, support, resistance, rsi, score):
 
 def analyze_symbol(symbol: str) -> dict:
     yf_symbol, df = download_symbol_data(symbol)
+    stock_name = get_stock_name(yf_symbol)
     df = calc_indicators(df)
 
     last = df.iloc[-1]
@@ -335,6 +348,7 @@ def analyze_symbol(symbol: str) -> dict:
 
     return {
         "input_symbol": symbol,
+        "name": stock_name,
         "yf_symbol": yf_symbol,
         "market": detect_market(symbol, yf_symbol),
         "close": close,
@@ -363,7 +377,7 @@ class GTCProApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_TITLE} {APP_VERSION}")
-        self.root.geometry("1880x980")
+        self.root.geometry("1920x1000")
         self.root.minsize(1500, 820)
         self.results = []
         self.current_sort_column = None
@@ -400,7 +414,7 @@ class GTCProApp:
 
     def _build_table_area(self, parent):
         columns = (
-            "排名", "市場", "代號", "收盤", "昨收", "漲跌", "漲跌幅%",
+            "排名", "市場", "代號", "名稱", "收盤", "昨收", "漲跌", "漲跌幅%",
             "訊號", "建議", "分數", "支撐", "壓力", "RSI"
         )
 
@@ -410,6 +424,7 @@ class GTCProApp:
             "排名": 55,
             "市場": 90,
             "代號": 80,
+            "名稱": 180,
             "收盤": 90,
             "昨收": 90,
             "漲跌": 90,
@@ -511,6 +526,7 @@ class GTCProApp:
                     idx,
                     r["market"],
                     r["input_symbol"],
+                    r["name"],
                     r["close"],
                     r["prev_close"],
                     change_str,
@@ -584,7 +600,7 @@ class GTCProApp:
             return
 
         detail = []
-        detail.append(f"【{target['input_symbol']}】個股明細分析")
+        detail.append(f"【{target['input_symbol']} {target['name']}】個股明細分析")
         detail.append(f"市場：{target['market']}")
         detail.append(f"收盤：{target['close']}")
         detail.append(f"昨收：{target['prev_close']}")
@@ -613,7 +629,7 @@ class GTCProApp:
         detail.append(target["comment"])
 
         advice = []
-        advice.append(f"【{target['input_symbol']}】操作建議")
+        advice.append(f"【{target['input_symbol']} {target['name']}】操作建議")
         advice.append(f"建議：{target['advice']}")
         advice.append("")
         advice.append("【風險提醒】")
@@ -640,6 +656,7 @@ class GTCProApp:
             "排名": None,
             "市場": "market",
             "代號": "input_symbol",
+            "名稱": "name",
             "收盤": "close",
             "昨收": "prev_close",
             "漲跌": "change",
@@ -686,7 +703,7 @@ class GTCProApp:
         lines.append("=" * 140)
 
         for idx, r in enumerate(self.results, start=1):
-            lines.append(f"{idx}. 市場：{r['market']} / 股票代號：{r['input_symbol']}")
+            lines.append(f"{idx}. 市場：{r['market']} / 股票代號：{r['input_symbol']} / 名稱：{r['name']}")
             lines.append(f"   收盤：{r['close']} / 昨收：{r['prev_close']}")
             lines.append(f"   漲跌：{r['change']:+.2f} / 漲跌幅：{r['change_pct']:+.2f}%")
             lines.append(f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']}")
@@ -727,8 +744,8 @@ class GTCProApp:
             c.setFont(font_name, 9)
             c.drawString(24, height - 46, f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-            headers = ["排名", "市場", "代號", "收盤", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI"]
-            x_positions = [20, 55, 125, 185, 245, 310, 385, 455, 530, 590, 655, 725]
+            headers = ["排名", "市場", "代號", "名稱", "收盤", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI"]
+            x_positions = [20, 50, 105, 155, 280, 340, 405, 475, 545, 620, 680, 740, 805]
             y = height - 72
 
             c.setFont(font_name, 8)
@@ -748,6 +765,7 @@ class GTCProApp:
                     str(idx),
                     r["market"],
                     r["input_symbol"],
+                    r["name"][:18],
                     str(r["close"]),
                     f"{r['change']:+.2f}",
                     f"{r['change_pct']:+.2f}%",
