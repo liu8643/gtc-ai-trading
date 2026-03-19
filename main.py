@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
+from functools import lru_cache
 import pandas as pd
 import yfinance as yf
 from reportlab.lib.pagesizes import A4, landscape
@@ -11,7 +12,7 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v3.1.0-TW"
+APP_VERSION = "v3.2.0-TW-LiveName"
 
 
 def setup_pdf_font():
@@ -47,7 +48,58 @@ def normalize_symbol(symbol: str) -> list[str]:
     return [s]
 
 
-def get_stock_name(yf_symbol: str) -> str:
+@lru_cache(maxsize=1)
+def get_tw_name_map():
+    """
+    自動抓台股中文名稱：
+    - 上市：strMode=2
+    - 上櫃：strMode=4
+    """
+    mapping = {}
+
+    urls = [
+        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
+        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",
+    ]
+
+    for url in urls:
+        try:
+            tables = pd.read_html(url)
+            if not tables:
+                continue
+
+            df = tables[0].copy()
+            first_col = df.columns[0]
+            df = df[[first_col]].copy()
+            df.columns = ["raw"]
+
+            for raw in df["raw"].astype(str).tolist():
+                raw = raw.strip()
+                if not raw:
+                    continue
+
+                # 例：2330　台積電
+                parts = raw.replace("\u3000", " ").split()
+                if len(parts) >= 2 and parts[0].isdigit() and len(parts[0]) == 4:
+                    code = parts[0]
+                    name = parts[1]
+                    mapping[code] = name
+        except Exception:
+            continue
+
+    return mapping
+
+
+def get_stock_name(input_symbol: str, yf_symbol: str) -> str:
+    """
+    台股：優先抓中文名稱
+    美股：抓 Yahoo shortName / longName
+    """
+    if input_symbol.isdigit() and len(input_symbol) == 4:
+        tw_map = get_tw_name_map()
+        if input_symbol in tw_map:
+            return tw_map[input_symbol]
+
     try:
         ticker = yf.Ticker(yf_symbol)
         info = ticker.info
@@ -56,6 +108,7 @@ def get_stock_name(yf_symbol: str) -> str:
             return str(name)
     except Exception:
         pass
+
     return yf_symbol
 
 
@@ -96,6 +149,48 @@ def download_symbol_data(symbol: str, period: str = "8mo") -> tuple[str, pd.Data
     if last_error:
         raise ValueError(f"查無資料：{symbol} / {last_error}")
     raise ValueError(f"查無資料：{symbol}")
+
+
+def get_live_price_fields(yf_symbol: str, fallback_close: float) -> tuple[float, float]:
+    """
+    嘗試抓近即時價格：
+    - 先用 fast_info / info
+    - 失敗就退回日線 close
+    """
+    live_price = fallback_close
+    prev_close = fallback_close
+
+    try:
+        ticker = yf.Ticker(yf_symbol)
+
+        try:
+            fi = ticker.fast_info
+            if fi:
+                lp = fi.get("lastPrice")
+                pc = fi.get("previousClose")
+                if lp is not None:
+                    live_price = round(float(lp), 2)
+                if pc is not None:
+                    prev_close = round(float(pc), 2)
+        except Exception:
+            pass
+
+        if prev_close == fallback_close or live_price == fallback_close:
+            try:
+                info = ticker.info
+                rp = info.get("regularMarketPrice")
+                pcp = info.get("regularMarketPreviousClose")
+                if rp is not None:
+                    live_price = round(float(rp), 2)
+                if pcp is not None:
+                    prev_close = round(float(pcp), 2)
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    return live_price, prev_close
 
 
 def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -220,25 +315,25 @@ def build_risk_note(close, support, resistance, rsi, score):
 
 def analyze_symbol(symbol: str) -> dict:
     yf_symbol, df = download_symbol_data(symbol)
-    stock_name = get_stock_name(yf_symbol)
+    stock_name = get_stock_name(symbol, yf_symbol)
     df = calc_indicators(df)
 
     last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else last
 
-    close = round_price(last["Close"])
-    prev_close = round_price(prev["Close"])
+    day_close = round_price(last["Close"])
+    live_price, prev_close = get_live_price_fields(yf_symbol, day_close)
+
     open_price = round_price(last["Open"])
     high_price = round_price(last["High"])
     low_price = round_price(last["Low"])
 
-    change = round_price(close - prev_close)
+    change = round_price(live_price - prev_close)
     change_pct = round((change / prev_close) * 100, 2) if prev_close != 0 else 0.0
 
-    ma5 = round_price(last["MA5"]) if pd.notna(last["MA5"]) else close
-    ma10 = round_price(last["MA10"]) if pd.notna(last["MA10"]) else close
-    ma20 = round_price(last["MA20"]) if pd.notna(last["MA20"]) else close
-    ma60 = round_price(last["MA60"]) if pd.notna(last["MA60"]) else close
+    ma5 = round_price(last["MA5"]) if pd.notna(last["MA5"]) else live_price
+    ma10 = round_price(last["MA10"]) if pd.notna(last["MA10"]) else live_price
+    ma20 = round_price(last["MA20"]) if pd.notna(last["MA20"]) else live_price
+    ma60 = round_price(last["MA60"]) if pd.notna(last["MA60"]) else live_price
     rsi = round(float(last["RSI"]), 2) if pd.notna(last["RSI"]) else 50.0
 
     sr = calc_professional_sr(df)
@@ -248,28 +343,28 @@ def analyze_symbol(symbol: str) -> dict:
     score = 50
     comments = []
 
-    if close >= ma5:
+    if live_price >= ma5:
         score += 4
         comments.append("站上5日線")
     else:
         score -= 4
         comments.append("跌破5日線")
 
-    if close >= ma10:
+    if live_price >= ma10:
         score += 6
         comments.append("站上10日線")
     else:
         score -= 5
         comments.append("跌破10日線")
 
-    if close >= ma20:
+    if live_price >= ma20:
         score += 10
         comments.append("站上20日線")
     else:
         score -= 10
         comments.append("跌破20日線")
 
-    if close >= ma60:
+    if live_price >= ma60:
         score += 15
         comments.append("站上60日線")
     else:
@@ -319,7 +414,7 @@ def analyze_symbol(symbol: str) -> dict:
         signal = "弱勢觀望"
 
     advice = build_trade_advice(
-        close=close,
+        close=live_price,
         ma20=ma20,
         ma60=ma60,
         score=score,
@@ -330,7 +425,7 @@ def analyze_symbol(symbol: str) -> dict:
     )
 
     risk_note = build_risk_note(
-        close=close,
+        close=live_price,
         support=support,
         resistance=resistance,
         rsi=rsi,
@@ -351,7 +446,7 @@ def analyze_symbol(symbol: str) -> dict:
         "name": stock_name,
         "yf_symbol": yf_symbol,
         "market": detect_market(symbol, yf_symbol),
-        "close": close,
+        "close": live_price,
         "prev_close": prev_close,
         "open": open_price,
         "high": high_price,
@@ -600,7 +695,7 @@ class GTCProApp:
             return
 
         detail = []
-        detail.append(f"【{target['input_symbol']} {target['name']}】個股明細分析")
+        detail.append(f"個股明細分析")
         detail.append(f"市場：{target['market']}")
         detail.append(f"收盤：{target['close']}")
         detail.append(f"昨收：{target['prev_close']}")
@@ -629,7 +724,7 @@ class GTCProApp:
         detail.append(target["comment"])
 
         advice = []
-        advice.append(f"【{target['input_symbol']} {target['name']}】操作建議")
+        advice.append(f"操作建議")
         advice.append(f"建議：{target['advice']}")
         advice.append("")
         advice.append("【風險提醒】")
@@ -745,7 +840,7 @@ class GTCProApp:
             c.drawString(24, height - 46, f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
             headers = ["排名", "市場", "代號", "名稱", "收盤", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI"]
-            x_positions = [20, 50, 105, 155, 280, 340, 405, 475, 545, 620, 680, 740, 805]
+            x_positions = [20, 50, 105, 155, 320, 380, 445, 515, 585, 655, 715, 775, 840]
             y = height - 72
 
             c.setFont(font_name, 8)
@@ -765,7 +860,7 @@ class GTCProApp:
                     str(idx),
                     r["market"],
                     r["input_symbol"],
-                    r["name"][:18],
+                    r["name"][:20],
                     str(r["close"]),
                     f"{r['change']:+.2f}",
                     f"{r['change_pct']:+.2f}%",
