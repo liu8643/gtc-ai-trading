@@ -12,7 +12,8 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v3.2.0-TW-LiveName"
+APP_VERSION = "v3.3.0-TW-Live-Auto"
+AUTO_REFRESH_MS = 60000  # 60 秒
 
 
 def setup_pdf_font():
@@ -52,38 +53,39 @@ def normalize_symbol(symbol: str) -> list[str]:
 def get_tw_name_map():
     """
     自動抓台股中文名稱：
-    - 上市：strMode=2
-    - 上櫃：strMode=4
+    - 上市：TWSE
+    - 上櫃：TPEx
     """
     mapping = {}
 
-    urls = [
-        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
-        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",
+    sources = [
+        "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+        "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
     ]
 
-    for url in urls:
+    for url in sources:
         try:
-            tables = pd.read_html(url)
-            if not tables:
+            df = pd.read_json(url)
+
+            code_col = None
+            name_col = None
+
+            for c in df.columns:
+                c_str = str(c).strip()
+                if code_col is None and ("代號" in c_str or "Code" in c_str):
+                    code_col = c
+                if name_col is None and ("簡稱" in c_str or "名稱" in c_str or "Name" in c_str):
+                    name_col = c
+
+            if code_col is None or name_col is None:
                 continue
 
-            df = tables[0].copy()
-            first_col = df.columns[0]
-            df = df[[first_col]].copy()
-            df.columns = ["raw"]
-
-            for raw in df["raw"].astype(str).tolist():
-                raw = raw.strip()
-                if not raw:
-                    continue
-
-                # 例：2330　台積電
-                parts = raw.replace("\u3000", " ").split()
-                if len(parts) >= 2 and parts[0].isdigit() and len(parts[0]) == 4:
-                    code = parts[0]
-                    name = parts[1]
+            for _, row in df.iterrows():
+                code = str(row[code_col]).strip()
+                name = str(row[name_col]).strip()
+                if code.isdigit() and len(code) == 4 and name:
                     mapping[code] = name
+
         except Exception:
             continue
 
@@ -92,8 +94,8 @@ def get_tw_name_map():
 
 def get_stock_name(input_symbol: str, yf_symbol: str) -> str:
     """
-    台股：優先抓中文名稱
-    美股：抓 Yahoo shortName / longName
+    台股：優先顯示中文名稱
+    美股：顯示 Yahoo 名稱
     """
     if input_symbol.isdigit() and len(input_symbol) == 4:
         tw_map = get_tw_name_map()
@@ -153,9 +155,7 @@ def download_symbol_data(symbol: str, period: str = "8mo") -> tuple[str, pd.Data
 
 def get_live_price_fields(yf_symbol: str, fallback_close: float) -> tuple[float, float]:
     """
-    嘗試抓近即時價格：
-    - 先用 fast_info / info
-    - 失敗就退回日線 close
+    盡量抓近即時價格，抓不到就退回日線收盤
     """
     live_price = fallback_close
     prev_close = fallback_close
@@ -166,26 +166,26 @@ def get_live_price_fields(yf_symbol: str, fallback_close: float) -> tuple[float,
         try:
             fi = ticker.fast_info
             if fi:
-                lp = fi.get("lastPrice")
-                pc = fi.get("previousClose")
-                if lp is not None:
-                    live_price = round(float(lp), 2)
-                if pc is not None:
-                    prev_close = round(float(pc), 2)
+                last_price = fi.get("lastPrice")
+                previous_close = fi.get("previousClose")
+                if last_price is not None:
+                    live_price = round(float(last_price), 2)
+                if previous_close is not None:
+                    prev_close = round(float(previous_close), 2)
         except Exception:
             pass
 
-        if prev_close == fallback_close or live_price == fallback_close:
-            try:
-                info = ticker.info
-                rp = info.get("regularMarketPrice")
-                pcp = info.get("regularMarketPreviousClose")
-                if rp is not None:
-                    live_price = round(float(rp), 2)
-                if pcp is not None:
-                    prev_close = round(float(pcp), 2)
-            except Exception:
-                pass
+        try:
+            info = ticker.info
+            regular_market_price = info.get("regularMarketPrice")
+            regular_market_prev_close = info.get("regularMarketPreviousClose")
+
+            if regular_market_price is not None:
+                live_price = round(float(regular_market_price), 2)
+            if regular_market_prev_close is not None:
+                prev_close = round(float(regular_market_prev_close), 2)
+        except Exception:
+            pass
 
     except Exception:
         pass
@@ -477,6 +477,7 @@ class GTCProApp:
         self.results = []
         self.current_sort_column = None
         self.sort_reverse = True
+        self.auto_refresh_enabled = False
         self._build_ui()
         self.set_status(f"系統已就緒。當前版本：{APP_VERSION}")
 
@@ -486,11 +487,13 @@ class GTCProApp:
 
         ttk.Label(top, text="股票代號（逗號分隔）").pack(side="left", padx=(0, 8))
 
-        self.symbol_entry = ttk.Entry(top, width=110)
+        self.symbol_entry = ttk.Entry(top, width=100)
         self.symbol_entry.pack(side="left", padx=(0, 8), fill="x", expand=True)
         self.symbol_entry.insert(0, "2330,2382,3231,2308,3017,AAPL,NVDA,MSFT")
 
         ttk.Button(top, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="匯出 PDF", command=self.export_pdf).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="匯出 TXT", command=self.export_txt).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="清空", command=self.clear_results).pack(side="left")
@@ -673,6 +676,28 @@ class GTCProApp:
         else:
             self.set_status(f"分析完成，共 {len(self.results)} 檔。版本：{APP_VERSION}")
 
+    def enable_auto_refresh(self):
+        self.auto_refresh_enabled = True
+        self.set_status(f"已啟用自動刷新（每 {AUTO_REFRESH_MS // 1000} 秒）。版本：{APP_VERSION}")
+        self.root.after(AUTO_REFRESH_MS, self.auto_refresh_job)
+
+    def disable_auto_refresh(self):
+        self.auto_refresh_enabled = False
+        self.set_status(f"已停止自動刷新。版本：{APP_VERSION}")
+
+    def auto_refresh_job(self):
+        if not self.auto_refresh_enabled:
+            return
+
+        symbols = self.parse_symbols()
+        if symbols:
+            try:
+                self.run_analysis()
+            except Exception:
+                pass
+
+        self.root.after(AUTO_REFRESH_MS, self.auto_refresh_job)
+
     def on_row_select(self, event=None):
         selected = self.tree.selection()
         if not selected:
@@ -695,7 +720,7 @@ class GTCProApp:
             return
 
         detail = []
-        detail.append(f"個股明細分析")
+        detail.append(f"【{target['input_symbol']} {target['name']}】個股明細分析")
         detail.append(f"市場：{target['market']}")
         detail.append(f"收盤：{target['close']}")
         detail.append(f"昨收：{target['prev_close']}")
@@ -724,7 +749,7 @@ class GTCProApp:
         detail.append(target["comment"])
 
         advice = []
-        advice.append(f"操作建議")
+        advice.append(f"【{target['input_symbol']} {target['name']}】操作建議")
         advice.append(f"建議：{target['advice']}")
         advice.append("")
         advice.append("【風險提醒】")
