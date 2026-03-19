@@ -4,6 +4,7 @@ from datetime import datetime
 from functools import lru_cache
 import pandas as pd
 import yfinance as yf
+import requests
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -12,8 +13,8 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v3.3.0-TW-Live-Auto"
-AUTO_REFRESH_MS = 60000  # 60 秒
+APP_VERSION = "v4.0.0-TW-Realtime"
+AUTO_REFRESH_MS = 30000  # 30 秒
 
 
 def setup_pdf_font():
@@ -53,8 +54,8 @@ def normalize_symbol(symbol: str) -> list[str]:
 def get_tw_name_map():
     """
     自動抓台股中文名稱：
-    - 上市：TWSE
-    - 上櫃：TPEx
+    - 上市：TWSE OpenAPI
+    - 上櫃：TPEx OpenAPI
     """
     mapping = {}
 
@@ -153,12 +154,99 @@ def download_symbol_data(symbol: str, period: str = "8mo") -> tuple[str, pd.Data
     raise ValueError(f"查無資料：{symbol}")
 
 
-def get_live_price_fields(yf_symbol: str, fallback_close: float) -> tuple[float, float]:
+def round_price(v: float) -> float:
+    return round(float(v), 2)
+
+
+def safe_float(v, default=None):
+    try:
+        if v in (None, "", "-", "--"):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def detect_market(input_symbol: str, yf_symbol: str) -> str:
+    if yf_symbol.endswith(".TW"):
+        return "台股上市"
+    if yf_symbol.endswith(".TWO"):
+        return "台股上櫃"
+    if input_symbol.isalpha():
+        return "美股/海外"
+    return "其他"
+
+
+def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
     """
-    盡量抓近即時價格，抓不到就退回日線收盤
+    台股盤中即時：
+    - 上市：tse_2330.tw
+    - 上櫃：otc_3481.tw
+    """
+    if market not in ("台股上市", "台股上櫃"):
+        return None
+
+    ex_prefix = "tse" if market == "台股上市" else "otc"
+    ex_ch = f"{ex_prefix}_{symbol}.tw"
+
+    url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+    params = {
+        "ex_ch": ex_ch,
+        "json": "1",
+        "delay": "0",
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+    }
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+
+        msg_array = data.get("msgArray", [])
+        if not msg_array:
+            return None
+
+        item = msg_array[0]
+
+        # 現價：z，若沒有則可退回成交價 tv / close
+        last_price = safe_float(item.get("z"))
+        open_price = safe_float(item.get("o"))
+        high_price = safe_float(item.get("h"))
+        low_price = safe_float(item.get("l"))
+        prev_close = safe_float(item.get("y"))
+
+        # 有時沒有成交價，退回昨收
+        if last_price is None:
+            last_price = prev_close
+
+        if last_price is None:
+            return None
+
+        return {
+            "close": round_price(last_price),
+            "prev_close": round_price(prev_close if prev_close is not None else last_price),
+            "open": round_price(open_price if open_price is not None else last_price),
+            "high": round_price(high_price if high_price is not None else last_price),
+            "low": round_price(low_price if low_price is not None else last_price),
+            "source": "TWSE MIS 即時",
+        }
+    except Exception:
+        return None
+
+
+def get_us_yahoo_quote(yf_symbol: str, fallback_close: float, fallback_prev_close: float, fallback_open: float, fallback_high: float, fallback_low: float) -> dict:
+    """
+    美股保留 Yahoo / yfinance
     """
     live_price = fallback_close
-    prev_close = fallback_close
+    prev_close = fallback_prev_close
+    open_price = fallback_open
+    high_price = fallback_high
+    low_price = fallback_low
 
     try:
         ticker = yf.Ticker(yf_symbol)
@@ -166,31 +254,57 @@ def get_live_price_fields(yf_symbol: str, fallback_close: float) -> tuple[float,
         try:
             fi = ticker.fast_info
             if fi:
-                last_price = fi.get("lastPrice")
-                previous_close = fi.get("previousClose")
-                if last_price is not None:
-                    live_price = round(float(last_price), 2)
-                if previous_close is not None:
-                    prev_close = round(float(previous_close), 2)
+                lp = fi.get("lastPrice")
+                pc = fi.get("previousClose")
+                day_high = fi.get("dayHigh")
+                day_low = fi.get("dayLow")
+                day_open = fi.get("open")
+
+                if lp is not None:
+                    live_price = round(float(lp), 2)
+                if pc is not None:
+                    prev_close = round(float(pc), 2)
+                if day_high is not None:
+                    high_price = round(float(day_high), 2)
+                if day_low is not None:
+                    low_price = round(float(day_low), 2)
+                if day_open is not None:
+                    open_price = round(float(day_open), 2)
         except Exception:
             pass
 
         try:
             info = ticker.info
-            regular_market_price = info.get("regularMarketPrice")
-            regular_market_prev_close = info.get("regularMarketPreviousClose")
+            rp = info.get("regularMarketPrice")
+            pcp = info.get("regularMarketPreviousClose")
+            day_high = info.get("regularMarketDayHigh")
+            day_low = info.get("regularMarketDayLow")
+            day_open = info.get("regularMarketOpen")
 
-            if regular_market_price is not None:
-                live_price = round(float(regular_market_price), 2)
-            if regular_market_prev_close is not None:
-                prev_close = round(float(regular_market_prev_close), 2)
+            if rp is not None:
+                live_price = round(float(rp), 2)
+            if pcp is not None:
+                prev_close = round(float(pcp), 2)
+            if day_high is not None:
+                high_price = round(float(day_high), 2)
+            if day_low is not None:
+                low_price = round(float(day_low), 2)
+            if day_open is not None:
+                open_price = round(float(day_open), 2)
         except Exception:
             pass
 
     except Exception:
         pass
 
-    return live_price, prev_close
+    return {
+        "close": live_price,
+        "prev_close": prev_close,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "source": "Yahoo Finance",
+    }
 
 
 def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -224,20 +338,6 @@ def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["D"] = df["K"].ewm(com=2).mean()
 
     return df
-
-
-def detect_market(input_symbol: str, yf_symbol: str) -> str:
-    if yf_symbol.endswith(".TW"):
-        return "台股上市"
-    if yf_symbol.endswith(".TWO"):
-        return "台股上櫃"
-    if input_symbol.isalpha():
-        return "美股/海外"
-    return "其他"
-
-
-def round_price(v: float) -> float:
-    return round(float(v), 2)
 
 
 def calc_professional_sr(df: pd.DataFrame) -> dict:
@@ -315,25 +415,52 @@ def build_risk_note(close, support, resistance, rsi, score):
 
 def analyze_symbol(symbol: str) -> dict:
     yf_symbol, df = download_symbol_data(symbol)
+    market = detect_market(symbol, yf_symbol)
     stock_name = get_stock_name(symbol, yf_symbol)
     df = calc_indicators(df)
 
     last = df.iloc[-1]
 
-    day_close = round_price(last["Close"])
-    live_price, prev_close = get_live_price_fields(yf_symbol, day_close)
+    fallback_close = round_price(last["Close"])
+    fallback_prev_close = round_price(df.iloc[-2]["Close"]) if len(df) >= 2 else fallback_close
+    fallback_open = round_price(last["Open"])
+    fallback_high = round_price(last["High"])
+    fallback_low = round_price(last["Low"])
 
-    open_price = round_price(last["Open"])
-    high_price = round_price(last["High"])
-    low_price = round_price(last["Low"])
+    if market in ("台股上市", "台股上櫃"):
+        rt = get_tw_realtime_quote(symbol, market)
+        if rt is None:
+            rt = {
+                "close": fallback_close,
+                "prev_close": fallback_prev_close,
+                "open": fallback_open,
+                "high": fallback_high,
+                "low": fallback_low,
+                "source": "日線回退",
+            }
+    else:
+        rt = get_us_yahoo_quote(
+            yf_symbol=yf_symbol,
+            fallback_close=fallback_close,
+            fallback_prev_close=fallback_prev_close,
+            fallback_open=fallback_open,
+            fallback_high=fallback_high,
+            fallback_low=fallback_low,
+        )
 
-    change = round_price(live_price - prev_close)
+    close = rt["close"]
+    prev_close = rt["prev_close"]
+    open_price = rt["open"]
+    high_price = rt["high"]
+    low_price = rt["low"]
+
+    change = round_price(close - prev_close)
     change_pct = round((change / prev_close) * 100, 2) if prev_close != 0 else 0.0
 
-    ma5 = round_price(last["MA5"]) if pd.notna(last["MA5"]) else live_price
-    ma10 = round_price(last["MA10"]) if pd.notna(last["MA10"]) else live_price
-    ma20 = round_price(last["MA20"]) if pd.notna(last["MA20"]) else live_price
-    ma60 = round_price(last["MA60"]) if pd.notna(last["MA60"]) else live_price
+    ma5 = round_price(last["MA5"]) if pd.notna(last["MA5"]) else close
+    ma10 = round_price(last["MA10"]) if pd.notna(last["MA10"]) else close
+    ma20 = round_price(last["MA20"]) if pd.notna(last["MA20"]) else close
+    ma60 = round_price(last["MA60"]) if pd.notna(last["MA60"]) else close
     rsi = round(float(last["RSI"]), 2) if pd.notna(last["RSI"]) else 50.0
 
     sr = calc_professional_sr(df)
@@ -343,28 +470,28 @@ def analyze_symbol(symbol: str) -> dict:
     score = 50
     comments = []
 
-    if live_price >= ma5:
+    if close >= ma5:
         score += 4
         comments.append("站上5日線")
     else:
         score -= 4
         comments.append("跌破5日線")
 
-    if live_price >= ma10:
+    if close >= ma10:
         score += 6
         comments.append("站上10日線")
     else:
         score -= 5
         comments.append("跌破10日線")
 
-    if live_price >= ma20:
+    if close >= ma20:
         score += 10
         comments.append("站上20日線")
     else:
         score -= 10
         comments.append("跌破20日線")
 
-    if live_price >= ma60:
+    if close >= ma60:
         score += 15
         comments.append("站上60日線")
     else:
@@ -414,7 +541,7 @@ def analyze_symbol(symbol: str) -> dict:
         signal = "弱勢觀望"
 
     advice = build_trade_advice(
-        close=live_price,
+        close=close,
         ma20=ma20,
         ma60=ma60,
         score=score,
@@ -425,7 +552,7 @@ def analyze_symbol(symbol: str) -> dict:
     )
 
     risk_note = build_risk_note(
-        close=live_price,
+        close=close,
         support=support,
         resistance=resistance,
         rsi=rsi,
@@ -439,14 +566,15 @@ def analyze_symbol(symbol: str) -> dict:
         f"；波段低點={sr['swing_low']}"
         f"；波段高點={sr['swing_high']}"
         f"；Pivot={sr['pivot']}"
+        f"；來源={rt['source']}"
     )
 
     return {
         "input_symbol": symbol,
         "name": stock_name,
         "yf_symbol": yf_symbol,
-        "market": detect_market(symbol, yf_symbol),
-        "close": live_price,
+        "market": market,
+        "close": close,
         "prev_close": prev_close,
         "open": open_price,
         "high": high_price,
@@ -465,6 +593,7 @@ def analyze_symbol(symbol: str) -> dict:
         "ma60": ma60,
         "comment": extra_comment,
         "risk_note": risk_note,
+        "source": rt["source"],
     }
 
 
@@ -720,9 +849,10 @@ class GTCProApp:
             return
 
         detail = []
-        detail.append(f"【{target['input_symbol']} {target['name']}】個股明細分析")
+        detail.append(f"個股明細分析")
         detail.append(f"市場：{target['market']}")
-        detail.append(f"收盤：{target['close']}")
+        detail.append(f"資料來源：{target['source']}")
+        detail.append(f"收盤/現價：{target['close']}")
         detail.append(f"昨收：{target['prev_close']}")
         detail.append(f"開盤：{target['open']}")
         detail.append(f"最高：{target['high']}")
@@ -749,7 +879,7 @@ class GTCProApp:
         detail.append(target["comment"])
 
         advice = []
-        advice.append(f"【{target['input_symbol']} {target['name']}】操作建議")
+        advice.append(f"操作建議")
         advice.append(f"建議：{target['advice']}")
         advice.append("")
         advice.append("【風險提醒】")
@@ -824,7 +954,8 @@ class GTCProApp:
 
         for idx, r in enumerate(self.results, start=1):
             lines.append(f"{idx}. 市場：{r['market']} / 股票代號：{r['input_symbol']} / 名稱：{r['name']}")
-            lines.append(f"   收盤：{r['close']} / 昨收：{r['prev_close']}")
+            lines.append(f"   資料來源：{r['source']}")
+            lines.append(f"   收盤/現價：{r['close']} / 昨收：{r['prev_close']}")
             lines.append(f"   漲跌：{r['change']:+.2f} / 漲跌幅：{r['change_pct']:+.2f}%")
             lines.append(f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']}")
             lines.append(f"   支撐：{r['support']} / 壓力：{r['resistance']} / RSI：{r['rsi']}")
