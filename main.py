@@ -13,7 +13,7 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v4.1.0-TW-Realtime-AI"
+APP_VERSION = "v4.2.0-TW-Realtime-AI-Wave"
 AUTO_REFRESH_MS = 30000  # 30 秒
 
 
@@ -106,7 +106,7 @@ def get_stock_name(input_symbol: str, yf_symbol: str) -> str:
     return yf_symbol
 
 
-def download_symbol_data(symbol: str, period: str = "8mo") -> tuple[str, pd.DataFrame]:
+def download_symbol_data(symbol: str, period: str = "12mo") -> tuple[str, pd.DataFrame]:
     candidates = normalize_symbol(symbol)
     last_error = None
 
@@ -222,7 +222,14 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
         return None
 
 
-def get_us_yahoo_quote(yf_symbol: str, fallback_close: float, fallback_prev_close: float, fallback_open: float, fallback_high: float, fallback_low: float) -> dict:
+def get_us_yahoo_quote(
+    yf_symbol: str,
+    fallback_close: float,
+    fallback_prev_close: float,
+    fallback_open: float,
+    fallback_high: float,
+    fallback_low: float,
+) -> dict:
     live_price = fallback_close
     prev_close = fallback_prev_close
     open_price = fallback_open
@@ -398,8 +405,6 @@ def build_ai_analysis(data: dict) -> str:
     lines = []
 
     close = data["close"]
-    ma5 = data["ma5"]
-    ma10 = data["ma10"]
     ma20 = data["ma20"]
     ma60 = data["ma60"]
     rsi = data["rsi"]
@@ -410,17 +415,15 @@ def build_ai_analysis(data: dict) -> str:
     signal = data["signal"]
     advice = data["advice"]
 
-    # 1. 趨勢判讀
     if close >= ma20 and close >= ma60:
         trend_text = "目前股價位於20日線與60日線之上，中期趨勢偏強。"
     elif close >= ma20 and close < ma60:
-        trend_text = "目前股價站上20日線，但仍在60日線下方，屬於短強中性結構。"
+        trend_text = "目前股價站上20日線，但仍在60日線下方，屬短強中性結構。"
     elif close < ma20 and close >= ma60:
-        trend_text = "目前股價跌破20日線但仍守住60日線，短線轉弱、中期仍待觀察。"
+        trend_text = "目前股價跌破20日線但仍守住60日線，短線轉弱、中期待觀察。"
     else:
         trend_text = "目前股價位於20日線與60日線下方，技術面偏弱。"
 
-    # 2. 動能判讀
     if rsi >= 70:
         rsi_text = f"RSI為 {rsi}，已接近或進入過熱區，短線需留意震盪與拉回。"
     elif rsi <= 30:
@@ -428,11 +431,10 @@ def build_ai_analysis(data: dict) -> str:
     elif rsi >= 55:
         rsi_text = f"RSI為 {rsi}，動能偏強，但仍需觀察是否能持續放大。"
     elif rsi >= 40:
-        rsi_text = f"RSI為 {rsi}，動能中性偏弱，屬於整理觀察區。"
+        rsi_text = f"RSI為 {rsi}，動能中性偏弱，屬整理觀察區。"
     else:
         rsi_text = f"RSI為 {rsi}，動能偏弱，短線仍需保守。"
 
-    # 3. 漲跌與強弱
     if change_pct >= 5:
         move_text = f"當前漲跌幅為 {change_pct:+.2f}%，屬於強勢波動，市場追價意願明顯。"
     elif change_pct > 0:
@@ -442,10 +444,8 @@ def build_ai_analysis(data: dict) -> str:
     else:
         move_text = f"當前漲跌幅為 {change_pct:+.2f}%，短線價格變化偏保守。"
 
-    # 4. 支撐壓力
     sr_text = f"下方主支撐約在 {support}，上方主壓力約在 {resistance}。若守穩支撐，有利延續整理後再攻；若壓力無法突破，則仍以區間看待。"
 
-    # 5. AI 綜合判斷
     if score >= 85:
         final_text = f"AI綜合判斷：目前屬高分強勢結構，訊號為「{signal}」，建議採取「{advice}」策略，但接近壓力區時不宜過度追價。"
     elif score >= 65:
@@ -463,6 +463,81 @@ def build_ai_analysis(data: dict) -> str:
     lines.append(f"5. AI結論：{final_text}")
 
     return "\n".join(lines)
+
+
+def detect_local_pivots(series: pd.Series, left: int = 2, right: int = 2):
+    pivots = []
+    values = series.tolist()
+
+    for i in range(left, len(values) - right):
+        window = values[i - left:i + right + 1]
+        center = values[i]
+
+        if center == max(window):
+            pivots.append((i, "H", float(center)))
+        elif center == min(window):
+            pivots.append((i, "L", float(center)))
+
+    return pivots
+
+
+def summarize_wave(df: pd.DataFrame, period: int, label: str) -> str:
+    part = df.tail(period).copy()
+    if len(part) < 15:
+        return f"{label}：資料不足，暫無法判讀。"
+
+    close_start = float(part["Close"].iloc[0])
+    close_end = float(part["Close"].iloc[-1])
+    highest = float(part["High"].max())
+    lowest = float(part["Low"].min())
+    amplitude_pct = ((highest - lowest) / lowest * 100) if lowest != 0 else 0
+
+    ma20_last = float(part["Close"].rolling(20).mean().iloc[-1]) if len(part) >= 20 else close_end
+    ma60_last = float(part["Close"].rolling(60).mean().iloc[-1]) if len(part) >= 60 else close_end
+
+    pivots = detect_local_pivots(part["Close"], left=2, right=2)
+    recent_pivots = pivots[-6:] if len(pivots) >= 6 else pivots
+
+    wave_hint = ""
+    if close_end > close_start and close_end >= ma20_last:
+        if len(recent_pivots) >= 5:
+            wave_hint = "較偏推動浪結構，可能處於第3浪或第5浪延伸區。"
+        else:
+            wave_hint = "偏多推升結構，可能處於推動浪初升段。"
+    elif close_end < close_start and close_end < ma20_last:
+        if len(recent_pivots) >= 4:
+            wave_hint = "較偏修正浪結構，可能位於 A / C 浪下修階段。"
+        else:
+            wave_hint = "偏弱修正結構，較像回檔整理波。"
+    else:
+        wave_hint = "目前較像整理浪或轉折確認階段，尚未形成明確單邊波段。"
+
+    if close_end >= ma20_last and close_end >= ma60_last:
+        trend_hint = "均線結構偏多。"
+    elif close_end >= ma20_last and close_end < ma60_last:
+        trend_hint = "短線偏強，但中期壓力仍在。"
+    elif close_end < ma20_last and close_end >= ma60_last:
+        trend_hint = "短線轉弱，中期尚未完全破壞。"
+    else:
+        trend_hint = "短中期均線結構偏弱。"
+
+    return (
+        f"{label}：區間波動約 {amplitude_pct:.2f}% ，"
+        f"{wave_hint}{trend_hint}"
+    )
+
+
+def build_wave_analysis(df: pd.DataFrame) -> str:
+    short_text = summarize_wave(df, 20, "短期")
+    mid_text = summarize_wave(df, 60, "中期")
+    long_text = summarize_wave(df, 120, "長期")
+
+    return "\n".join([
+        "【波浪理論分析】",
+        f"1. {short_text}",
+        f"2. {mid_text}",
+        f"3. {long_text}",
+    ])
 
 
 def analyze_symbol(symbol: str) -> dict:
@@ -649,6 +724,7 @@ def analyze_symbol(symbol: str) -> dict:
     }
 
     result["ai_analysis"] = build_ai_analysis(result)
+    result["wave_analysis"] = build_wave_analysis(df)
     return result
 
 
@@ -934,6 +1010,8 @@ class GTCProApp:
         detail.append(target["comment"])
         detail.append("")
         detail.append(target["ai_analysis"])
+        detail.append("")
+        detail.append(target["wave_analysis"])
 
         advice = []
         advice.append(f"【{target['input_symbol']} {target['name']}】操作建議")
@@ -1019,6 +1097,7 @@ class GTCProApp:
             lines.append(f"   說明：{r['comment']}")
             lines.append(f"   風險：{r['risk_note']}")
             lines.append(r["ai_analysis"])
+            lines.append(r["wave_analysis"])
             lines.append("-" * 140)
 
         try:
