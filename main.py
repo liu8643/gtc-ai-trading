@@ -10,7 +10,8 @@ from reportlab.pdfgen import canvas
 import os
 
 
-APP_TITLE = "GTC AI Trading System Pro Plus"
+APP_TITLE = "GTC 股票專業版看盤分析系統"
+APP_VERSION = "v3.0.0-TW"
 
 
 def setup_pdf_font():
@@ -19,7 +20,6 @@ def setup_pdf_font():
         r"C:\Windows\Fonts\msjh.ttf",
         r"C:\Windows\Fonts\mingliu.ttc",
         r"C:\Windows\Fonts\kaiu.ttf",
-        r"C:\Windows\Fonts\simhei.ttf",
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -47,7 +47,7 @@ def normalize_symbol(symbol: str) -> list[str]:
     return [s]
 
 
-def download_symbol_data(symbol: str, period: str = "6mo") -> tuple[str, pd.DataFrame]:
+def download_symbol_data(symbol: str, period: str = "8mo") -> tuple[str, pd.DataFrame]:
     candidates = normalize_symbol(symbol)
     last_error = None
 
@@ -69,8 +69,7 @@ def download_symbol_data(symbol: str, period: str = "6mo") -> tuple[str, pd.Data
                 df.columns = [c[0] for c in df.columns]
 
             needed = ["Open", "High", "Low", "Close", "Volume"]
-            ok = all(c in df.columns for c in needed)
-            if not ok:
+            if not all(c in df.columns for c in needed):
                 continue
 
             df = df.dropna(subset=["Close"]).copy()
@@ -90,6 +89,8 @@ def download_symbol_data(symbol: str, period: str = "6mo") -> tuple[str, pd.Data
 def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
+    df["MA5"] = df["Close"].rolling(5).mean()
+    df["MA10"] = df["Close"].rolling(10).mean()
     df["MA20"] = df["Close"].rolling(20).mean()
     df["MA60"] = df["Close"].rolling(60).mean()
 
@@ -128,6 +129,83 @@ def detect_market(input_symbol: str, yf_symbol: str) -> str:
     return "其他"
 
 
+def round_price(v: float) -> float:
+    return round(float(v), 2)
+
+
+def calc_professional_sr(df: pd.DataFrame) -> dict:
+    recent20 = df.tail(20)
+    recent40 = df.tail(40)
+
+    close = float(df["Close"].iloc[-1])
+
+    support_20 = float(recent20["Low"].min())
+    resistance_20 = float(recent20["High"].max())
+
+    swing_low = float(recent40["Low"].min())
+    swing_high = float(recent40["High"].max())
+
+    last_bar = df.iloc[-1]
+    pivot = (float(last_bar["High"]) + float(last_bar["Low"]) + float(last_bar["Close"])) / 3
+    r1 = pivot * 2 - float(last_bar["Low"])
+    s1 = pivot * 2 - float(last_bar["High"])
+
+    support_candidates = [support_20, swing_low, s1]
+    resistance_candidates = [resistance_20, swing_high, r1]
+
+    supports_below = [x for x in support_candidates if x <= close]
+    main_support = max(supports_below) if supports_below else min(support_candidates)
+
+    resistances_above = [x for x in resistance_candidates if x >= close]
+    main_resistance = min(resistances_above) if resistances_above else max(resistance_candidates)
+
+    return {
+        "support": round_price(main_support),
+        "resistance": round_price(main_resistance),
+        "support20": round_price(support_20),
+        "resistance20": round_price(resistance_20),
+        "swing_low": round_price(swing_low),
+        "swing_high": round_price(swing_high),
+        "pivot": round_price(pivot),
+        "s1": round_price(s1),
+        "r1": round_price(r1),
+    }
+
+
+def build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct) -> str:
+    if close >= ma20 and close >= ma60 and score >= 80:
+        return "強勢買進"
+    if close >= ma20 and score >= 65:
+        return "拉回布局"
+    if score >= 45 and close >= support:
+        return "區間觀察"
+    if rsi > 70 or close >= resistance * 0.98:
+        return "減碼/停利"
+    if close < ma20 and close < ma60 and change_pct < 0:
+        return "轉弱觀望"
+    return "保守觀察"
+
+
+def build_risk_note(close, support, resistance, rsi, score):
+    notes = []
+
+    if close <= support * 1.01:
+        notes.append("接近支撐，觀察是否守穩")
+    if close >= resistance * 0.99:
+        notes.append("逼近壓力，留意獲利了結賣壓")
+    if rsi >= 70:
+        notes.append("RSI 偏高，短線過熱風險上升")
+    if rsi <= 30:
+        notes.append("RSI 偏低，可能進入超跌區")
+    if score < 30:
+        notes.append("綜合評分偏弱，不宜積極追價")
+
+    if not notes:
+        notes.append("目前技術面無明顯異常，但仍須控管部位")
+
+    return "；".join(notes)
+
+
 def analyze_symbol(symbol: str) -> dict:
     yf_symbol, df = download_symbol_data(symbol)
     df = calc_indicators(df)
@@ -135,37 +213,55 @@ def analyze_symbol(symbol: str) -> dict:
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
 
-    close = round(float(last["Close"]), 2)
-    prev_close = round(float(prev["Close"]), 2)
+    close = round_price(last["Close"])
+    prev_close = round_price(prev["Close"])
+    open_price = round_price(last["Open"])
+    high_price = round_price(last["High"])
+    low_price = round_price(last["Low"])
 
-    change = round(close - prev_close, 2)
+    change = round_price(close - prev_close)
     change_pct = round((change / prev_close) * 100, 2) if prev_close != 0 else 0.0
 
-    ma20 = round(float(last["MA20"]), 2) if pd.notna(last["MA20"]) else None
-    ma60 = round(float(last["MA60"]), 2) if pd.notna(last["MA60"]) else None
+    ma5 = round_price(last["MA5"]) if pd.notna(last["MA5"]) else close
+    ma10 = round_price(last["MA10"]) if pd.notna(last["MA10"]) else close
+    ma20 = round_price(last["MA20"]) if pd.notna(last["MA20"]) else close
+    ma60 = round_price(last["MA60"]) if pd.notna(last["MA60"]) else close
     rsi = round(float(last["RSI"]), 2) if pd.notna(last["RSI"]) else 50.0
 
-    support = round(float(df.tail(20)["Low"].min()), 2)
-    resistance = round(float(df.tail(20)["High"].max()), 2)
+    sr = calc_professional_sr(df)
+    support = sr["support"]
+    resistance = sr["resistance"]
 
     score = 50
     comments = []
 
-    if ma20 is not None:
-        if close >= ma20:
-            score += 10
-            comments.append("站上20日線")
-        else:
-            score -= 10
-            comments.append("跌破20日線")
+    if close >= ma5:
+        score += 4
+        comments.append("站上5日線")
+    else:
+        score -= 4
+        comments.append("跌破5日線")
 
-    if ma60 is not None:
-        if close >= ma60:
-            score += 15
-            comments.append("站上60日線")
-        else:
-            score -= 12
-            comments.append("跌破60日線")
+    if close >= ma10:
+        score += 6
+        comments.append("站上10日線")
+    else:
+        score -= 5
+        comments.append("跌破10日線")
+
+    if close >= ma20:
+        score += 10
+        comments.append("站上20日線")
+    else:
+        score -= 10
+        comments.append("跌破20日線")
+
+    if close >= ma60:
+        score += 15
+        comments.append("站上60日線")
+    else:
+        score -= 12
+        comments.append("跌破60日線")
 
     if float(last["MACD"]) >= float(last["MACD_SIGNAL"]):
         score += 8
@@ -209,7 +305,33 @@ def analyze_symbol(symbol: str) -> dict:
     else:
         signal = "弱勢觀望"
 
-    direction_text = "上漲" if change > 0 else "下跌" if change < 0 else "平盤"
+    advice = build_trade_advice(
+        close=close,
+        ma20=ma20,
+        ma60=ma60,
+        score=score,
+        rsi=rsi,
+        support=support,
+        resistance=resistance,
+        change_pct=change_pct,
+    )
+
+    risk_note = build_risk_note(
+        close=close,
+        support=support,
+        resistance=resistance,
+        rsi=rsi,
+        score=score,
+    )
+
+    extra_comment = (
+        f"{'；'.join(comments)}"
+        f"；20日支撐={sr['support20']}"
+        f"；20日壓力={sr['resistance20']}"
+        f"；波段低點={sr['swing_low']}"
+        f"；波段高點={sr['swing_high']}"
+        f"；Pivot={sr['pivot']}"
+    )
 
     return {
         "input_symbol": symbol,
@@ -217,36 +339,45 @@ def analyze_symbol(symbol: str) -> dict:
         "market": detect_market(symbol, yf_symbol),
         "close": close,
         "prev_close": prev_close,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
         "change": change,
         "change_pct": change_pct,
-        "direction": direction_text,
         "signal": signal,
+        "advice": advice,
         "score": score,
         "support": support,
         "resistance": resistance,
         "rsi": rsi,
-        "comment": "；".join(comments),
+        "ma5": ma5,
+        "ma10": ma10,
+        "ma20": ma20,
+        "ma60": ma60,
+        "comment": extra_comment,
+        "risk_note": risk_note,
     }
 
 
 class GTCProApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(APP_TITLE)
-        self.root.geometry("1750x860")
-        self.root.minsize(1350, 720)
+        self.root.title(f"{APP_TITLE} {APP_VERSION}")
+        self.root.geometry("1880x980")
+        self.root.minsize(1500, 820)
         self.results = []
         self.current_sort_column = None
         self.sort_reverse = True
         self._build_ui()
+        self.set_status(f"系統已就緒。當前版本：{APP_VERSION}")
 
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=12)
+        top = ttk.Frame(self.root, padding=10)
         top.pack(fill="x")
 
         ttk.Label(top, text="股票代號（逗號分隔）").pack(side="left", padx=(0, 8))
 
-        self.symbol_entry = ttk.Entry(top, width=100)
+        self.symbol_entry = ttk.Entry(top, width=110)
         self.symbol_entry.pack(side="left", padx=(0, 8), fill="x", expand=True)
         self.symbol_entry.insert(0, "2330,2382,3231,2308,3017,AAPL,NVDA,MSFT")
 
@@ -255,30 +386,40 @@ class GTCProApp:
         ttk.Button(top, text="匯出 TXT", command=self.export_txt).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="清空", command=self.clear_results).pack(side="left")
 
-        middle = ttk.Frame(self.root, padding=(12, 0, 12, 12))
-        middle.pack(fill="both", expand=True)
+        center = ttk.Panedwindow(self.root, orient=tk.VERTICAL)
+        center.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
+        top_frame = ttk.Frame(center)
+        bottom_frame = ttk.Frame(center)
+
+        center.add(top_frame, weight=3)
+        center.add(bottom_frame, weight=2)
+
+        self._build_table_area(top_frame)
+        self._build_detail_area(bottom_frame)
+
+    def _build_table_area(self, parent):
         columns = (
-            "排名", "市場", "代號", "收盤", "昨收", "漲跌", "漲跌幅%", "訊號",
-            "分數", "支撐", "壓力", "RSI", "說明"
+            "排名", "市場", "代號", "收盤", "昨收", "漲跌", "漲跌幅%",
+            "訊號", "建議", "分數", "支撐", "壓力", "RSI"
         )
 
-        self.tree = ttk.Treeview(middle, columns=columns, show="headings", height=25)
+        self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
 
         widths = {
-            "排名": 70,
-            "市場": 110,
-            "代號": 90,
-            "收盤": 100,
-            "昨收": 100,
-            "漲跌": 100,
-            "漲跌幅%": 100,
-            "訊號": 120,
-            "分數": 80,
-            "支撐": 110,
-            "壓力": 110,
-            "RSI": 90,
-            "說明": 500,
+            "排名": 55,
+            "市場": 90,
+            "代號": 80,
+            "收盤": 90,
+            "昨收": 90,
+            "漲跌": 90,
+            "漲跌幅%": 95,
+            "訊號": 100,
+            "建議": 100,
+            "分數": 65,
+            "支撐": 90,
+            "壓力": 90,
+            "RSI": 70,
         }
 
         for c in columns:
@@ -288,35 +429,52 @@ class GTCProApp:
         self.tree.tag_configure("up", foreground="red", background="#ffecec")
         self.tree.tag_configure("down", foreground="green", background="#ecffec")
         self.tree.tag_configure("flat", foreground="black", background="white")
-        self.tree.tag_configure("strong", background="#fff5cc")
+        self.tree.tag_configure("strong", background="#fff2b3")
+        self.tree.tag_configure("watch", background="#eef5ff")
 
-        yscroll = ttk.Scrollbar(middle, orient="vertical", command=self.tree.yview)
-        xscroll = ttk.Scrollbar(middle, orient="horizontal", command=self.tree.xview)
+        self.tree.bind("<<TreeviewSelect>>", self.on_row_select)
+
+        yscroll = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(parent, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
 
         self.tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
 
-        middle.rowconfigure(0, weight=1)
-        middle.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+    def _build_detail_area(self, parent):
+        left = ttk.LabelFrame(parent, text="個股明細分析", padding=10)
+        right = ttk.LabelFrame(parent, text="操作建議 / 風險提醒", padding=10)
+
+        left.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        right.pack(side="left", fill="both", expand=True, padx=(5, 0))
+
+        self.detail_text = tk.Text(left, height=14, wrap="word", font=("Microsoft JhengHei", 10))
+        self.detail_text.pack(fill="both", expand=True)
+
+        self.advice_text = tk.Text(right, height=14, wrap="word", font=("Microsoft JhengHei", 10))
+        self.advice_text.pack(fill="both", expand=True)
 
         bottom = ttk.LabelFrame(self.root, text="系統訊息", padding=10)
-        bottom.pack(fill="x", padx=12, pady=(0, 12))
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
 
-        self.status_var = tk.StringVar(value="系統已就緒。")
+        self.status_var = tk.StringVar(value="")
         ttk.Label(bottom, textvariable=self.status_var).pack(anchor="w")
 
     def set_status(self, text: str):
         now = datetime.now().strftime("%H:%M:%S")
         self.status_var.set(f"[{now}] {text}")
-        self.root.update_idletasks()
 
     def clear_results(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.results = []
-        self.set_status("已清空結果。")
+        self.detail_text.delete("1.0", tk.END)
+        self.advice_text.delete("1.0", tk.END)
+        self.set_status(f"已清空結果。版本：{APP_VERSION}")
 
     def parse_symbols(self):
         raw = self.symbol_entry.get().strip()
@@ -340,6 +498,8 @@ class GTCProApp:
 
             if r["score"] >= 80:
                 tags.append("strong")
+            elif r["score"] >= 65:
+                tags.append("watch")
 
             change_str = f"{r['change']:+.2f}"
             change_pct_str = f"{r['change_pct']:+.2f}%"
@@ -356,11 +516,11 @@ class GTCProApp:
                     change_str,
                     change_pct_str,
                     r["signal"],
+                    r["advice"],
                     r["score"],
                     r["support"],
                     r["resistance"],
                     r["rsi"],
-                    r["comment"],
                 ),
                 tags=tuple(tags),
             )
@@ -372,7 +532,8 @@ class GTCProApp:
             return
 
         self.clear_results()
-        self.set_status("開始抓取即時股票資料...")
+        self.set_status(f"開始抓取即時股票資料... 版本：{APP_VERSION}")
+        self.root.update_idletasks()
 
         ok_results = []
         errors = []
@@ -381,18 +542,95 @@ class GTCProApp:
             try:
                 result = analyze_symbol(sym)
                 ok_results.append(result)
-                self.set_status(f"完成：{sym}")
+                self.set_status(f"完成：{sym} / 版本：{APP_VERSION}")
+                self.root.update_idletasks()
             except Exception as e:
                 errors.append(f"{sym}: {e}")
 
         self.results = sorted(ok_results, key=lambda x: x["score"], reverse=True)
         self.render_results()
 
+        if self.results:
+            first_id = self.tree.get_children()[0]
+            self.tree.selection_set(first_id)
+            self.tree.focus(first_id)
+            self.on_row_select()
+
         if errors:
-            self.set_status(f"完成 {len(self.results)} 檔，失敗 {len(errors)} 檔。")
+            self.set_status(f"完成 {len(self.results)} 檔，失敗 {len(errors)} 檔。版本：{APP_VERSION}")
             messagebox.showwarning("部分股票失敗", "\n".join(errors[:10]))
         else:
-            self.set_status(f"分析完成，共 {len(self.results)} 檔。")
+            self.set_status(f"分析完成，共 {len(self.results)} 檔。版本：{APP_VERSION}")
+
+    def on_row_select(self, event=None):
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        item = self.tree.item(selected[0])
+        values = item["values"]
+        if not values:
+            return
+
+        symbol = str(values[2])
+
+        target = None
+        for r in self.results:
+            if r["input_symbol"] == symbol:
+                target = r
+                break
+
+        if not target:
+            return
+
+        detail = []
+        detail.append(f"【{target['input_symbol']}】個股明細分析")
+        detail.append(f"市場：{target['market']}")
+        detail.append(f"收盤：{target['close']}")
+        detail.append(f"昨收：{target['prev_close']}")
+        detail.append(f"開盤：{target['open']}")
+        detail.append(f"最高：{target['high']}")
+        detail.append(f"最低：{target['low']}")
+        detail.append(f"漲跌：{target['change']:+.2f}")
+        detail.append(f"漲跌幅：{target['change_pct']:+.2f}%")
+        detail.append("")
+        detail.append("【均線結構】")
+        detail.append(f"MA5：{target['ma5']}")
+        detail.append(f"MA10：{target['ma10']}")
+        detail.append(f"MA20：{target['ma20']}")
+        detail.append(f"MA60：{target['ma60']}")
+        detail.append("")
+        detail.append("【技術指標】")
+        detail.append(f"RSI：{target['rsi']}")
+        detail.append(f"綜合訊號：{target['signal']}")
+        detail.append(f"綜合分數：{target['score']}")
+        detail.append("")
+        detail.append("【支撐壓力】")
+        detail.append(f"主支撐：{target['support']}")
+        detail.append(f"主壓力：{target['resistance']}")
+        detail.append("")
+        detail.append("【技術說明】")
+        detail.append(target["comment"])
+
+        advice = []
+        advice.append(f"【{target['input_symbol']}】操作建議")
+        advice.append(f"建議：{target['advice']}")
+        advice.append("")
+        advice.append("【風險提醒】")
+        advice.append(target["risk_note"])
+        advice.append("")
+        advice.append("【操作觀察重點】")
+        advice.append(f"1. 支撐區：{target['support']} 附近是否守穩")
+        advice.append(f"2. 壓力區：{target['resistance']} 附近是否放量突破")
+        advice.append(f"3. RSI：{target['rsi']} 是否進一步轉強/轉弱")
+        advice.append(f"4. 均線結構：MA20={target['ma20']} / MA60={target['ma60']}")
+        advice.append(f"5. 分數：{target['score']}，高分優先、低分保守")
+
+        self.detail_text.delete("1.0", tk.END)
+        self.detail_text.insert(tk.END, "\n".join(detail))
+
+        self.advice_text.delete("1.0", tk.END)
+        self.advice_text.insert(tk.END, "\n".join(advice))
 
     def sort_by_column(self, col_name):
         if not self.results:
@@ -407,11 +645,11 @@ class GTCProApp:
             "漲跌": "change",
             "漲跌幅%": "change_pct",
             "訊號": "signal",
+            "建議": "advice",
             "分數": "score",
             "支撐": "support",
             "壓力": "resistance",
             "RSI": "rsi",
-            "說明": "comment",
         }
 
         real_key = key_map.get(col_name)
@@ -443,28 +681,24 @@ class GTCProApp:
             return
 
         lines = []
-        lines.append(APP_TITLE)
+        lines.append(f"{APP_TITLE} {APP_VERSION}")
         lines.append(f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append("=" * 120)
+        lines.append("=" * 140)
 
         for idx, r in enumerate(self.results, start=1):
             lines.append(f"{idx}. 市場：{r['market']} / 股票代號：{r['input_symbol']}")
-            lines.append(f"   收盤：{r['close']}")
-            lines.append(f"   昨收：{r['prev_close']}")
-            lines.append(f"   漲跌：{r['change']:+.2f}")
-            lines.append(f"   漲跌幅：{r['change_pct']:+.2f}%")
-            lines.append(f"   訊號：{r['signal']}")
-            lines.append(f"   分數：{r['score']}")
-            lines.append(f"   支撐：{r['support']}")
-            lines.append(f"   壓力：{r['resistance']}")
-            lines.append(f"   RSI：{r['rsi']}")
+            lines.append(f"   收盤：{r['close']} / 昨收：{r['prev_close']}")
+            lines.append(f"   漲跌：{r['change']:+.2f} / 漲跌幅：{r['change_pct']:+.2f}%")
+            lines.append(f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']}")
+            lines.append(f"   支撐：{r['support']} / 壓力：{r['resistance']} / RSI：{r['rsi']}")
             lines.append(f"   說明：{r['comment']}")
-            lines.append("-" * 120)
+            lines.append(f"   風險：{r['risk_note']}")
+            lines.append("-" * 140)
 
         try:
             with open(file_path, "w", encoding="utf-8-sig") as f:
                 f.write("\n".join(lines))
-            self.set_status(f"已匯出 TXT：{file_path}")
+            self.set_status(f"已匯出 TXT：{file_path} / 版本：{APP_VERSION}")
             messagebox.showinfo("完成", "TXT 匯出成功。")
         except Exception as e:
             messagebox.showerror("錯誤", f"匯出失敗：{e}")
@@ -488,26 +722,26 @@ class GTCProApp:
             width, height = landscape(A4)
 
             c.setFont(font_name, 16)
-            c.drawString(30, height - 30, APP_TITLE)
-
-            c.setFont(font_name, 10)
-            c.drawString(30, height - 50, f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-            y = height - 80
-            headers = ["排名", "市場", "代號", "收盤", "漲跌", "漲跌幅%", "訊號", "分數", "支撐", "壓力", "RSI"]
-            x_positions = [20, 60, 140, 200, 260, 320, 390, 470, 530, 610, 690]
+            c.drawString(24, height - 28, f"{APP_TITLE} {APP_VERSION}")
 
             c.setFont(font_name, 9)
+            c.drawString(24, height - 46, f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            headers = ["排名", "市場", "代號", "收盤", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI"]
+            x_positions = [20, 55, 125, 185, 245, 310, 385, 455, 530, 590, 655, 725]
+            y = height - 72
+
+            c.setFont(font_name, 8)
             for h, x in zip(headers, x_positions):
                 c.drawString(x, y, h)
 
-            y -= 18
-            c.line(20, y + 8, width - 20, y + 8)
+            y -= 14
+            c.line(18, y + 8, width - 18, y + 8)
 
             for idx, r in enumerate(self.results, start=1):
-                if y < 40:
+                if y < 42:
                     c.showPage()
-                    c.setFont(font_name, 9)
+                    c.setFont(font_name, 8)
                     y = height - 40
 
                 row = [
@@ -518,6 +752,7 @@ class GTCProApp:
                     f"{r['change']:+.2f}",
                     f"{r['change_pct']:+.2f}%",
                     r["signal"],
+                    r["advice"],
                     str(r["score"]),
                     str(r["support"]),
                     str(r["resistance"]),
@@ -525,14 +760,13 @@ class GTCProApp:
                 ]
 
                 for text, x in zip(row, x_positions):
-                    c.drawString(x, y, text)
+                    c.drawString(x, y, str(text))
 
-                y -= 16
+                y -= 14
 
             c.save()
-            self.set_status(f"已匯出 PDF：{file_path}")
+            self.set_status(f"已匯出 PDF：{file_path} / 版本：{APP_VERSION}")
             messagebox.showinfo("完成", "PDF 匯出成功。")
-
         except Exception as e:
             messagebox.showerror("錯誤", f"PDF 匯出失敗：{e}")
 
