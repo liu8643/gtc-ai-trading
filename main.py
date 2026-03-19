@@ -13,7 +13,7 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v4.0.0-TW-Realtime"
+APP_VERSION = "v4.1.0-TW-Realtime-AI"
 AUTO_REFRESH_MS = 30000  # 30 秒
 
 
@@ -52,11 +52,6 @@ def normalize_symbol(symbol: str) -> list[str]:
 
 @lru_cache(maxsize=1)
 def get_tw_name_map():
-    """
-    自動抓台股中文名稱：
-    - 上市：TWSE OpenAPI
-    - 上櫃：TPEx OpenAPI
-    """
     mapping = {}
 
     sources = [
@@ -94,10 +89,6 @@ def get_tw_name_map():
 
 
 def get_stock_name(input_symbol: str, yf_symbol: str) -> str:
-    """
-    台股：優先顯示中文名稱
-    美股：顯示 Yahoo 名稱
-    """
     if input_symbol.isdigit() and len(input_symbol) == 4:
         tw_map = get_tw_name_map()
         if input_symbol in tw_map:
@@ -178,11 +169,6 @@ def detect_market(input_symbol: str, yf_symbol: str) -> str:
 
 
 def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
-    """
-    台股盤中即時：
-    - 上市：tse_2330.tw
-    - 上櫃：otc_3481.tw
-    """
     if market not in ("台股上市", "台股上櫃"):
         return None
 
@@ -212,14 +198,12 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
 
         item = msg_array[0]
 
-        # 現價：z，若沒有則可退回成交價 tv / close
         last_price = safe_float(item.get("z"))
         open_price = safe_float(item.get("o"))
         high_price = safe_float(item.get("h"))
         low_price = safe_float(item.get("l"))
         prev_close = safe_float(item.get("y"))
 
-        # 有時沒有成交價，退回昨收
         if last_price is None:
             last_price = prev_close
 
@@ -239,9 +223,6 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
 
 
 def get_us_yahoo_quote(yf_symbol: str, fallback_close: float, fallback_prev_close: float, fallback_open: float, fallback_high: float, fallback_low: float) -> dict:
-    """
-    美股保留 Yahoo / yfinance
-    """
     live_price = fallback_close
     prev_close = fallback_prev_close
     open_price = fallback_open
@@ -413,6 +394,77 @@ def build_risk_note(close, support, resistance, rsi, score):
     return "；".join(notes)
 
 
+def build_ai_analysis(data: dict) -> str:
+    lines = []
+
+    close = data["close"]
+    ma5 = data["ma5"]
+    ma10 = data["ma10"]
+    ma20 = data["ma20"]
+    ma60 = data["ma60"]
+    rsi = data["rsi"]
+    score = data["score"]
+    support = data["support"]
+    resistance = data["resistance"]
+    change_pct = data["change_pct"]
+    signal = data["signal"]
+    advice = data["advice"]
+
+    # 1. 趨勢判讀
+    if close >= ma20 and close >= ma60:
+        trend_text = "目前股價位於20日線與60日線之上，中期趨勢偏強。"
+    elif close >= ma20 and close < ma60:
+        trend_text = "目前股價站上20日線，但仍在60日線下方，屬於短強中性結構。"
+    elif close < ma20 and close >= ma60:
+        trend_text = "目前股價跌破20日線但仍守住60日線，短線轉弱、中期仍待觀察。"
+    else:
+        trend_text = "目前股價位於20日線與60日線下方，技術面偏弱。"
+
+    # 2. 動能判讀
+    if rsi >= 70:
+        rsi_text = f"RSI為 {rsi}，已接近或進入過熱區，短線需留意震盪與拉回。"
+    elif rsi <= 30:
+        rsi_text = f"RSI為 {rsi}，已進入相對低檔區，若量價配合有機會出現反彈。"
+    elif rsi >= 55:
+        rsi_text = f"RSI為 {rsi}，動能偏強，但仍需觀察是否能持續放大。"
+    elif rsi >= 40:
+        rsi_text = f"RSI為 {rsi}，動能中性偏弱，屬於整理觀察區。"
+    else:
+        rsi_text = f"RSI為 {rsi}，動能偏弱，短線仍需保守。"
+
+    # 3. 漲跌與強弱
+    if change_pct >= 5:
+        move_text = f"當前漲跌幅為 {change_pct:+.2f}%，屬於強勢波動，市場追價意願明顯。"
+    elif change_pct > 0:
+        move_text = f"當前漲跌幅為 {change_pct:+.2f}%，價格仍維持正向變化。"
+    elif change_pct <= -5:
+        move_text = f"當前漲跌幅為 {change_pct:+.2f}%，屬於明顯轉弱走勢，須提高風險意識。"
+    else:
+        move_text = f"當前漲跌幅為 {change_pct:+.2f}%，短線價格變化偏保守。"
+
+    # 4. 支撐壓力
+    sr_text = f"下方主支撐約在 {support}，上方主壓力約在 {resistance}。若守穩支撐，有利延續整理後再攻；若壓力無法突破，則仍以區間看待。"
+
+    # 5. AI 綜合判斷
+    if score >= 85:
+        final_text = f"AI綜合判斷：目前屬高分強勢結構，訊號為「{signal}」，建議採取「{advice}」策略，但接近壓力區時不宜過度追價。"
+    elif score >= 65:
+        final_text = f"AI綜合判斷：目前結構偏多，訊號為「{signal}」，建議以「{advice}」方式操作，等待拉回或突破確認。"
+    elif score >= 45:
+        final_text = f"AI綜合判斷：目前屬整理盤，訊號為「{signal}」，建議以「{advice}」為主，不宜激進追價。"
+    else:
+        final_text = f"AI綜合判斷：目前技術面偏弱，訊號為「{signal}」，建議採「{advice}」策略，先以風險控制優先。"
+
+    lines.append("【AI個股分析】")
+    lines.append(f"1. 趨勢判讀：{trend_text}")
+    lines.append(f"2. 動能狀態：{rsi_text}")
+    lines.append(f"3. 價格強弱：{move_text}")
+    lines.append(f"4. 關鍵位置：{sr_text}")
+    lines.append(f"5. AI結論：{final_text}")
+
+    return "\n".join(lines)
+
+
 def analyze_symbol(symbol: str) -> dict:
     yf_symbol, df = download_symbol_data(symbol)
     market = detect_market(symbol, yf_symbol)
@@ -569,7 +621,7 @@ def analyze_symbol(symbol: str) -> dict:
         f"；來源={rt['source']}"
     )
 
-    return {
+    result = {
         "input_symbol": symbol,
         "name": stock_name,
         "yf_symbol": yf_symbol,
@@ -595,6 +647,9 @@ def analyze_symbol(symbol: str) -> dict:
         "risk_note": risk_note,
         "source": rt["source"],
     }
+
+    result["ai_analysis"] = build_ai_analysis(result)
+    return result
 
 
 class GTCProApp:
@@ -849,7 +904,7 @@ class GTCProApp:
             return
 
         detail = []
-        detail.append(f"個股明細分析")
+        detail.append(f"【{target['input_symbol']} {target['name']}】個股明細分析")
         detail.append(f"市場：{target['market']}")
         detail.append(f"資料來源：{target['source']}")
         detail.append(f"收盤/現價：{target['close']}")
@@ -877,9 +932,11 @@ class GTCProApp:
         detail.append("")
         detail.append("【技術說明】")
         detail.append(target["comment"])
+        detail.append("")
+        detail.append(target["ai_analysis"])
 
         advice = []
-        advice.append(f"操作建議")
+        advice.append(f"【{target['input_symbol']} {target['name']}】操作建議")
         advice.append(f"建議：{target['advice']}")
         advice.append("")
         advice.append("【風險提醒】")
@@ -961,6 +1018,7 @@ class GTCProApp:
             lines.append(f"   支撐：{r['support']} / 壓力：{r['resistance']} / RSI：{r['rsi']}")
             lines.append(f"   說明：{r['comment']}")
             lines.append(f"   風險：{r['risk_note']}")
+            lines.append(r["ai_analysis"])
             lines.append("-" * 140)
 
         try:
