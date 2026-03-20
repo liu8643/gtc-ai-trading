@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.1-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.1.2-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -620,7 +620,25 @@ def build_bull_bear_path(data: dict) -> str:
     next_target = data["fibo"]["next_target"]
     signal = data["signal"]
     advice = data["advice"]
-    return "\n".join([
+    fibo_direction = data.get("fibo", {}).get("direction", "")
+
+    if fibo_direction == "下降波":
+        "\n".join([
+            "【多空路徑圖示】",
+            "◎ 反彈路徑：",
+            f"→ 反彈觀察①：先看 {support} 是否止穩",
+            f"→ 反彈觀察②：若站回 {resistance}，才算反彈轉強",
+            f"→ 反彈觀察③：只有有效突破 {resistance}，才考慮結構翻多",
+            "",
+            "◎ 續弱路徑：",
+            f"→ 續弱路徑①：若跌破 {support}",
+            f"→ 續弱路徑②：下降波延續，下一觀察目標看 {next_target}",
+            f"→ 續弱路徑③：若反彈無法站回 {resistance}，仍以弱勢整理看待",
+            "",
+            f"【路徑結論】當前訊號為「{signal}」，操作建議為「{advice}」。",
+        ])
+
+    "\n".join([
         "【多空路徑圖示】",
         "◎ 多方路徑：",
         f"→ 多方路徑①：守住支撐 {support}",
@@ -634,7 +652,6 @@ def build_bull_bear_path(data: dict) -> str:
         "",
         f"【路徑結論】當前訊號為「{signal}」，操作建議為「{advice}」。",
     ])
-
 
 
 def get_light(signal, score, change_pct, intraday_score=None):
@@ -1409,9 +1426,10 @@ class GTCProApp:
 
     def _build_advice_lines(self, target: dict):
         rr_text = f"1:{target['rr']:.2f}" if target.get('rr', 0) > 0 else "-"
+        is_weak = target.get('state_bucket') == 'weak'
         entry_text = (
             f"{target['entry_low']} ~ {target['entry_high']}"
-            if target.get('entry_high', 0) > 0 else "弱勢不建議主動進場"
+            if target.get('entry_high', 0) > 0 and not is_weak else "不建議主動進場"
         )
         return [
             f"【{target['input_symbol']} {target['name']}】交易決策報告",
@@ -1421,9 +1439,11 @@ class GTCProApp:
             "",
             "【交易計畫】",
             f"建議進場：{entry_text}",
-            f"停損點：{target.get('stop_loss', 0)}",
-            f"第一目標：{target.get('target_price', target['resistance'])}",
-            f"風險報酬比：{rr_text}",
+            f"停損點：{target.get('stop_loss', 0) if target.get('state_bucket') != 'weak' else '-'}",
+            f"第一目標：{target.get('target_price', target['resistance']) if target.get('state_bucket') != 'weak' else '-'}",
+            f"風險報酬比：{rr_text if target.get('state_bucket') != 'weak' else '-'}",
+            f"觀察支撐：{target['support']}" if target.get('state_bucket') == 'weak' else "",
+            f"反彈壓力：{target['resistance']}" if target.get('state_bucket') == 'weak' else "",
             "",
             "【風險提醒】",
             target["risk_note"],
