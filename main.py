@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.2.1-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.1.3-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -620,22 +620,6 @@ def build_bull_bear_path(data: dict) -> str:
     next_target = data["fibo"]["next_target"]
     signal = data["signal"]
     advice = data["advice"]
-    fibo_dir = data.get("fibo", {}).get("direction", "")
-    if fibo_dir == "下降波":
-        return "\n".join([
-            "【反彈 / 續弱路徑】",
-            "◎ 反彈路徑：",
-            f"→ 反彈路徑①：先觀察 {support} 是否止跌",
-            f"→ 反彈路徑②：若反彈延續，先看壓力 {resistance}",
-            f"→ 反彈路徑③：只有重新站穩 {resistance}，才視為弱轉中性",
-            "",
-            "◎ 續弱路徑：",
-            f"→ 續弱路徑①：若失守支撐 {support}",
-            f"→ 續弱路徑②：優先視為下降波延續，續看 {next_target}",
-            "→ 續弱路徑③：未止穩前不主動抄底",
-            "",
-            f"【路徑結論】當前訊號為「{signal}」，操作建議為「{advice}」。",
-        ])
     return "\n".join([
         "【多空路徑圖示】",
         "◎ 多方路徑：",
@@ -661,7 +645,7 @@ def get_light(signal, score, change_pct, intraday_score=None):
         return "🟠"
     if signal == "突破強勢":
         return "🔵"
-    if signal in ("偏多觀察", "強勢追蹤", "整理偏多"):
+    if signal in ("偏多觀察", "強勢追蹤"):
         return "🟢"
     if signal == "區間整理":
         return "🟡"
@@ -672,13 +656,13 @@ def get_light(signal, score, change_pct, intraday_score=None):
 
 
 def evaluate_trade_state(close, prev_close, open_price, support, resistance, change_pct,
-                         trend_score, intraday_score, score, orderbook_bias):
-    near_resistance = close >= resistance * 0.988 if resistance else False
-    at_breakout = close >= resistance * 0.998 if resistance else False
+                         trend_score, intraday_score, score, orderbook_bias, ma20=0, ma60=0, rsi=50):
+    near_resistance = close >= resistance * 0.988
+    at_breakout = close >= resistance * 0.998
     above_open = close >= open_price
     above_prev = close >= prev_close
     bullish_orderbook = orderbook_bias in ("買盤偏強", "買盤明顯偏強")
-    neutral_or_bullish_orderbook = orderbook_bias in ("買盤偏強", "買盤明顯偏強", "多空均衡")
+    structure_bullish = close > ma20 > ma60
 
     if change_pct <= -9.0 or intraday_score <= 15:
         return "急跌風險", "跌幅過大，先觀望/減碼", "weak"
@@ -707,16 +691,16 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
             return "強勢追蹤", "拉回不破可偏多", "strong"
         return "強勢追蹤", "拉回布局", "strong"
 
+    # v5.1.3: 正式新增「整理偏多」層，優先於區間整理
     if (
-        trend_score >= 80 and intraday_score >= 70 and score >= 78 and
-        change_pct >= 1.2 and above_open and above_prev and neutral_or_bullish_orderbook and
-        support <= close <= resistance * 1.01
+        trend_score >= 85 and intraday_score >= 72 and score >= 80 and
+        structure_bullish and bullish_orderbook and change_pct >= 1.0
     ):
-        return "整理偏多", "區間偏多", "bullish"
+        return "整理偏多", "可布局觀察", "bullish"
 
     if (
         trend_score >= 72 and intraday_score >= 58 and score >= 70 and
-        change_pct >= 0.3 and above_open
+        change_pct >= 0.3 and (above_open or structure_bullish)
     ):
         return "偏多觀察", "拉回布局", "bullish"
 
@@ -727,7 +711,6 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
         return "轉弱警戒", "保守觀察/減碼", "weak"
 
     return "轉弱警戒", "轉弱觀望", "weak"
-
 
 def is_main_trend_candidate(data: dict) -> bool:
     close = data.get("close", 0)
@@ -746,8 +729,7 @@ def is_main_trend_candidate(data: dict) -> bool:
 
     bullish_orderbook = orderbook in ("買盤偏強", "買盤明顯偏強", "多空均衡")
     not_too_far_from_resistance = close <= resistance * 1.01 if resistance else True
-    too_close_to_resistance = close >= resistance * 0.97 if resistance else False
-    healthy_strength = signal in ("強勢追蹤", "突破強勢", "偏多觀察", "整理偏多")
+    healthy_strength = signal in ("強勢追蹤", "突破強勢", "偏多觀察")
 
     return (
         score >= 90 and
@@ -760,11 +742,13 @@ def is_main_trend_candidate(data: dict) -> bool:
         change_pct >= 0.8 and
         bullish_orderbook and
         healthy_strength and
-        not_too_far_from_resistance and
-        not too_close_to_resistance
+        not_too_far_from_resistance
     )
 
 def classify_leader_stage(data: dict) -> str:
+    if is_main_trend_candidate(data):
+        return "是"
+
     close = data.get("close", 0)
     ma20 = data.get("ma20", 0)
     ma60 = data.get("ma60", 0)
@@ -776,23 +760,10 @@ def classify_leader_stage(data: dict) -> str:
     signal = data.get("signal", "")
     orderbook = data.get("orderbook_bias", "無")
 
-    if is_main_trend_candidate(data):
-        return "是"
-
-    too_close_to_resistance = close >= resistance * 0.97 if resistance else False
-    strong_core = (
-        score >= 90 and trend >= 85 and intra >= 80 and
-        close > ma20 > ma60 and 50 <= rsi <= 70 and
-        signal in ("強勢追蹤", "突破強勢", "偏多觀察", "整理偏多") and
-        orderbook != "賣盤偏強"
-    )
-    if strong_core and too_close_to_resistance:
-        return "觀察"
-
     if (
         score >= 85 and trend >= 80 and intra >= 70 and
         close > ma20 >= ma60 and 48 <= rsi <= 72 and
-        signal in ("強勢追蹤", "突破強勢", "偏多觀察", "整理偏多") and
+        signal in ("強勢追蹤", "突破強勢", "偏多觀察") and
         orderbook != "賣盤偏強" and close <= resistance * 1.003
     ):
         return "觀察"
@@ -1082,6 +1053,32 @@ def analyze_symbol(symbol: str) -> dict:
     return result
 
 
+
+
+def format_code_bucket(items: list[dict]) -> str:
+    if not items:
+        return "-"
+    return ",".join(str(x.get("input_symbol", x.get("code", ""))) for x in items[:3])
+
+def generate_daily_strategy(results: list[dict]) -> str:
+    if not results:
+        return "今日策略：尚無資料"
+    main = [r for r in results if r.get("leader_candidate") == "是"]
+    watch = [r for r in results if r.get("leader_candidate") == "觀察"]
+    layout = [r for r in results if r.get("signal") in ("整理偏多", "偏多觀察")]
+    avoid = [r for r in results if r.get("signal") in ("轉弱警戒", "急跌風險", "跌破支撐")]
+
+    parts = []
+    if main:
+        parts.append(f"主攻={format_code_bucket(main)}")
+    if watch:
+        parts.append(f"觀察={format_code_bucket(watch)}")
+    if layout:
+        parts.append(f"布局={format_code_bucket(layout)}")
+    if avoid:
+        parts.append(f"避免={format_code_bucket(avoid)}")
+    return "今日策略：" + " / ".join(parts) if parts else "今日策略：暫無明確可交易標的"
+
 def build_market_overview(results: list[dict]) -> str:
     if not results:
         return "盤勢總覽：尚無資料"
@@ -1091,20 +1088,22 @@ def build_market_overview(results: list[dict]) -> str:
     weak = sum(1 for r in results if r.get("signal") in ("轉弱警戒", "急跌風險", "跌破支撐"))
     leaders = sum(1 for r in results if r.get("leader_candidate") == "是")
     leader_watch = sum(1 for r in results if r.get("leader_candidate") == "觀察")
-    avg_score = round(sum(r.get("score", 0) for r in results) / total, 1)
+    mid = max(0, total - strong - weak)
+    tradable = leaders + leader_watch + bullish
+
     if strong >= max(2, total * 0.35):
-        market = "盤勢：偏多到強勢"
-        strategy = "今日策略：強勢股不追高，優先等回測支撐再布局"
-    elif weak >= max(3, total * 0.5):
+        market = "盤勢：偏多震盪"
+    elif weak >= max(3, total * 0.45):
         market = "盤勢：偏弱震盪"
-        strategy = "今日策略：優先防守，弱勢股不抄底，只觀察支撐是否止穩"
     elif bullish + strong >= max(3, total * 0.4):
         market = "盤勢：震盪偏多"
-        strategy = "今日策略：以偏多股回測承接為主，突破股少量追蹤"
     else:
         market = "盤勢：區間震盪"
-        strategy = "今日策略：區間操作，靠近支撐觀察，接近壓力不追價"
-    return f"{market} ｜ 強勢股：{strong} ｜ 偏多股：{bullish} ｜ 弱勢警戒：{weak} ｜ 主升候選：{leaders} ｜ 主升觀察：{leader_watch} ｜ 平均分：{avg_score} ｜ {strategy}"
+
+    structure = f"市場結構：強={strong}({round(strong/total*100,1)}%) / 中={mid}({round(mid/total*100,1)}%) / 弱={weak}({round(weak/total*100,1)}%)"
+    density = f"可交易密度：{tradable}/{total}"
+    strategy = generate_daily_strategy(results)
+    return f"{market} ｜ 強勢股：{strong} ｜ 偏多股：{bullish} ｜ 弱勢警戒：{weak} ｜ 主升候選：{leaders} ｜ 主升觀察：{leader_watch} ｜ {structure} ｜ {density} ｜ {strategy}"
 
 class GTCProApp:
     def __init__(self, root: tk.Tk):
@@ -1449,15 +1448,10 @@ class GTCProApp:
 
     def _build_advice_lines(self, target: dict):
         rr_text = f"1:{target['rr']:.2f}" if target.get('rr', 0) > 0 else "-"
-        is_weak = target.get('state_bucket') == 'weak'
         entry_text = (
-            "不建議主動進場" if is_weak else
             f"{target['entry_low']} ~ {target['entry_high']}"
             if target.get('entry_high', 0) > 0 else "弱勢不建議主動進場"
         )
-        stop_text = "-" if is_weak else str(target.get('stop_loss', 0))
-        target_text = str(target['resistance']) if is_weak else str(target.get('target_price', target['resistance']))
-        rr_display = "-" if is_weak else rr_text
         return [
             f"【{target['input_symbol']} {target['name']}】交易決策報告",
             "【交易結論】",
@@ -1466,9 +1460,9 @@ class GTCProApp:
             "",
             "【交易計畫】",
             f"建議進場：{entry_text}",
-            f"{'觀察支撐' if is_weak else '停損點'}：{target['support'] if is_weak else stop_text}",
-            f"{'反彈壓力' if is_weak else '第一目標'}：{target_text}",
-            f"風險報酬比：{rr_display}",
+            f"停損點：{target.get('stop_loss', 0)}",
+            f"第一目標：{target.get('target_price', target['resistance'])}",
+            f"風險報酬比：{rr_text}",
             "",
             "【風險提醒】",
             target["risk_note"],
