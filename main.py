@@ -990,7 +990,7 @@ class GTCProApp:
         values = item["values"]
         if not values:
             return
-        symbol = str(values[3])
+        symbol = str(values[2])
         target = next((r for r in self.results if r["input_symbol"] == symbol), None)
         if not target:
             return
