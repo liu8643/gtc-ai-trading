@@ -13,7 +13,7 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v4.3.0-TW-Realtime-AI-Wave-Fibo"
+APP_VERSION = "v4.4.0-TW-Realtime-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000  # 30 秒
 
 
@@ -176,12 +176,7 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
     ex_ch = f"{ex_prefix}_{symbol}.tw"
 
     url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-    params = {
-        "ex_ch": ex_ch,
-        "json": "1",
-        "delay": "0",
-    }
-
+    params = {"ex_ch": ex_ch, "json": "1", "delay": "0"}
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://mis.twse.com.tw/stock/index.jsp",
@@ -197,7 +192,6 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
             return None
 
         item = msg_array[0]
-
         last_price = safe_float(item.get("z"))
         open_price = safe_float(item.get("o"))
         high_price = safe_float(item.get("h"))
@@ -536,12 +530,6 @@ def build_wave_analysis(df: pd.DataFrame) -> str:
 
 
 def calc_fibonacci_targets(df: pd.DataFrame) -> dict:
-    """
-    以近 120 日主波段高低點計算費波南西目標位
-    1. 先判斷當前比較像上升波或下降波
-    2. 列出 1.0 / 1.382 / 1.618
-    3. 給下一目標價
-    """
     lookback = df.tail(120).copy()
     if len(lookback) < 30:
         close_now = float(df["Close"].iloc[-1])
@@ -640,6 +628,44 @@ def build_fibonacci_analysis(fibo: dict) -> str:
         f"5. 1.618 目標位：{fibo['target_1_618']}",
         f"6. 下一目標價：{fibo['next_target']}",
         f"7. 判讀：{fibo['summary']}",
+    ])
+
+
+def build_bull_bear_path(data: dict) -> str:
+    close = data["close"]
+    support = data["support"]
+    resistance = data["resistance"]
+    next_target = data["fibo"]["next_target"]
+    signal = data["signal"]
+    advice = data["advice"]
+
+    bull_path = [
+        f"多方路徑①：守住支撐 {support}",
+        f"多方路徑②：重新挑戰壓力 {resistance}",
+        f"多方路徑③：若有效突破壓力，下一目標看 {next_target}",
+    ]
+
+    bear_path = [
+        f"空方路徑①：若跌破支撐 {support}",
+        f"空方路徑②：短線結構轉弱，恐回測更低整理區",
+        f"空方路徑③：若反彈無法站回壓力 {resistance}，弱勢格局延續",
+    ]
+
+    conclusion = f"當前訊號為「{signal}」，操作建議為「{advice}」。"
+
+    return "\n".join([
+        "【多空路徑圖示】",
+        "🔴 多方路徑：",
+        f"  → {bull_path[0]}",
+        f"  → {bull_path[1]}",
+        f"  → {bull_path[2]}",
+        "",
+        "🟢 空方路徑：",
+        f"  → {bear_path[0]}",
+        f"  → {bear_path[1]}",
+        f"  → {bear_path[2]}",
+        "",
+        f"【路徑結論】{conclusion}",
     ])
 
 
@@ -832,6 +858,7 @@ def analyze_symbol(symbol: str) -> dict:
     result["ai_analysis"] = build_ai_analysis(result)
     result["wave_analysis"] = build_wave_analysis(df)
     result["fibo_analysis"] = build_fibonacci_analysis(fibo)
+    result["path_analysis"] = build_bull_bear_path(result)
     return result
 
 
@@ -1121,6 +1148,8 @@ class GTCProApp:
         detail.append(target["wave_analysis"])
         detail.append("")
         detail.append(target["fibo_analysis"])
+        detail.append("")
+        detail.append(target["path_analysis"])
 
         advice = []
         advice.append(f"【{target['input_symbol']} {target['name']}】操作建議")
@@ -1134,6 +1163,10 @@ class GTCProApp:
         advice.append(f"1.0：{target['fibo']['target_1_0']}")
         advice.append(f"1.382：{target['fibo']['target_1_382']}")
         advice.append(f"1.618：{target['fibo']['target_1_618']}")
+        advice.append("")
+        advice.append("【多空路徑重點】")
+        advice.append(f"多方關鍵：守 {target['support']}、破 {target['resistance']}、看 {target['fibo']['next_target']}")
+        advice.append(f"空方關鍵：失守 {target['support']} 後，短線結構轉弱")
         advice.append("")
         advice.append("【操作觀察重點】")
         advice.append(f"1. 支撐區：{target['support']} 附近是否守穩")
@@ -1214,6 +1247,7 @@ class GTCProApp:
             lines.append(r["ai_analysis"])
             lines.append(r["wave_analysis"])
             lines.append(r["fibo_analysis"])
+            lines.append(r["path_analysis"])
             lines.append("-" * 140)
 
         try:
