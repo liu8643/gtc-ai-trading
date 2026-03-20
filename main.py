@@ -13,7 +13,7 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.0.0-TW-Realtime-Fix-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.0.1-TW-Realtime-Fix2-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000  # 30 秒
 
 
@@ -272,10 +272,12 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
         low_price = safe_float(item.get("l"))
         prev_close = safe_float(item.get("y"))
 
+        # TWSE MIS 正確五檔欄位
+        # a = 賣價, f = 賣量, b = 買價, g = 買量
+        ask_prices = split_prices(item.get("a"))
         bid_prices = split_prices(item.get("b"))
-        ask_prices = split_prices(item.get("g"))
-        bid_vols = split_ints(item.get("bv"))
-        ask_vols = split_ints(item.get("gv"))
+        ask_vols = split_ints(item.get("f"))
+        bid_vols = split_ints(item.get("g"))
 
         indicative_price = None
         if bid_prices and ask_prices:
@@ -1314,8 +1316,8 @@ class GTCProApp:
         detail.append(f"賣盤總量：{target['sell_qty']}")
         detail.append(f"委買/委賣比：{target['orderbook_ratio']}")
         detail.append(f"五檔力道：{target['orderbook_bias']}")
-        detail.append(f"買一：{target['bid_prices'][0] if target['bid_prices'] else '-'}")
-        detail.append(f"賣一：{target['ask_prices'][0] if target['ask_prices'] else '-'}")
+        detail.append(f"買一：{target['bid_prices'][0] if target['bid_prices'] else '-'} / 量：{target['bid_vols'][0] if target['bid_vols'] else '-'}")
+        detail.append(f"賣一：{target['ask_prices'][0] if target['ask_prices'] else '-'} / 量：{target['ask_vols'][0] if target['ask_vols'] else '-'}")
         detail.append("")
         detail.append("【均線結構】")
         detail.append(f"MA5：{target['ma5']}")
@@ -1441,6 +1443,8 @@ class GTCProApp:
             lines.append(f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']}")
             lines.append(f"   支撐：{r['support']} / 壓力：{r['resistance']} / RSI：{r['rsi']}")
             lines.append(f"   五檔：{r['orderbook_bias']} / 委買委賣比：{r['orderbook_ratio']}")
+            lines.append(f"   買一：{r['bid_prices'][0] if r['bid_prices'] else '-'} / 量：{r['bid_vols'][0] if r['bid_vols'] else '-'}")
+            lines.append(f"   賣一：{r['ask_prices'][0] if r['ask_prices'] else '-'} / 量：{r['ask_vols'][0] if r['ask_vols'] else '-'}")
             lines.append(f"   說明：{r['comment']}")
             lines.append(f"   風險：{r['risk_note']}")
             lines.append(r["ai_analysis"])
