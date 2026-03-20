@@ -13,7 +13,7 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v4.4.0-TW-Realtime-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.0.0-TW-Realtime-Fix-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000  # 30 秒
 
 
@@ -44,7 +44,8 @@ def normalize_symbol(symbol: str) -> list[str]:
 
     if s.isdigit():
         if len(s) == 4:
-            return [f"{s}.TW", f"{s}.TWO"]
+            # 先試上櫃，再試上市，避免 4979 這種代號先命中錯市場
+            return [f"{s}.TWO", f"{s}.TW"]
         return [s]
 
     return [s]
@@ -158,6 +159,73 @@ def safe_float(v, default=None):
         return default
 
 
+def safe_int(v, default=None):
+    try:
+        if v in (None, "", "-", "--"):
+            return default
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def split_prices(text):
+    if not text:
+        return []
+    vals = []
+    for x in str(text).split("_"):
+        v = safe_float(x)
+        if v is not None and v > 0:
+            vals.append(round_price(v))
+    return vals
+
+
+def split_ints(text):
+    if not text:
+        return []
+    vals = []
+    for x in str(text).split("_"):
+        v = safe_int(x)
+        if v is not None and v >= 0:
+            vals.append(v)
+    return vals
+
+
+def get_orderbook_bias(bid_vols, ask_vols):
+    buy_qty = sum(bid_vols[:5]) if bid_vols else 0
+    sell_qty = sum(ask_vols[:5]) if ask_vols else 0
+
+    if buy_qty == 0 and sell_qty == 0:
+        return {
+            "buy_qty": 0,
+            "sell_qty": 0,
+            "ratio": "-",
+            "bias": "無有效五檔",
+        }
+
+    if sell_qty == 0:
+        return {
+            "buy_qty": buy_qty,
+            "sell_qty": sell_qty,
+            "ratio": "∞",
+            "bias": "買盤明顯偏強",
+        }
+
+    ratio = buy_qty / sell_qty
+    if ratio >= 1.5:
+        bias = "買盤偏強"
+    elif ratio <= 0.67:
+        bias = "賣盤偏強"
+    else:
+        bias = "多空均衡"
+
+    return {
+        "buy_qty": buy_qty,
+        "sell_qty": sell_qty,
+        "ratio": f"{ratio:.2f}",
+        "bias": bias,
+    }
+
+
 def detect_market(input_symbol: str, yf_symbol: str) -> str:
     if yf_symbol.endswith(".TW"):
         return "台股上市"
@@ -176,7 +244,12 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
     ex_ch = f"{ex_prefix}_{symbol}.tw"
 
     url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-    params = {"ex_ch": ex_ch, "json": "1", "delay": "0"}
+    params = {
+        "ex_ch": ex_ch,
+        "json": "1",
+        "delay": "0",
+        "_": str(int(datetime.now().timestamp() * 1000)),
+    }
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://mis.twse.com.tw/stock/index.jsp",
@@ -192,23 +265,59 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
             return None
 
         item = msg_array[0]
-        last_price = safe_float(item.get("z"))
+
+        last_trade = safe_float(item.get("z"))
         open_price = safe_float(item.get("o"))
         high_price = safe_float(item.get("h"))
         low_price = safe_float(item.get("l"))
         prev_close = safe_float(item.get("y"))
 
-        if last_price is None:
-            last_price = prev_close
-        if last_price is None:
+        bid_prices = split_prices(item.get("b"))
+        ask_prices = split_prices(item.get("g"))
+        bid_vols = split_ints(item.get("bv"))
+        ask_vols = split_ints(item.get("gv"))
+
+        indicative_price = None
+        if bid_prices and ask_prices:
+            indicative_price = round_price((bid_prices[0] + ask_prices[0]) / 2)
+        elif bid_prices:
+            indicative_price = bid_prices[0]
+        elif ask_prices:
+            indicative_price = ask_prices[0]
+
+        if last_trade is not None:
+            display_price = round_price(last_trade)
+            display_note = "即時成交價"
+        elif indicative_price is not None:
+            display_price = round_price(indicative_price)
+            display_note = "當下無成交，改用買一/賣一中間價"
+        elif prev_close is not None:
+            display_price = round_price(prev_close)
+            display_note = "當下無成交且無五檔，暫以昨收顯示"
+        else:
             return None
 
+        ob = get_orderbook_bias(bid_vols, ask_vols)
+
         return {
-            "close": round_price(last_price),
-            "prev_close": round_price(prev_close if prev_close is not None else last_price),
-            "open": round_price(open_price if open_price is not None else last_price),
-            "high": round_price(high_price if high_price is not None else last_price),
-            "low": round_price(low_price if low_price is not None else last_price),
+            "close": display_price,
+            "display_price": display_price,
+            "display_note": display_note,
+            "last_trade": round_price(last_trade) if last_trade is not None else None,
+            "indicative_price": round_price(indicative_price) if indicative_price is not None else None,
+            "prev_close": round_price(prev_close if prev_close is not None else display_price),
+            "open": round_price(open_price if open_price is not None else display_price),
+            "high": round_price(high_price if high_price is not None else display_price),
+            "low": round_price(low_price if low_price is not None else display_price),
+            "bid_prices": bid_prices,
+            "ask_prices": ask_prices,
+            "bid_vols": bid_vols,
+            "ask_vols": ask_vols,
+            "buy_qty": ob["buy_qty"],
+            "sell_qty": ob["sell_qty"],
+            "orderbook_ratio": ob["ratio"],
+            "orderbook_bias": ob["bias"],
+            "quote_time": item.get("t") or item.get("tt") or "",
             "source": "TWSE MIS 即時",
         }
     except Exception:
@@ -360,14 +469,19 @@ def calc_professional_sr(df: pd.DataFrame) -> dict:
     }
 
 
-def build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct) -> str:
+def build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct):
+    if close < support:
+        return "減碼 / 停損優先"
+    if close > resistance:
+        return "突破追蹤 / 拉回不破可偏多"
+
     if close >= ma20 and close >= ma60 and score >= 80:
         return "強勢買進"
     if close >= ma20 and score >= 65:
         return "拉回布局"
-    if score >= 45 and close >= support:
+    if score >= 45 and support <= close <= resistance:
         return "區間觀察"
-    if rsi > 70 or close >= resistance * 0.98:
+    if rsi > 70:
         return "減碼/停利"
     if close < ma20 and close < ma60 and change_pct < 0:
         return "轉弱觀望"
@@ -379,8 +493,12 @@ def build_risk_note(close, support, resistance, rsi, score):
 
     if close <= support * 1.01:
         notes.append("接近支撐，觀察是否守穩")
+    if close < support:
+        notes.append("已跌破支撐，需提高風險控管")
     if close >= resistance * 0.99:
         notes.append("逼近壓力，留意獲利了結賣壓")
+    if close > resistance:
+        notes.append("已突破壓力，觀察是否假突破")
     if rsi >= 70:
         notes.append("RSI 偏高，短線過熱風險上升")
     if rsi <= 30:
@@ -404,18 +522,30 @@ def build_ai_analysis(data: dict) -> str:
     score = data["score"]
     support = data["support"]
     resistance = data["resistance"]
-    change_pct = data["change_pct"]
     signal = data["signal"]
     advice = data["advice"]
+    orderbook_bias = data.get("orderbook_bias", "無")
+    orderbook_ratio = data.get("orderbook_ratio", "-")
 
     if close >= ma20 and close >= ma60:
         trend_text = "目前股價位於20日線與60日線之上，中期趨勢偏強。"
+        trend = "偏多"
     elif close >= ma20 and close < ma60:
         trend_text = "目前股價站上20日線，但仍在60日線下方，屬短強中性結構。"
+        trend = "盤整偏多"
     elif close < ma20 and close >= ma60:
         trend_text = "目前股價跌破20日線但仍守住60日線，短線轉弱、中期待觀察。"
+        trend = "盤整偏弱"
     else:
         trend_text = "目前股價位於20日線與60日線下方，技術面偏弱。"
+        trend = "偏空"
+
+    if close < support:
+        pos_text = f"目前股價 {close} 已跌破支撐 {support}，位置偏弱。"
+    elif close > resistance:
+        pos_text = f"目前股價 {close} 已突破壓力 {resistance}，位置轉強。"
+    else:
+        pos_text = f"目前股價位於支撐 {support} 與壓力 {resistance} 之間，仍屬區間內。"
 
     if rsi >= 70:
         rsi_text = f"RSI為 {rsi}，已接近或進入過熱區，短線需留意震盪與拉回。"
@@ -428,32 +558,26 @@ def build_ai_analysis(data: dict) -> str:
     else:
         rsi_text = f"RSI為 {rsi}，動能偏弱，短線仍需保守。"
 
-    if change_pct >= 5:
-        move_text = f"當前漲跌幅為 {change_pct:+.2f}%，屬於強勢波動，市場追價意願明顯。"
-    elif change_pct > 0:
-        move_text = f"當前漲跌幅為 {change_pct:+.2f}%，價格仍維持正向變化。"
-    elif change_pct <= -5:
-        move_text = f"當前漲跌幅為 {change_pct:+.2f}%，屬於明顯轉弱走勢，須提高風險意識。"
-    else:
-        move_text = f"當前漲跌幅為 {change_pct:+.2f}%，短線價格變化偏保守。"
+    ob_text = f"五檔力道為「{orderbook_bias}」，委買/委賣比為 {orderbook_ratio}。"
 
-    sr_text = f"下方主支撐約在 {support}，上方主壓力約在 {resistance}。若守穩支撐，有利延續整理後再攻；若壓力無法突破，則仍以區間看待。"
-
-    if score >= 85:
-        final_text = f"AI綜合判斷：目前屬高分強勢結構，訊號為「{signal}」，建議採取「{advice}」策略，但接近壓力區時不宜過度追價。"
+    if score >= 80:
+        score_text = "綜合評分屬高分區，結構偏強。"
     elif score >= 65:
-        final_text = f"AI綜合判斷：目前結構偏多，訊號為「{signal}」，建議以「{advice}」方式操作，等待拉回或突破確認。"
+        score_text = "綜合評分中上，偏多但仍需確認續航力。"
     elif score >= 45:
-        final_text = f"AI綜合判斷：目前屬整理盤，訊號為「{signal}」，建議以「{advice}」為主，不宜激進追價。"
+        score_text = "綜合評分中性，屬區間整理型。"
     else:
-        final_text = f"AI綜合判斷：目前技術面偏弱，訊號為「{signal}」，建議採「{advice}」策略，先以風險控制優先。"
+        score_text = "綜合評分偏弱，先以風險控制優先。"
+
+    final_text = f"AI綜合判斷：趨勢偏向「{trend}」，訊號為「{signal}」，建議採取「{advice}」策略。"
 
     lines.append("【AI個股分析】")
     lines.append(f"1. 趨勢判讀：{trend_text}")
-    lines.append(f"2. 動能狀態：{rsi_text}")
-    lines.append(f"3. 價格強弱：{move_text}")
-    lines.append(f"4. 關鍵位置：{sr_text}")
-    lines.append(f"5. AI結論：{final_text}")
+    lines.append(f"2. 位置判讀：{pos_text}")
+    lines.append(f"3. 動能狀態：{rsi_text}")
+    lines.append(f"4. 五檔力道：{ob_text}")
+    lines.append(f"5. 分數解讀：{score_text}")
+    lines.append(f"6. AI結論：{final_text}")
 
     return "\n".join(lines)
 
@@ -632,7 +756,6 @@ def build_fibonacci_analysis(fibo: dict) -> str:
 
 
 def build_bull_bear_path(data: dict) -> str:
-    close = data["close"]
     support = data["support"]
     resistance = data["resistance"]
     next_target = data["fibo"]["next_target"]
@@ -647,7 +770,7 @@ def build_bull_bear_path(data: dict) -> str:
 
     bear_path = [
         f"空方路徑①：若跌破支撐 {support}",
-        f"空方路徑②：短線結構轉弱，恐回測更低整理區",
+        "空方路徑②：短線結構轉弱，恐回測更低整理區",
         f"空方路徑③：若反彈無法站回壓力 {resistance}，弱勢格局延續",
     ]
 
@@ -688,10 +811,23 @@ def analyze_symbol(symbol: str) -> dict:
         if rt is None:
             rt = {
                 "close": fallback_close,
+                "display_price": fallback_close,
+                "display_note": "日線回退",
+                "last_trade": None,
+                "indicative_price": None,
                 "prev_close": fallback_prev_close,
                 "open": fallback_open,
                 "high": fallback_high,
                 "low": fallback_low,
+                "bid_prices": [],
+                "ask_prices": [],
+                "bid_vols": [],
+                "ask_vols": [],
+                "buy_qty": 0,
+                "sell_qty": 0,
+                "orderbook_ratio": "-",
+                "orderbook_bias": "無有效五檔",
+                "quote_time": "",
                 "source": "日線回退",
             }
     else:
@@ -703,6 +839,19 @@ def analyze_symbol(symbol: str) -> dict:
             fallback_high=fallback_high,
             fallback_low=fallback_low,
         )
+        rt["display_price"] = rt["close"]
+        rt["display_note"] = "即時/近即時成交價"
+        rt["last_trade"] = rt["close"]
+        rt["indicative_price"] = rt["close"]
+        rt["bid_prices"] = []
+        rt["ask_prices"] = []
+        rt["bid_vols"] = []
+        rt["ask_vols"] = []
+        rt["buy_qty"] = 0
+        rt["sell_qty"] = 0
+        rt["orderbook_ratio"] = "-"
+        rt["orderbook_bias"] = "不適用"
+        rt["quote_time"] = ""
 
     close = rt["close"]
     prev_close = rt["prev_close"]
@@ -783,9 +932,23 @@ def analyze_symbol(symbol: str) -> dict:
             score += 4
             comments.append("量能放大")
 
+    if rt.get("orderbook_bias") == "買盤偏強":
+        score += 5
+        comments.append("五檔買盤偏強")
+    elif rt.get("orderbook_bias") == "買盤明顯偏強":
+        score += 8
+        comments.append("五檔買盤明顯偏強")
+    elif rt.get("orderbook_bias") == "賣盤偏強":
+        score -= 6
+        comments.append("五檔賣盤偏強")
+
     score = max(0, min(100, int(score)))
 
-    if score >= 80:
+    if close < support:
+        signal = "跌破支撐"
+    elif close > resistance:
+        signal = "突破壓力"
+    elif score >= 80:
         signal = "強勢買進"
     elif score >= 65:
         signal = "偏多觀察"
@@ -833,6 +996,10 @@ def analyze_symbol(symbol: str) -> dict:
         "yf_symbol": yf_symbol,
         "market": market,
         "close": close,
+        "display_price": rt.get("display_price", close),
+        "display_note": rt.get("display_note", ""),
+        "last_trade": rt.get("last_trade"),
+        "indicative_price": rt.get("indicative_price"),
         "prev_close": prev_close,
         "open": open_price,
         "high": high_price,
@@ -853,6 +1020,15 @@ def analyze_symbol(symbol: str) -> dict:
         "risk_note": risk_note,
         "source": rt["source"],
         "fibo": fibo,
+        "bid_prices": rt.get("bid_prices", []),
+        "ask_prices": rt.get("ask_prices", []),
+        "bid_vols": rt.get("bid_vols", []),
+        "ask_vols": rt.get("ask_vols", []),
+        "buy_qty": rt.get("buy_qty", 0),
+        "sell_qty": rt.get("sell_qty", 0),
+        "orderbook_ratio": rt.get("orderbook_ratio", "-"),
+        "orderbook_bias": rt.get("orderbook_bias", "無"),
+        "quote_time": rt.get("quote_time", ""),
     }
 
     result["ai_analysis"] = build_ai_analysis(result)
@@ -883,7 +1059,7 @@ class GTCProApp:
 
         self.symbol_entry = ttk.Entry(top, width=100)
         self.symbol_entry.pack(side="left", padx=(0, 8), fill="x", expand=True)
-        self.symbol_entry.insert(0, "2330,2382,3231,2308,3017,AAPL,NVDA,MSFT")
+        self.symbol_entry.insert(0, "2330,2382,3231,2308,3017,4979,AAPL,NVDA,MSFT")
 
         ttk.Button(top, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 8))
@@ -906,8 +1082,8 @@ class GTCProApp:
 
     def _build_table_area(self, parent):
         columns = (
-            "排名", "市場", "代號", "名稱", "收盤", "昨收", "漲跌", "漲跌幅%",
-            "訊號", "建議", "分數", "支撐", "壓力", "RSI"
+            "排名", "市場", "代號", "名稱", "顯示價", "報價說明", "昨收", "漲跌", "漲跌幅%",
+            "訊號", "建議", "分數", "支撐", "壓力", "RSI", "五檔力道"
         )
 
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
@@ -917,16 +1093,18 @@ class GTCProApp:
             "市場": 90,
             "代號": 80,
             "名稱": 180,
-            "收盤": 90,
+            "顯示價": 90,
+            "報價說明": 180,
             "昨收": 90,
             "漲跌": 90,
             "漲跌幅%": 95,
             "訊號": 100,
-            "建議": 100,
+            "建議": 120,
             "分數": 65,
             "支撐": 90,
             "壓力": 90,
             "RSI": 70,
+            "五檔力道": 110,
         }
 
         for c in columns:
@@ -1019,7 +1197,8 @@ class GTCProApp:
                     r["market"],
                     r["input_symbol"],
                     r["name"],
-                    r["close"],
+                    r["display_price"],
+                    r["display_note"],
                     r["prev_close"],
                     change_str,
                     change_pct_str,
@@ -1029,6 +1208,7 @@ class GTCProApp:
                     r["support"],
                     r["resistance"],
                     r["rsi"],
+                    r["orderbook_bias"],
                 ),
                 tags=tuple(tags),
             )
@@ -1117,13 +1297,25 @@ class GTCProApp:
         detail.append(f"【{target['input_symbol']} {target['name']}】個股明細分析")
         detail.append(f"市場：{target['market']}")
         detail.append(f"資料來源：{target['source']}")
-        detail.append(f"收盤/現價：{target['close']}")
+        detail.append(f"報價時間：{target['quote_time']}")
+        detail.append(f"顯示價：{target['display_price']}")
+        detail.append(f"報價說明：{target['display_note']}")
+        detail.append(f"即時成交價：{target['last_trade'] if target['last_trade'] is not None else '-'}")
+        detail.append(f"參考價/中間價：{target['indicative_price'] if target['indicative_price'] is not None else '-'}")
         detail.append(f"昨收：{target['prev_close']}")
         detail.append(f"開盤：{target['open']}")
         detail.append(f"最高：{target['high']}")
         detail.append(f"最低：{target['low']}")
         detail.append(f"漲跌：{target['change']:+.2f}")
         detail.append(f"漲跌幅：{target['change_pct']:+.2f}%")
+        detail.append("")
+        detail.append("【五檔資訊】")
+        detail.append(f"買盤總量：{target['buy_qty']}")
+        detail.append(f"賣盤總量：{target['sell_qty']}")
+        detail.append(f"委買/委賣比：{target['orderbook_ratio']}")
+        detail.append(f"五檔力道：{target['orderbook_bias']}")
+        detail.append(f"買一：{target['bid_prices'][0] if target['bid_prices'] else '-'}")
+        detail.append(f"賣一：{target['ask_prices'][0] if target['ask_prices'] else '-'}")
         detail.append("")
         detail.append("【均線結構】")
         detail.append(f"MA5：{target['ma5']}")
@@ -1169,11 +1361,13 @@ class GTCProApp:
         advice.append(f"空方關鍵：失守 {target['support']} 後，短線結構轉弱")
         advice.append("")
         advice.append("【操作觀察重點】")
-        advice.append(f"1. 支撐區：{target['support']} 附近是否守穩")
-        advice.append(f"2. 壓力區：{target['resistance']} 附近是否放量突破")
-        advice.append(f"3. RSI：{target['rsi']} 是否進一步轉強/轉弱")
-        advice.append(f"4. 均線結構：MA20={target['ma20']} / MA60={target['ma60']}")
-        advice.append(f"5. 分數：{target['score']}，高分優先、低分保守")
+        advice.append(f"1. 報價模式：{target['display_note']}")
+        advice.append(f"2. 支撐區：{target['support']} 附近是否守穩")
+        advice.append(f"3. 壓力區：{target['resistance']} 附近是否放量突破")
+        advice.append(f"4. RSI：{target['rsi']} 是否進一步轉強/轉弱")
+        advice.append(f"5. 五檔力道：{target['orderbook_bias']} / 比值={target['orderbook_ratio']}")
+        advice.append(f"6. 均線結構：MA20={target['ma20']} / MA60={target['ma60']}")
+        advice.append(f"7. 分數：{target['score']}，高分優先、低分保守")
 
         self.detail_text.delete("1.0", tk.END)
         self.detail_text.insert(tk.END, "\n".join(detail))
@@ -1190,7 +1384,8 @@ class GTCProApp:
             "市場": "market",
             "代號": "input_symbol",
             "名稱": "name",
-            "收盤": "close",
+            "顯示價": "display_price",
+            "報價說明": "display_note",
             "昨收": "prev_close",
             "漲跌": "change",
             "漲跌幅%": "change_pct",
@@ -1200,6 +1395,7 @@ class GTCProApp:
             "支撐": "support",
             "壓力": "resistance",
             "RSI": "rsi",
+            "五檔力道": "orderbook_bias",
         }
 
         real_key = key_map.get(col_name)
@@ -1238,10 +1434,13 @@ class GTCProApp:
         for idx, r in enumerate(self.results, start=1):
             lines.append(f"{idx}. 市場：{r['market']} / 股票代號：{r['input_symbol']} / 名稱：{r['name']}")
             lines.append(f"   資料來源：{r['source']}")
-            lines.append(f"   收盤/現價：{r['close']} / 昨收：{r['prev_close']}")
+            lines.append(f"   顯示價：{r['display_price']} / 報價說明：{r['display_note']}")
+            lines.append(f"   即時成交價：{r['last_trade']} / 參考價：{r['indicative_price']}")
+            lines.append(f"   昨收：{r['prev_close']} / 開盤：{r['open']} / 高：{r['high']} / 低：{r['low']}")
             lines.append(f"   漲跌：{r['change']:+.2f} / 漲跌幅：{r['change_pct']:+.2f}%")
             lines.append(f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']}")
             lines.append(f"   支撐：{r['support']} / 壓力：{r['resistance']} / RSI：{r['rsi']}")
+            lines.append(f"   五檔：{r['orderbook_bias']} / 委買委賣比：{r['orderbook_ratio']}")
             lines.append(f"   說明：{r['comment']}")
             lines.append(f"   風險：{r['risk_note']}")
             lines.append(r["ai_analysis"])
@@ -1282,8 +1481,8 @@ class GTCProApp:
             c.setFont(font_name, 9)
             c.drawString(24, height - 46, f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-            headers = ["排名", "市場", "代號", "名稱", "收盤", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI"]
-            x_positions = [20, 50, 105, 155, 320, 380, 445, 515, 585, 655, 715, 775, 840]
+            headers = ["排名", "市場", "代號", "名稱", "顯示價", "昨收", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI"]
+            x_positions = [20, 50, 105, 155, 320, 385, 445, 510, 580, 650, 735, 790, 845, 900]
             y = height - 72
 
             c.setFont(font_name, 8)
@@ -1303,8 +1502,9 @@ class GTCProApp:
                     str(idx),
                     r["market"],
                     r["input_symbol"],
-                    r["name"][:20],
-                    str(r["close"]),
+                    r["name"][:18],
+                    str(r["display_price"]),
+                    str(r["prev_close"]),
                     f"{r['change']:+.2f}",
                     f"{r['change_pct']:+.2f}%",
                     r["signal"],
