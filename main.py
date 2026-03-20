@@ -18,7 +18,7 @@ from reportlab.pdfgen import canvas
 import os
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.0.5-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.0.6-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -642,24 +642,63 @@ def build_bull_bear_path(data: dict) -> str:
 def get_light(signal, score, change_pct, intraday_score=None):
     if signal == "急跌風險" or change_pct <= -9.0:
         return "🔴"
-    if signal == "跌破支撐":
+    if signal in ("跌破支撐", "轉弱警戒"):
         return "🟠"
-    if signal == "突破壓力" or change_pct >= 3.0:
+    if signal == "突破強勢":
         return "🔵"
-    if score >= 75 and (intraday_score is None or intraday_score >= 60):
+    if signal == "偏多觀察":
         return "🟢"
+    if signal == "區間整理":
+        return "🟡"
     if score >= 45:
         return "🟡"
     return "🟠"
 
 
+def evaluate_trade_state(close, prev_close, open_price, support, resistance, change_pct,
+                         trend_score, intraday_score, score, orderbook_bias):
+    if change_pct <= -9.0 or intraday_score <= 18:
+        return "急跌風險", "跌幅過大，先觀望/減碼", "weak"
+
+    if close < support * 0.997 or (close < support and intraday_score < 45):
+        return "跌破支撐", "跌破支撐，減碼 / 停損優先", "weak"
+
+    if (
+        close > resistance and
+        trend_score >= 72 and intraday_score >= 78 and score >= 82 and
+        change_pct >= 1.8 and close >= open_price and close >= prev_close and
+        orderbook_bias not in ("賣盤偏強",)
+    ):
+        return "突破強勢", "突破追蹤", "strong"
+
+    if (
+        trend_score >= 70 and intraday_score >= 68 and score >= 78 and
+        change_pct >= 0.8 and close >= open_price and close >= prev_close and
+        close < resistance * 0.995
+    ):
+        return "偏多觀察", "拉回布局", "strong"
+
+    if score >= 45 and support <= close <= resistance:
+        return "區間整理", "區間觀察", "range"
+
+    if score >= 30:
+        return "轉弱警戒", "保守觀察/減碼", "weak"
+
+    return "轉弱警戒", "轉弱觀望", "weak"
+
+
 def is_leader_candidate(data: dict) -> bool:
     return (
-        data.get("score", 0) >= 80 and
-        data.get("intraday_score", 0) >= 65 and
+        data.get("score", 0) >= 78 and
+        data.get("trend_score", 0) >= 70 and
+        data.get("intraday_score", 0) >= 68 and
         data.get("change_pct", 0) >= 1.2 and
+        data.get("close", 0) >= data.get("open", 0) and
+        data.get("close", 0) >= data.get("prev_close", 0) and
         data.get("orderbook_bias") not in ("賣盤偏強", "不適用") and
-        data.get("signal") not in ("急跌風險", "跌破支撐")
+        data.get("signal") in ("突破強勢", "偏多觀察") and
+        data.get("advice") in ("突破追蹤", "拉回布局") and
+        data.get("close", 0) < data.get("resistance", 0) * 0.995
     )
 
 
@@ -667,10 +706,24 @@ def build_trade_scripts(data: dict) -> dict:
     support = data["support"]
     resistance = data["resistance"]
     next_target = data["fibo"]["next_target"]
+    bucket = data.get("state_bucket", "range")
+
+    if bucket == "strong":
+        return {
+            "script_a": f"劇本A（續強）: 守住 {support} 後續強，先看 {resistance}，突破後上看 {next_target}",
+            "script_b": f"劇本B（拉回）: 若回測 {support} 但不破，可分批承接；跌破則轉保守",
+            "script_c": f"劇本C（壓力前）: 若逼近 {resistance} 量縮震盪，可等帶量突破再追或拉回再多",
+        }
+    if bucket == "weak":
+        return {
+            "script_a": f"劇本A（反彈測壓）: 若反彈至 {resistance} 下方仍無法突破，先視為弱勢反彈",
+            "script_b": f"劇本B（跌破）: 若失守 {support}，優先控管部位，避免逆勢攤平",
+            "script_c": f"劇本C（轉強確認）: 只有重新站回 {support} 之上且量價轉強，才考慮恢復偏多",
+        }
     return {
-        "script_a": f"劇本A（站穩）: 守住 {support}，續看 {resistance}，若放量突破則上看 {next_target}",
-        "script_b": f"劇本B（跌破）: 若跌破 {support}，先降部位，觀察是否轉弱回測更低區",
-        "script_c": f"劇本C（突破）: 若有效突破 {resistance} 且量能配合，可續抱或拉回再偏多",
+        "script_a": f"劇本A（區間低接）: 守住 {support} 可維持區間整理看法，靠近下緣再觀察承接",
+        "script_b": f"劇本B（區間轉弱）: 若跌破 {support}，整理結構破壞，先轉保守",
+        "script_c": f"劇本C（區間突破）: 若有效突破 {resistance} 且量能配合，可從整理轉為偏多追蹤",
     }
 
 
@@ -838,25 +891,10 @@ def analyze_symbol(symbol: str) -> dict:
     )
     score = max(0, min(100, int(round(trend_score * 0.6 + intraday_score * 0.4))))
 
-    if change_pct <= -9.0:
-        signal = "急跌風險"
-    elif close < support:
-        signal = "跌破支撐"
-    elif close > resistance:
-        signal = "突破壓力"
-    elif (score >= 82 and intraday_score >= 70 and change_pct > 0.8 and
-          close >= open_price and close >= prev_close and close < resistance * 0.995):
-        signal = "強勢買進"
-    elif score >= 68 and intraday_score >= 58:
-        signal = "偏多觀察"
-    elif score >= 45:
-        signal = "區間整理"
-    elif score >= 30:
-        signal = "保守/減碼"
-    else:
-        signal = "弱勢觀望"
-
-    advice = build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct, intraday_score, open_price, prev_close)
+    signal, advice, state_bucket = evaluate_trade_state(
+        close, prev_close, open_price, support, resistance, change_pct,
+        trend_score, intraday_score, score, rt.get("orderbook_bias", "無")
+    )
     risk_note = build_risk_note(close, support, resistance, rsi, score, change_pct)
     extra_comment = (
         f"{'；'.join(comments)}"
@@ -883,6 +921,7 @@ def analyze_symbol(symbol: str) -> dict:
         "ask_vols": rt.get("ask_vols", []), "buy_qty": rt.get("buy_qty", 0),
         "sell_qty": rt.get("sell_qty", 0), "orderbook_ratio": rt.get("orderbook_ratio", "-"),
         "orderbook_bias": rt.get("orderbook_bias", "無"), "quote_time": rt.get("quote_time", ""),
+        "state_bucket": state_bucket,
     }
     result["light"] = get_light(result["signal"], result["score"], result["change_pct"], intraday_score=result["intraday_score"])
     result["rank_score"] = result["trend_score"] * 0.35 + result["intraday_score"] * 0.45 + result["change_pct"] * 2.0
@@ -1023,7 +1062,11 @@ class GTCProApp:
         else:
             last = "-"
         mode = "自動刷新開啟" if self.auto_refresh_enabled else "自動刷新關閉"
-        self.status_var.set(f"最後更新：{last} ｜ 下次刷新：{self.next_refresh_sec} 秒 ｜ {mode} ｜ 版本：{APP_VERSION}")
+        source_mix = "TWSE MIS / Yahoo"
+        self.status_var.set(
+            f"最後更新：{last} ｜ 下次刷新：{self.next_refresh_sec} 秒 ｜ {mode} ｜ "
+            f"來源：{source_mix} ｜ 追蹤檔數：{len(self.results)} ｜ 版本：{APP_VERSION}"
+        )
 
     def clear_results(self):
         for item in self.tree.get_children():
@@ -1169,6 +1212,12 @@ class GTCProApp:
             f"漲跌：{target['change']:+.2f}",
             f"漲跌幅：{target['change_pct']:+.2f}%",
             "",
+            "【摘要】",
+            f"現價 / 漲跌幅 / 報價模式：{target['display_price']} / {target['change_pct']:+.2f}% / {target['display_note']}",
+            f"總分 / 波段分 / 盤中分：{target['score']} / {target['trend_score']} / {target['intraday_score']}",
+            f"支撐 / 壓力 / 五檔力道：{target['support']} / {target['resistance']} / {target['orderbook_bias']}",
+            f"燈號 / 訊號 / 建議 / 主升候選：{target['light']} / {target['signal']} / {target['advice']} / {target['leader_candidate']}",
+            "",
             "【五檔資訊】",
             f"買盤總量：{target['buy_qty']}",
             f"賣盤總量：{target['sell_qty']}",
@@ -1221,6 +1270,7 @@ class GTCProApp:
             "【多空路徑重點】",
             f"多方關鍵：守 {target['support']}、破 {target['resistance']}、看 {target['fibo']['next_target']}",
             f"空方關鍵：失守 {target['support']} 後，短線結構轉弱",
+            f"狀態分類：{target['state_bucket']}",
             "",
             "【交易劇本】",
             target["script_a"],
@@ -1234,7 +1284,8 @@ class GTCProApp:
             f"4. RSI：{target['rsi']} 是否進一步轉強/轉弱",
             f"5. 五檔力道：{target['orderbook_bias']} / 比值={target['orderbook_ratio']}",
             f"6. 波段分 / 盤中分 / 總分：{target['trend_score']} / {target['intraday_score']} / {target['score']}",
-            f"7. 均線結構：MA20={target['ma20']} / MA60={target['ma60']}",
+            f"7. 主升候選：{target['leader_candidate']} / 狀態：{target['state_bucket']}",
+            f"8. 均線結構：MA20={target['ma20']} / MA60={target['ma60']}",
         ]
         self.detail_text.delete("1.0", tk.END)
         self.detail_text.insert(tk.END, "\n".join(detail))
