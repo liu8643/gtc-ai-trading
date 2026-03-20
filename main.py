@@ -13,7 +13,7 @@ import os
 
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v4.2.0-TW-Realtime-AI-Wave"
+APP_VERSION = "v4.3.0-TW-Realtime-AI-Wave-Fibo"
 AUTO_REFRESH_MS = 30000  # 30 秒
 
 
@@ -206,7 +206,6 @@ def get_tw_realtime_quote(symbol: str, market: str) -> dict | None:
 
         if last_price is None:
             last_price = prev_close
-
         if last_price is None:
             return None
 
@@ -498,7 +497,6 @@ def summarize_wave(df: pd.DataFrame, period: int, label: str) -> str:
     pivots = detect_local_pivots(part["Close"], left=2, right=2)
     recent_pivots = pivots[-6:] if len(pivots) >= 6 else pivots
 
-    wave_hint = ""
     if close_end > close_start and close_end >= ma20_last:
         if len(recent_pivots) >= 5:
             wave_hint = "較偏推動浪結構，可能處於第3浪或第5浪延伸區。"
@@ -521,10 +519,7 @@ def summarize_wave(df: pd.DataFrame, period: int, label: str) -> str:
     else:
         trend_hint = "短中期均線結構偏弱。"
 
-    return (
-        f"{label}：區間波動約 {amplitude_pct:.2f}% ，"
-        f"{wave_hint}{trend_hint}"
-    )
+    return f"{label}：區間波動約 {amplitude_pct:.2f}% ，{wave_hint}{trend_hint}"
 
 
 def build_wave_analysis(df: pd.DataFrame) -> str:
@@ -537,6 +532,114 @@ def build_wave_analysis(df: pd.DataFrame) -> str:
         f"1. {short_text}",
         f"2. {mid_text}",
         f"3. {long_text}",
+    ])
+
+
+def calc_fibonacci_targets(df: pd.DataFrame) -> dict:
+    """
+    以近 120 日主波段高低點計算費波南西目標位
+    1. 先判斷當前比較像上升波或下降波
+    2. 列出 1.0 / 1.382 / 1.618
+    3. 給下一目標價
+    """
+    lookback = df.tail(120).copy()
+    if len(lookback) < 30:
+        close_now = float(df["Close"].iloc[-1])
+        return {
+            "direction": "資料不足",
+            "base_low": round_price(close_now),
+            "base_high": round_price(close_now),
+            "range": 0.0,
+            "target_1_0": round_price(close_now),
+            "target_1_382": round_price(close_now),
+            "target_1_618": round_price(close_now),
+            "next_target": round_price(close_now),
+            "summary": "資料不足，暫無法估算費波南西目標位。",
+        }
+
+    close_now = float(lookback["Close"].iloc[-1])
+    low_val = float(lookback["Low"].min())
+    high_val = float(lookback["High"].max())
+    price_range = high_val - low_val
+
+    low_idx = lookback["Low"].idxmin()
+    high_idx = lookback["High"].idxmax()
+
+    upward = low_idx < high_idx
+
+    if price_range <= 0:
+        return {
+            "direction": "整理",
+            "base_low": round_price(low_val),
+            "base_high": round_price(high_val),
+            "range": round_price(price_range),
+            "target_1_0": round_price(close_now),
+            "target_1_382": round_price(close_now),
+            "target_1_618": round_price(close_now),
+            "next_target": round_price(close_now),
+            "summary": "區間過小，暫不適合估算費波南西延伸目標。",
+        }
+
+    if upward:
+        direction = "上升波"
+        target_1_0 = high_val
+        target_1_382 = low_val + price_range * 1.382
+        target_1_618 = low_val + price_range * 1.618
+
+        if close_now < target_1_0:
+            next_target = target_1_0
+        elif close_now < target_1_382:
+            next_target = target_1_382
+        else:
+            next_target = target_1_618
+
+        summary = (
+            f"目前較偏上升波段，近波段低點 {round_price(low_val)} 至高點 {round_price(high_val)}。"
+            f"若續強，下一觀察目標依序為 1.0={round_price(target_1_0)}、"
+            f"1.382={round_price(target_1_382)}、1.618={round_price(target_1_618)}。"
+        )
+    else:
+        direction = "下降波"
+        target_1_0 = low_val
+        target_1_382 = high_val - price_range * 1.382
+        target_1_618 = high_val - price_range * 1.618
+
+        if close_now > target_1_0:
+            next_target = target_1_0
+        elif close_now > target_1_382:
+            next_target = target_1_382
+        else:
+            next_target = target_1_618
+
+        summary = (
+            f"目前較偏下降修正波，近波段高點 {round_price(high_val)} 至低點 {round_price(low_val)}。"
+            f"若續弱，下一觀察目標依序為 1.0={round_price(target_1_0)}、"
+            f"1.382={round_price(target_1_382)}、1.618={round_price(target_1_618)}。"
+        )
+
+    return {
+        "direction": direction,
+        "base_low": round_price(low_val),
+        "base_high": round_price(high_val),
+        "range": round_price(price_range),
+        "target_1_0": round_price(target_1_0),
+        "target_1_382": round_price(target_1_382),
+        "target_1_618": round_price(target_1_618),
+        "next_target": round_price(next_target),
+        "summary": summary,
+    }
+
+
+def build_fibonacci_analysis(fibo: dict) -> str:
+    return "\n".join([
+        "【費波南西目標位】",
+        f"1. 波段方向：{fibo['direction']}",
+        f"2. 波段低點：{fibo['base_low']} / 波段高點：{fibo['base_high']}",
+        f"3. 1.0 目標位：{fibo['target_1_0']}",
+        f"4. 1.382 目標位：{fibo['target_1_382']}",
+        f"5. 1.618 目標位：{fibo['target_1_618']}",
+        f"6. 下一目標價：{fibo['next_target']}",
+        f"7. 判讀：{fibo['summary']}",
     ])
 
 
@@ -696,6 +799,8 @@ def analyze_symbol(symbol: str) -> dict:
         f"；來源={rt['source']}"
     )
 
+    fibo = calc_fibonacci_targets(df)
+
     result = {
         "input_symbol": symbol,
         "name": stock_name,
@@ -721,10 +826,12 @@ def analyze_symbol(symbol: str) -> dict:
         "comment": extra_comment,
         "risk_note": risk_note,
         "source": rt["source"],
+        "fibo": fibo,
     }
 
     result["ai_analysis"] = build_ai_analysis(result)
     result["wave_analysis"] = build_wave_analysis(df)
+    result["fibo_analysis"] = build_fibonacci_analysis(fibo)
     return result
 
 
@@ -1012,6 +1119,8 @@ class GTCProApp:
         detail.append(target["ai_analysis"])
         detail.append("")
         detail.append(target["wave_analysis"])
+        detail.append("")
+        detail.append(target["fibo_analysis"])
 
         advice = []
         advice.append(f"【{target['input_symbol']} {target['name']}】操作建議")
@@ -1019,6 +1128,12 @@ class GTCProApp:
         advice.append("")
         advice.append("【風險提醒】")
         advice.append(target["risk_note"])
+        advice.append("")
+        advice.append("【下一目標價】")
+        advice.append(f"下一目標價：{target['fibo']['next_target']}")
+        advice.append(f"1.0：{target['fibo']['target_1_0']}")
+        advice.append(f"1.382：{target['fibo']['target_1_382']}")
+        advice.append(f"1.618：{target['fibo']['target_1_618']}")
         advice.append("")
         advice.append("【操作觀察重點】")
         advice.append(f"1. 支撐區：{target['support']} 附近是否守穩")
@@ -1098,6 +1213,7 @@ class GTCProApp:
             lines.append(f"   風險：{r['risk_note']}")
             lines.append(r["ai_analysis"])
             lines.append(r["wave_analysis"])
+            lines.append(r["fibo_analysis"])
             lines.append("-" * 140)
 
         try:
