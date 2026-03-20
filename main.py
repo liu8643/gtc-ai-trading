@@ -18,7 +18,7 @@ from reportlab.pdfgen import canvas
 import os
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.0.3-2-TW-Realtime-Fix2-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.0.4-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -410,6 +410,8 @@ def build_ai_analysis(data: dict) -> str:
     ma60 = data["ma60"]
     rsi = data["rsi"]
     score = data["score"]
+    trend_score = data.get("trend_score", score)
+    intraday_score = data.get("intraday_score", score)
     support = data["support"]
     resistance = data["resistance"]
     signal = data["signal"]
@@ -470,7 +472,7 @@ def build_ai_analysis(data: dict) -> str:
         f"3. 動能狀態：{rsi_text}",
         f"4. 五檔力道：{ob_text}",
         f"5. 當日強弱：{drop_text}",
-        f"6. 分數解讀：{score_text}",
+        f"6. 分數解讀：{score_text}（波段分={trend_score} / 盤中分={intraday_score} / 總分={score}）",
         f"7. AI結論：{final_text}",
     ])
 
@@ -632,17 +634,94 @@ def build_bull_bear_path(data: dict) -> str:
         f"【路徑結論】當前訊號為「{signal}」，操作建議為「{advice}」。",
     ])
 
+
+
+def get_light(signal, score, change_pct, intraday_score=None):
+    if signal == "急跌風險" or change_pct <= -9.0:
+        return "🔴"
+    if signal == "跌破支撐":
+        return "🟠"
+    if signal == "突破壓力" or change_pct >= 3.0:
+        return "🔵"
+    if score >= 75 and (intraday_score is None or intraday_score >= 60):
+        return "🟢"
+    if score >= 45:
+        return "🟡"
+    return "🟠"
+
+
+def build_trade_scripts(data: dict) -> dict:
+    support = data["support"]
+    resistance = data["resistance"]
+    next_target = data["fibo"]["next_target"]
+    return {
+        "script_a": f"劇本A（站穩）: 守住 {support}，續看 {resistance}，若放量突破則上看 {next_target}",
+        "script_b": f"劇本B（跌破）: 若跌破 {support}，先降部位，觀察是否轉弱回測更低區",
+        "script_c": f"劇本C（突破）: 若有效突破 {resistance} 且量能配合，可續抱或拉回再偏多",
+    }
+
+
+def calc_intraday_score(close, prev_close, open_price, high_price, low_price, support, resistance, orderbook_bias, change_pct):
+    score = 50
+    comments = []
+
+    if change_pct >= 3:
+        score += 20; comments.append("當日漲幅偏強")
+    elif change_pct >= 1:
+        score += 10; comments.append("當日漲幅為正")
+    elif change_pct <= -9:
+        score -= 35; comments.append("急跌風險")
+    elif change_pct <= -5:
+        score -= 20; comments.append("當日跌幅偏大")
+    elif change_pct < 0:
+        score -= 8; comments.append("當日走弱")
+
+    if close >= open_price:
+        score += 8; comments.append("站上開盤")
+    else:
+        score -= 8; comments.append("跌破開盤")
+
+    if close >= prev_close:
+        score += 8; comments.append("站上昨收")
+    else:
+        score -= 8; comments.append("跌破昨收")
+
+    day_range = max(high_price - low_price, 0.01)
+    pos = (close - low_price) / day_range
+    if pos >= 0.8:
+        score += 12; comments.append("接近日高")
+    elif pos <= 0.2:
+        score -= 12; comments.append("接近日低")
+
+    if close > resistance:
+        score += 15; comments.append("突破壓力")
+    elif close < support:
+        score -= 15; comments.append("跌破支撐")
+
+    if orderbook_bias == "買盤明顯偏強":
+        score += 12; comments.append("五檔買盤明顯偏強")
+    elif orderbook_bias == "買盤偏強":
+        score += 7; comments.append("五檔買盤偏強")
+    elif orderbook_bias == "賣盤偏強":
+        score -= 8; comments.append("五檔賣盤偏強")
+
+    score = max(0, min(100, int(score)))
+    return score, "；".join(comments)
+
+
 def analyze_symbol(symbol: str) -> dict:
     yf_symbol, df = download_symbol_data(symbol)
     market = detect_market(symbol, yf_symbol)
     stock_name = get_stock_name(symbol, yf_symbol)
     df = calc_indicators(df)
     last = df.iloc[-1]
+
     fallback_close = round_price(last["Close"])
     fallback_prev_close = round_price(df.iloc[-2]["Close"]) if len(df) >= 2 else fallback_close
     fallback_open = round_price(last["Open"])
     fallback_high = round_price(last["High"])
     fallback_low = round_price(last["Low"])
+
     if market in ("台股上市", "台股上櫃"):
         rt = get_tw_realtime_quote(symbol, market)
         if rt is None:
@@ -655,7 +734,14 @@ def analyze_symbol(symbol: str) -> dict:
                 "quote_time": "", "source": "日線回退",
             }
     else:
-        rt = get_us_yahoo_quote(yf_symbol, fallback_close, fallback_prev_close, fallback_open, fallback_high, fallback_low)
+        rt = get_us_yahoo_quote(
+            yf_symbol=yf_symbol,
+            fallback_close=fallback_close,
+            fallback_prev_close=fallback_prev_close,
+            fallback_open=fallback_open,
+            fallback_high=fallback_high,
+            fallback_low=fallback_low,
+        )
         rt["display_price"] = rt["close"]
         rt["display_note"] = "即時/近即時成交價"
         rt["last_trade"] = rt["close"]
@@ -669,85 +755,78 @@ def analyze_symbol(symbol: str) -> dict:
         rt["orderbook_ratio"] = "-"
         rt["orderbook_bias"] = "不適用"
         rt["quote_time"] = ""
+
     close = rt["close"]
     prev_close = rt["prev_close"]
     open_price = rt["open"]
     high_price = rt["high"]
     low_price = rt["low"]
+
     change = round_price(close - prev_close)
     change_pct = round((change / prev_close) * 100, 2) if prev_close != 0 else 0.0
+
     ma5 = round_price(last["MA5"]) if pd.notna(last["MA5"]) else close
     ma10 = round_price(last["MA10"]) if pd.notna(last["MA10"]) else close
     ma20 = round_price(last["MA20"]) if pd.notna(last["MA20"]) else close
     ma60 = round_price(last["MA60"]) if pd.notna(last["MA60"]) else close
     rsi = round(float(last["RSI"]), 2) if pd.notna(last["RSI"]) else 50.0
+
     sr = calc_professional_sr(df)
     support = sr["support"]
     resistance = sr["resistance"]
-    score = 50
+
+    trend_score = 50
     comments = []
+
     if close >= ma5:
-        score += 4; comments.append("站上5日線")
+        trend_score += 4; comments.append("站上5日線")
     else:
-        score -= 4; comments.append("跌破5日線")
+        trend_score -= 4; comments.append("跌破5日線")
     if close >= ma10:
-        score += 6; comments.append("站上10日線")
+        trend_score += 6; comments.append("站上10日線")
     else:
-        score -= 5; comments.append("跌破10日線")
+        trend_score -= 5; comments.append("跌破10日線")
     if close >= ma20:
-        score += 10; comments.append("站上20日線")
+        trend_score += 10; comments.append("站上20日線")
     else:
-        score -= 10; comments.append("跌破20日線")
+        trend_score -= 10; comments.append("跌破20日線")
     if close >= ma60:
-        score += 15; comments.append("站上60日線")
+        trend_score += 15; comments.append("站上60日線")
     else:
-        score -= 12; comments.append("跌破60日線")
+        trend_score -= 12; comments.append("跌破60日線")
     if float(last["MACD"]) >= float(last["MACD_SIGNAL"]):
-        score += 8; comments.append("MACD偏多")
+        trend_score += 8; comments.append("MACD偏多")
     else:
-        score -= 6; comments.append("MACD偏弱")
+        trend_score -= 6; comments.append("MACD偏弱")
     if pd.notna(last["K"]) and pd.notna(last["D"]):
         if float(last["K"]) >= float(last["D"]):
-            score += 6; comments.append("KD偏多")
+            trend_score += 6; comments.append("KD偏多")
         else:
-            score -= 4; comments.append("KD偏空")
+            trend_score -= 4; comments.append("KD偏空")
     if rsi < 30:
-        score += 8; comments.append("RSI超跌")
+        trend_score += 8; comments.append("RSI超跌")
     elif rsi > 70:
-        score -= 8; comments.append("RSI過熱")
+        trend_score -= 8; comments.append("RSI過熱")
     if len(df) >= 20:
         vol5 = df["Volume"].tail(5).mean()
         vol20 = df["Volume"].tail(20).mean()
         if pd.notna(vol5) and pd.notna(vol20) and vol5 > vol20:
-            score += 4; comments.append("量能放大")
-    if rt.get("orderbook_bias") == "買盤偏強":
-        score += 5; comments.append("五檔買盤偏強")
-    elif rt.get("orderbook_bias") == "買盤明顯偏強":
-        score += 8; comments.append("五檔買盤明顯偏強")
-    elif rt.get("orderbook_bias") == "賣盤偏強":
-        score -= 6; comments.append("五檔賣盤偏強")
-    if change_pct <= -9.0:
-        score -= 50; comments.append("當日大跌>9%，強制壓低分數")
-    elif change_pct <= -7.0:
-        score -= 30; comments.append("當日大跌>7%，顯著壓低分數")
-    elif change_pct <= -5.0:
-        score -= 18; comments.append("當日跌幅偏大，降低分數")
-    if close < open_price:
-        score -= 6; comments.append("現價低於開盤")
-    if close < prev_close:
-        score -= 6; comments.append("現價低於昨收")
-    if close <= low_price * 1.01:
-        score -= 8; comments.append("接近日低，弱勢")
-    if close < support:
-        score -= 15; comments.append("跌破主支撐")
-    score = max(0, min(100, int(score)))
+            trend_score += 4; comments.append("量能放大")
+
+    trend_score = max(0, min(100, int(trend_score)))
+    intraday_score, intraday_comment = calc_intraday_score(
+        close, prev_close, open_price, high_price, low_price, support, resistance,
+        rt.get("orderbook_bias", "無"), change_pct
+    )
+    score = max(0, min(100, int(round(trend_score * 0.6 + intraday_score * 0.4))))
+
     if change_pct <= -9.0:
         signal = "急跌風險"
     elif close < support:
         signal = "跌破支撐"
     elif close > resistance:
         signal = "突破壓力"
-    elif score >= 80:
+    elif score >= 80 and intraday_score >= 60:
         signal = "強勢買進"
     elif score >= 65:
         signal = "偏多觀察"
@@ -757,9 +836,19 @@ def analyze_symbol(symbol: str) -> dict:
         signal = "保守/減碼"
     else:
         signal = "弱勢觀望"
+
     advice = build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct)
     risk_note = build_risk_note(close, support, resistance, rsi, score, change_pct)
-    extra_comment = f"{'；'.join(comments)}；20日支撐={sr['support20']}；20日壓力={sr['resistance20']}；波段低點={sr['swing_low']}；波段高點={sr['swing_high']}；Pivot={sr['pivot']}；來源={rt['source']}"
+    extra_comment = (
+        f"{'；'.join(comments)}"
+        f"；盤中={intraday_comment}"
+        f"；20日支撐={sr['support20']}"
+        f"；20日壓力={sr['resistance20']}"
+        f"；波段低點={sr['swing_low']}"
+        f"；波段高點={sr['swing_high']}"
+        f"；Pivot={sr['pivot']}"
+        f"；來源={rt['source']}"
+    )
     fibo = calc_fibonacci_targets(df)
     result = {
         "input_symbol": symbol, "name": stock_name, "yf_symbol": yf_symbol, "market": market,
@@ -767,6 +856,7 @@ def analyze_symbol(symbol: str) -> dict:
         "last_trade": rt.get("last_trade"), "indicative_price": rt.get("indicative_price"),
         "prev_close": prev_close, "open": open_price, "high": high_price, "low": low_price,
         "change": change, "change_pct": change_pct, "signal": signal, "advice": advice, "score": score,
+        "trend_score": trend_score, "intraday_score": intraday_score,
         "support": support, "resistance": resistance, "rsi": rsi, "ma5": ma5, "ma10": ma10,
         "ma20": ma20, "ma60": ma60, "comment": extra_comment, "risk_note": risk_note,
         "source": rt["source"], "fibo": fibo, "bid_prices": rt.get("bid_prices", []),
@@ -775,10 +865,13 @@ def analyze_symbol(symbol: str) -> dict:
         "sell_qty": rt.get("sell_qty", 0), "orderbook_ratio": rt.get("orderbook_ratio", "-"),
         "orderbook_bias": rt.get("orderbook_bias", "無"), "quote_time": rt.get("quote_time", ""),
     }
+    result["light"] = get_light(result["signal"], result["score"], result["change_pct"], intraday_score=result["intraday_score"])
+    result["rank_score"] = result["trend_score"] * 0.35 + result["intraday_score"] * 0.45 + result["change_pct"] * 2.0
     result["ai_analysis"] = build_ai_analysis(result)
     result["wave_analysis"] = build_wave_analysis(df)
     result["fibo_analysis"] = build_fibonacci_analysis(fibo)
     result["path_analysis"] = build_bull_bear_path(result)
+    result.update(build_trade_scripts(result))
     return result
 
 class GTCProApp:
@@ -820,9 +913,18 @@ class GTCProApp:
         self._build_detail_area(bottom_frame)
 
     def _build_table_area(self, parent):
-        columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "報價說明", "昨收", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI", "五檔力道")
+        columns = (
+            "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%",
+            "訊號", "建議", "分數", "波段分", "盤中分", "支撐", "壓力", "RSI",
+            "五檔力道", "報價說明"
+        )
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
-        widths = {"排名": 55, "燈號": 55, "市場": 90, "代號": 80, "名稱": 180, "顯示價": 90, "報價說明": 180, "昨收": 90, "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 140, "分數": 65, "支撐": 90, "壓力": 90, "RSI": 70, "五檔力道": 110}
+        widths = {
+            "排名": 55, "燈號": 55, "市場": 90, "代號": 80, "名稱": 190, "顯示價": 90,
+            "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "分數": 65,
+            "波段分": 70, "盤中分": 70, "支撐": 90, "壓力": 90, "RSI": 70,
+            "五檔力道": 110, "報價說明": 180
+        }
         for c in columns:
             self.tree.heading(c, text=c, command=lambda col=c: self.sort_by_column(col))
             self.tree.column(c, width=widths[c], anchor="center")
@@ -878,16 +980,8 @@ class GTCProApp:
         now = datetime.now().strftime("%H:%M:%S")
         self.status_var.set(f"[{now}] {text}")
 
-    def get_light(self, signal, score, change_pct):
-        if change_pct <= -4:
-            return "🟣"
-        if signal == "突破壓力" or change_pct >= 3:
-            return "🔵"
-        if score >= 80 and change_pct > 0:
-            return "🟢"
-        if score >= 45:
-            return "🟡"
-        return "🔴"
+    def get_light(self, signal, score, change_pct, intraday_score=None):
+        return get_light(signal, score, change_pct, intraday_score)
 
     def update_status_with_timer(self):
         if self.last_update_time:
@@ -915,6 +1009,7 @@ class GTCProApp:
     def render_results(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
+
         for idx, r in enumerate(self.results, start=1):
             tags = []
             if r["change"] > 0:
@@ -929,8 +1024,18 @@ class GTCProApp:
                 tags.append("strong")
             elif r["score"] >= 65:
                 tags.append("watch")
-            light = self.get_light(r["signal"], r["score"], r["change_pct"])
-            self.tree.insert("", "end", values=(idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"], r["display_note"], r["prev_close"], f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["support"], r["resistance"], r["rsi"], r["orderbook_bias"]), tags=tuple(tags))
+
+            light = self.get_light(r["signal"], r["score"], r["change_pct"], r["intraday_score"])
+            self.tree.insert(
+                "", "end",
+                values=(
+                    idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"],
+                    f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"],
+                    r["score"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
+                    r["rsi"], r["orderbook_bias"], r["display_note"]
+                ),
+                tags=tuple(tags)
+            )
 
     def run_analysis(self):
         symbols = self.parse_symbols()
@@ -949,7 +1054,7 @@ class GTCProApp:
                 self.root.update_idletasks()
             except Exception as e:
                 errors.append(f"{sym}: {e}")
-        self.results = sorted(ok_results, key=lambda x: x["score"] * 0.6 + x["change_pct"] * 0.4, reverse=True)
+        self.results = sorted(ok_results, key=lambda x: x["rank_score"], reverse=True)
         self.render_results()
         self.last_update_time = datetime.now()
         self.next_refresh_sec = AUTO_REFRESH_MS // 1000
@@ -1048,6 +1153,8 @@ class GTCProApp:
             f"RSI：{target['rsi']}",
             f"綜合訊號：{target['signal']}",
             f"綜合分數：{target['score']}",
+            f"波段分數：{target['trend_score']}",
+            f"盤中分數：{target['intraday_score']}",
             "",
             "【支撐壓力】",
             f"主支撐：{target['support']}",
@@ -1081,14 +1188,19 @@ class GTCProApp:
             f"多方關鍵：守 {target['support']}、破 {target['resistance']}、看 {target['fibo']['next_target']}",
             f"空方關鍵：失守 {target['support']} 後，短線結構轉弱",
             "",
+            "【交易劇本】",
+            target["script_a"],
+            target["script_b"],
+            target["script_c"],
+            "",
             "【操作觀察重點】",
             f"1. 報價模式：{target['display_note']}",
             f"2. 支撐區：{target['support']} 附近是否守穩",
             f"3. 壓力區：{target['resistance']} 附近是否放量突破",
             f"4. RSI：{target['rsi']} 是否進一步轉強/轉弱",
             f"5. 五檔力道：{target['orderbook_bias']} / 比值={target['orderbook_ratio']}",
-            f"6. 均線結構：MA20={target['ma20']} / MA60={target['ma60']}",
-            f"7. 分數：{target['score']}，高分優先、低分保守",
+            f"6. 波段分 / 盤中分 / 總分：{target['trend_score']} / {target['intraday_score']} / {target['score']}",
+            f"7. 均線結構：MA20={target['ma20']} / MA60={target['ma60']}",
         ]
         self.detail_text.delete("1.0", tk.END)
         self.detail_text.insert(tk.END, "\n".join(detail))
@@ -1098,10 +1210,29 @@ class GTCProApp:
     def sort_by_column(self, col_name):
         if not self.results:
             return
-        key_map = {"排名": None, "燈號": None, "市場": "market", "代號": "input_symbol", "名稱": "name", "顯示價": "display_price", "報價說明": "display_note", "昨收": "prev_close", "漲跌": "change", "漲跌幅%": "change_pct", "訊號": "signal", "建議": "advice", "分數": "score", "支撐": "support", "壓力": "resistance", "RSI": "rsi", "五檔力道": "orderbook_bias"}
+        key_map = {
+            "排名": "rank_score",
+            "燈號": "light",
+            "市場": "market",
+            "代號": "input_symbol",
+            "名稱": "name",
+            "顯示價": "display_price",
+            "漲跌": "change",
+            "漲跌幅%": "change_pct",
+            "訊號": "signal",
+            "建議": "advice",
+            "分數": "score",
+            "波段分": "trend_score",
+            "盤中分": "intraday_score",
+            "支撐": "support",
+            "壓力": "resistance",
+            "RSI": "rsi",
+            "五檔力道": "orderbook_bias",
+            "報價說明": "display_note",
+        }
         real_key = key_map.get(col_name)
         if real_key is None:
-            self.results = sorted(self.results, key=lambda x: x["score"], reverse=True)
+            self.results = sorted(self.results, key=lambda x: x["rank_score"], reverse=True)
             self.render_results()
             return
         if self.current_sort_column == col_name:
@@ -1128,7 +1259,7 @@ class GTCProApp:
                 f"   即時成交價：{r['last_trade']} / 參考價：{r['indicative_price']}",
                 f"   昨收：{r['prev_close']} / 開盤：{r['open']} / 高：{r['high']} / 低：{r['low']}",
                 f"   漲跌：{r['change']:+.2f} / 漲跌幅：{r['change_pct']:+.2f}%",
-                f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']}",
+                f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']} / 波段分：{r['trend_score']} / 盤中分：{r['intraday_score']}",
                 f"   支撐：{r['support']} / 壓力：{r['resistance']} / RSI：{r['rsi']}",
                 f"   五檔：{r['orderbook_bias']} / 委買委賣比：{r['orderbook_ratio']}",
                 f"   買一：{r['bid_prices'][0] if r['bid_prices'] else '-'} / 量：{r['bid_vols'][0] if r['bid_vols'] else '-'}",
@@ -1160,8 +1291,8 @@ class GTCProApp:
         c.drawString(24, height - 28, f"{APP_TITLE} {APP_VERSION}")
         c.setFont(font_name, 9)
         c.drawString(24, height - 46, f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        headers = ["排名", "市場", "代號", "名稱", "顯示價", "昨收", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI"]
-        x_positions = [20, 50, 105, 155, 320, 385, 445, 510, 580, 650, 750, 810, 865, 920]
+        headers = ["排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌%", "訊號", "建議", "分數", "波段分", "盤中分"]
+        x_positions = [20, 55, 95, 150, 205, 360, 430, 505, 585, 690, 750, 820]
         y = height - 72
         c.setFont(font_name, 8)
         for h, x in zip(headers, x_positions):
@@ -1173,7 +1304,11 @@ class GTCProApp:
                 c.showPage()
                 c.setFont(font_name, 8)
                 y = height - 40
-            row = [str(idx), r["market"], r["input_symbol"], r["name"][:18], str(r["display_price"]), str(r["prev_close"]), f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"][:10], str(r["score"]), str(r["support"]), str(r["resistance"]), str(r["rsi"])]
+            row = [
+                str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:16],
+                str(r["display_price"]), f"{r['change_pct']:+.2f}%", r["signal"],
+                r["advice"][:10], str(r["score"]), str(r["trend_score"]), str(r["intraday_score"])
+            ]
             for text, x in zip(row, x_positions):
                 c.drawString(x, y, str(text))
             y -= 14
