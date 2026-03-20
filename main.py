@@ -18,7 +18,7 @@ from reportlab.pdfgen import canvas
 import os
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.0.4-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.0.5-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -361,16 +361,19 @@ def calc_professional_sr(df: pd.DataFrame) -> dict:
         "r1": round_price(r1),
     }
 
-def build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct):
+def build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct, intraday_score=0, open_price=None, prev_close=None):
     if change_pct <= -9.0:
         return "跌幅過大，先觀望/減碼"
     if close < support:
-        return "減碼 / 停損優先"
+        return "跌破支撐，減碼 / 停損優先"
     if close > resistance:
         return "突破追蹤 / 拉回不破可偏多"
-    if close >= ma20 and close >= ma60 and score >= 80:
+    if (score >= 82 and intraday_score >= 70 and change_pct > 0.8 and
+        (open_price is None or close >= open_price) and
+        (prev_close is None or close >= prev_close) and
+        close < resistance * 0.995):
         return "強勢買進"
-    if close >= ma20 and score >= 65:
+    if close >= ma20 and intraday_score >= 58 and score >= 68:
         return "拉回布局"
     if score >= 45 and support <= close <= resistance:
         return "區間觀察"
@@ -650,6 +653,16 @@ def get_light(signal, score, change_pct, intraday_score=None):
     return "🟠"
 
 
+def is_leader_candidate(data: dict) -> bool:
+    return (
+        data.get("score", 0) >= 80 and
+        data.get("intraday_score", 0) >= 65 and
+        data.get("change_pct", 0) >= 1.2 and
+        data.get("orderbook_bias") not in ("賣盤偏強", "不適用") and
+        data.get("signal") not in ("急跌風險", "跌破支撐")
+    )
+
+
 def build_trade_scripts(data: dict) -> dict:
     support = data["support"]
     resistance = data["resistance"]
@@ -694,9 +707,14 @@ def calc_intraday_score(close, prev_close, open_price, high_price, low_price, su
         score -= 12; comments.append("接近日低")
 
     if close > resistance:
-        score += 15; comments.append("突破壓力")
+        score += 18; comments.append("突破壓力")
+    elif close >= resistance * 0.995:
+        score += 6; comments.append("逼近壓力")
     elif close < support:
-        score -= 15; comments.append("跌破支撐")
+        score -= 18; comments.append("跌破支撐")
+
+    if change_pct >= 1.5 and close >= open_price and close >= prev_close:
+        score += 10; comments.append("盤中續強")
 
     if orderbook_bias == "買盤明顯偏強":
         score += 12; comments.append("五檔買盤明顯偏強")
@@ -826,9 +844,10 @@ def analyze_symbol(symbol: str) -> dict:
         signal = "跌破支撐"
     elif close > resistance:
         signal = "突破壓力"
-    elif score >= 80 and intraday_score >= 60:
+    elif (score >= 82 and intraday_score >= 70 and change_pct > 0.8 and
+          close >= open_price and close >= prev_close and close < resistance * 0.995):
         signal = "強勢買進"
-    elif score >= 65:
+    elif score >= 68 and intraday_score >= 58:
         signal = "偏多觀察"
     elif score >= 45:
         signal = "區間整理"
@@ -837,7 +856,7 @@ def analyze_symbol(symbol: str) -> dict:
     else:
         signal = "弱勢觀望"
 
-    advice = build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct)
+    advice = build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct, intraday_score, open_price, prev_close)
     risk_note = build_risk_note(close, support, resistance, rsi, score, change_pct)
     extra_comment = (
         f"{'；'.join(comments)}"
@@ -867,6 +886,7 @@ def analyze_symbol(symbol: str) -> dict:
     }
     result["light"] = get_light(result["signal"], result["score"], result["change_pct"], intraday_score=result["intraday_score"])
     result["rank_score"] = result["trend_score"] * 0.35 + result["intraday_score"] * 0.45 + result["change_pct"] * 2.0
+    result["leader_candidate"] = "是" if is_leader_candidate(result) else "-"
     result["ai_analysis"] = build_ai_analysis(result)
     result["wave_analysis"] = build_wave_analysis(df)
     result["fibo_analysis"] = build_fibonacci_analysis(fibo)
@@ -887,6 +907,7 @@ class GTCProApp:
         self.next_refresh_sec = AUTO_REFRESH_MS // 1000
         self.last_update_time = None
         self._timer_job_id = None
+        self.show_advanced_columns = False
         self._build_ui()
         self.set_status(f"系統已就緒。當前版本：{APP_VERSION}")
 
@@ -900,6 +921,7 @@ class GTCProApp:
         ttk.Button(top, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="切換進階欄位", command=self.toggle_advanced_columns).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="匯出 PDF", command=self.export_pdf).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="匯出 TXT", command=self.export_txt).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="清空", command=self.clear_results).pack(side="left")
@@ -915,13 +937,16 @@ class GTCProApp:
     def _build_table_area(self, parent):
         columns = (
             "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%",
-            "訊號", "建議", "分數", "波段分", "盤中分", "支撐", "壓力", "RSI",
+            "訊號", "建議", "分數", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI",
             "五檔力道", "報價說明"
         )
+        self.all_columns = columns
+        self.core_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "分數", "主升候選")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
+        self.tree.configure(displaycolumns=self.core_columns)
         widths = {
             "排名": 55, "燈號": 55, "市場": 90, "代號": 80, "名稱": 190, "顯示價": 90,
-            "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "分數": 65,
+            "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "分數": 65, "主升候選": 80,
             "波段分": 70, "盤中分": 70, "支撐": 90, "壓力": 90, "RSI": 70,
             "五檔力道": 110, "報價說明": 180
         }
@@ -943,6 +968,15 @@ class GTCProApp:
         xscroll.grid(row=1, column=0, sticky="ew")
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(0, weight=1)
+
+    def toggle_advanced_columns(self):
+        self.show_advanced_columns = not self.show_advanced_columns
+        if self.show_advanced_columns:
+            self.tree.configure(displaycolumns=self.all_columns)
+            self.set_status(f"已顯示進階欄位。版本：{APP_VERSION}")
+        else:
+            self.tree.configure(displaycolumns=self.core_columns)
+            self.set_status(f"已切回核心欄位。版本：{APP_VERSION}")
 
     def _build_detail_area(self, parent):
         left = ttk.LabelFrame(parent, text="個股明細分析", padding=10)
@@ -1031,7 +1065,7 @@ class GTCProApp:
                 values=(
                     idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"],
                     f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"],
-                    r["score"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
+                    r["score"], r["leader_candidate"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
                     r["rsi"], r["orderbook_bias"], r["display_note"]
                 ),
                 tags=tuple(tags)
@@ -1222,6 +1256,7 @@ class GTCProApp:
             "訊號": "signal",
             "建議": "advice",
             "分數": "score",
+            "主升候選": "leader_candidate",
             "波段分": "trend_score",
             "盤中分": "intraday_score",
             "支撐": "support",
@@ -1259,7 +1294,7 @@ class GTCProApp:
                 f"   即時成交價：{r['last_trade']} / 參考價：{r['indicative_price']}",
                 f"   昨收：{r['prev_close']} / 開盤：{r['open']} / 高：{r['high']} / 低：{r['low']}",
                 f"   漲跌：{r['change']:+.2f} / 漲跌幅：{r['change_pct']:+.2f}%",
-                f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']} / 波段分：{r['trend_score']} / 盤中分：{r['intraday_score']}",
+                f"   訊號：{r['signal']} / 建議：{r['advice']} / 分數：{r['score']} / 主升候選：{r['leader_candidate']} / 波段分：{r['trend_score']} / 盤中分：{r['intraday_score']}",
                 f"   支撐：{r['support']} / 壓力：{r['resistance']} / RSI：{r['rsi']}",
                 f"   五檔：{r['orderbook_bias']} / 委買委賣比：{r['orderbook_ratio']}",
                 f"   買一：{r['bid_prices'][0] if r['bid_prices'] else '-'} / 量：{r['bid_vols'][0] if r['bid_vols'] else '-'}",
