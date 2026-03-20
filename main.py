@@ -704,6 +704,40 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
 
     return "轉弱警戒", "轉弱觀望", "weak"
 
+
+def is_main_trend_candidate(data: dict) -> bool:
+    close = data.get("close", 0)
+    open_price = data.get("open", 0)
+    prev_close = data.get("prev_close", 0)
+    resistance = data.get("resistance", 0)
+    trend = data.get("trend_score", 0)
+    intra = data.get("intraday_score", 0)
+    score = data.get("score", 0)
+    rsi = data.get("rsi", 0)
+    ma20 = data.get("ma20", 0)
+    ma60 = data.get("ma60", 0)
+    signal = data.get("signal", "")
+    orderbook = data.get("orderbook_bias", "無")
+    change_pct = data.get("change_pct", 0)
+
+    bullish_orderbook = orderbook in ("買盤偏強", "買盤明顯偏強", "多空均衡")
+    not_too_far_from_resistance = close <= resistance * 1.01 if resistance else True
+    healthy_strength = signal in ("強勢追蹤", "突破強勢", "偏多觀察")
+
+    return (
+        score >= 90 and
+        trend >= 85 and
+        intra >= 80 and
+        50 <= rsi <= 70 and
+        close > ma20 > ma60 and
+        close >= open_price and
+        close >= prev_close and
+        change_pct >= 0.8 and
+        bullish_orderbook and
+        healthy_strength and
+        not_too_far_from_resistance
+    )
+
 def classify_leader_stage(data: dict) -> str:
     if is_main_trend_candidate(data):
         return "是"
