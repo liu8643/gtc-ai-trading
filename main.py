@@ -632,19 +632,6 @@ def build_bull_bear_path(data: dict) -> str:
         f"【路徑結論】當前訊號為「{signal}」，操作建議為「{advice}」。",
     ])
 
-
-def get_light(signal, score, change_pct):
-    if change_pct <= -4:
-        return "🟣"
-    if change_pct >= 3:
-        return "🔵"
-    if score >= 80 and change_pct > 0:
-        return "🟢"
-    if score >= 45:
-        return "🟡"
-    return "🔴"
-
-
 def analyze_symbol(symbol: str) -> dict:
     yf_symbol, df = download_symbol_data(symbol)
     market = detect_market(symbol, yf_symbol)
@@ -788,8 +775,6 @@ def analyze_symbol(symbol: str) -> dict:
         "sell_qty": rt.get("sell_qty", 0), "orderbook_ratio": rt.get("orderbook_ratio", "-"),
         "orderbook_bias": rt.get("orderbook_bias", "無"), "quote_time": rt.get("quote_time", ""),
     }
-    result["light"] = get_light(result["signal"], result["score"], result["change_pct"])
-    result["rank_score"] = result["score"] * 0.6 + result["change_pct"] * 0.4
     result["ai_analysis"] = build_ai_analysis(result)
     result["wave_analysis"] = build_wave_analysis(df)
     result["fibo_analysis"] = build_fibonacci_analysis(fibo)
@@ -835,9 +820,9 @@ class GTCProApp:
         self._build_detail_area(bottom_frame)
 
     def _build_table_area(self, parent):
-        columns = ("排名", "市場", "代號", "名稱", "顯示價", "報價說明", "昨收", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI", "五檔力道")
+        columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "報價說明", "昨收", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "支撐", "壓力", "RSI", "五檔力道")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
-        widths = {"排名": 55, "市場": 90, "代號": 80, "名稱": 180, "顯示價": 90, "報價說明": 180, "昨收": 90, "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 140, "分數": 65, "支撐": 90, "壓力": 90, "RSI": 70, "五檔力道": 110}
+        widths = {"排名": 55, "燈號": 55, "市場": 90, "代號": 80, "名稱": 180, "顯示價": 90, "報價說明": 180, "昨收": 90, "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 140, "分數": 65, "支撐": 90, "壓力": 90, "RSI": 70, "五檔力道": 110}
         for c in columns:
             self.tree.heading(c, text=c, command=lambda col=c: self.sort_by_column(col))
             self.tree.column(c, width=widths[c], anchor="center")
@@ -893,8 +878,22 @@ class GTCProApp:
         now = datetime.now().strftime("%H:%M:%S")
         self.status_var.set(f"[{now}] {text}")
 
+    def get_light(self, signal, score, change_pct):
+        if change_pct <= -4:
+            return "🟣"
+        if signal == "突破壓力" or change_pct >= 3:
+            return "🔵"
+        if score >= 80 and change_pct > 0:
+            return "🟢"
+        if score >= 45:
+            return "🟡"
+        return "🔴"
+
     def update_status_with_timer(self):
-        last = self.last_update_time.strftime("%H:%M:%S") if self.last_update_time else "-"
+        if self.last_update_time:
+            last = self.last_update_time.strftime("%H:%M:%S")
+        else:
+            last = "-"
         mode = "自動刷新開啟" if self.auto_refresh_enabled else "自動刷新關閉"
         self.status_var.set(f"最後更新：{last} ｜ 下次刷新：{self.next_refresh_sec} 秒 ｜ {mode} ｜ 版本：{APP_VERSION}")
 
@@ -930,7 +929,8 @@ class GTCProApp:
                 tags.append("strong")
             elif r["score"] >= 65:
                 tags.append("watch")
-            self.tree.insert("", "end", values=(idx, r["market"], r["input_symbol"], r["name"], r["display_price"], r["display_note"], r["prev_close"], f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["support"], r["resistance"], r["rsi"], r["orderbook_bias"]), tags=tuple(tags))
+            light = self.get_light(r["signal"], r["score"], r["change_pct"])
+            self.tree.insert("", "end", values=(idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"], r["display_note"], r["prev_close"], f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["support"], r["resistance"], r["rsi"], r["orderbook_bias"]), tags=tuple(tags))
 
     def run_analysis(self):
         symbols = self.parse_symbols()
@@ -949,8 +949,11 @@ class GTCProApp:
                 self.root.update_idletasks()
             except Exception as e:
                 errors.append(f"{sym}: {e}")
-        self.results = sorted(ok_results, key=lambda x: x["score"], reverse=True)
+        self.results = sorted(ok_results, key=lambda x: x["score"] * 0.6 + x["change_pct"] * 0.4, reverse=True)
         self.render_results()
+        self.last_update_time = datetime.now()
+        self.next_refresh_sec = AUTO_REFRESH_MS // 1000
+        self.update_status_with_timer()
         if self.results:
             first_id = self.tree.get_children()[0]
             self.tree.selection_set(first_id)
@@ -964,23 +967,40 @@ class GTCProApp:
 
     def enable_auto_refresh(self):
         self.auto_refresh_enabled = True
-        self.set_status(f"已啟用自動刷新（每 {AUTO_REFRESH_MS // 1000} 秒）。版本：{APP_VERSION}")
-        self.root.after(AUTO_REFRESH_MS, self.auto_refresh_job)
+        self.next_refresh_sec = AUTO_REFRESH_MS // 1000
+        self.update_status_with_timer()
+        if self._timer_job_id is not None:
+            try:
+                self.root.after_cancel(self._timer_job_id)
+            except Exception:
+                pass
+        self._timer_job_id = self.root.after(1000, self.auto_refresh_job)
 
     def disable_auto_refresh(self):
         self.auto_refresh_enabled = False
-        self.set_status(f"已停止自動刷新。版本：{APP_VERSION}")
+        if self._timer_job_id is not None:
+            try:
+                self.root.after_cancel(self._timer_job_id)
+            except Exception:
+                pass
+            self._timer_job_id = None
+        self.update_status_with_timer()
 
     def auto_refresh_job(self):
         if not self.auto_refresh_enabled:
+            self._timer_job_id = None
             return
-        symbols = self.parse_symbols()
-        if symbols:
-            try:
-                self.run_analysis()
-            except Exception:
-                pass
-        self.root.after(AUTO_REFRESH_MS, self.auto_refresh_job)
+        self.next_refresh_sec -= 1
+        if self.next_refresh_sec <= 0:
+            symbols = self.parse_symbols()
+            if symbols:
+                try:
+                    self.run_analysis()
+                except Exception:
+                    pass
+            self.next_refresh_sec = AUTO_REFRESH_MS // 1000
+        self.update_status_with_timer()
+        self._timer_job_id = self.root.after(1000, self.auto_refresh_job)
 
     def on_row_select(self, event=None):
         selected = self.tree.selection()
@@ -990,7 +1010,7 @@ class GTCProApp:
         values = item["values"]
         if not values:
             return
-        symbol = str(values[2])
+        symbol = str(values[3])
         target = next((r for r in self.results if r["input_symbol"] == symbol), None)
         if not target:
             return
@@ -1078,7 +1098,7 @@ class GTCProApp:
     def sort_by_column(self, col_name):
         if not self.results:
             return
-        key_map = {"排名": None, "市場": "market", "代號": "input_symbol", "名稱": "name", "顯示價": "display_price", "報價說明": "display_note", "昨收": "prev_close", "漲跌": "change", "漲跌幅%": "change_pct", "訊號": "signal", "建議": "advice", "分數": "score", "支撐": "support", "壓力": "resistance", "RSI": "rsi", "五檔力道": "orderbook_bias"}
+        key_map = {"排名": None, "燈號": None, "市場": "market", "代號": "input_symbol", "名稱": "name", "顯示價": "display_price", "報價說明": "display_note", "昨收": "prev_close", "漲跌": "change", "漲跌幅%": "change_pct", "訊號": "signal", "建議": "advice", "分數": "score", "支撐": "support", "壓力": "resistance", "RSI": "rsi", "五檔力道": "orderbook_bias"}
         real_key = key_map.get(col_name)
         if real_key is None:
             self.results = sorted(self.results, key=lambda x: x["score"], reverse=True)
