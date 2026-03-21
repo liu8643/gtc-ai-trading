@@ -1783,7 +1783,11 @@ class GTCProApp:
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill="x")
 
-        input_frame = ttk.Frame(top)
+        # 第一列：輸入區 + 匯出按鈕
+        row1 = ttk.Frame(top)
+        row1.pack(fill="x")
+
+        input_frame = ttk.Frame(row1)
         input_frame.pack(side="left", fill="x", expand=True)
 
         ttk.Label(input_frame, text="股票代號（逗號分隔）").pack(side="left", padx=(0, 8))
@@ -1791,21 +1795,7 @@ class GTCProApp:
         self.symbol_entry.pack(side="left", padx=(0, 8), fill="x", expand=True)
         self.symbol_entry.insert(0, "2330,2382,3231,2308,3017,4979,AAPL,NVDA,MSFT")
 
-        action_frame = ttk.Frame(top)
-        action_frame.pack(side="left", padx=(8, 0))
-
-        ttk.Button(action_frame, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 6))
-        self.category_combo = ttk.Combobox(action_frame, textvariable=self.category_var, values=list(CATEGORY_OPTIONS.keys()), width=16, state="readonly")
-        self.category_combo.pack(side="left", padx=(0, 6))
-        self.category_combo.set("上市全部")
-        ttk.Button(action_frame, text="下載官方CSV", command=self.download_selected_category_snapshot).pack(side="left", padx=(0, 6))
-        ttk.Button(action_frame, text="分析目前分類A級", command=self.analyze_selected_category_snapshot).pack(side="left", padx=(0, 6))
-        ttk.Button(action_frame, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 6))
-        ttk.Button(action_frame, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 6))
-        ttk.Button(action_frame, text="切換進階欄位", command=self.toggle_advanced_columns).pack(side="left", padx=(0, 6))
-        ttk.Button(action_frame, text="清空", command=self.clear_results).pack(side="left", padx=(0, 6))
-
-        right_frame = ttk.Frame(top)
+        right_frame = ttk.Frame(row1)
         right_frame.pack(side="right")
 
         self.download_btn = tk.Menubutton(right_frame, text="下載報告 ▼", relief="raised")
@@ -1818,6 +1808,39 @@ class GTCProApp:
         self.download_menu.add_command(label="TXT：全部完整報告", command=self.export_txt_full)
         self.download_menu.add_command(label="CSV：主表資料", command=self.export_csv_table)
         self.download_btn.pack(side="right", padx=(8, 0))
+
+        # 第二列：工具列 + 橫向 scrollbar，避免按鈕跑位
+        toolbar_outer = ttk.LabelFrame(top, text="工具列", padding=(8, 6))
+        toolbar_outer.pack(fill="x", pady=(8, 0))
+
+        self.toolbar_canvas = tk.Canvas(toolbar_outer, height=36, highlightthickness=0)
+        self.toolbar_canvas.pack(side="top", fill="x", expand=True)
+        toolbar_scroll = ttk.Scrollbar(toolbar_outer, orient="horizontal", command=self.toolbar_canvas.xview)
+        toolbar_scroll.pack(side="bottom", fill="x")
+        self.toolbar_canvas.configure(xscrollcommand=toolbar_scroll.set)
+
+        toolbar_frame = ttk.Frame(self.toolbar_canvas)
+        self.toolbar_canvas_window = self.toolbar_canvas.create_window((0, 0), window=toolbar_frame, anchor="nw")
+
+        def _update_toolbar_scrollregion(event=None):
+            self.toolbar_canvas.configure(scrollregion=self.toolbar_canvas.bbox("all"))
+
+        def _fit_toolbar_width(event):
+            self.toolbar_canvas.itemconfigure(self.toolbar_canvas_window, height=max(event.height - 2, 30))
+
+        toolbar_frame.bind("<Configure>", _update_toolbar_scrollregion)
+        self.toolbar_canvas.bind("<Configure>", _fit_toolbar_width)
+
+        ttk.Button(toolbar_frame, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 6))
+        self.category_combo = ttk.Combobox(toolbar_frame, textvariable=self.category_var, values=list(CATEGORY_OPTIONS.keys()), width=16, state="readonly")
+        self.category_combo.pack(side="left", padx=(0, 6))
+        self.category_combo.set("上市全部")
+        ttk.Button(toolbar_frame, text="下載官方CSV", command=self.download_selected_category_snapshot).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="分析目前分類A級", command=self.analyze_selected_category_snapshot).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="切換進階欄位", command=self.toggle_advanced_columns).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="清空", command=self.clear_results).pack(side="left", padx=(0, 6))
 
         market_bar = ttk.Frame(self.root, padding=(10, 0, 10, 6))
         market_bar.pack(fill="x")
@@ -1832,6 +1855,7 @@ class GTCProApp:
         center.add(bottom_frame, weight=2)
         self._build_table_area(top_frame)
         self._build_detail_area(bottom_frame)
+
     def _build_table_area(self, parent):
         columns = (
             "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%",
