@@ -1055,55 +1055,102 @@ def analyze_symbol(symbol: str) -> dict:
 
 
 
-def format_code_bucket(items: list[dict]) -> str:
-    if not items:
-        return "-"
-    return ",".join(str(x.get("input_symbol", x.get("code", ""))) for x in items[:3])
 
-def generate_daily_strategy(results: list[dict]) -> str:
+def get_market_index_quote(symbol: str) -> dict:
+    """使用 yfinance 抓取大盤指數；若失敗則回傳 None。"""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        if hist is None or hist.empty:
+            return None
+        last = hist.iloc[-1]
+        if len(hist) >= 2:
+            prev_close = float(hist.iloc[-2]["Close"])
+        else:
+            prev_close = float(last["Close"])
+        close = float(last["Close"])
+        change = close - prev_close
+        pct = (change / prev_close * 100) if prev_close else 0.0
+        return {
+            "close": round(close, 2),
+            "change": round(change, 2),
+            "pct": round(pct, 2),
+        }
+    except Exception:
+        return None
+
+def infer_volume_status(results: list[dict]) -> str:
     if not results:
-        return "今日策略：尚無資料"
-    main = [r for r in results if r.get("leader_candidate") == "是"]
-    watch = [r for r in results if r.get("leader_candidate") == "觀察"]
-    layout = [r for r in results if r.get("signal") in ("整理偏多", "偏多觀察")]
-    avoid = [r for r in results if r.get("signal") in ("轉弱警戒", "急跌風險", "跌破支撐")]
+        return "未知"
+    trend_up = sum(1 for r in results if r.get("trend_score", 0) >= 75)
+    weak = sum(1 for r in results if r.get("trend_score", 0) < 40)
+    if trend_up >= max(2, len(results) * 0.35):
+        return "放量"
+    if weak >= max(3, len(results) * 0.45):
+        return "量縮"
+    return "正常"
 
-    parts = []
-    if main:
-        parts.append(f"主攻={format_code_bucket(main)}")
-    if watch:
-        parts.append(f"觀察={format_code_bucket(watch)}")
-    if layout:
-        parts.append(f"布局={format_code_bucket(layout)}")
-    if avoid:
-        parts.append(f"避免={format_code_bucket(avoid)}")
-    return "今日策略：" + " / ".join(parts) if parts else "今日策略：暫無明確可交易標的"
+def get_market_data(results: list[dict]) -> dict:
+    twse = get_market_index_quote("^TWII")
+    otc = get_market_index_quote("^TWOII")
 
-def build_market_overview(results: list[dict]) -> str:
+    # 上漲 / 下跌家數：若無法直接抓市場廣度，退回用追蹤清單代理
+    up = sum(1 for r in results if r.get("change", 0) > 0)
+    down = sum(1 for r in results if r.get("change", 0) < 0)
+
+    return {
+        "twse": twse or {"close": 0.0, "change": 0.0, "pct": 0.0},
+        "otc": otc or {"close": 0.0, "change": 0.0, "pct": 0.0},
+        "up": up,
+        "down": down,
+        "volume_status": infer_volume_status(results),
+    }
+
+def get_market_mode(results: list[dict]) -> str:
     if not results:
-        return "盤勢總覽：尚無資料"
-    total = len(results)
+        return "尚無資料"
     strong = sum(1 for r in results if r.get("signal") in ("突破強勢", "強勢追蹤"))
     bullish = sum(1 for r in results if r.get("signal") in ("偏多觀察", "整理偏多"))
     weak = sum(1 for r in results if r.get("signal") in ("轉弱警戒", "急跌風險", "跌破支撐"))
-    leaders = sum(1 for r in results if r.get("leader_candidate") == "是")
-    leader_watch = sum(1 for r in results if r.get("leader_candidate") == "觀察")
-    mid = max(0, total - strong - weak)
-    tradable = leaders + leader_watch + bullish
+    total = len(results)
 
     if strong >= max(2, total * 0.35):
-        market = "盤勢：偏多震盪"
-    elif weak >= max(3, total * 0.45):
-        market = "盤勢：偏弱震盪"
-    elif bullish + strong >= max(3, total * 0.4):
-        market = "盤勢：震盪偏多"
-    else:
-        market = "盤勢：區間震盪"
+        return "偏多震盪"
+    if weak >= max(3, total * 0.45):
+        return "偏弱震盪"
+    if bullish + strong >= max(3, total * 0.40):
+        return "震盪偏多"
+    return "區間震盪"
 
-    structure = f"市場結構：強={strong}({round(strong/total*100,1)}%) / 中={mid}({round(mid/total*100,1)}%) / 弱={weak}({round(weak/total*100,1)}%)"
-    density = f"可交易密度：{tradable}/{total}"
-    strategy = generate_daily_strategy(results)
-    return f"{market} ｜ 強勢股：{strong} ｜ 偏多股：{bullish} ｜ 弱勢警戒：{weak} ｜ 主升候選：{leaders} ｜ 主升觀察：{leader_watch} ｜ {structure} ｜ {density} ｜ {strategy}"
+def get_today_strategy(mode: str) -> str:
+    if mode == "偏多震盪":
+        return "只做主升與整理偏多"
+    if mode == "震盪偏多":
+        return "可觀察主升與整理偏多，不追高"
+    if mode == "偏弱震盪":
+        return "優先防守，弱勢股不抄底"
+    return "區間操作，等待方向"
+
+def build_market_overview(results: list[dict]) -> str:
+    if not results:
+        return "加權：- ｜ OTC：- ｜ 上漲/下跌：-/- ｜ 量能：未知\n市場模式：尚無資料 ｜ 今日策略：尚無資料"
+
+    market = get_market_data(results)
+    mode = get_market_mode(results)
+    strategy = get_today_strategy(mode)
+
+    twse = market["twse"]
+    otc = market["otc"]
+    twse_arrow = "▲" if twse["change"] >= 0 else "▼"
+    otc_arrow = "▲" if otc["change"] >= 0 else "▼"
+
+    line1 = (
+        f"加權：{twse['close']} {twse_arrow}{abs(twse['change'])} ({twse['pct']:+.2f}%) ｜ "
+        f"OTC：{otc['close']} {otc_arrow}{abs(otc['change'])} ({otc['pct']:+.2f}%) ｜ "
+        f"上漲/下跌：{market['up']}/{market['down']} ｜ 量能：{market['volume_status']}"
+    )
+    line2 = f"市場模式：{mode} ｜ 今日策略：{strategy}"
+    return line1 + "\n" + line2
 
 class GTCProApp:
     def __init__(self, root: tk.Tk):
@@ -1119,7 +1166,7 @@ class GTCProApp:
         self.last_update_time = None
         self._timer_job_id = None
         self.show_advanced_columns = False
-        self.market_overview_var = tk.StringVar(value="盤勢總覽：尚無資料")
+        self.market_overview_var = tk.StringVar(value="加權：- ｜ OTC：- ｜ 上漲/下跌：-/- ｜ 量能：未知\n市場模式：尚無資料 ｜ 今日策略：尚無資料")
         self._build_ui()
         self.set_status(f"系統已就緒。當前版本：{APP_VERSION}")
 
@@ -1161,7 +1208,7 @@ class GTCProApp:
 
         market_bar = ttk.Frame(self.root, padding=(10, 0, 10, 6))
         market_bar.pack(fill="x")
-        ttk.Label(market_bar, textvariable=self.market_overview_var).pack(anchor="w")
+        ttk.Label(market_bar, textvariable=self.market_overview_var, justify="left").pack(anchor="w")
 
         center = ttk.Panedwindow(self.root, orient=tk.VERTICAL)
         center.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1262,7 +1309,7 @@ class GTCProApp:
             last = "-"
         mode = "自動刷新開啟" if self.auto_refresh_enabled else "自動刷新關閉"
         source_mix = "TWSE MIS / Yahoo"
-        market_text = self.market_overview_var.get() if hasattr(self, "market_overview_var") else "盤勢總覽：尚無資料"
+        market_text = self.market_overview_var.get().replace("\n", " ｜ ") if hasattr(self, "market_overview_var") else "市場模式：尚無資料"
         self.status_var.set(
             f"最後更新：{last} ｜ 下次刷新：{self.next_refresh_sec} 秒 ｜ {mode} ｜ "
             f"來源：{source_mix} ｜ 追蹤檔數：{len(self.results)} ｜ {market_text} ｜ 版本：{APP_VERSION}"
