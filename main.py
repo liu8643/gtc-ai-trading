@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.5-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.1.3-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -667,6 +667,7 @@ def get_light(signal, score, change_pct, intraday_score=None):
 
 
 
+
 def evaluate_trade_state(close, prev_close, open_price, support, resistance, change_pct,
                          trend_score, intraday_score, score, orderbook_bias, ma20=0, ma60=0, rsi=50):
     near_resistance = close >= resistance * 0.988 if resistance else False
@@ -709,7 +710,7 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
         trend_score >= 82 and intraday_score >= 68 and score >= 78 and
         structure_bullish and change_pct >= 1.5 and
         orderbook_bias in ("買盤偏強", "買盤明顯偏強") and 35 <= rsi <= 68 and
-        close <= resistance * 1.03
+        (not resistance or close <= resistance * 1.03)
     ):
         return "整理偏多", "偏多整理", "bullish"
 
@@ -726,6 +727,7 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
         return "轉弱警戒", "保守觀察/減碼", "weak"
 
     return "轉弱警戒", "轉弱觀望", "weak"
+
 
 def is_main_trend_candidate(data: dict) -> bool:
     close = data.get("close", 0)
@@ -1018,7 +1020,7 @@ def analyze_symbol(symbol: str) -> dict:
 
     signal, advice, state_bucket = evaluate_trade_state(
         close, prev_close, open_price, support, resistance, change_pct,
-        trend_score, intraday_score, score, rt.get("orderbook_bias", "無"), ma20, ma60, rsi
+        trend_score, intraday_score, score, rt.get("orderbook_bias", "無")
     )
     risk_note = build_risk_note(close, support, resistance, rsi, score, change_pct)
     extra_comment = (
@@ -1073,6 +1075,7 @@ def analyze_symbol(symbol: str) -> dict:
 
 
 
+
 def get_market_index_quote(symbol: str) -> dict:
     """使用 yfinance 抓取大盤指數；若失敗則回傳 None。"""
     try:
@@ -1088,12 +1091,7 @@ def get_market_index_quote(symbol: str) -> dict:
         close = float(last["Close"])
         change = close - prev_close
         pct = (change / prev_close * 100) if prev_close else 0.0
-        return {
-            "close": round(close, 2),
-            "change": round(change, 2),
-            "pct": round(pct, 2),
-            "source": "Yahoo Finance"
-        }
+        return {"close": round(close, 2), "change": round(change, 2), "pct": round(pct, 2), "source": "Yahoo Finance"}
     except Exception:
         return None
 
@@ -1107,7 +1105,6 @@ def infer_volume_status(results: list[dict]) -> str:
     if weak >= max(3, len(results) * 0.45):
         return "量縮"
     return "正常"
-
 
 def _count_change_sign(v) -> int:
     if v in (None, "", "--", "---"):
@@ -1128,7 +1125,6 @@ def _count_change_sign(v) -> int:
         return 1 if f > 0 else (-1 if f < 0 else 0)
     except Exception:
         return 0
-
 
 def fetch_twse_breadth() -> tuple[int, int, str]:
     urls = [
@@ -1165,7 +1161,6 @@ def fetch_twse_breadth() -> tuple[int, int, str]:
             continue
     return 0, 0, ""
 
-
 def fetch_tpex_breadth() -> tuple[int, int, str]:
     candidate_urls = [
         "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
@@ -1199,27 +1194,16 @@ def fetch_tpex_breadth() -> tuple[int, int, str]:
             continue
     return 0, 0, ""
 
-
 def get_tsmc_market_quote() -> dict:
     rt = get_tw_realtime_quote("2330", "台股上市")
     if rt:
         change = round_price(rt["close"] - rt["prev_close"])
         pct = round((change / rt["prev_close"] * 100), 2) if rt["prev_close"] else 0.0
-        return {
-            "close": rt["close"],
-            "change": change,
-            "pct": pct,
-            "source": rt.get("source", "TWSE MIS")
-        }
+        return {"close": rt["close"], "change": change, "pct": pct, "source": rt.get("source", "TWSE MIS")}
     yq = get_us_yahoo_quote("2330.TW", 0.0, 0.0, 0.0, 0.0, 0.0)
     change = round_price(yq["close"] - yq["prev_close"])
     pct = round((change / yq["prev_close"] * 100), 2) if yq["prev_close"] else 0.0
-    return {
-        "close": yq["close"],
-        "change": change,
-        "pct": pct,
-        "source": yq.get("source", "Yahoo Finance")
-    }
+    return {"close": yq["close"], "change": change, "pct": pct, "source": yq.get("source", "Yahoo Finance")}
 
 def get_market_data(results: list[dict]) -> dict:
     twse = get_market_index_quote("^TWII") or {"close": 0.0, "change": 0.0, "pct": 0.0, "source": "Yahoo Finance"}
@@ -1232,7 +1216,6 @@ def get_market_data(results: list[dict]) -> dict:
     breadth_source = " / ".join([s for s in (src1, src2) if s]).strip()
 
     if up + down == 0:
-        # 最後保底：仍回退為觀察池代理，但明確標示來源
         up = sum(1 for r in results if r.get("change", 0) > 0)
         down = sum(1 for r in results if r.get("change", 0) < 0)
         breadth_source = "觀察池代理"
@@ -1252,7 +1235,6 @@ def get_market_mode(market: dict) -> str:
     tsmc_pct = market.get("tsmc", {}).get("pct", 0.0)
     up = market.get("up", 0)
     down = market.get("down", 0)
-
     if twse_pct >= 0.6 and tsmc_pct >= 0.8 and up > down:
         return "偏多震盪"
     if twse_pct <= -0.6 and tsmc_pct <= -0.5 and down > up:
@@ -1267,11 +1249,10 @@ def get_today_strategy(market: dict, mode: str) -> str:
     twse_pct = market.get("twse", {}).get("pct", 0.0)
     tsmc_pct = market.get("tsmc", {}).get("pct", 0.0)
     breadth_balance = market.get("up", 0) - market.get("down", 0)
-
     if mode == "偏多震盪":
         if tsmc_pct >= 1.0:
             return "大盤與台積電同步偏強，只做主升與整理偏多，避免追高末升段"
-        return "指數偏強但權值未全面發動，以拉回承接為主，不追爆量長紅"
+        return "指數偏強但台積電未全面發動，以拉回承接為主，不追爆量長紅"
     if mode == "震盪偏多":
         return "大盤偏多但結構未全面擴散，以整理偏多與低接型主升股為主"
     if mode == "偏弱震盪":
@@ -1279,13 +1260,12 @@ def get_today_strategy(market: dict, mode: str) -> str:
     if mode == "震盪偏弱":
         return "盤面偏弱且家數落後，降低持股水位，反彈先看壓力不追價"
     if twse_pct > 0 or breadth_balance > 0:
-        return "市場仍在區間，偏向選股操作，只做型態完整個股"
+        return "市場無明確主流但略有撐盤，只做型態完整個股"
     return "市場無明確優勢，觀望為主，等待大盤與台積電同步轉強"
 
 def build_market_overview(results: list[dict]) -> str:
     if not results:
         return "加權：- ｜ 台積電：- ｜ 上漲/下跌：-/- ｜ 量能：未知\n市場模式：尚無資料 ｜ 今日策略：尚無資料"
-
     market = get_market_data(results)
     mode = get_market_mode(market)
     strategy = get_today_strategy(market, mode)
@@ -1294,7 +1274,6 @@ def build_market_overview(results: list[dict]) -> str:
     tsmc = market["tsmc"]
     twse_arrow = "▲" if twse["change"] >= 0 else "▼"
     tsmc_arrow = "▲" if tsmc["change"] >= 0 else "▼"
-
     line1 = (
         f"加權：{twse['close']} {twse_arrow}{abs(twse['change'])} ({twse['pct']:+.2f}%) ｜ "
         f"台積電：{tsmc['close']} {tsmc_arrow}{abs(tsmc['change'])} ({tsmc['pct']:+.2f}%) ｜ "
@@ -1302,6 +1281,659 @@ def build_market_overview(results: list[dict]) -> str:
     )
     line2 = f"市場模式：{mode} ｜ 今日策略：{strategy} ｜ 資料源：{market['source_note']}"
     return line1 + "\n" + line2
+
+
+
+class GTCProApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(f"{APP_TITLE} {APP_VERSION}")
+        self.root.geometry("1920x1000")
+        self.root.minsize(1500, 820)
+        self.results = []
+        self.current_sort_column = None
+        self.sort_reverse = True
+        self.auto_refresh_enabled = False
+        self.next_refresh_sec = AUTO_REFRESH_MS // 1000
+        self.last_update_time = None
+        self._timer_job_id = None
+        self.show_advanced_columns = False
+        self.market_overview_var = tk.StringVar(value="加權：- ｜ 台積電：- ｜ 上漲/下跌：-/- ｜ 量能：未知\n市場模式：尚無資料 ｜ 今日策略：尚無資料")
+        self._build_ui()
+        self.set_status(f"系統已就緒。當前版本：{APP_VERSION}")
+
+
+    def _build_ui(self):
+        top = ttk.Frame(self.root, padding=10)
+        top.pack(fill="x")
+
+        input_frame = ttk.Frame(top)
+        input_frame.pack(side="left", fill="x", expand=True)
+
+        ttk.Label(input_frame, text="股票代號（逗號分隔）").pack(side="left", padx=(0, 8))
+        self.symbol_entry = ttk.Entry(input_frame, width=80)
+        self.symbol_entry.pack(side="left", padx=(0, 8), fill="x", expand=True)
+        self.symbol_entry.insert(0, "2330,2382,3231,2308,3017,4979,AAPL,NVDA,MSFT")
+
+        action_frame = ttk.Frame(top)
+        action_frame.pack(side="left", padx=(8, 0))
+
+        ttk.Button(action_frame, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="切換進階欄位", command=self.toggle_advanced_columns).pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="清空", command=self.clear_results).pack(side="left", padx=(0, 6))
+
+        right_frame = ttk.Frame(top)
+        right_frame.pack(side="right")
+
+        self.download_btn = tk.Menubutton(right_frame, text="下載報告 ▼", relief="raised")
+        self.download_menu = tk.Menu(self.download_btn, tearoff=0)
+        self.download_btn.config(menu=self.download_menu)
+        self.download_menu.add_command(label="PDF：總表摘要", command=self.export_pdf_summary)
+        self.download_menu.add_command(label="PDF：目前選取個股", command=self.export_pdf_selected)
+        self.download_menu.add_command(label="PDF：全部完整報告", command=self.export_pdf_full)
+        self.download_menu.add_separator()
+        self.download_menu.add_command(label="TXT：全部完整報告", command=self.export_txt_full)
+        self.download_menu.add_command(label="CSV：主表資料", command=self.export_csv_table)
+        self.download_btn.pack(side="right", padx=(8, 0))
+
+        market_bar = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        market_bar.pack(fill="x")
+        ttk.Label(market_bar, textvariable=self.market_overview_var, justify="left").pack(anchor="w")
+
+        center = ttk.Panedwindow(self.root, orient=tk.VERTICAL)
+        center.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        top_frame = ttk.Frame(center)
+        bottom_frame = ttk.Frame(center)
+        center.add(top_frame, weight=3)
+        center.add(bottom_frame, weight=2)
+        self._build_table_area(top_frame)
+        self._build_detail_area(bottom_frame)
+    def _build_table_area(self, parent):
+        columns = (
+            "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%",
+            "訊號", "建議", "分數", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI",
+            "五檔力道", "交易類型", "報價說明"
+        )
+        self.all_columns = columns
+        self.core_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "分數", "主升候選")
+        self.advanced_columns = ("排名", "燈號", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "分數", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明")
+        self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
+        self.tree.configure(displaycolumns=self.core_columns)
+        widths = {
+            "排名": 55, "燈號": 55, "市場": 90, "代號": 80, "名稱": 190, "顯示價": 90,
+            "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "分數": 65, "主升候選": 80,
+            "波段分": 70, "盤中分": 70, "支撐": 90, "壓力": 90, "RSI": 70,
+            "五檔力道": 110, "交易類型": 100, "報價說明": 180
+        }
+        for c in columns:
+            self.tree.heading(c, text=c, command=lambda col=c: self.sort_by_column(col))
+            self.tree.column(c, width=widths[c], anchor="center")
+        self.tree.tag_configure("up", foreground="red", background="#ffecec")
+        self.tree.tag_configure("down", foreground="green", background="#ecffec")
+        self.tree.tag_configure("flat", foreground="black", background="white")
+        self.tree.tag_configure("strong", background="#fff2b3")
+        self.tree.tag_configure("watch", background="#eef5ff")
+        self.tree.tag_configure("danger", background="#ffd9d9")
+        self.tree.bind("<<TreeviewSelect>>", self.on_row_select)
+        yscroll = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(parent, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+    def toggle_advanced_columns(self):
+        self.show_advanced_columns = not self.show_advanced_columns
+        if self.show_advanced_columns:
+            self.tree.configure(displaycolumns=self.advanced_columns)
+            self.set_status(f"已顯示進階欄位。版本：{APP_VERSION}")
+        else:
+            self.tree.configure(displaycolumns=self.core_columns)
+            self.set_status(f"已切回核心欄位。版本：{APP_VERSION}")
+
+    def _build_detail_area(self, parent):
+        left = ttk.LabelFrame(parent, text="個股明細分析", padding=10)
+        right = ttk.LabelFrame(parent, text="操作建議 / 風險提醒", padding=10)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        right.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        left_text_frame = ttk.Frame(left)
+        left_text_frame.pack(fill="both", expand=True)
+        self.detail_text = tk.Text(left_text_frame, height=14, wrap="none", font=("Microsoft JhengHei", 10))
+        left_y_scroll = ttk.Scrollbar(left_text_frame, orient="vertical", command=self.detail_text.yview)
+        left_x_scroll = ttk.Scrollbar(left_text_frame, orient="horizontal", command=self.detail_text.xview)
+        self.detail_text.configure(yscrollcommand=left_y_scroll.set, xscrollcommand=left_x_scroll.set)
+        self.detail_text.grid(row=0, column=0, sticky="nsew")
+        left_y_scroll.grid(row=0, column=1, sticky="ns")
+        left_x_scroll.grid(row=1, column=0, sticky="ew")
+        left_text_frame.rowconfigure(0, weight=1)
+        left_text_frame.columnconfigure(0, weight=1)
+        right_text_frame = ttk.Frame(right)
+        right_text_frame.pack(fill="both", expand=True)
+        self.advice_text = tk.Text(right_text_frame, height=14, wrap="none", font=("Microsoft JhengHei", 10))
+        right_y_scroll = ttk.Scrollbar(right_text_frame, orient="vertical", command=self.advice_text.yview)
+        right_x_scroll = ttk.Scrollbar(right_text_frame, orient="horizontal", command=self.advice_text.xview)
+        self.advice_text.configure(yscrollcommand=right_y_scroll.set, xscrollcommand=right_x_scroll.set)
+        self.advice_text.grid(row=0, column=0, sticky="nsew")
+        right_y_scroll.grid(row=0, column=1, sticky="ns")
+        right_x_scroll.grid(row=1, column=0, sticky="ew")
+        right_text_frame.rowconfigure(0, weight=1)
+        right_text_frame.columnconfigure(0, weight=1)
+        bottom = ttk.LabelFrame(self.root, text="系統訊息", padding=10)
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(bottom, textvariable=self.status_var).pack(anchor="w")
+
+    def set_status(self, text: str):
+        now = datetime.now().strftime("%H:%M:%S")
+        self.status_var.set(f"[{now}] {text}")
+
+    def get_light(self, signal, score, change_pct, intraday_score=None):
+        return get_light(signal, score, change_pct, intraday_score)
+
+    def update_status_with_timer(self):
+        if self.last_update_time:
+            last = self.last_update_time.strftime("%H:%M:%S")
+        else:
+            last = "-"
+        mode = "自動刷新開啟" if self.auto_refresh_enabled else "自動刷新關閉"
+        source_mix = "TWSE MIS / Yahoo"
+        market_text = self.market_overview_var.get().replace("\n", " ｜ ") if hasattr(self, "market_overview_var") else "市場模式：尚無資料"
+        self.status_var.set(
+            f"最後更新：{last} ｜ 下次刷新：{self.next_refresh_sec} 秒 ｜ {mode} ｜ "
+            f"來源：{source_mix} ｜ 追蹤檔數：{len(self.results)} ｜ {market_text} ｜ 版本：{APP_VERSION}"
+        )
+
+    def clear_results(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.results = []
+        self.detail_text.delete("1.0", tk.END)
+        self.advice_text.delete("1.0", tk.END)
+        self.set_status(f"已清空結果。版本：{APP_VERSION}")
+
+    def parse_symbols(self):
+        raw = self.symbol_entry.get().strip()
+        if not raw:
+            return []
+        parts = [x.strip() for x in raw.replace("，", ",").split(",")]
+        return [p for p in parts if p]
+
+    def render_results(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for idx, r in enumerate(self.results, start=1):
+            tags = []
+            if r["change"] > 0:
+                tags.append("up")
+            elif r["change"] < 0:
+                tags.append("down")
+            else:
+                tags.append("flat")
+            if r["signal"] == "急跌風險":
+                tags.append("danger")
+            elif r["score"] >= 80:
+                tags.append("strong")
+            elif r["score"] >= 65:
+                tags.append("watch")
+
+            light = self.get_light(r["signal"], r["score"], r["change_pct"], r["intraday_score"])
+            self.tree.insert(
+                "", "end",
+                values=(
+                    idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"],
+                    f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"],
+                    r["score"], r["leader_candidate"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
+                    r["rsi"], r["orderbook_bias"], r["display_note"]
+                ),
+                tags=tuple(tags)
+            )
+
+    def run_analysis(self):
+        symbols = self.parse_symbols()
+        if not symbols:
+            messagebox.showwarning("提醒", "請輸入至少一個股票代號。")
+            return
+        self.clear_results()
+        self.set_status(f"開始抓取即時股票資料... 版本：{APP_VERSION}")
+        self.root.update_idletasks()
+        ok_results, errors = [], []
+        for sym in symbols:
+            try:
+                result = analyze_symbol(sym)
+                ok_results.append(result)
+                self.set_status(f"完成：{sym} / 版本：{APP_VERSION}")
+                self.root.update_idletasks()
+            except Exception as e:
+                errors.append(f"{sym}: {e}")
+        self.results = sorted(ok_results, key=lambda x: x["rank_score"], reverse=True)
+        self.render_results()
+        self.market_overview_var.set(build_market_overview(self.results))
+        self.last_update_time = datetime.now()
+        self.next_refresh_sec = AUTO_REFRESH_MS // 1000
+        self.update_status_with_timer()
+        if self.results:
+            first_id = self.tree.get_children()[0]
+            self.tree.selection_set(first_id)
+            self.tree.focus(first_id)
+            self.on_row_select()
+        if errors:
+            self.set_status(f"完成 {len(self.results)} 檔，失敗 {len(errors)} 檔。版本：{APP_VERSION}")
+            messagebox.showwarning("部分股票失敗", "\n".join(errors[:10]))
+        else:
+            self.set_status(f"分析完成，共 {len(self.results)} 檔。版本：{APP_VERSION}")
+
+    def enable_auto_refresh(self):
+        self.auto_refresh_enabled = True
+        self.next_refresh_sec = AUTO_REFRESH_MS // 1000
+        self.update_status_with_timer()
+        if self._timer_job_id is not None:
+            try:
+                self.root.after_cancel(self._timer_job_id)
+            except Exception:
+                pass
+        self._timer_job_id = self.root.after(1000, self.auto_refresh_job)
+
+    def disable_auto_refresh(self):
+        self.auto_refresh_enabled = False
+        if self._timer_job_id is not None:
+            try:
+                self.root.after_cancel(self._timer_job_id)
+            except Exception:
+                pass
+            self._timer_job_id = None
+        self.update_status_with_timer()
+
+    def auto_refresh_job(self):
+        if not self.auto_refresh_enabled:
+            self._timer_job_id = None
+            return
+        self.next_refresh_sec -= 1
+        if self.next_refresh_sec <= 0:
+            symbols = self.parse_symbols()
+            if symbols:
+                try:
+                    self.run_analysis()
+                except Exception:
+                    pass
+            self.next_refresh_sec = AUTO_REFRESH_MS // 1000
+        self.update_status_with_timer()
+        self._timer_job_id = self.root.after(1000, self.auto_refresh_job)
+
+
+    def _get_result_by_symbol(self, symbol: str):
+        return next((r for r in self.results if r["input_symbol"] == symbol), None)
+
+    def _build_detail_lines(self, target: dict):
+        return [
+            f"【{target['input_symbol']} {target['name']}】個股明細分析",
+            f"市場：{target['market']}",
+            f"資料來源：{target['source']}",
+            f"報價時間：{target['quote_time']}",
+            f"顯示價：{target['display_price']}",
+            f"報價說明：{target['display_note']}",
+            f"即時成交價：{target['last_trade'] if target['last_trade'] is not None else '-'}",
+            f"參考價/中間價：{target['indicative_price'] if target['indicative_price'] is not None else '-'}",
+            f"昨收：{target['prev_close']}",
+            f"開盤：{target['open']}",
+            f"最高：{target['high']}",
+            f"最低：{target['low']}",
+            f"漲跌：{target['change']:+.2f}",
+            f"漲跌幅：{target['change_pct']:+.2f}%",
+            "",
+            target["summary_block"],
+            f"交易計畫：進場={target.get('entry_low',0)}~{target.get('entry_high',0)} / 停損={target.get('stop_loss',0)} / 目標={target.get('target_price',0)} / RR={target.get('rr',0)}",
+            "",
+            "【五檔資訊】",
+            f"買盤總量：{target['buy_qty']}",
+            f"賣盤總量：{target['sell_qty']}",
+            f"委買/委賣比：{target['orderbook_ratio']}",
+            f"五檔力道：{target['orderbook_bias']}",
+            f"買一：{target['bid_prices'][0] if target['bid_prices'] else '-'} / 量：{target['bid_vols'][0] if target['bid_vols'] else '-'}",
+            f"賣一：{target['ask_prices'][0] if target['ask_prices'] else '-'} / 量：{target['ask_vols'][0] if target['ask_vols'] else '-'}",
+            "",
+            "【均線結構】",
+            f"MA5：{target['ma5']}",
+            f"MA10：{target['ma10']}",
+            f"MA20：{target['ma20']}",
+            f"MA60：{target['ma60']}",
+            "",
+            "【技術指標】",
+            f"RSI：{target['rsi']}",
+            f"綜合訊號：{target['signal']}",
+            f"綜合分數：{target['score']}",
+            f"波段分數：{target['trend_score']}",
+            f"盤中分數：{target['intraday_score']}",
+            "",
+            "【支撐壓力】",
+            f"主支撐：{target['support']}",
+            f"主壓力：{target['resistance']}",
+            "",
+            "【技術說明】",
+            target["comment"],
+            "",
+            target["ai_analysis"],
+            "",
+            target["wave_analysis"],
+            "",
+            target["fibo_analysis"],
+            "",
+            target["path_analysis"],
+        ]
+
+    def _build_advice_lines(self, target: dict):
+        rr_text = f"1:{target['rr']:.2f}" if target.get('rr', 0) > 0 else "-"
+        entry_text = (
+            f"{target['entry_low']} ~ {target['entry_high']}"
+            if target.get('entry_high', 0) > 0 else "弱勢不建議主動進場"
+        )
+        return [
+            f"【{target['input_symbol']} {target['name']}】交易決策報告",
+            "【交易結論】",
+            f"建議：{target['advice']}",
+            f"訊號：{target['signal']} / 狀態：{target['state_bucket']} / 主升：{target['leader_candidate']}",
+            "",
+            "【交易計畫】",
+            f"建議進場：{entry_text}",
+            f"停損點：{target.get('stop_loss', 0)}",
+            f"第一目標：{target.get('target_price', target['resistance'])}",
+            f"風險報酬比：{rr_text}",
+            "",
+            "【風險提醒】",
+            target["risk_note"],
+            "",
+            "【關鍵價位】",
+            f"主支撐：{target['support']}",
+            f"主壓力：{target['resistance']}",
+            f"下一目標價：{target['fibo']['next_target']}",
+            f"1.0：{target['fibo']['target_1_0']}",
+            f"1.382：{target['fibo']['target_1_382']}",
+            f"1.618：{target['fibo']['target_1_618']}",
+            "",
+            "【多空路徑重點】",
+            f"多方關鍵：守 {target['support']}、破 {target['resistance']}、看 {target['fibo']['next_target']}",
+            f"空方關鍵：失守 {target['support']} 後，短線結構轉弱",
+            f"狀態分類：{target['state_bucket']}",
+            "",
+            "【交易劇本】",
+            target["script_a"],
+            target["script_b"],
+            target["script_c"],
+            "",
+            "【操作觀察重點】",
+            f"1. 報價模式：{target['display_note']}",
+            f"2. 支撐區：{target['support']} 附近是否守穩",
+            f"3. 壓力區：{target['resistance']} 附近是否放量突破",
+            f"4. RSI：{target['rsi']} 是否進一步轉強/轉弱",
+            f"5. 五檔力道：{target['orderbook_bias']} / 比值={target['orderbook_ratio']}",
+            f"6. 波段分 / 盤中分 / 總分：{target['trend_score']} / {target['intraday_score']} / {target['score']}",
+            f"7. 主升狀態：{target['leader_candidate']} / 狀態：{target['state_bucket']}",
+            f"8. 均線結構：MA20={target['ma20']} / MA60={target['ma60']}",
+        ]
+
+    def _render_selected_result(self, target: dict):
+        self.detail_text.delete("1.0", tk.END)
+        self.detail_text.insert(tk.END, "\n".join(self._build_detail_lines(target)))
+        self.advice_text.delete("1.0", tk.END)
+        self.advice_text.insert(tk.END, "\n".join(self._build_advice_lines(target)))
+
+    def on_row_select(self, event=None):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        item = self.tree.item(selected[0])
+        values = item["values"]
+        if not values:
+            return
+        symbol = str(values[3])
+        target = self._get_result_by_symbol(symbol)
+        if not target:
+            return
+        self._render_selected_result(target)
+
+    def _draw_wrapped_lines(self, canvas_obj, font_name, lines, x, y, max_width, line_height=12):
+        canvas_obj.setFont(font_name, 9)
+        for raw_line in lines:
+            text = "" if raw_line is None else str(raw_line)
+            if text == "":
+                y -= line_height
+                if y < 42:
+                    canvas_obj.showPage()
+                    canvas_obj.setFont(font_name, 9)
+                    y = 560
+                continue
+
+            current = ""
+            for ch in text:
+                candidate = current + ch
+                if canvas_obj.stringWidth(candidate, font_name, 9) <= max_width:
+                    current = candidate
+                else:
+                    canvas_obj.drawString(x, y, current)
+                    y -= line_height
+                    if y < 42:
+                        canvas_obj.showPage()
+                        canvas_obj.setFont(font_name, 9)
+                        y = 560
+                    current = ch
+            if current:
+                canvas_obj.drawString(x, y, current)
+                y -= line_height
+                if y < 42:
+                    canvas_obj.showPage()
+                    canvas_obj.setFont(font_name, 9)
+                    y = 560
+        return y
+
+    def _export_pdf_header(self, canvas_obj, font_name, title):
+        width, height = landscape(A4)
+        canvas_obj.setFont(font_name, 16)
+        canvas_obj.drawString(24, height - 28, f"{APP_TITLE} {APP_VERSION}")
+        canvas_obj.setFont(font_name, 10)
+        canvas_obj.drawString(24, height - 46, title)
+        canvas_obj.setFont(font_name, 9)
+        canvas_obj.drawString(24, height - 62, f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        return width, height
+    def sort_by_column(self, col_name):
+        if not self.results:
+            return
+        key_map = {
+            "排名": "rank_score",
+            "燈號": "light",
+            "市場": "market",
+            "代號": "input_symbol",
+            "名稱": "name",
+            "顯示價": "display_price",
+            "漲跌": "change",
+            "漲跌幅%": "change_pct",
+            "訊號": "signal",
+            "建議": "advice",
+            "分數": "score",
+            "主升候選": "leader_candidate",
+            "波段分": "trend_score",
+            "盤中分": "intraday_score",
+            "支撐": "support",
+            "壓力": "resistance",
+            "RSI": "rsi",
+            "五檔力道": "orderbook_bias",
+            "交易類型": "trade_type",
+            "報價說明": "display_note",
+        }
+        real_key = key_map.get(col_name)
+        if real_key is None:
+            self.results = sorted(self.results, key=lambda x: x["rank_score"], reverse=True)
+            self.render_results()
+            return
+        if self.current_sort_column == col_name:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.current_sort_column = col_name
+            self.sort_reverse = True
+        self.results = sorted(self.results, key=lambda x: x[real_key], reverse=self.sort_reverse)
+        self.render_results()
+
+
+    def export_pdf_summary(self):
+        if not self.results:
+            messagebox.showwarning("提醒", "目前沒有分析結果可匯出。")
+            return
+        file_path = filedialog.asksaveasfilename(title="PDF：總表摘要", defaultextension=".pdf", filetypes=[("PDF file", "*.pdf"), ("All files", "*.*")])
+        if not file_path:
+            return
+        font_name = setup_pdf_font()
+        c = canvas.Canvas(file_path, pagesize=landscape(A4))
+        width, height = self._export_pdf_header(c, font_name, "總表摘要")
+        headers = ["排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌%", "訊號", "建議", "分數", "波段分", "盤中分", "主升候選"]
+        x_positions = [20, 55, 95, 155, 215, 360, 430, 505, 585, 690, 745, 805, 865]
+        y = height - 82
+        c.setFont(font_name, 8)
+        for h, x in zip(headers, x_positions):
+            c.drawString(x, y, h)
+        y -= 14
+        c.line(18, y + 8, width - 18, y + 8)
+
+        for idx, r in enumerate(self.results, start=1):
+            if y < 42:
+                c.showPage()
+                width, height = self._export_pdf_header(c, font_name, "總表摘要（續）")
+                y = height - 50
+                c.setFont(font_name, 8)
+            row = [
+                str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:14], str(r["display_price"]),
+                f"{r['change_pct']:+.2f}%", r["signal"][:8], r["advice"][:10], str(r["score"]),
+                str(r["trend_score"]), str(r["intraday_score"]), r["leader_candidate"]
+            ]
+            for text, x in zip(row, x_positions):
+                c.drawString(x, y, str(text))
+            y -= 14
+        c.save()
+        self.set_status(f"已匯出 PDF 總表：{file_path} / 版本：{APP_VERSION}")
+        messagebox.showinfo("完成", "PDF：總表摘要匯出成功。")
+
+    def export_pdf_selected(self):
+        if not self.results:
+            messagebox.showwarning("提醒", "目前沒有分析結果可匯出。")
+            return
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("提醒", "請先在表格中選取一檔個股。")
+            return
+        item = self.tree.item(selected[0])
+        symbol = str(item["values"][3])
+        target = self._get_result_by_symbol(symbol)
+        if not target:
+            messagebox.showwarning("提醒", "找不到目前選取個股資料。")
+            return
+        file_path = filedialog.asksaveasfilename(title="PDF：目前選取個股", defaultextension=".pdf", filetypes=[("PDF file", "*.pdf"), ("All files", "*.*")])
+        if not file_path:
+            return
+        font_name = setup_pdf_font()
+        c = canvas.Canvas(file_path, pagesize=landscape(A4))
+        width, height = self._export_pdf_header(c, font_name, f"個股完整報告：{target['input_symbol']} {target['name']}")
+        y = height - 82
+        self._draw_wrapped_lines(c, font_name, self._build_detail_lines(target), 24, y, 520)
+        c.showPage()
+        width, height = self._export_pdf_header(c, font_name, f"操作建議與劇本：{target['input_symbol']} {target['name']}")
+        y = height - 82
+        self._draw_wrapped_lines(c, font_name, self._build_advice_lines(target), 24, y, 760)
+        c.save()
+        self.set_status(f"已匯出 PDF 個股：{file_path} / 版本：{APP_VERSION}")
+        messagebox.showinfo("完成", "PDF：目前選取個股匯出成功。")
+
+    def export_pdf_full(self):
+        if not self.results:
+            messagebox.showwarning("提醒", "目前沒有分析結果可匯出。")
+            return
+        file_path = filedialog.asksaveasfilename(title="PDF：全部完整報告", defaultextension=".pdf", filetypes=[("PDF file", "*.pdf"), ("All files", "*.*")])
+        if not file_path:
+            return
+        font_name = setup_pdf_font()
+        c = canvas.Canvas(file_path, pagesize=landscape(A4))
+        width, height = self._export_pdf_header(c, font_name, f"盤勢總覽：{self.market_overview_var.get()}")
+        y = height - 82
+        overview_lines = [
+            "【總表摘要】",
+            f"追蹤檔數：{len(self.results)}",
+            self.market_overview_var.get(),
+            ""
+        ]
+        for idx, r in enumerate(self.results, start=1):
+            overview_lines.append(
+                f"{idx}. {r['input_symbol']} {r['name']} / 現價={r['display_price']} / 漲跌幅={r['change_pct']:+.2f}% / 訊號={r['signal']} / 建議={r['advice']} / 分數={r['score']} / 主升={r['leader_candidate']}"
+            )
+        self._draw_wrapped_lines(c, font_name, overview_lines, 24, y, 760)
+
+        for r in self.results:
+            c.showPage()
+            width, height = self._export_pdf_header(c, font_name, f"個股完整報告：{r['input_symbol']} {r['name']}")
+            y = height - 82
+            self._draw_wrapped_lines(c, font_name, self._build_detail_lines(r), 24, y, 520)
+            c.showPage()
+            width, height = self._export_pdf_header(c, font_name, f"操作建議與劇本：{r['input_symbol']} {r['name']}")
+            y = height - 82
+            self._draw_wrapped_lines(c, font_name, self._build_advice_lines(r), 24, y, 760)
+        c.save()
+        self.set_status(f"已匯出 PDF 完整報告：{file_path} / 版本：{APP_VERSION}")
+        messagebox.showinfo("完成", "PDF：全部完整報告匯出成功。")
+
+    def export_txt_full(self):
+        if not self.results:
+            messagebox.showwarning("提醒", "目前沒有分析結果可匯出。")
+            return
+        file_path = filedialog.asksaveasfilename(title="TXT：全部完整報告", defaultextension=".txt", filetypes=[("Text file", "*.txt"), ("All files", "*.*")])
+        if not file_path:
+            return
+        lines = [
+            f"{APP_TITLE} {APP_VERSION}",
+            f"報告時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            self.market_overview_var.get(),
+            "=" * 140
+        ]
+        for idx, r in enumerate(self.results, start=1):
+            lines.append(f"[{idx}] {r['input_symbol']} {r['name']}")
+            lines.extend(self._build_detail_lines(r))
+            lines.append("")
+            lines.extend(self._build_advice_lines(r))
+            lines.append("-" * 140)
+        with open(file_path, "w", encoding="utf-8-sig") as f:
+            f.write("\n".join(lines))
+        self.set_status(f"已匯出 TXT 完整報告：{file_path} / 版本：{APP_VERSION}")
+        messagebox.showinfo("完成", "TXT：全部完整報告匯出成功。")
+
+    def export_csv_table(self):
+        if not self.results:
+            messagebox.showwarning("提醒", "目前沒有分析結果可匯出。")
+            return
+        file_path = filedialog.asksaveasfilename(title="CSV：主表資料", defaultextension=".csv", filetypes=[("CSV file", "*.csv"), ("All files", "*.*")])
+        if not file_path:
+            return
+        fieldnames = [
+            "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議",
+            "分數", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明"
+        ]
+        with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(fieldnames)
+            for idx, r in enumerate(self.results, start=1):
+                writer.writerow([
+                    idx, r["light"], r["market"], r["input_symbol"], r["name"], r["display_price"], f"{r['change']:+.2f}",
+                    f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["leader_candidate"],
+                    r["trend_score"], r["intraday_score"], r["support"], r["resistance"], r["rsi"],
+                    r["orderbook_bias"], r["trade_type"], r["display_note"]
+                ])
+        self.set_status(f"已匯出 CSV 主表：{file_path} / 版本：{APP_VERSION}")
+        messagebox.showinfo("完成", "CSV：主表資料匯出成功。")
+
+    # Backward-compatible wrappers
+    def export_txt(self):
+        self.export_txt_full()
+
+    def export_pdf(self):
+        self.export_pdf_summary()
 def main():
     root = tk.Tk()
     try:
