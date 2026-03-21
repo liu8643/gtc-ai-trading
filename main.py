@@ -24,7 +24,7 @@ import threading
 import sqlite3
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.3.0-REAL-DATA-ENGINE"
+APP_VERSION = "v5.3.2-REAL-DATA-ENGINE-FALLBACK"
 AUTO_REFRESH_MS = 30000
 
 CACHE_ROOT = os.path.join(os.path.expanduser("~"), "GTC_A_SCANNER_CACHE")
@@ -1784,21 +1784,38 @@ def run_simple_backtest(category: str, top_n: int = 5) -> dict:
         conn.close()
 
 
-def download_twse_official_daily_csv(date_str: str | None = None) -> tuple[pd.DataFrame, str, str]:
-    if not date_str:
-        date_str = datetime.now().strftime("%Y%m%d")
-    url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={date_str}&type=ALLBUT0999"
+def download_twse_official_daily_csv(date_str: str | None = None, fallback_days: int = 10) -> tuple[pd.DataFrame, str, str]:
+    """
+    下載 TWSE 每日收盤 CSV。
+    若指定日期無資料（例如假日、尚未產出），自動往前回退尋找最近可用交易日。
+    """
+    base_date = datetime.strptime(date_str, "%Y%m%d") if date_str else datetime.now()
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    text = resp.text
-    df = parse_twse_mi_index_csv(text)
-    if df.empty:
-        raise ValueError("官方 CSV 無有效上市收盤資料，可能該日未開市或資料尚未產出。")
-    raw_csv_path = os.path.join(OFFICIAL_RAW_DIR, f"TWSE_MI_INDEX_{date_str}.csv")
-    with open(raw_csv_path, "w", encoding="utf-8-sig", newline="") as f:
-        f.write(text)
-    return df, raw_csv_path, date_str
+    last_error = None
+
+    for offset in range(fallback_days + 1):
+        use_date = (base_date - pd.Timedelta(days=offset)).strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={use_date}&type=ALLBUT0999"
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            csv_text = resp.text
+            df = parse_twse_mi_index_csv(csv_text)
+            if df is None or df.empty:
+                last_error = f"{use_date} 無有效資料"
+                continue
+
+            raw_csv_path = os.path.join(OFFICIAL_RAW_DIR, f"TWSE_MI_INDEX_{use_date}.csv")
+            with open(raw_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(csv_text)
+            return df, raw_csv_path, use_date
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    raise ValueError(
+        f"官方 CSV 近 {fallback_days + 1} 天都無有效上市收盤資料，最後錯誤：{last_error}"
+    )
 
 
 # 相容保留：避免舊呼叫名稱造成遞迴；一律導向真正的 CSV 下載函式
@@ -2225,8 +2242,8 @@ class GTCProApp:
 
     def _download_selected_category_snapshot_worker(self, category_name: str):
         try:
-            self.set_status(f"開始下載每日收盤 CSV 並建立分類快照：{category_name}")
-            df, raw_json_path, use_date = download_twse_official_daily_csv()
+            self.set_status(f"開始下載每日收盤 CSV 並建立分類快照：{category_name}（若今日無資料將自動回退最近交易日）")
+            df, raw_csv_path, use_date = download_twse_official_daily_csv()
             category_df = filter_category_df(df, category_name)
             if category_df.empty:
                 raise ValueError(f"{category_name} 沒有符合的官方當日收盤資料。")
@@ -2234,7 +2251,7 @@ class GTCProApp:
             category_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
             category_df.to_json(json_path, orient="records", force_ascii=False, indent=2)
             self.snapshot_info_var.set(f"快照：{category_name} / {len(category_df)} 檔 / 日期={use_date} / {os.path.basename(json_path)}")
-            self.set_status(f"下載完成：{category_name} 共 {len(category_df)} 檔，已存到本地快照（CSV）。")
+            self.set_status(f"下載完成：{category_name} 共 {len(category_df)} 檔，使用交易日 {use_date}，已存到本地快照（CSV）。")
         except Exception as e:
             self.set_status(f"下載失敗：{category_name} / {e}")
             try:
