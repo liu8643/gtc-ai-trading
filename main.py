@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.7-FINAL-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.1.7.1-FINAL-MASTER-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -677,7 +677,16 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
     above_open = close >= open_price
     above_prev = close >= prev_close
     bullish_orderbook = orderbook_bias in ("買盤偏強", "買盤明顯偏強")
-    structure_bullish = close > ma20 > ma60 if ma20 and ma60 else False
+    structure_bullish = (close >= ma20 and close >= ma60 and ma20 >= ma60) if ma20 and ma60 else False
+
+    # v5.1.7.1 修正：在 signal 判斷最前面優先啟動「整理偏多」
+    if (
+        trend_score >= 80 and
+        intraday_score >= 70 and
+        score >= 75 and
+        structure_bullish
+    ):
+        return "整理偏多", "偏多觀察", "bullish"
 
     if change_pct <= -9.0 or intraday_score <= 15:
         return "急跌風險", "跌幅過大，先觀望/減碼", "weak"
@@ -1022,7 +1031,8 @@ def analyze_symbol(symbol: str) -> dict:
 
     signal, advice, state_bucket = evaluate_trade_state(
         close, prev_close, open_price, support, resistance, change_pct,
-        trend_score, intraday_score, score, rt.get("orderbook_bias", "無")
+        trend_score, intraday_score, score, rt.get("orderbook_bias", "無"),
+        ma20=ma20, ma60=ma60, rsi=rsi
     )
     risk_note = build_risk_note(close, support, resistance, rsi, score, change_pct)
     extra_comment = (
