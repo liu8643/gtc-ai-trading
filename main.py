@@ -17,10 +17,14 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 import os
 import csv
+import json
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.2.0-FULL-MARKET-A-SCANNER"
+APP_VERSION = "v5.2.1-DATA-FIRST-SCANNER"
 AUTO_REFRESH_MS = 30000
+SNAPSHOT_DIR = os.path.join(os.path.expanduser("~"), "GTC_A_SCANNER_CACHE")
+SNAPSHOT_JSON = os.path.join(SNAPSHOT_DIR, "listed_market_snapshot.json")
+SNAPSHOT_CSV = os.path.join(SNAPSHOT_DIR, "listed_market_snapshot_summary.csv")
 
 def setup_pdf_font():
     candidates = [
@@ -1521,6 +1525,203 @@ def build_market_overview(results: list[dict]) -> str:
 
 
 
+
+
+def ensure_snapshot_dir():
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+def chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+def refresh_summary_today_pick(result: dict):
+    summary_lines = result.get("summary_block", "").split("\n") if result.get("summary_block") else []
+    for i, line in enumerate(summary_lines):
+        if line.startswith("決策 / 波浪 / 勝率 / 今日清單："):
+            summary_lines[i] = (
+                f"決策 / 波浪 / 勝率 / 今日清單："
+                f"{result.get('decision','-')} / {result.get('wave_position','-')} / "
+                f"{result.get('win_rate','-')}% / {result.get('today_pick','-')}"
+            )
+    if summary_lines:
+        result["summary_block"] = "\n".join(summary_lines)
+    return result
+
+def analyze_symbol_local_from_df(symbol: str, stock_name: str, df: pd.DataFrame) -> dict:
+    df = calc_indicators(df)
+    last = df.iloc[-1]
+
+    close = round_price(last["Close"])
+    prev_close = round_price(df.iloc[-2]["Close"]) if len(df) >= 2 else close
+    open_price = round_price(last["Open"])
+    high_price = round_price(last["High"])
+    low_price = round_price(last["Low"])
+
+    change = round_price(close - prev_close)
+    change_pct = round((change / prev_close) * 100, 2) if prev_close != 0 else 0.0
+
+    ma5 = round_price(last["MA5"]) if pd.notna(last["MA5"]) else close
+    ma10 = round_price(last["MA10"]) if pd.notna(last["MA10"]) else close
+    ma20 = round_price(last["MA20"]) if pd.notna(last["MA20"]) else close
+    ma60 = round_price(last["MA60"]) if pd.notna(last["MA60"]) else close
+    rsi = round(float(last["RSI"]), 2) if pd.notna(last["RSI"]) else 50.0
+
+    sr = calc_professional_sr(df)
+    support = sr["support"]
+    resistance = sr["resistance"]
+
+    trend_score = 50
+    comments = []
+
+    if close >= ma5:
+        trend_score += 4; comments.append("站上5日線")
+    else:
+        trend_score -= 4; comments.append("跌破5日線")
+    if close >= ma10:
+        trend_score += 6; comments.append("站上10日線")
+    else:
+        trend_score -= 5; comments.append("跌破10日線")
+    if close >= ma20:
+        trend_score += 10; comments.append("站上20日線")
+    else:
+        trend_score -= 10; comments.append("跌破20日線")
+    if close >= ma60:
+        trend_score += 15; comments.append("站上60日線")
+    else:
+        trend_score -= 12; comments.append("跌破60日線")
+    if float(last["MACD"]) >= float(last["MACD_SIGNAL"]):
+        trend_score += 8; comments.append("MACD偏多")
+    else:
+        trend_score -= 6; comments.append("MACD偏弱")
+    if pd.notna(last["K"]) and pd.notna(last["D"]):
+        if float(last["K"]) >= float(last["D"]):
+            trend_score += 6; comments.append("KD偏多")
+        else:
+            trend_score -= 4; comments.append("KD偏空")
+    if rsi < 30:
+        trend_score += 8; comments.append("RSI超跌")
+    elif rsi > 70:
+        trend_score -= 8; comments.append("RSI過熱")
+    if len(df) >= 20:
+        vol5 = df["Volume"].tail(5).mean()
+        vol20 = df["Volume"].tail(20).mean()
+        if pd.notna(vol5) and pd.notna(vol20) and vol5 > vol20:
+            trend_score += 4; comments.append("量能放大")
+
+    trend_score = max(0, min(100, int(trend_score)))
+    intraday_score, intraday_comment = calc_intraday_score(
+        close, prev_close, open_price, high_price, low_price, support, resistance,
+        "不適用", change_pct
+    )
+    score = max(0, min(100, int(round(trend_score * 0.6 + intraday_score * 0.4))))
+
+    signal, advice, state_bucket = evaluate_trade_state(
+        close, prev_close, open_price, support, resistance, change_pct,
+        trend_score, intraday_score, score, "不適用", ma20=ma20, ma60=ma60, rsi=rsi
+    )
+    risk_note = build_risk_note(close, support, resistance, rsi, score, change_pct)
+    extra_comment = (
+        f"{'；'.join(comments)}"
+        f"；盤中={intraday_comment}"
+        f"；20日支撐={sr['support20']}"
+        f"；20日壓力={sr['resistance20']}"
+        f"；波段低點={sr['swing_low']}"
+        f"；波段高點={sr['swing_high']}"
+        f"；Pivot={sr['pivot']}"
+        f"；來源=本地下載快照"
+    )
+    fibo = calc_fibonacci_targets(df)
+    market = "台股上市"
+    result = {
+        "input_symbol": symbol, "name": stock_name, "yf_symbol": f"{symbol}.TW", "market": market,
+        "close": close, "display_price": close, "display_note": "本地下載快照",
+        "last_trade": close, "indicative_price": close,
+        "prev_close": prev_close, "open": open_price, "high": high_price, "low": low_price,
+        "change": change, "change_pct": change_pct, "signal": signal, "advice": advice, "score": score,
+        "trend_score": trend_score, "intraday_score": intraday_score,
+        "support": support, "resistance": resistance, "rsi": rsi, "ma5": ma5, "ma10": ma10,
+        "ma20": ma20, "ma60": ma60, "comment": extra_comment, "risk_note": risk_note,
+        "source": "本地下載快照", "fibo": fibo, "bid_prices": [],
+        "ask_prices": [], "bid_vols": [],
+        "ask_vols": [], "buy_qty": 0,
+        "sell_qty": 0, "orderbook_ratio": "-", "orderbook_bias": "不適用", "quote_time": "",
+        "state_bucket": state_bucket,
+        "strategy_level": get_strategy_level(score),
+        "strategy_level_score": get_strategy_level_score(get_strategy_level(score)),
+        "target_price": fibo.get("next_target", resistance),
+    }
+    result["trade_type"] = classify_trade_type(state_bucket, signal, advice)
+    result["light"] = get_light(result["signal"], result["score"], result["change_pct"], intraday_score=result["intraday_score"])
+    result["leader_candidate"] = classify_leader_stage(result)
+    result["rank_score"] = 0.0
+    result.update(calc_trade_plan(result))
+    result["display_target_price"] = get_display_target(result.get("target_price"), result["signal"], result["state_bucket"])
+    result["display_rr"] = normalize_rr_display(result.get("rr"))
+    result["wave_position"] = get_wave_position(result)
+    result["win_rate"] = calc_win_rate(result)
+    result["decision"] = get_trade_decision(result)
+    result["today_pick"] = "-"
+    result["trading_score"] = calc_trading_score(result)
+    result["rank_score"] = calc_rank_score(result)
+    result["summary_block"] = "\n".join([
+        "【速讀摘要】",
+        f"現價 / 漲跌幅 / 報價：{result['display_price']} / {result['change_pct']:+.2f}% / {result['display_note']}",
+        f"總分 / 波段 / 盤中：{result['score']} / {result['trend_score']} / {result['intraday_score']}",
+        f"支撐 / 壓力 / 五檔：{result['support']} / {result['resistance']} / {result['orderbook_bias']}",
+        f"燈號 / 訊號 / 建議 / 主升狀態：{result['light']} / {result['signal']} / {result['advice']} / {result['leader_candidate']}",
+        f"交易類型 / 等級：{result['trade_type']} / {result['strategy_level']}",
+        f"目標價 / RR：{result['display_target_price']} / {result['display_rr']}",
+        f"決策 / 波浪 / 勝率 / 今日清單：{result['decision']} / {result['wave_position']} / {result['win_rate']}% / {result['today_pick']}",
+        f"交易分：{result['trading_score']}",
+        f"策略定位：狀態={result['state_bucket']} / 量價比={result['orderbook_ratio']} / RSI={result['rsi']}",
+    ])
+    result["ai_analysis"] = build_ai_analysis(result)
+    result["wave_analysis"] = build_wave_analysis(df)
+    result["fibo_analysis"] = build_fibonacci_analysis(fibo)
+    result["path_analysis"] = build_bull_bear_path(result)
+    result.update(build_trade_scripts(result))
+    return result
+
+def get_local_market_mode(results: list[dict]) -> str:
+    if not results:
+        return "尚無資料"
+    up = sum(1 for r in results if r.get("change_pct", 0) > 0)
+    down = sum(1 for r in results if r.get("change_pct", 0) < 0)
+    avg_pct = round(sum(r.get("change_pct", 0) for r in results) / max(len(results), 1), 2)
+    tsmc_pct = 0.0
+    tsmc = next((r for r in results if r.get("input_symbol") == "2330"), None)
+    if tsmc:
+        tsmc_pct = tsmc.get("change_pct", 0)
+    if avg_pct >= 0.6 and tsmc_pct >= 0.8 and up > down:
+        return "偏多震盪"
+    if avg_pct <= -0.6 and tsmc_pct <= -0.5 and down > up:
+        return "偏弱震盪"
+    if avg_pct >= 0 and up >= down * 0.9:
+        return "震盪偏多"
+    if avg_pct < 0 and down > up:
+        return "震盪偏弱"
+    return "區間震盪"
+
+def build_local_scanner_overview(results: list[dict], a_grade: list[dict], elite: list[dict]) -> str:
+    if not results:
+        return "加權：- ｜ 台積電：- ｜ 上漲/下跌：-/- ｜ 量能：未知\n市場模式：尚無資料 ｜ 今日策略：尚無資料"
+    up = sum(1 for r in results if r.get("change_pct", 0) > 0)
+    down = sum(1 for r in results if r.get("change_pct", 0) < 0)
+    avg_pct = round(sum(r.get("change_pct", 0) for r in results) / max(len(results), 1), 2)
+    volume_status = infer_volume_status(results)
+    tsmc = next((r for r in results if r.get("input_symbol") == "2330"), None)
+    tsmc_text = f"{tsmc['display_price']} {'▲' if tsmc['change'] >= 0 else '▼'}{abs(tsmc['change'])} ({tsmc['change_pct']:+.2f}%)" if tsmc else "-"
+    mode = get_local_market_mode(results)
+    strategy = get_today_strategy(
+        {"twse": {"pct": avg_pct}, "tsmc": {"pct": tsmc.get("change_pct", 0) if tsmc else 0}, "up": up, "down": down},
+        mode
+    )
+    base1 = f"加權代理：{avg_pct:+.2f}% ｜ 台積電：{tsmc_text} ｜ 上漲/下跌：{up}/{down} ｜ 量能：{volume_status}"
+    base2 = f"市場模式：{mode} ｜ 今日策略：{strategy}"
+    a_text = "A級清單：" + ("、".join([f"{r['input_symbol']}({r['decision']}/{r['win_rate']}%/TS={r['trading_score']})" for r in a_grade[:10]]) if a_grade else "暫無")
+    elite_text = "A級中的A級：" + ("、".join([f"{r['input_symbol']}({r['decision']}/{r['win_rate']}%/TS={r['trading_score']})" for r in elite[:5]]) if elite else "暫無")
+    return base1 + "\n" + base2 + "\n" + build_today_pick_summary(a_grade) + "\n" + a_text + "\n" + elite_text
+
 def fetch_twse_listed_symbols() -> list[str]:
     """取得台股上市四碼代號清單（先以上市為主，不含上櫃）。"""
     urls = [
@@ -1615,6 +1816,8 @@ class GTCProApp:
         self.scan_mode = "manual"
         self.a_grade_results = []
         self.elite_results = []
+        self.snapshot_results = []
+        ensure_snapshot_dir()
         self.market_overview_var = tk.StringVar(value="加權：- ｜ 台積電：- ｜ 上漲/下跌：-/- ｜ 量能：未知\n市場模式：尚無資料 ｜ 今日策略：尚無資料")
         self.data_source_var = tk.StringVar(value="資料來源：尚無資料")
         self._build_ui()
@@ -1637,7 +1840,8 @@ class GTCProApp:
         action_frame.pack(side="left", padx=(8, 0))
 
         ttk.Button(action_frame, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 6))
-        ttk.Button(action_frame, text="上市全市場掃A級", command=self.run_full_market_a_scan).pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="下載上市資料", command=self.download_full_market_snapshot).pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="分析A級/A級中的A級", command=self.analyze_local_market_snapshot).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="切換進階欄位", command=self.toggle_advanced_columns).pack(side="left", padx=(0, 6))
@@ -1795,46 +1999,129 @@ class GTCProApp:
         self.advice_text.delete("1.0", tk.END)
         self.set_status(f"已清空結果。版本：{APP_VERSION}")
 
-    def run_full_market_a_scan(self):
+
+    def download_full_market_snapshot(self):
         listed_symbols = fetch_twse_listed_symbols()
         if not listed_symbols:
             messagebox.showwarning("提醒", "無法取得台股上市清單。")
             return
         self.clear_results()
-        self.scan_mode = "full_market_a"
-        self.set_status(f"開始掃描台股上市全市場，共 {len(listed_symbols)} 檔... 版本：{APP_VERSION}")
+        self.scan_mode = "download_snapshot"
+        self.set_status(f"開始下載台股上市全市場資料，共 {len(listed_symbols)} 檔... 版本：{APP_VERSION}")
         self.root.update_idletasks()
-        ok_results, errors = [], []
-        total = len(listed_symbols)
-        for idx, sym in enumerate(listed_symbols, start=1):
-            try:
-                r = analyze_symbol(sym)
-                ok_results.append(r)
-            except Exception as e:
-                errors.append(f"{sym}: {e}")
-            if idx == 1 or idx % 30 == 0 or idx == total:
-                self.set_status(f"掃描中 {idx}/{total} ｜ 已完成 {len(ok_results)} 檔 ｜ 版本：{APP_VERSION}")
-                self.root.update_idletasks()
 
-        market = get_market_data(ok_results) if ok_results else {}
-        market_mode = get_market_mode(market) if ok_results else ""
-        for r in ok_results:
+        name_map = get_tw_name_map()
+        all_results, errors = [], []
+        total = len(listed_symbols)
+        for batch_idx, batch in enumerate(chunked(listed_symbols, 80), start=1):
+            tickers = " ".join([f"{sym}.TW" for sym in batch])
+            try:
+                hist = yf.download(
+                    tickers,
+                    period="12mo",
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                    group_by="ticker",
+                )
+                if hist is None or hist.empty:
+                    raise ValueError("批次下載無資料")
+                for sym in batch:
+                    try:
+                        ticker_key = f"{sym}.TW"
+                        if isinstance(hist.columns, pd.MultiIndex):
+                            if ticker_key in hist.columns.get_level_values(0):
+                                sdf = hist[ticker_key].copy()
+                            elif sym in hist.columns.get_level_values(0):
+                                sdf = hist[sym].copy()
+                            else:
+                                raise KeyError(f"{sym} 缺少欄位")
+                        else:
+                            sdf = hist.copy()
+                        if isinstance(sdf.columns, pd.MultiIndex):
+                            sdf.columns = [c[0] for c in sdf.columns]
+                        needed = ["Open", "High", "Low", "Close", "Volume"]
+                        if not all(c in sdf.columns for c in needed):
+                            raise ValueError("欄位不足")
+                        sdf = sdf.dropna(subset=["Close"]).copy()
+                        if len(sdf) < 30:
+                            raise ValueError("歷史資料不足")
+                        row = analyze_symbol_local_from_df(sym, name_map.get(sym, sym), sdf)
+                        all_results.append(row)
+                    except Exception as e:
+                        errors.append(f"{sym}: {e}")
+            except Exception:
+                for sym in batch:
+                    try:
+                        _, sdf = download_symbol_data(sym)
+                        row = analyze_symbol_local_from_df(sym, name_map.get(sym, sym), sdf)
+                        all_results.append(row)
+                    except Exception as e:
+                        errors.append(f"{sym}: {e}")
+            processed = min(batch_idx * 80, total)
+            self.set_status(f"下載快照中 {processed}/{total} ｜ 已完成 {len(all_results)} 檔 ｜ 版本：{APP_VERSION}")
+            self.root.update_idletasks()
+
+        if not all_results:
+            messagebox.showerror("錯誤", "下載快照失敗，沒有可用資料。")
+            return
+
+        ensure_snapshot_dir()
+        with open(SNAPSHOT_JSON, "w", encoding="utf-8") as f:
+            json.dump(all_results, f, ensure_ascii=False)
+        pd.DataFrame([
+            {
+                "代號": r["input_symbol"], "名稱": r["name"], "現價": r["display_price"], "漲跌幅%": r["change_pct"],
+                "訊號": r["signal"], "建議": r["advice"], "決策": r["decision"], "勝率": r["win_rate"],
+                "交易分": r["trading_score"], "分數": r["score"], "等級": r["strategy_level"],
+                "目標價": r["display_target_price"], "RR": r["display_rr"], "主升候選": r["leader_candidate"]
+            } for r in all_results
+        ]).to_csv(SNAPSHOT_CSV, index=False, encoding="utf-8-sig")
+
+        self.snapshot_results = all_results
+        mode = get_local_market_mode(all_results)
+        self.market_overview_var.set(
+            f"上市資料下載完成：{len(all_results)} 檔 ｜ 快照檔：{SNAPSHOT_JSON}\n"
+            f"本地分析模式：{mode} ｜ 接下來請按「分析A級/A級中的A級」"
+        )
+        self.update_data_source_bar()
+        self.last_update_time = datetime.now()
+        self.update_status_with_timer()
+        msg = f"資料下載完成：成功 {len(all_results)} 檔，失敗 {len(errors)} 檔。快照已存到本機。版本：{APP_VERSION}"
+        self.set_status(msg)
+        if errors and len(errors) <= 10:
+            messagebox.showwarning("部分股票失敗", "\n".join(errors))
+
+    def analyze_local_market_snapshot(self):
+        if self.snapshot_results:
+            raw_results = self.snapshot_results
+        elif os.path.exists(SNAPSHOT_JSON):
+            try:
+                with open(SNAPSHOT_JSON, "r", encoding="utf-8") as f:
+                    raw_results = json.load(f)
+            except Exception as e:
+                messagebox.showerror("錯誤", f"讀取本地快照失敗：{e}")
+                return
+        else:
+            messagebox.showwarning("提醒", "尚未下載上市資料，請先按「下載上市資料」。")
+            return
+
+        self.scan_mode = "local_snapshot_analysis"
+        market_mode = get_local_market_mode(raw_results)
+        normalized = []
+        for r in raw_results:
             r["today_pick"] = "入選" if is_today_pick(r, market_mode) else "-"
             r["rank_score"] = calc_rank_score(r)
-            summary_lines = r.get("summary_block", "").split("\n") if r.get("summary_block") else []
-            for i, line in enumerate(summary_lines):
-                if line.startswith("決策 / 波浪 / 勝率 / 今日清單："):
-                    summary_lines[i] = f"決策 / 波浪 / 勝率 / 今日清單：{r['decision']} / {r['wave_position']} / {r['win_rate']}% / {r['today_pick']}"
-            if summary_lines:
-                r["summary_block"] = "\n".join(summary_lines)
+            refresh_summary_today_pick(r)
+            normalized.append(r)
 
-        a_grade, elite = filter_a_grade_candidates(ok_results, market_mode)
+        a_grade, elite = filter_a_grade_candidates(normalized, market_mode)
         self.a_grade_results = a_grade
         self.elite_results = elite
-        # 主表顯示 A級清單；前幾名若有 elite 會自然排前
         self.results = a_grade
         self.render_results()
-        self.market_overview_var.set(build_scanner_overview(ok_results, market_mode, a_grade, elite))
+        self.market_overview_var.set(build_local_scanner_overview(normalized, a_grade, elite))
         self.update_data_source_bar()
         self.last_update_time = datetime.now()
         self.next_refresh_sec = AUTO_REFRESH_MS // 1000
@@ -1844,10 +2131,12 @@ class GTCProApp:
             self.tree.selection_set(first_id)
             self.tree.focus(first_id)
             self.on_row_select()
-        msg = f"上市全市場掃描完成：A級 {len(a_grade)} 檔，A級中的A級 {len(elite)} 檔，失敗 {len(errors)} 檔。版本：{APP_VERSION}"
-        self.set_status(msg)
-        if errors and len(errors) <= 10:
-            messagebox.showwarning("部分股票失敗", "\n".join(errors))
+        self.set_status(f"本地分析完成：A級 {len(a_grade)} 檔，A級中的A級 {len(elite)} 檔。版本：{APP_VERSION}")
+
+    def run_full_market_a_scan(self):
+        self.download_full_market_snapshot()
+        if os.path.exists(SNAPSHOT_JSON):
+            self.analyze_local_market_snapshot()
 
     def parse_symbols(self):
         raw = self.symbol_entry.get().strip()
