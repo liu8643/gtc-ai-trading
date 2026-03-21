@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.7.3-FINAL-MASTER-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.1.7.4-UPGRADE2-Institutional-Decision-System"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -797,6 +797,16 @@ def classify_leader_stage(data: dict) -> str:
 
     return "-"
 
+def get_strategy_level(score: int) -> str:
+    if score >= 85:
+        return "A"
+    if score >= 70:
+        return "B"
+    if score >= 55:
+        return "C"
+    return "D"
+
+
 def calc_trade_plan(data: dict) -> dict:
     support = float(data.get("support", 0) or 0)
     resistance = float(data.get("resistance", 0) or 0)
@@ -1060,6 +1070,8 @@ def analyze_symbol(symbol: str) -> dict:
         "sell_qty": rt.get("sell_qty", 0), "orderbook_ratio": rt.get("orderbook_ratio", "-"),
         "orderbook_bias": rt.get("orderbook_bias", "無"), "quote_time": rt.get("quote_time", ""),
         "state_bucket": state_bucket,
+        "strategy_level": get_strategy_level(score),
+        "target_price": fibo.get("next_target", resistance),
     }
     result["trade_type"] = classify_trade_type(state_bucket, signal, advice)
     result["light"] = get_light(result["signal"], result["score"], result["change_pct"], intraday_score=result["intraday_score"])
@@ -1072,7 +1084,8 @@ def analyze_symbol(symbol: str) -> dict:
         f"總分 / 波段 / 盤中：{result['score']} / {result['trend_score']} / {result['intraday_score']}",
         f"支撐 / 壓力 / 五檔：{result['support']} / {result['resistance']} / {result['orderbook_bias']}",
         f"燈號 / 訊號 / 建議 / 主升狀態：{result['light']} / {result['signal']} / {result['advice']} / {result['leader_candidate']}",
-        f"交易類型：{result['trade_type']}",
+        f"交易類型 / 等級：{result['trade_type']} / {result['strategy_level']}",
+        f"目標價 / RR：{result['target_price']} / {result['rr']}",
         f"策略定位：狀態={result['state_bucket']} / 量價比={result['orderbook_ratio']} / RSI={result['rsi']}",
     ])
     result["ai_analysis"] = build_ai_analysis(result)
@@ -1365,17 +1378,17 @@ class GTCProApp:
     def _build_table_area(self, parent):
         columns = (
             "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%",
-            "訊號", "建議", "分數", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI",
+            "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI",
             "五檔力道", "交易類型", "報價說明"
         )
         self.all_columns = columns
-        self.core_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "分數", "主升候選")
-        self.advanced_columns = ("排名", "燈號", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "分數", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明")
+        self.core_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選")
+        self.advanced_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
         self.tree.configure(displaycolumns=self.core_columns)
         widths = {
             "排名": 55, "燈號": 55, "市場": 90, "代號": 80, "名稱": 190, "顯示價": 90,
-            "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "分數": 65, "主升候選": 80,
+            "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "分數": 65, "等級": 60, "目標價": 90, "RR": 70, "主升候選": 80,
             "波段分": 70, "盤中分": 70, "支撐": 90, "壓力": 90, "RSI": 70,
             "五檔力道": 110, "交易類型": 100, "報價說明": 180
         }
@@ -1514,7 +1527,7 @@ class GTCProApp:
                 values=(
                     idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"],
                     f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"],
-                    r["score"], r["leader_candidate"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
+                    r["score"], r["strategy_level"], r["target_price"], r["rr"], r["leader_candidate"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
                     r["rsi"], r["orderbook_bias"], r["trade_type"], r["display_note"]
                 ),
                 tags=tuple(tags)
@@ -1633,7 +1646,8 @@ class GTCProApp:
             "【技術指標】",
             f"RSI：{target['rsi']}",
             f"綜合訊號：{target['signal']}",
-            f"綜合分數：{target['score']}",
+            f"綜合分數：{target['score']}"
+            ,f"策略等級：{target['strategy_level']}",
             f"波段分數：{target['trend_score']}",
             f"盤中分數：{target['intraday_score']}",
             "",
@@ -1668,6 +1682,7 @@ class GTCProApp:
             "【交易計畫】",
             f"建議進場：{entry_text}",
             f"停損點：{target.get('stop_loss', 0)}",
+            f"策略等級：{target['strategy_level']}",
             f"第一目標：{target.get('target_price', target['resistance'])}",
             f"風險報酬比：{rr_text}",
             "",
@@ -1781,6 +1796,9 @@ class GTCProApp:
             "訊號": "signal",
             "建議": "advice",
             "分數": "score",
+            "等級": "strategy_level",
+            "目標價": "target_price",
+            "RR": "rr",
             "主升候選": "leader_candidate",
             "波段分": "trend_score",
             "盤中分": "intraday_score",
@@ -1815,8 +1833,8 @@ class GTCProApp:
         font_name = setup_pdf_font()
         c = canvas.Canvas(file_path, pagesize=landscape(A4))
         width, height = self._export_pdf_header(c, font_name, "總表摘要")
-        headers = ["排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌%", "訊號", "建議", "分數", "波段分", "盤中分", "主升候選"]
-        x_positions = [20, 55, 95, 155, 215, 360, 430, 505, 585, 690, 745, 805, 865]
+        headers = ["排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌%", "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選"]
+        x_positions = [18, 50, 88, 145, 200, 330, 395, 465, 540, 630, 680, 730, 790, 845]
         y = height - 82
         c.setFont(font_name, 8)
         for h, x in zip(headers, x_positions):
@@ -1831,9 +1849,9 @@ class GTCProApp:
                 y = height - 50
                 c.setFont(font_name, 8)
             row = [
-                str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:14], str(r["display_price"]),
-                f"{r['change_pct']:+.2f}%", r["signal"][:8], r["advice"][:10], str(r["score"]),
-                str(r["trend_score"]), str(r["intraday_score"]), r["leader_candidate"]
+                str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:10], str(r["display_price"]),
+                f"{r['change_pct']:+.2f}%", r["signal"][:8], r["advice"][:8], str(r["score"]),
+                r["strategy_level"], str(r["target_price"]), str(r["rr"]), r["leader_candidate"]
             ]
             for text, x in zip(row, x_positions):
                 c.drawString(x, y, str(text))
@@ -1891,7 +1909,7 @@ class GTCProApp:
         ]
         for idx, r in enumerate(self.results, start=1):
             overview_lines.append(
-                f"{idx}. {r['input_symbol']} {r['name']} / 現價={r['display_price']} / 漲跌幅={r['change_pct']:+.2f}% / 訊號={r['signal']} / 建議={r['advice']} / 分數={r['score']} / 主升={r['leader_candidate']}"
+                f"{idx}. {r['input_symbol']} {r['name']} / 現價={r['display_price']} / 漲跌幅={r['change_pct']:+.2f}% / 訊號={r['signal']} / 建議={r['advice']} / 分數={r['score']} / 等級={r['strategy_level']} / 目標價={r['target_price']} / RR={r['rr']} / 主升={r['leader_candidate']}"
             )
         self._draw_wrapped_lines(c, font_name, overview_lines, 24, y, 760)
 
@@ -1941,7 +1959,7 @@ class GTCProApp:
             return
         fieldnames = [
             "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議",
-            "分數", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明"
+            "分數", "等級", "目標價", "RR", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明"
         ]
         with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
@@ -1949,7 +1967,7 @@ class GTCProApp:
             for idx, r in enumerate(self.results, start=1):
                 writer.writerow([
                     idx, r["light"], r["market"], r["input_symbol"], r["name"], r["display_price"], f"{r['change']:+.2f}",
-                    f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["leader_candidate"],
+                    f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["strategy_level"], r["target_price"], r["rr"], r["leader_candidate"],
                     r["trend_score"], r["intraday_score"], r["support"], r["resistance"], r["rsi"],
                     r["orderbook_bias"], r["trade_type"], r["display_note"]
                 ])
