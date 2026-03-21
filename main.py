@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.3-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.1.7-FINAL-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -383,6 +383,8 @@ def build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, chang
 
 
 def classify_trade_type(state_bucket: str, signal: str, advice: str) -> str:
+    if signal == "整理偏多":
+        return "整理偏多"
     if signal == "突破強勢" or "突破可追" in advice:
         return "突破追價"
     if state_bucket == "strong":
@@ -1279,7 +1281,7 @@ def build_market_overview(results: list[dict]) -> str:
         f"台積電：{tsmc['close']} {tsmc_arrow}{abs(tsmc['change'])} ({tsmc['pct']:+.2f}%) ｜ "
         f"上漲/下跌：{market['up']}/{market['down']} ｜ 量能：{market['volume_status']}"
     )
-    line2 = f"市場模式：{mode} ｜ 今日策略：{strategy} ｜ 資料源：{market['source_note']}"
+    line2 = f"市場模式：{mode} ｜ 今日策略：{strategy}"
     return line1 + "\n" + line2
 
 
@@ -1299,6 +1301,7 @@ class GTCProApp:
         self._timer_job_id = None
         self.show_advanced_columns = False
         self.market_overview_var = tk.StringVar(value="加權：- ｜ 台積電：- ｜ 上漲/下跌：-/- ｜ 量能：未知\n市場模式：尚無資料 ｜ 今日策略：尚無資料")
+        self.data_source_var = tk.StringVar(value="資料來源：尚無資料")
         self._build_ui()
         self.set_status(f"系統已就緒。當前版本：{APP_VERSION}")
 
@@ -1425,7 +1428,10 @@ class GTCProApp:
         bottom = ttk.LabelFrame(self.root, text="系統訊息", padding=10)
         bottom.pack(fill="x", padx=10, pady=(0, 10))
         self.status_var = tk.StringVar(value="")
-        ttk.Label(bottom, textvariable=self.status_var).pack(anchor="w")
+        bottom_row = ttk.Frame(bottom)
+        bottom_row.pack(fill="x")
+        ttk.Label(bottom_row, textvariable=self.status_var).pack(side="left", anchor="w")
+        ttk.Label(bottom_row, textvariable=self.data_source_var, foreground="gray").pack(side="right", anchor="e")
 
     def set_status(self, text: str):
         now = datetime.now().strftime("%H:%M:%S")
@@ -1440,17 +1446,29 @@ class GTCProApp:
         else:
             last = "-"
         mode = "自動刷新開啟" if self.auto_refresh_enabled else "自動刷新關閉"
-        source_mix = "TWSE MIS / Yahoo"
-        market_text = self.market_overview_var.get().replace("\n", " ｜ ") if hasattr(self, "market_overview_var") else "市場模式：尚無資料"
         self.status_var.set(
             f"最後更新：{last} ｜ 下次刷新：{self.next_refresh_sec} 秒 ｜ {mode} ｜ "
-            f"來源：{source_mix} ｜ 追蹤檔數：{len(self.results)} ｜ {market_text} ｜ 版本：{APP_VERSION}"
+            f"追蹤檔數：{len(self.results)} ｜ 版本：{APP_VERSION}"
         )
+
+    def update_data_source_bar(self):
+        try:
+            if self.results:
+                market = get_market_data(self.results)
+                now_text = datetime.now().strftime("%H:%M:%S")
+                self.data_source_var.set(
+                    f"資料來源：{market['source_note']} ｜ 更新時間：{now_text}"
+                )
+            else:
+                self.data_source_var.set("資料來源：尚無資料")
+        except Exception as e:
+            self.data_source_var.set(f"資料來源：更新失敗 ({e})")
 
     def clear_results(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.results = []
+        self.data_source_var.set("資料來源：尚無資料")
         self.detail_text.delete("1.0", tk.END)
         self.advice_text.delete("1.0", tk.END)
         self.set_status(f"已清空結果。版本：{APP_VERSION}")
@@ -1488,7 +1506,7 @@ class GTCProApp:
                     idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"],
                     f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"],
                     r["score"], r["leader_candidate"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
-                    r["rsi"], r["orderbook_bias"], r["display_note"]
+                    r["rsi"], r["orderbook_bias"], r["trade_type"], r["display_note"]
                 ),
                 tags=tuple(tags)
             )
@@ -1513,6 +1531,7 @@ class GTCProApp:
         self.results = sorted(ok_results, key=lambda x: x["rank_score"], reverse=True)
         self.render_results()
         self.market_overview_var.set(build_market_overview(self.results))
+        self.update_data_source_bar()
         self.last_update_time = datetime.now()
         self.next_refresh_sec = AUTO_REFRESH_MS // 1000
         self.update_status_with_timer()
