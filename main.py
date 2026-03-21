@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.8.2-UPGRADE3-OPTIMIZED-FINALSORT"
+APP_VERSION = "v5.1.8.3-UPGRADE3-TRADINGSCORE-FIXED"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -973,16 +973,22 @@ def get_unified_sort_key(data: dict):
     統一排序規則：
     1) 先套市場風控門檻，今日清單入選者永遠排前面
     2) 入選與未入選各自依交易分排序
-    3) 交易分相同時，再用勝率 / 分數 / 決策等級補排序
-    讓主表前幾名與今日清單順序完全一致
+    3) 同群內再用勝率 / 分數 / 決策等級補排序
+    4) 搭配 reverse=True 使用
     """
-    pick_priority = 1 if data.get("today_pick") == "入選" else 0
+    in_today_pick = 1 if data.get("today_pick") == "入選" else 0
+    trading_score = float(data.get("trading_score", 0) or 0)
+    win_rate = float(data.get("win_rate", 0) or 0)
+    score = float(data.get("score", 0) or 0)
+    decision_rank = get_decision_rank(data.get("decision", ""))
+    rr = float(data.get("rr", 0) or 0)
     return (
-        pick_priority,
-        float(data.get("trading_score", 0) or 0),
-        float(data.get("win_rate", 0) or 0),
-        float(data.get("score", 0) or 0),
-        get_decision_rank(data.get("decision", "")),
+        in_today_pick,
+        trading_score,
+        win_rate,
+        score,
+        decision_rank,
+        rr,
         float(data.get("rank_score", 0) or 0),
     )
 
@@ -1775,6 +1781,12 @@ class GTCProApp:
         for r in ok_results:
             r["today_pick"] = "入選" if is_today_pick(r, market_mode) else "-"
             r["rank_score"] = calc_rank_score(r)
+            summary_lines = r.get("summary_block", "").split("\n") if r.get("summary_block") else []
+            for i, line in enumerate(summary_lines):
+                if line.startswith("決策 / 波浪 / 勝率 / 今日清單："):
+                    summary_lines[i] = f"決策 / 波浪 / 勝率 / 今日清單：{r['decision']} / {r['wave_position']} / {r['win_rate']}% / {r['today_pick']}"
+            if summary_lines:
+                r["summary_block"] = "\n".join(summary_lines)
         self.results = sorted(ok_results, key=get_unified_sort_key, reverse=True)
         self.render_results()
         self.market_overview_var.set(build_market_overview(self.results))
@@ -2217,7 +2229,8 @@ class GTCProApp:
             for idx, r in enumerate(self.results, start=1):
                 writer.writerow([
                     idx, r["light"], r["market"], r["input_symbol"], r["name"], r["display_price"], f"{r['change']:+.2f}",
-                    f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["decision"], r["wave_position"], f"{r['win_rate']}%", r["today_pick"], r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"],
+                    f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["decision"], r["wave_position"], f"{r['win_rate']}%", r["trading_score"], r["today_pick"],
+                    r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"],
                     r["trend_score"], r["intraday_score"], r["support"], r["resistance"], r["rsi"],
                     r["orderbook_bias"], r["trade_type"], r["display_note"]
                 ])
