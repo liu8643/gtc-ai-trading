@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.7.6-UPGRADE2-FIXED2-Institutional-Decision-System"
+APP_VERSION = "v5.1.7.7-UPGRADE2-FIXED3-Institutional-Decision-System"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -816,7 +816,7 @@ def normalize_rr_display(rr):
 
 
 def get_display_target(target, signal: str, state_bucket: str):
-    if signal in ("轉弱警戒", "急跌風險", "跌破支撐") or state_bucket == "weak":
+    if signal in ("轉弱警戒", "急跌風險", "跌破支撐", "區間整理") or state_bucket in ("weak", "range"):
         return "-"
     return target
 
