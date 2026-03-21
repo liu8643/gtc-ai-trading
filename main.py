@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.8.0-UPGRADE3-Trading-Engine"
+APP_VERSION = "v5.1.8.1-UPGRADE3-OPTIMIZED"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -875,28 +875,105 @@ def get_trade_decision(data: dict) -> str:
     rr = data.get("rr")
     win = data.get("win_rate", 0)
     leader = data.get("leader_candidate", "-")
+    trend = data.get("trend_score", 0)
+    intra = data.get("intraday_score", 0)
 
-    if signal in ("急跌風險", "轉弱警戒", "跌破支撐") or state == "weak":
-        return "SELL"
-    if state in ("strong", "bullish") and level in ("A", "B") and rr is not None and rr >= 1.5 and win >= 60:
+    if signal == "急跌風險":
+        return "AVOID"
+    if signal in ("轉弱警戒", "跌破支撐") or state == "weak":
+        if win < 30 or trend < 20 or intra < 20:
+            return "AVOID"
+        if win < 40 or level == "D":
+            return "EXIT"
+        return "REDUCE"
+
+    if state == "strong" and level == "A" and rr is not None and rr >= 1.8 and win >= 95 and leader == "是":
+        return "STRONG BUY"
+    if state in ("strong", "bullish") and level in ("A", "B") and rr is not None and rr >= 1.5 and win >= 85:
         return "BUY"
-    if leader == "是" and state == "strong" and win >= 58:
-        return "BUY"
+    if state in ("strong", "bullish") and level in ("A", "B") and rr is not None and rr >= 1.0 and win >= 75:
+        return "WEAK BUY"
     return "HOLD"
 
 
-def is_today_pick(data: dict) -> bool:
+def get_decision_rank(decision: str) -> int:
+    mapping = {
+        "STRONG BUY": 7,
+        "BUY": 6,
+        "WEAK BUY": 5,
+        "HOLD": 4,
+        "REDUCE": 3,
+        "EXIT": 2,
+        "AVOID": 1,
+    }
+    return mapping.get(str(decision).strip().upper(), 0)
+
+
+def calc_trading_score(data: dict) -> float:
+    rr = data.get("rr")
+    if rr is None or data.get("display_target_price", "-") == "-":
+        return 0.0
+
+    win = float(data.get("win_rate", 0) or 0)
+    state_coeff = {
+        "strong": 1.20,
+        "bullish": 1.00,
+        "range": 0.65,
+        "weak": 0.35,
+    }.get(data.get("state_bucket", "range"), 0.60)
+    wave_coeff = {
+        "第3浪": 1.15,
+        "推動浪": 1.05,
+        "第5浪": 0.95,
+        "整理浪": 0.70,
+        "修正浪": 0.45,
+    }.get(data.get("wave_position", "整理浪"), 0.80)
+    decision_coeff = {
+        "STRONG BUY": 1.15,
+        "BUY": 1.00,
+        "WEAK BUY": 0.85,
+        "HOLD": 0.55,
+        "REDUCE": 0.35,
+        "EXIT": 0.15,
+        "AVOID": 0.05,
+    }.get(data.get("decision", "HOLD"), 0.50)
+    return round(win * float(rr) * state_coeff * wave_coeff * decision_coeff, 2)
+
+
+def is_today_pick(data: dict, market_mode: str = "") -> bool:
+    weak_market = market_mode in ("偏弱震盪", "震盪偏弱")
+    required_win = 91 if weak_market else 75
     return (
-        data.get("decision") == "BUY" and
+        data.get("decision") in ("STRONG BUY", "BUY", "WEAK BUY") and
         data.get("strategy_level") in ("A", "B") and
         data.get("display_target_price") != "-" and
-        data.get("win_rate", 0) >= 60 and
+        data.get("win_rate", 0) >= required_win and
         (data.get("leader_candidate") in ("是", "觀察") or (data.get("rr") is not None and data.get("rr", 0) >= 2.0))
     )
 
 
+def calc_rank_score(data: dict) -> float:
+    return round(
+        data.get("score", 0) * 0.4 +
+        data.get("trend_score", 0) * 0.3 +
+        data.get("intraday_score", 0) * 0.2 +
+        data.get("change_pct", 0) * 1.5 +
+        (15 if data.get("leader_candidate") == "是" else 0) +
+        (6 if data.get("leader_candidate") == "觀察" else 0) +
+        data.get("win_rate", 0) * 0.35 +
+        data.get("trading_score", 0) * 0.8 +
+        get_decision_rank(data.get("decision", "")) * 6 +
+        (8 if data.get("today_pick") == "入選" else 0),
+        2
+    )
+
+
 def build_today_pick_summary(results: list[dict]) -> str:
-    picks = [r for r in results if r.get("today_pick") == "入選"][:5]
+    picks = sorted(
+        [r for r in results if r.get("today_pick") == "入選"],
+        key=lambda x: (x.get("trading_score", 0), x.get("win_rate", 0), x.get("score", 0)),
+        reverse=True,
+    )[:5]
     if not picks:
         return "今日清單：暫無符合條件標的"
     parts = [f"{r['input_symbol']}({r['decision']}/{r['win_rate']}%)" for r in picks]
@@ -1174,22 +1251,16 @@ def analyze_symbol(symbol: str) -> dict:
     result["trade_type"] = classify_trade_type(state_bucket, signal, advice)
     result["light"] = get_light(result["signal"], result["score"], result["change_pct"], intraday_score=result["intraday_score"])
     result["leader_candidate"] = classify_leader_stage(result)
-    result["rank_score"] = (
-        result["score"] * 0.4 +
-        result["trend_score"] * 0.3 +
-        result["intraday_score"] * 0.2 +
-        result["change_pct"] * 1.5 +
-        (15 if result["leader_candidate"] == "是" else 0) +
-        (6 if result["leader_candidate"] == "觀察" else 0)
-    )
+    result["rank_score"] = 0.0
     result.update(calc_trade_plan(result))
     result["display_target_price"] = get_display_target(result.get("target_price"), result["signal"], result["state_bucket"])
     result["display_rr"] = normalize_rr_display(result.get("rr"))
     result["wave_position"] = get_wave_position(result)
     result["win_rate"] = calc_win_rate(result)
     result["decision"] = get_trade_decision(result)
-    result["today_pick"] = "入選" if is_today_pick(result) else "-"
-    result["rank_score"] += result["win_rate"] * 0.35 + (10 if result["decision"] == "BUY" else 0) + (8 if result["today_pick"] == "入選" else 0)
+    result["today_pick"] = "-"
+    result["trading_score"] = calc_trading_score(result)
+    result["rank_score"] = calc_rank_score(result)
     result["summary_block"] = "\n".join([
         "【速讀摘要】",
         f"現價 / 漲跌幅 / 報價：{result['display_price']} / {result['change_pct']:+.2f}% / {result['display_note']}",
@@ -1199,6 +1270,7 @@ def analyze_symbol(symbol: str) -> dict:
         f"交易類型 / 等級：{result['trade_type']} / {result['strategy_level']}",
         f"目標價 / RR：{result['display_target_price']} / {result['display_rr']}",
         f"決策 / 波浪 / 勝率 / 今日清單：{result['decision']} / {result['wave_position']} / {result['win_rate']}% / {result['today_pick']}",
+        f"交易分：{result['trading_score']}",
         f"策略定位：狀態={result['state_bucket']} / 量價比={result['orderbook_ratio']} / RSI={result['rsi']}",
     ])
     result["ai_analysis"] = build_ai_analysis(result)
@@ -1492,18 +1564,18 @@ class GTCProApp:
     def _build_table_area(self, parent):
         columns = (
             "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%",
-            "訊號", "建議", "決策", "波浪位置", "勝率", "今日清單",
+            "訊號", "建議", "決策", "波浪位置", "勝率", "交易分", "今日清單",
             "分數", "等級", "目標價", "RR", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI",
             "五檔力道", "交易類型", "報價說明"
         )
         self.all_columns = columns
-        self.core_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "決策", "勝率", "分數", "等級", "目標價", "RR", "主升候選")
-        self.advanced_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議", "決策", "波浪位置", "勝率", "今日清單", "分數", "等級", "目標價", "RR", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明")
+        self.core_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "決策", "勝率", "交易分", "分數", "等級", "目標價", "RR", "主升候選")
+        self.advanced_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議", "決策", "波浪位置", "勝率", "交易分", "今日清單", "分數", "等級", "目標價", "RR", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
         self.tree.configure(displaycolumns=self.core_columns)
         widths = {
             "排名": 55, "燈號": 55, "市場": 90, "代號": 80, "名稱": 190, "顯示價": 90,
-            "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "決策": 85, "波浪位置": 90, "勝率": 75, "今日清單": 75,
+            "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "決策": 95, "波浪位置": 90, "勝率": 75, "交易分": 80, "今日清單": 75,
             "分數": 65, "等級": 60, "目標價": 90, "RR": 70, "主升候選": 80,
             "波段分": 70, "盤中分": 70, "支撐": 90, "壓力": 90, "RSI": 70,
             "五檔力道": 110, "交易類型": 100, "報價說明": 180
@@ -1655,7 +1727,7 @@ class GTCProApp:
                 "", "end",
                 values=(
                     idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"],
-                    f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["decision"], r["wave_position"], f"{r['win_rate']}%", r["today_pick"],
+                    f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["decision"], r["wave_position"], f"{r['win_rate']}%", r["trading_score"], r["today_pick"],
                     r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
                     r["rsi"], r["orderbook_bias"], r["trade_type"], r["display_note"]
                 ),
@@ -1679,6 +1751,11 @@ class GTCProApp:
                 self.root.update_idletasks()
             except Exception as e:
                 errors.append(f"{sym}: {e}")
+        market = get_market_data(ok_results) if ok_results else {}
+        market_mode = get_market_mode(market) if ok_results else ""
+        for r in ok_results:
+            r["today_pick"] = "入選" if is_today_pick(r, market_mode) else "-"
+            r["rank_score"] = calc_rank_score(r)
         self.results = sorted(ok_results, key=lambda x: x["rank_score"], reverse=True)
         self.render_results()
         self.market_overview_var.set(build_market_overview(self.results))
@@ -1757,7 +1834,7 @@ class GTCProApp:
             "",
             target["summary_block"],
             f"交易計畫：進場={target.get('entry_low',0)}~{target.get('entry_high',0)} / 停損={target.get('stop_loss',0)} / 目標={target.get('display_target_price','-')} / RR={target.get('display_rr','-')}",
-            f"交易引擎：決策={target.get('decision','-')} / 波浪位置={target.get('wave_position','-')} / 勝率={target.get('win_rate','-')}% / 今日清單={target.get('today_pick','-')}",
+            f"交易引擎：決策={target.get('decision','-')} / 波浪位置={target.get('wave_position','-')} / 勝率={target.get('win_rate','-')}% / 交易分={target.get('trading_score','-')} / 今日清單={target.get('today_pick','-')}",
             "",
             "【五檔資訊】",
             f"買盤總量：{target['buy_qty']}",
@@ -1781,6 +1858,7 @@ class GTCProApp:
             f"決策：{target.get('decision','-')}",
             f"波浪位置：{target.get('wave_position','-')}",
             f"勝率：{target.get('win_rate','-')}%",
+            f"交易分：{target.get('trading_score','-')}",
             f"今日清單：{target.get('today_pick','-')}",
             f"波段分數：{target['trend_score']}",
             f"盤中分數：{target['intraday_score']}",
@@ -1812,7 +1890,7 @@ class GTCProApp:
             "【交易結論】",
             f"建議：{target['advice']}",
             f"訊號：{target['signal']} / 狀態：{target['state_bucket']} / 主升：{target['leader_candidate']}",
-            f"決策：{target.get('decision','-')} / 波浪位置：{target.get('wave_position','-')} / 勝率：{target.get('win_rate','-')}% / 今日清單：{target.get('today_pick','-')}",
+            f"決策：{target.get('decision','-')} / 波浪位置：{target.get('wave_position','-')} / 勝率：{target.get('win_rate','-')}% / 交易分：{target.get('trading_score','-')} / 今日清單：{target.get('today_pick','-')}",
             "",
             "【交易計畫】",
             f"建議進場：{entry_text}",
@@ -1933,6 +2011,7 @@ class GTCProApp:
             "決策": "decision",
             "波浪位置": "wave_position",
             "勝率": "win_rate",
+            "交易分": "trading_score",
             "今日清單": "today_pick",
             "分數": "score",
             "等級": "strategy_level_score",
@@ -1964,6 +2043,8 @@ class GTCProApp:
                 return int(v or 0)
             if real_key == "win_rate":
                 return int(v or 0)
+            if real_key == "trading_score":
+                return float(v or 0)
             if real_key in ("target_price", "rr", "display_target_price", "display_rr"):
                 if v in (None, "-"):
                     return float("-inf") if self.sort_reverse else float("inf")
@@ -1983,8 +2064,8 @@ class GTCProApp:
         font_name = setup_pdf_font()
         c = canvas.Canvas(file_path, pagesize=landscape(A4))
         width, height = self._export_pdf_header(c, font_name, "總表摘要")
-        headers = ["排名", "燈號", "代號", "名稱", "漲跌%", "訊號", "建議", "決策", "勝率", "等級", "目標價", "RR", "主升", "今日"]
-        x_positions = [18, 50, 92, 150, 300, 360, 435, 515, 585, 645, 700, 760, 815, 860]
+        headers = ["排名", "燈號", "代號", "名稱", "漲跌%", "訊號", "決策", "勝率", "交易分", "等級", "目標價", "RR", "主升", "今日"]
+        x_positions = [18, 50, 92, 150, 300, 360, 445, 535, 605, 670, 725, 785, 840, 885]
         y = height - 82
         c.setFont(font_name, 8)
         for h, x in zip(headers, x_positions):
@@ -1999,9 +2080,9 @@ class GTCProApp:
                 y = height - 50
                 c.setFont(font_name, 8)
             row = [
-                str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:10], str(r["display_price"]),
-                f"{r['change_pct']:+.2f}%", r["signal"][:8], r["advice"][:8], str(r["score"]),
-                r["strategy_level"], str(r["display_target_price"]), str(r["display_rr"]), r["leader_candidate"]
+                str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:10], f"{r['change_pct']:+.2f}%",
+                r["signal"][:8], r["decision"][:10], f"{r['win_rate']}%", str(r["trading_score"]),
+                r["strategy_level"], str(r["display_target_price"]), str(r["display_rr"]), r["today_pick"]
             ]
             for text, x in zip(row, x_positions):
                 c.drawString(x, y, str(text))
@@ -2108,7 +2189,7 @@ class GTCProApp:
         if not file_path:
             return
         fieldnames = [
-            "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議", "決策", "波浪位置", "勝率", "今日清單",
+            "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議", "決策", "波浪位置", "勝率", "交易分", "今日清單",
             "分數", "等級", "目標價", "RR", "主升候選", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明"
         ]
         with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
