@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.8.3-UPGRADE3-TRADINGSCORE-FIXED"
+APP_VERSION = "v5.2.0-FULL-MARKET-A-SCANNER"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -1519,6 +1519,85 @@ def build_market_overview(results: list[dict]) -> str:
 
 
 
+
+
+def fetch_twse_listed_symbols() -> list[str]:
+    """取得台股上市四碼代號清單（先以上市為主，不含上櫃）。"""
+    urls = [
+        "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+        "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALLBUT0999",
+    ]
+    symbols = []
+    seen = set()
+    # 官方上市清單
+    try:
+        df = pd.read_json(urls[0])
+        code_col = None
+        for c in df.columns:
+            c_str = str(c).strip()
+            if "代號" in c_str or c_str.lower() == 'code':
+                code_col = c
+                break
+        if code_col is not None:
+            for _, row in df.iterrows():
+                code = str(row[code_col]).strip()
+                if code.isdigit() and len(code) == 4 and code not in seen:
+                    seen.add(code)
+                    symbols.append(code)
+    except Exception:
+        pass
+    # 備援：MI_INDEX
+    if not symbols:
+        try:
+            r = requests.get(urls[1], timeout=12, headers={"User-Agent":"Mozilla/5.0"})
+            r.raise_for_status()
+            data = r.json()
+            rows = data.get('data9') or data.get('data8') or data.get('data') or []
+            for row in rows:
+                if not row:
+                    continue
+                code = str(row[0]).strip()
+                if code.isdigit() and len(code) == 4 and code not in seen:
+                    seen.add(code)
+                    symbols.append(code)
+        except Exception:
+            pass
+    return symbols
+
+
+def filter_a_grade_candidates(results: list[dict], market_mode: str = "") -> tuple[list[dict], list[dict]]:
+    """
+    先篩 A 級，再做 A級中的A級（Elite）
+    """
+    weak_market = market_mode in ("偏弱震盪", "震盪偏弱")
+    a_grade = [
+        r for r in results
+        if r.get('strategy_level') == 'A'
+        and r.get('decision') in ('STRONG BUY', 'BUY', 'WEAK BUY')
+        and r.get('display_target_price') != '-'
+        and r.get('trading_score', 0) > 0
+    ]
+    elite = [
+        r for r in a_grade
+        if r.get('decision') in ('STRONG BUY', 'BUY', 'WEAK BUY')
+        and r.get('win_rate', 0) >= (91 if weak_market else 90)
+        and r.get('leader_candidate') == '是'
+        and r.get('wave_position') in ('第3浪', '推動浪')
+        and (r.get('rr') is not None and float(r.get('rr') or 0) >= 1.5)
+    ]
+    a_grade = sorted(a_grade, key=get_unified_sort_key, reverse=True)
+    elite = sorted(elite, key=get_unified_sort_key, reverse=True)
+    return a_grade, elite
+
+
+def build_scanner_overview(results: list[dict], market_mode: str, a_grade: list[dict], elite: list[dict]) -> str:
+    base = build_market_overview(results)
+    a_text = "A級清單：" + ("、".join([f"{r['input_symbol']}({r['decision']}/{r['win_rate']}%/TS={r['trading_score']})" for r in a_grade[:10]]) if a_grade else "暫無")
+    elite_text = "A級中的A級：" + ("、".join([f"{r['input_symbol']}({r['decision']}/{r['win_rate']}%/TS={r['trading_score']})" for r in elite[:5]]) if elite else "暫無")
+    count_text = f"上市全市場掃描：A級 {len(a_grade)} 檔 ｜ A級中的A級 {len(elite)} 檔 ｜ 市場模式：{market_mode}"
+    return base + "\n" + count_text + "\n" + a_text + "\n" + elite_text
+
+
 class GTCProApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1533,6 +1612,9 @@ class GTCProApp:
         self.last_update_time = None
         self._timer_job_id = None
         self.show_advanced_columns = False
+        self.scan_mode = "manual"
+        self.a_grade_results = []
+        self.elite_results = []
         self.market_overview_var = tk.StringVar(value="加權：- ｜ 台積電：- ｜ 上漲/下跌：-/- ｜ 量能：未知\n市場模式：尚無資料 ｜ 今日策略：尚無資料")
         self.data_source_var = tk.StringVar(value="資料來源：尚無資料")
         self._build_ui()
@@ -1555,6 +1637,7 @@ class GTCProApp:
         action_frame.pack(side="left", padx=(8, 0))
 
         ttk.Button(action_frame, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="上市全市場掃A級", command=self.run_full_market_a_scan).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="切換進階欄位", command=self.toggle_advanced_columns).pack(side="left", padx=(0, 6))
@@ -1711,6 +1794,60 @@ class GTCProApp:
         self.detail_text.delete("1.0", tk.END)
         self.advice_text.delete("1.0", tk.END)
         self.set_status(f"已清空結果。版本：{APP_VERSION}")
+
+    def run_full_market_a_scan(self):
+        listed_symbols = fetch_twse_listed_symbols()
+        if not listed_symbols:
+            messagebox.showwarning("提醒", "無法取得台股上市清單。")
+            return
+        self.clear_results()
+        self.scan_mode = "full_market_a"
+        self.set_status(f"開始掃描台股上市全市場，共 {len(listed_symbols)} 檔... 版本：{APP_VERSION}")
+        self.root.update_idletasks()
+        ok_results, errors = [], []
+        total = len(listed_symbols)
+        for idx, sym in enumerate(listed_symbols, start=1):
+            try:
+                r = analyze_symbol(sym)
+                ok_results.append(r)
+            except Exception as e:
+                errors.append(f"{sym}: {e}")
+            if idx == 1 or idx % 30 == 0 or idx == total:
+                self.set_status(f"掃描中 {idx}/{total} ｜ 已完成 {len(ok_results)} 檔 ｜ 版本：{APP_VERSION}")
+                self.root.update_idletasks()
+
+        market = get_market_data(ok_results) if ok_results else {}
+        market_mode = get_market_mode(market) if ok_results else ""
+        for r in ok_results:
+            r["today_pick"] = "入選" if is_today_pick(r, market_mode) else "-"
+            r["rank_score"] = calc_rank_score(r)
+            summary_lines = r.get("summary_block", "").split("\n") if r.get("summary_block") else []
+            for i, line in enumerate(summary_lines):
+                if line.startswith("決策 / 波浪 / 勝率 / 今日清單："):
+                    summary_lines[i] = f"決策 / 波浪 / 勝率 / 今日清單：{r['decision']} / {r['wave_position']} / {r['win_rate']}% / {r['today_pick']}"
+            if summary_lines:
+                r["summary_block"] = "\n".join(summary_lines)
+
+        a_grade, elite = filter_a_grade_candidates(ok_results, market_mode)
+        self.a_grade_results = a_grade
+        self.elite_results = elite
+        # 主表顯示 A級清單；前幾名若有 elite 會自然排前
+        self.results = a_grade
+        self.render_results()
+        self.market_overview_var.set(build_scanner_overview(ok_results, market_mode, a_grade, elite))
+        self.update_data_source_bar()
+        self.last_update_time = datetime.now()
+        self.next_refresh_sec = AUTO_REFRESH_MS // 1000
+        self.update_status_with_timer()
+        if self.results:
+            first_id = self.tree.get_children()[0]
+            self.tree.selection_set(first_id)
+            self.tree.focus(first_id)
+            self.on_row_select()
+        msg = f"上市全市場掃描完成：A級 {len(a_grade)} 檔，A級中的A級 {len(elite)} 檔，失敗 {len(errors)} 檔。版本：{APP_VERSION}"
+        self.set_status(msg)
+        if errors and len(errors) <= 10:
+            messagebox.showwarning("部分股票失敗", "\n".join(errors))
 
     def parse_symbols(self):
         raw = self.symbol_entry.get().strip()
