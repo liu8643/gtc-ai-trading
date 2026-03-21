@@ -18,13 +18,31 @@ from reportlab.pdfgen import canvas
 import os
 import csv
 import json
+import threading
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.2.1-DATA-FIRST-SCANNER"
+APP_VERSION = "v5.2.2-CATEGORY-DOWNLOAD-SCANNER"
 AUTO_REFRESH_MS = 30000
 SNAPSHOT_DIR = os.path.join(os.path.expanduser("~"), "GTC_A_SCANNER_CACHE")
 SNAPSHOT_JSON = os.path.join(SNAPSHOT_DIR, "listed_market_snapshot.json")
 SNAPSHOT_CSV = os.path.join(SNAPSHOT_DIR, "listed_market_snapshot_summary.csv")
+CATEGORY_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "category_snapshots")
+CATEGORY_OPTIONS = [
+    "上市全部",
+    "上市1100-1999",
+    "上市2000-2999",
+    "上市3000-3999",
+    "上市4000-4999",
+    "上市5000-5999",
+    "上市6000-6999",
+    "上市8000-8999",
+    "上市9000-9999",
+    "上櫃全部",
+    "上櫃3000-3999",
+    "上櫃4000-4999",
+    "上櫃5000-6999",
+    "上櫃8000-8999",
+]
 
 def setup_pdf_font():
     candidates = [
@@ -1530,6 +1548,50 @@ def build_market_overview(results: list[dict]) -> str:
 def ensure_snapshot_dir():
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
+
+def ensure_category_snapshot_dir():
+    os.makedirs(CATEGORY_SNAPSHOT_DIR, exist_ok=True)
+
+def slugify_category(label: str) -> str:
+    return (label.replace(" ", "_")
+                 .replace("/", "_")
+                 .replace("–", "-")
+                 .replace("－", "-")
+                 .replace("上櫃", "otc_")
+                 .replace("上市", "listed_")
+                 .replace("全部", "all"))
+
+def parse_category_meta(label: str) -> dict:
+    market = "listed" if label.startswith("上市") else "otc"
+    if "全部" in label:
+        return {"label": label, "market": market, "range": None, "slug": slugify_category(label)}
+    m = re.search(r"(\d{4})-(\d{4})", label)
+    code_range = None
+    if m:
+        code_range = (int(m.group(1)), int(m.group(2)))
+    return {"label": label, "market": market, "range": code_range, "slug": slugify_category(label)}
+
+def get_category_snapshot_paths(label: str) -> tuple[str, str]:
+    meta = parse_category_meta(label)
+    ensure_snapshot_dir()
+    ensure_category_snapshot_dir()
+    return (
+        os.path.join(CATEGORY_SNAPSHOT_DIR, f"{meta['slug']}.json"),
+        os.path.join(CATEGORY_SNAPSHOT_DIR, f"{meta['slug']}_summary.csv"),
+    )
+
+def filter_symbols_by_range(symbols: list[str], code_range=None) -> list[str]:
+    if not code_range:
+        return symbols
+    lo, hi = code_range
+    out = []
+    for s in symbols:
+        if s.isdigit() and len(s) == 4:
+            v = int(s)
+            if lo <= v <= hi:
+                out.append(s)
+    return out
+
 def chunked(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
@@ -1766,6 +1828,47 @@ def fetch_twse_listed_symbols() -> list[str]:
     return symbols
 
 
+
+
+def fetch_tpex_otc_symbols() -> list[str]:
+    """取得台股上櫃四碼代號清單。"""
+    urls = [
+        "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+    ]
+    symbols = []
+    seen = set()
+    for url in urls:
+        try:
+            df = pd.read_json(url)
+            code_col = None
+            for c in df.columns:
+                c_str = str(c).strip()
+                if "代號" in c_str or c_str.lower() == "code" or "SecuritiesCompanyCode" in c_str:
+                    code_col = c
+                    break
+            if code_col is None and len(df.columns) > 0:
+                code_col = df.columns[0]
+            if code_col is not None:
+                for _, row in df.iterrows():
+                    code = str(row[code_col]).strip()
+                    if code.isdigit() and len(code) == 4 and code not in seen:
+                        seen.add(code)
+                        symbols.append(code)
+            if symbols:
+                break
+        except Exception:
+            continue
+    return symbols
+
+def get_symbols_for_category(label: str) -> list[str]:
+    meta = parse_category_meta(label)
+    if meta["market"] == "listed":
+        symbols = fetch_twse_listed_symbols()
+    else:
+        symbols = fetch_tpex_otc_symbols()
+    return filter_symbols_by_range(symbols, meta["range"])
+
 def filter_a_grade_candidates(results: list[dict], market_mode: str = "") -> tuple[list[dict], list[dict]]:
     """
     先篩 A 級，再做 A級中的A級（Elite）
@@ -1840,8 +1943,11 @@ class GTCProApp:
         action_frame.pack(side="left", padx=(8, 0))
 
         ttk.Button(action_frame, text="執行分析", command=self.run_analysis).pack(side="left", padx=(0, 6))
-        ttk.Button(action_frame, text="下載上市資料", command=self.download_full_market_snapshot).pack(side="left", padx=(0, 6))
-        ttk.Button(action_frame, text="分析A級/A級中的A級", command=self.analyze_local_market_snapshot).pack(side="left", padx=(0, 6))
+        self.download_category_var = tk.StringVar(value=CATEGORY_OPTIONS[1])
+        self.download_category_combo = ttk.Combobox(action_frame, textvariable=self.download_category_var, values=CATEGORY_OPTIONS, state="readonly", width=18)
+        self.download_category_combo.pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="下載分類資料", command=self.download_selected_category_snapshot).pack(side="left", padx=(0, 6))
+        ttk.Button(action_frame, text="分析目前分類A級", command=self.analyze_local_market_snapshot).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(action_frame, text="切換進階欄位", command=self.toggle_advanced_columns).pack(side="left", padx=(0, 6))
@@ -2000,53 +2106,53 @@ class GTCProApp:
         self.set_status(f"已清空結果。版本：{APP_VERSION}")
 
 
-    def download_full_market_snapshot(self):
-        listed_symbols = fetch_twse_listed_symbols()
-        if not listed_symbols:
-            messagebox.showwarning("提醒", "無法取得台股上市清單。")
-            return
-        self.clear_results()
-        self.scan_mode = "download_snapshot"
-        self.set_status(f"開始下載台股上市全市場資料，共 {len(listed_symbols)} 檔... 版本：{APP_VERSION}")
-        self.root.update_idletasks()
 
+    def download_selected_category_snapshot(self):
+        label = self.download_category_var.get().strip() if hasattr(self, "download_category_var") else CATEGORY_OPTIONS[0]
+        if not label:
+            messagebox.showwarning("提醒", "請先選擇下載分類。")
+            return
+        self.set_status(f"開始下載分類資料：{label} ｜ 版本：{APP_VERSION}")
+        threading.Thread(target=self._download_category_snapshot_worker, args=(label,), daemon=True).start()
+
+    def download_full_market_snapshot(self):
+        # 向下相容：沿用目前下拉選單的分類下載
+        self.download_selected_category_snapshot()
+
+    def _download_category_snapshot_worker(self, label: str):
+        symbols = get_symbols_for_category(label)
+        if not symbols:
+            self.root.after(0, lambda: messagebox.showwarning("提醒", f"無法取得分類清單：{label}"))
+            return
+
+        self.root.after(0, self.clear_results)
+        self.scan_mode = "download_snapshot"
+        total = len(symbols)
         name_map = get_tw_name_map()
-        all_results, errors = [], []
-        total = len(listed_symbols)
-        for batch_idx, batch in enumerate(chunked(listed_symbols, 80), start=1):
-            tickers = " ".join([f"{sym}.TW" for sym in batch])
+        all_results = []
+        errors = []
+        json_path, csv_path = get_category_snapshot_paths(label)
+
+        for batch_idx, batch in enumerate(chunked(symbols, 40), start=1):
             try:
-                hist = yf.download(
-                    tickers,
-                    period="12mo",
-                    interval="1d",
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                    group_by="ticker",
-                )
-                if hist is None or hist.empty:
-                    raise ValueError("批次下載無資料")
-                for sym in batch:
+                yf_symbols = [f"{s}.TW" if label.startswith("上市") else f"{s}.TWO" for s in batch]
+                try:
+                    df = yf.download(
+                        yf_symbols, period="12mo", interval="1d", auto_adjust=False,
+                        progress=False, threads=True, group_by="ticker"
+                    )
+                except TypeError:
+                    df = yf.download(
+                        yf_symbols, period="12mo", interval="1d", auto_adjust=False,
+                        progress=False, threads=False, group_by="ticker"
+                    )
+                for sym, yf_symbol in zip(batch, yf_symbols):
                     try:
-                        ticker_key = f"{sym}.TW"
-                        if isinstance(hist.columns, pd.MultiIndex):
-                            if ticker_key in hist.columns.get_level_values(0):
-                                sdf = hist[ticker_key].copy()
-                            elif sym in hist.columns.get_level_values(0):
-                                sdf = hist[sym].copy()
-                            else:
-                                raise KeyError(f"{sym} 缺少欄位")
-                        else:
-                            sdf = hist.copy()
+                        sdf = df[yf_symbol].copy() if isinstance(df.columns, pd.MultiIndex) else df.copy()
+                        if sdf is None or sdf.empty:
+                            raise ValueError("空資料")
                         if isinstance(sdf.columns, pd.MultiIndex):
                             sdf.columns = [c[0] for c in sdf.columns]
-                        needed = ["Open", "High", "Low", "Close", "Volume"]
-                        if not all(c in sdf.columns for c in needed):
-                            raise ValueError("欄位不足")
-                        sdf = sdf.dropna(subset=["Close"]).copy()
-                        if len(sdf) < 30:
-                            raise ValueError("歷史資料不足")
                         row = analyze_symbol_local_from_df(sym, name_map.get(sym, sym), sdf)
                         all_results.append(row)
                     except Exception as e:
@@ -2054,21 +2160,26 @@ class GTCProApp:
             except Exception:
                 for sym in batch:
                     try:
-                        _, sdf = download_symbol_data(sym)
+                        _, sdf = download_symbol_data(f"{sym}.TW" if label.startswith("上市") else f"{sym}.TWO")
                         row = analyze_symbol_local_from_df(sym, name_map.get(sym, sym), sdf)
                         all_results.append(row)
                     except Exception as e:
                         errors.append(f"{sym}: {e}")
-            processed = min(batch_idx * 80, total)
-            self.set_status(f"下載快照中 {processed}/{total} ｜ 已完成 {len(all_results)} 檔 ｜ 版本：{APP_VERSION}")
-            self.root.update_idletasks()
+
+            processed = min(batch_idx * 40, total)
+            self.root.after(
+                0,
+                lambda p=processed, t=total, ok=len(all_results), lb=label:
+                    self.set_status(f"下載中 {lb} {p}/{t} ｜ 已完成 {ok} 檔 ｜ 版本：{APP_VERSION}")
+            )
 
         if not all_results:
-            messagebox.showerror("錯誤", "下載快照失敗，沒有可用資料。")
+            self.root.after(0, lambda: messagebox.showerror("錯誤", f"下載快照失敗：{label} 沒有可用資料。"))
             return
 
         ensure_snapshot_dir()
-        with open(SNAPSHOT_JSON, "w", encoding="utf-8") as f:
+        ensure_category_snapshot_dir()
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(all_results, f, ensure_ascii=False)
         pd.DataFrame([
             {
@@ -2077,34 +2188,43 @@ class GTCProApp:
                 "交易分": r["trading_score"], "分數": r["score"], "等級": r["strategy_level"],
                 "目標價": r["display_target_price"], "RR": r["display_rr"], "主升候選": r["leader_candidate"]
             } for r in all_results
-        ]).to_csv(SNAPSHOT_CSV, index=False, encoding="utf-8-sig")
+        ]).to_csv(csv_path, index=False, encoding="utf-8-sig")
 
-        self.snapshot_results = all_results
-        mode = get_local_market_mode(all_results)
-        self.market_overview_var.set(
-            f"上市資料下載完成：{len(all_results)} 檔 ｜ 快照檔：{SNAPSHOT_JSON}\n"
-            f"本地分析模式：{mode} ｜ 接下來請按「分析A級/A級中的A級」"
-        )
-        self.update_data_source_bar()
-        self.last_update_time = datetime.now()
-        self.update_status_with_timer()
-        msg = f"資料下載完成：成功 {len(all_results)} 檔，失敗 {len(errors)} 檔。快照已存到本機。版本：{APP_VERSION}"
-        self.set_status(msg)
-        if errors and len(errors) <= 10:
-            messagebox.showwarning("部分股票失敗", "\n".join(errors))
+        def finish_download():
+            self.snapshot_results = all_results
+            self.snapshot_category_label = label
+            self.snapshot_json_path = json_path
+            self.snapshot_csv_path = csv_path
+            mode = get_local_market_mode(all_results)
+            self.market_overview_var.set(
+                f"分類資料下載完成：{label} ｜ {len(all_results)} 檔 ｜ 快照檔：{json_path}\n"
+                f"本地分析模式：{mode} ｜ 接下來請按「分析目前分類A級」"
+            )
+            self.update_data_source_bar()
+            self.last_update_time = datetime.now()
+            self.update_status_with_timer()
+            self.set_status(f"分類下載完成：{label} ｜ 成功 {len(all_results)} 檔，失敗 {len(errors)} 檔。版本：{APP_VERSION}")
+            if errors and len(errors) <= 10:
+                messagebox.showwarning("部分股票失敗", "\n".join(errors))
+
+        self.root.after(0, finish_download)
 
     def analyze_local_market_snapshot(self):
-        if self.snapshot_results:
+        selected_label = self.download_category_var.get().strip() if hasattr(self, "download_category_var") else self.snapshot_category_label
+        json_path, _csv_path = get_category_snapshot_paths(selected_label)
+        if self.snapshot_results and self.snapshot_category_label == selected_label:
             raw_results = self.snapshot_results
-        elif os.path.exists(SNAPSHOT_JSON):
+        elif os.path.exists(json_path):
             try:
-                with open(SNAPSHOT_JSON, "r", encoding="utf-8") as f:
+                with open(json_path, "r", encoding="utf-8") as f:
                     raw_results = json.load(f)
+                self.snapshot_json_path = json_path
+                self.snapshot_category_label = selected_label
             except Exception as e:
                 messagebox.showerror("錯誤", f"讀取本地快照失敗：{e}")
                 return
         else:
-            messagebox.showwarning("提醒", "尚未下載上市資料，請先按「下載上市資料」。")
+            messagebox.showwarning("提醒", f"尚未下載分類資料：{selected_label}，請先按「下載分類資料」。")
             return
 
         self.scan_mode = "local_snapshot_analysis"
@@ -2121,7 +2241,7 @@ class GTCProApp:
         self.elite_results = elite
         self.results = a_grade
         self.render_results()
-        self.market_overview_var.set(build_local_scanner_overview(normalized, a_grade, elite))
+        self.market_overview_var.set(f"目前分類：{selected_label}\n" + build_local_scanner_overview(normalized, a_grade, elite))
         self.update_data_source_bar()
         self.last_update_time = datetime.now()
         self.next_refresh_sec = AUTO_REFRESH_MS // 1000
@@ -2131,12 +2251,10 @@ class GTCProApp:
             self.tree.selection_set(first_id)
             self.tree.focus(first_id)
             self.on_row_select()
-        self.set_status(f"本地分析完成：A級 {len(a_grade)} 檔，A級中的A級 {len(elite)} 檔。版本：{APP_VERSION}")
+        self.set_status(f"本地分析完成：{selected_label} ｜ A級 {len(a_grade)} 檔，A級中的A級 {len(elite)} 檔。版本：{APP_VERSION}")
 
     def run_full_market_a_scan(self):
-        self.download_full_market_snapshot()
-        if os.path.exists(SNAPSHOT_JSON):
-            self.analyze_local_market_snapshot()
+        self.download_selected_category_snapshot()
 
     def parse_symbols(self):
         raw = self.symbol_entry.get().strip()
