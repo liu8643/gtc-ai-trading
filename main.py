@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.7.5-UPGRADE2-FIXED-Institutional-Decision-System"
+APP_VERSION = "v5.1.7.6-UPGRADE2-FIXED2-Institutional-Decision-System"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -811,6 +811,16 @@ def get_strategy_level_score(level: str) -> int:
     return mapping.get(str(level).strip().upper(), 0)
 
 
+def normalize_rr_display(rr):
+    return "-" if rr is None else rr
+
+
+def get_display_target(target, signal: str, state_bucket: str):
+    if signal in ("轉弱警戒", "急跌風險", "跌破支撐") or state_bucket == "weak":
+        return "-"
+    return target
+
+
 def calc_trade_plan(data: dict) -> dict:
     support = float(data.get("support", 0) or 0)
     resistance = float(data.get("resistance", 0) or 0)
@@ -838,7 +848,7 @@ def calc_trade_plan(data: dict) -> dict:
 
     risk = entry_high - stop
     reward = target - entry_high
-    rr = round(reward / risk, 2) if (entry_high > 0 and stop > 0 and risk > 0 and reward > 0) else 0.0
+    rr = round(reward / risk, 2) if (entry_high > 0 and stop > 0 and risk > 0 and reward > 0) else None
 
     return {
         "entry_low": round_price(entry_low) if entry_low else 0.0,
@@ -1087,10 +1097,12 @@ def analyze_symbol(symbol: str) -> dict:
         result["trend_score"] * 0.3 +
         result["intraday_score"] * 0.2 +
         result["change_pct"] * 1.5 +
-        (10 if result["leader_candidate"] == "是" else 0) +
-        (4 if result["leader_candidate"] == "觀察" else 0)
+        (15 if result["leader_candidate"] == "是" else 0) +
+        (6 if result["leader_candidate"] == "觀察" else 0)
     )
     result.update(calc_trade_plan(result))
+    result["display_target_price"] = get_display_target(result.get("target_price"), result["signal"], result["state_bucket"])
+    result["display_rr"] = normalize_rr_display(result.get("rr"))
     result["summary_block"] = "\n".join([
         "【速讀摘要】",
         f"現價 / 漲跌幅 / 報價：{result['display_price']} / {result['change_pct']:+.2f}% / {result['display_note']}",
@@ -1098,7 +1110,7 @@ def analyze_symbol(symbol: str) -> dict:
         f"支撐 / 壓力 / 五檔：{result['support']} / {result['resistance']} / {result['orderbook_bias']}",
         f"燈號 / 訊號 / 建議 / 主升狀態：{result['light']} / {result['signal']} / {result['advice']} / {result['leader_candidate']}",
         f"交易類型 / 等級：{result['trade_type']} / {result['strategy_level']}",
-        f"目標價 / RR：{result['target_price']} / {result['rr']}",
+        f"目標價 / RR：{result['display_target_price']} / {result['display_rr']}",
         f"策略定位：狀態={result['state_bucket']} / 量價比={result['orderbook_ratio']} / RSI={result['rsi']}",
     ])
     result["ai_analysis"] = build_ai_analysis(result)
@@ -1553,7 +1565,7 @@ class GTCProApp:
                 values=(
                     idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"],
                     f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"],
-                    r["score"], r["strategy_level"], r["target_price"], r["rr"], r["leader_candidate"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
+                    r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"], r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
                     r["rsi"], r["orderbook_bias"], r["trade_type"], r["display_note"]
                 ),
                 tags=tuple(tags)
@@ -1653,7 +1665,7 @@ class GTCProApp:
             f"漲跌幅：{target['change_pct']:+.2f}%",
             "",
             target["summary_block"],
-            f"交易計畫：進場={target.get('entry_low',0)}~{target.get('entry_high',0)} / 停損={target.get('stop_loss',0)} / 目標={target.get('target_price',0)} / RR={target.get('rr',0)}",
+            f"交易計畫：進場={target.get('entry_low',0)}~{target.get('entry_high',0)} / 停損={target.get('stop_loss',0)} / 目標={target.get('display_target_price','-')} / RR={target.get('display_rr','-')}",
             "",
             "【五檔資訊】",
             f"買盤總量：{target['buy_qty']}",
@@ -1694,7 +1706,7 @@ class GTCProApp:
         ]
 
     def _build_advice_lines(self, target: dict):
-        rr_text = f"1:{target['rr']:.2f}" if target.get('rr', 0) > 0 else "-"
+        rr_text = f"1:{target['rr']:.2f}" if target.get('rr') is not None else "-"
         entry_text = (
             f"{target['entry_low']} ~ {target['entry_high']}"
             if target.get('entry_high', 0) > 0 else "弱勢不建議主動進場"
@@ -1709,7 +1721,7 @@ class GTCProApp:
             f"建議進場：{entry_text}",
             f"停損點：{target.get('stop_loss', 0)}",
             f"策略等級：{target['strategy_level']}",
-            f"第一目標：{target.get('target_price', target['resistance'])}",
+            f"第一目標：{target.get('display_target_price', '-') }",
             f"風險報酬比：{rr_text}",
             "",
             "【風險提醒】",
@@ -1845,7 +1857,16 @@ class GTCProApp:
         else:
             self.current_sort_column = col_name
             self.sort_reverse = True
-        self.results = sorted(self.results, key=lambda x: x[real_key], reverse=self.sort_reverse)
+        def sort_value(x):
+            v = x.get(real_key)
+            if real_key == "strategy_level_score":
+                return int(v or 0)
+            if real_key in ("target_price", "rr", "display_target_price", "display_rr"):
+                if v in (None, "-"):
+                    return float("-inf") if self.sort_reverse else float("inf")
+                return float(v)
+            return v
+        self.results = sorted(self.results, key=sort_value, reverse=self.sort_reverse)
         self.render_results()
 
 
@@ -1877,7 +1898,7 @@ class GTCProApp:
             row = [
                 str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:10], str(r["display_price"]),
                 f"{r['change_pct']:+.2f}%", r["signal"][:8], r["advice"][:8], str(r["score"]),
-                r["strategy_level"], str(r["target_price"]), str(r["rr"]), r["leader_candidate"]
+                r["strategy_level"], str(r["display_target_price"]), str(r["display_rr"]), r["leader_candidate"]
             ]
             for text, x in zip(row, x_positions):
                 c.drawString(x, y, str(text))
@@ -1935,7 +1956,7 @@ class GTCProApp:
         ]
         for idx, r in enumerate(self.results, start=1):
             overview_lines.append(
-                f"{idx}. {r['input_symbol']} {r['name']} / 現價={r['display_price']} / 漲跌幅={r['change_pct']:+.2f}% / 訊號={r['signal']} / 建議={r['advice']} / 分數={r['score']} / 等級={r['strategy_level']} / 目標價={r['target_price']} / RR={r['rr']} / 主升={r['leader_candidate']}"
+                f"{idx}. {r['input_symbol']} {r['name']} / 現價={r['display_price']} / 漲跌幅={r['change_pct']:+.2f}% / 訊號={r['signal']} / 建議={r['advice']} / 分數={r['score']} / 等級={r['strategy_level']} / 目標價={r['display_target_price']} / RR={r['display_rr']} / 主升={r['leader_candidate']}"
             )
         self._draw_wrapped_lines(c, font_name, overview_lines, 24, y, 760)
 
@@ -1993,7 +2014,7 @@ class GTCProApp:
             for idx, r in enumerate(self.results, start=1):
                 writer.writerow([
                     idx, r["light"], r["market"], r["input_symbol"], r["name"], r["display_price"], f"{r['change']:+.2f}",
-                    f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["strategy_level"], r["target_price"], r["rr"], r["leader_candidate"],
+                    f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"],
                     r["trend_score"], r["intraday_score"], r["support"], r["resistance"], r["rsi"],
                     r["orderbook_bias"], r["trade_type"], r["display_note"]
                 ])
