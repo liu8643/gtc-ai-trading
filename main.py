@@ -21,14 +21,16 @@ import io
 import json
 import re
 import threading
+import sqlite3
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.2.3.2-DATA-FLOW-FIX"
+APP_VERSION = "v5.3.0-REAL-DATA-ENGINE"
 AUTO_REFRESH_MS = 30000
 
 CACHE_ROOT = os.path.join(os.path.expanduser("~"), "GTC_A_SCANNER_CACHE")
 OFFICIAL_RAW_DIR = os.path.join(CACHE_ROOT, "official_daily")
 CATEGORY_SNAPSHOT_DIR = os.path.join(CACHE_ROOT, "category_snapshots")
+HISTORY_DB_PATH = os.path.join(CACHE_ROOT, "market_history.db")
 for _d in (CACHE_ROOT, OFFICIAL_RAW_DIR, CATEGORY_SNAPSHOT_DIR):
     os.makedirs(_d, exist_ok=True)
 
@@ -1645,32 +1647,163 @@ def _normalize_twse_openapi_df(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep_cols]
 
 
-def download_twse_official_daily_openapi() -> tuple[pd.DataFrame, str, str]:
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    today_key = datetime.now().strftime("%Y%m%d")
-    endpoint_candidates = [
-        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-        "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX",
+def init_history_db():
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_rankings (
+            trade_date TEXT NOT NULL,
+            category TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            market TEXT,
+            close REAL,
+            change_pct REAL,
+            signal TEXT,
+            advice TEXT,
+            decision TEXT,
+            win_rate REAL,
+            trading_score REAL,
+            score REAL,
+            level TEXT,
+            target_price REAL,
+            rr REAL,
+            leader_candidate TEXT,
+            today_pick TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (trade_date, category, code)
+        )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_results_to_history_db(trade_date: str, category: str, results: list[dict]):
+    init_history_db()
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        rows = []
+        for r in results:
+            rows.append((
+                trade_date, category, str(r.get("input_symbol", "")), r.get("name", ""), r.get("market", ""),
+                safe_float(r.get("display_price"), 0.0) or 0.0, safe_float(r.get("change_pct"), 0.0) or 0.0,
+                r.get("signal", ""), r.get("advice", ""), r.get("decision", ""), safe_float(r.get("win_rate"), 0.0) or 0.0,
+                safe_float(r.get("trading_score"), 0.0) or 0.0, safe_float(r.get("score"), 0.0) or 0.0,
+                r.get("strategy_level", ""), safe_float(r.get("display_target_price"), None), safe_float(r.get("rr"), None),
+                r.get("leader_candidate", ""), r.get("today_pick", "-")
+            ))
+        conn.executemany("""
+            INSERT OR REPLACE INTO daily_rankings (
+                trade_date, category, code, name, market, close, change_pct, signal, advice, decision,
+                win_rate, trading_score, score, level, target_price, rr, leader_candidate, today_pick
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, rows)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_history_dates(category: str | None = None) -> list[str]:
+    init_history_db()
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        if category:
+            cur = conn.execute("SELECT DISTINCT trade_date FROM daily_rankings WHERE category=? ORDER BY trade_date", (category,))
+        else:
+            cur = conn.execute("SELECT DISTINCT trade_date FROM daily_rankings ORDER BY trade_date")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def build_a_grade_ranking(results: list[dict], limit: int = 20) -> list[dict]:
+    return sorted(
+        [r for r in results if r.get("strategy_level") == "A"],
+        key=lambda x: (x.get("trading_score", 0), x.get("win_rate", 0), x.get("score", 0)),
+        reverse=True
+    )[:limit]
+
+
+def build_auto_top5(results: list[dict]) -> list[dict]:
+    candidates = [
+        r for r in results
+        if r.get("strategy_level") == "A" and r.get("decision") in ("STRONG BUY", "BUY", "WEAK BUY")
     ]
-    last_error = None
-    for url in endpoint_candidates:
-        try:
-            resp = requests.get(url, headers=headers, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict):
-                data = data.get("data") or data.get("records") or []
-            df = _normalize_twse_openapi_df(pd.DataFrame(data))
-            if df.empty:
+    return sorted(candidates, key=get_unified_sort_key, reverse=True)[:5]
+
+
+def run_simple_backtest(category: str, top_n: int = 5) -> dict:
+    dates = load_history_dates(category)
+    if len(dates) < 2:
+        return {"ok": False, "message": "歷史資料不足，至少需要兩個交易日。"}
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        trades = []
+        for i in range(len(dates) - 1):
+            d0, d1 = dates[i], dates[i + 1]
+            picks = pd.read_sql_query(
+                """
+                SELECT * FROM daily_rankings
+                WHERE trade_date=? AND category=? AND level='A'
+                ORDER BY trading_score DESC, win_rate DESC, score DESC
+                LIMIT ?
+                """, conn, params=(d0, category, top_n)
+            )
+            if picks.empty:
                 continue
-            raw_json_path = os.path.join(OFFICIAL_RAW_DIR, f"TWSE_OPENAPI_{today_key}.json")
-            with open(raw_json_path, "w", encoding="utf-8-sig") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            return df, raw_json_path, today_key
-        except Exception as e:
-            last_error = e
-            continue
-    raise ValueError(f"TWSE OpenAPI 無有效上市收盤資料，可能該日未開市或端點資料格式異動。{f' / {last_error}' if last_error else ''}")
+            nxt = pd.read_sql_query(
+                "SELECT code, close FROM daily_rankings WHERE trade_date=? AND category=?",
+                conn, params=(d1, category)
+            )
+            nxt_map = {str(r['code']): float(r['close']) for _, r in nxt.iterrows()}
+            for _, row in picks.iterrows():
+                code = str(row['code'])
+                if code not in nxt_map or float(row['close']) <= 0:
+                    continue
+                ret = (nxt_map[code] - float(row['close'])) / float(row['close']) * 100
+                trades.append({
+                    'trade_date': d0, 'next_date': d1, 'code': code, 'name': row['name'],
+                    'entry_close': float(row['close']), 'next_close': nxt_map[code], 'return_pct': round(ret, 2)
+                })
+        if not trades:
+            return {"ok": False, "message": "目前歷史資料無法形成有效回測樣本。"}
+        rets = [t['return_pct'] for t in trades]
+        win = sum(1 for x in rets if x > 0)
+        return {
+            "ok": True,
+            "samples": len(trades),
+            "avg_return": round(sum(rets) / len(rets), 2),
+            "win_rate": round(win / len(rets) * 100, 2),
+            "best": max(rets),
+            "worst": min(rets),
+            "trades": trades[:30],
+        }
+    finally:
+        conn.close()
+
+
+def download_twse_official_daily_csv(date_str: str | None = None) -> tuple[pd.DataFrame, str, str]:
+    if not date_str:
+        date_str = datetime.now().strftime("%Y%m%d")
+    url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={date_str}&type=ALLBUT0999"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    text = resp.text
+    df = parse_twse_mi_index_csv(text)
+    if df.empty:
+        raise ValueError("官方 CSV 無有效上市收盤資料，可能該日未開市或資料尚未產出。")
+    raw_csv_path = os.path.join(OFFICIAL_RAW_DIR, f"TWSE_MI_INDEX_{date_str}.csv")
+    with open(raw_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(text)
+    return df, raw_csv_path, date_str
+
+
+def download_twse_official_daily_csv() -> tuple[pd.DataFrame, str, str]:
+    # 保留舊函式名供相容，實際改走 CSV Data Engine
+    return download_twse_official_daily_csv()
 
 def filter_category_df(df: pd.DataFrame, category_name: str) -> pd.DataFrame:
     market, start_code, end_code = CATEGORY_OPTIONS.get(category_name, ("listed", None, None))
@@ -1694,7 +1827,7 @@ def load_local_category_snapshot(category_name: str) -> tuple[pd.DataFrame, str,
         if os.path.isfile(fpath):
             candidates.append((os.path.getmtime(fpath), fpath))
     if not candidates:
-        raise FileNotFoundError(f"找不到分類快照：{category_name}，請先下載官方 API。")
+        raise FileNotFoundError(f"找不到分類快照：{category_name}，請先抓每日收盤 CSV。")
     candidates.sort(reverse=True)
     latest = candidates[0][1]
     ext = os.path.splitext(latest)[1].lower()
@@ -1868,6 +2001,7 @@ class GTCProApp:
         self.snapshot_info_var = tk.StringVar(value="快照：尚未下載")
         self.data_source_var = tk.StringVar(value="資料來源：尚無資料")
         self._build_ui()
+        init_history_db()
         self.set_status(f"系統已就緒。當前版本：{APP_VERSION}")
 
 
@@ -1927,8 +2061,11 @@ class GTCProApp:
         self.category_combo = ttk.Combobox(toolbar_frame, textvariable=self.category_var, values=list(CATEGORY_OPTIONS.keys()), width=16, state="readonly")
         self.category_combo.pack(side="left", padx=(0, 6))
         self.category_combo.set("上市全部")
-        ttk.Button(toolbar_frame, text="下載官方API", command=self.download_selected_category_snapshot).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="抓每日收盤CSV", command=self.download_selected_category_snapshot).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar_frame, text="分析目前分類A級", command=self.analyze_selected_category_snapshot).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="A級排行榜", command=self.show_a_grade_ranking).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="AI策略回測", command=self.run_ai_backtest).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="自動選股TOP5", command=self.show_auto_top5).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar_frame, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar_frame, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar_frame, text="切換進階欄位", command=self.toggle_advanced_columns).pack(side="left", padx=(0, 6))
@@ -2088,8 +2225,8 @@ class GTCProApp:
 
     def _download_selected_category_snapshot_worker(self, category_name: str):
         try:
-            self.set_status(f"開始下載官方 API 並建立分類快照：{category_name}")
-            df, raw_json_path, use_date = download_twse_official_daily_openapi()
+            self.set_status(f"開始下載每日收盤 CSV 並建立分類快照：{category_name}")
+            df, raw_json_path, use_date = download_twse_official_daily_csv()
             category_df = filter_category_df(df, category_name)
             if category_df.empty:
                 raise ValueError(f"{category_name} 沒有符合的官方當日收盤資料。")
@@ -2097,7 +2234,7 @@ class GTCProApp:
             category_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
             category_df.to_json(json_path, orient="records", force_ascii=False, indent=2)
             self.snapshot_info_var.set(f"快照：{category_name} / {len(category_df)} 檔 / 日期={use_date} / {os.path.basename(json_path)}")
-            self.set_status(f"下載完成：{category_name} 共 {len(category_df)} 檔，已存到本地快照（API）。")
+            self.set_status(f"下載完成：{category_name} 共 {len(category_df)} 檔，已存到本地快照（CSV）。")
         except Exception as e:
             self.set_status(f"下載失敗：{category_name} / {e}")
             try:
@@ -2136,6 +2273,7 @@ class GTCProApp:
                     r["summary_block"] = "\n".join(summary_lines)
                 r["rank_score"] = calc_rank_score(r)
             self.results = sorted(local_results, key=get_unified_sort_key, reverse=True)
+            save_results_to_history_db(date_str, category_name, self.results)
             self.render_results()
             self.market_overview_var.set(build_market_overview(self.results))
             self.update_data_source_bar()
@@ -2147,13 +2285,66 @@ class GTCProApp:
                 self.tree.selection_set(first_id)
                 self.tree.focus(first_id)
                 self.on_row_select()
-            self.set_status(f"本地分析完成：{category_name} / 成功 {len(self.results)} 檔 / 失敗 {failed_rows} 檔")
+            a_count = len([r for r in self.results if r.get("strategy_level") == "A"])
+            self.set_status(f"本地分析完成：{category_name} / 成功 {len(self.results)} 檔 / A級 {a_count} 檔 / 失敗 {failed_rows} 檔")
         except Exception as e:
             self.set_status(f"本地分析失敗：{category_name} / {e}")
             try:
                 messagebox.showerror("分析失敗", f"{category_name}\n{e}")
             except Exception:
                 pass
+
+    def show_a_grade_ranking(self):
+        if not self.results:
+            messagebox.showwarning("提醒", "請先完成分類分析。")
+            return
+        ranking = build_a_grade_ranking(self.results, limit=20)
+        if not ranking:
+            messagebox.showinfo("A級排行榜", "目前沒有 A 級股票。")
+            return
+        lines = [f"【A級排行榜】分類：{self.category_var.get()} / 共 {len(ranking)} 檔"]
+        for i, r in enumerate(ranking, start=1):
+            lines.append(f"{i}. {r['input_symbol']} {r['name']} / 決策={r['decision']} / 勝率={r['win_rate']}% / 交易分={r['trading_score']} / RR={r['display_rr']}")
+        self.advice_text.delete("1.0", tk.END)
+        self.advice_text.insert(tk.END, "\n".join(lines))
+        self.set_status(f"已產生 A級排行榜：{self.category_var.get()} / {len(ranking)} 檔")
+
+    def show_auto_top5(self):
+        if not self.results:
+            messagebox.showwarning("提醒", "請先完成分類分析。")
+            return
+        picks = build_auto_top5(self.results)
+        if not picks:
+            messagebox.showinfo("自動選股 TOP5", "目前沒有符合條件的 TOP5。")
+            return
+        lines = [f"【自動選股 TOP5】分類：{self.category_var.get()}"]
+        for i, r in enumerate(picks, start=1):
+            lines.append(f"{i}. {r['input_symbol']} {r['name']} / 決策={r['decision']} / 勝率={r['win_rate']}% / 交易分={r['trading_score']} / 支撐={r['support']} / 目標={r['display_target_price']}")
+        self.advice_text.delete("1.0", tk.END)
+        self.advice_text.insert(tk.END, "\n".join(lines))
+        self.set_status(f"已產生自動選股 TOP5：{self.category_var.get()}")
+
+    def run_ai_backtest(self):
+        category_name = self.category_var.get().strip() or "上市全部"
+        result = run_simple_backtest(category_name, top_n=5)
+        if not result.get("ok"):
+            messagebox.showwarning("AI策略回測", result.get("message", "回測失敗"))
+            return
+        lines = [
+            f"【AI策略回測】分類：{category_name}",
+            f"樣本數：{result['samples']}",
+            f"平均報酬：{result['avg_return']}%",
+            f"勝率：{result['win_rate']}%",
+            f"最佳單筆：{result['best']}%",
+            f"最差單筆：{result['worst']}%",
+            "",
+            "【最近樣本】",
+        ]
+        for t in result['trades'][:15]:
+            lines.append(f"{t['trade_date']} -> {t['next_date']} / {t['code']} {t['name']} / {t['entry_close']} -> {t['next_close']} / {t['return_pct']}%")
+        self.advice_text.delete("1.0", tk.END)
+        self.advice_text.insert(tk.END, "\n".join(lines))
+        self.set_status(f"AI策略回測完成：{category_name} / 樣本 {result['samples']} / 勝率 {result['win_rate']}%")
 
     def parse_symbols(self):
         raw = self.symbol_entry.get().strip()
