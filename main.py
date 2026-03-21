@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.8.1-UPGRADE3-OPTIMIZED"
+APP_VERSION = "v5.1.8.2-UPGRADE3-OPTIMIZED-FINALSORT"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -968,6 +968,25 @@ def calc_rank_score(data: dict) -> float:
     )
 
 
+def get_unified_sort_key(data: dict):
+    """
+    統一排序規則：
+    1) 先套市場風控門檻，今日清單入選者永遠排前面
+    2) 入選與未入選各自依交易分排序
+    3) 交易分相同時，再用勝率 / 分數 / 決策等級補排序
+    讓主表前幾名與今日清單順序完全一致
+    """
+    pick_priority = 1 if data.get("today_pick") == "入選" else 0
+    return (
+        pick_priority,
+        float(data.get("trading_score", 0) or 0),
+        float(data.get("win_rate", 0) or 0),
+        float(data.get("score", 0) or 0),
+        get_decision_rank(data.get("decision", "")),
+        float(data.get("rank_score", 0) or 0),
+    )
+
+
 def build_today_pick_summary(results: list[dict]) -> str:
     picks = sorted(
         [r for r in results if r.get("today_pick") == "入選"],
@@ -1756,7 +1775,7 @@ class GTCProApp:
         for r in ok_results:
             r["today_pick"] = "入選" if is_today_pick(r, market_mode) else "-"
             r["rank_score"] = calc_rank_score(r)
-        self.results = sorted(ok_results, key=lambda x: x["rank_score"], reverse=True)
+        self.results = sorted(ok_results, key=get_unified_sort_key, reverse=True)
         self.render_results()
         self.market_overview_var.set(build_market_overview(self.results))
         self.update_data_source_bar()
