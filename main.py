@@ -1801,8 +1801,8 @@ def download_twse_official_daily_csv(date_str: str | None = None) -> tuple[pd.Da
     return df, raw_csv_path, date_str
 
 
-def download_twse_official_daily_csv() -> tuple[pd.DataFrame, str, str]:
-    # 保留舊函式名供相容，實際改走 CSV Data Engine
+# 相容保留：避免舊呼叫名稱造成遞迴；一律導向真正的 CSV 下載函式
+def download_twse_official_daily_csv_compat() -> tuple[pd.DataFrame, str, str]:
     return download_twse_official_daily_csv()
 
 def filter_category_df(df: pd.DataFrame, category_name: str) -> pd.DataFrame:
