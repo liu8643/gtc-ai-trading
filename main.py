@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.7.1-FINAL-MASTER-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
+APP_VERSION = "v5.1.7.2-FINAL-MASTER-PRO-TW-Realtime-Pro-AI-Wave-Fibo-Path"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -364,22 +364,22 @@ def calc_professional_sr(df: pd.DataFrame) -> dict:
 
 def build_trade_advice(close, ma20, ma60, score, rsi, support, resistance, change_pct, intraday_score=0, open_price=None, prev_close=None, trend_score=0, orderbook_bias="無"):
     if change_pct <= -9.0:
-        return "跌幅過大，先觀望/減碼"
+        return "觀望為主"
     if close < support:
-        return "跌破支撐，減碼 / 停損優先"
+        return "減碼/防守"
     if close > resistance and trend_score >= 82 and intraday_score >= 78 and orderbook_bias in ("買盤偏強", "買盤明顯偏強"):
-        return "突破可追"
+        return "突破追價"
     if score >= 95 and trend_score >= 90 and intraday_score >= 85:
-        return "拉回不破可偏多" if close >= resistance * 0.988 else "拉回布局"
+        return "拉回加碼"
     if score >= 82 and trend_score >= 80 and intraday_score >= 70 and change_pct > 0.5:
-        return "拉回布局"
+        return "低接布局"
     if score >= 45 and support <= close <= resistance:
         return "區間操作"
     if rsi > 70:
-        return "減碼/停利"
+        return "減碼/防守"
     if close < ma20 and close < ma60 and change_pct < 0:
-        return "轉弱觀望"
-    return "保守觀察/減碼"
+        return "減碼/防守"
+    return "觀望為主"
 
 
 def classify_trade_type(state_bucket: str, signal: str, advice: str) -> str:
@@ -686,20 +686,20 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
         score >= 75 and
         structure_bullish
     ):
-        return "整理偏多", "偏多觀察", "bullish"
+        return "整理偏多", "低接布局", "bullish"
 
     if change_pct <= -9.0 or intraday_score <= 15:
-        return "急跌風險", "跌幅過大，先觀望/減碼", "weak"
+        return "急跌風險", "觀望為主", "weak"
 
     if close < support * 0.997 or (close < support and intraday_score < 42):
-        return "跌破支撐", "跌破支撐，減碼 / 停損優先", "weak"
+        return "跌破支撐", "減碼/防守", "weak"
 
     if score >= 95 and trend_score >= 90 and intraday_score >= 85:
         if at_breakout and bullish_orderbook:
             return "突破強勢", "突破可追", "strong"
         if near_resistance:
-            return "強勢追蹤", "拉回不破可偏多", "strong"
-        return "強勢追蹤", "拉回布局", "strong"
+            return "強勢追蹤", "拉回加碼", "strong"
+        return "強勢追蹤", "拉回加碼", "strong"
 
     if (
         close > resistance and trend_score >= 82 and intraday_score >= 78 and score >= 86 and
@@ -712,8 +712,8 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
         change_pct >= 0.8 and above_open and above_prev and bullish_orderbook
     ):
         if near_resistance:
-            return "強勢追蹤", "拉回不破可偏多", "strong"
-        return "強勢追蹤", "拉回布局", "strong"
+            return "強勢追蹤", "拉回加碼", "strong"
+        return "強勢追蹤", "拉回加碼", "strong"
 
     # 專家規則：像 4979 這種「站穩中期均線、波段強、五檔偏多、但未完成有效突破」
     # 不再歸類為單純區間整理，升級為「整理偏多」
@@ -723,21 +723,21 @@ def evaluate_trade_state(close, prev_close, open_price, support, resistance, cha
         orderbook_bias in ("買盤偏強", "買盤明顯偏強") and 35 <= rsi <= 68 and
         (not resistance or close <= resistance * 1.03)
     ):
-        return "整理偏多", "偏多整理", "bullish"
+        return "整理偏多", "低接布局", "bullish"
 
     if (
         trend_score >= 72 and intraday_score >= 58 and score >= 70 and
         change_pct >= 0.3 and (above_open or structure_bullish)
     ):
-        return "偏多觀察", "拉回布局", "bullish"
+        return "偏多觀察", "低接布局", "bullish"
 
     if score >= 45 and support <= close <= resistance:
-        return "區間整理", "區間觀察", "range"
+        return "區間整理", "區間操作", "range"
 
     if score >= 30:
-        return "轉弱警戒", "保守觀察/減碼", "weak"
+        return "轉弱警戒", "減碼/防守", "weak"
 
-    return "轉弱警戒", "轉弱觀望", "weak"
+    return "轉弱警戒", "減碼/防守", "weak"
 
 
 def is_main_trend_candidate(data: dict) -> bool:
