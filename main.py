@@ -23,7 +23,7 @@ import re
 import threading
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.2.2.3-OFFICIAL-CSV-DATA-FIRST"
+APP_VERSION = "v5.2.3-OPENAPI-DATA-ENGINE"
 AUTO_REFRESH_MS = 30000
 
 CACHE_ROOT = os.path.join(os.path.expanduser("~"), "GTC_A_SCANNER_CACHE")
@@ -1590,21 +1590,87 @@ def parse_twse_mi_index_csv(csv_text: str) -> pd.DataFrame:
                 df[c] = df[c].astype(str).str.replace(",", "", regex=False)
     return df
 
-def download_twse_official_daily_csv(use_date: str | None = None) -> tuple[pd.DataFrame, str, str]:
-    if use_date is None:
-        use_date = datetime.now().strftime("%Y%m%d")
-    url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={use_date}&type=ALLBUT0999"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    text = resp.text
-    df = parse_twse_mi_index_csv(text)
-    if df.empty:
-        raise ValueError("官方 CSV 無有效上市收盤資料，可能該日未開市或資料格式異動。")
-    raw_csv_path = os.path.join(OFFICIAL_RAW_DIR, f"MI_INDEX_{use_date}.csv")
-    with open(raw_csv_path, "w", encoding="utf-8-sig", newline="") as f:
-        f.write(text)
-    return df, raw_csv_path, use_date
+def _normalize_twse_openapi_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    rename_map = {}
+    for c in df.columns:
+        s = str(c).strip()
+        if s in ("Code", "證券代號", "股票代號"):
+            rename_map[c] = "Code"
+        elif s in ("Name", "證券名稱", "股票名稱"):
+            rename_map[c] = "Name"
+        elif s in ("TradeVolume", "成交股數", "成交數量"):
+            rename_map[c] = "Volume"
+        elif s in ("TradeValue", "成交金額"):
+            rename_map[c] = "Amount"
+        elif s in ("成交筆數", "Transaction", "成交筆數 "):
+            rename_map[c] = "Trades"
+        elif s in ("OpeningPrice", "開盤價"):
+            rename_map[c] = "Open"
+        elif s in ("HighestPrice", "最高價"):
+            rename_map[c] = "High"
+        elif s in ("LowestPrice", "最低價"):
+            rename_map[c] = "Low"
+        elif s in ("ClosingPrice", "收盤價"):
+            rename_map[c] = "Close"
+        elif s in ("Dir", "漲跌(+/-)", "漲跌"):
+            rename_map[c] = "UpDown"
+        elif s in ("Change", "漲跌價差"):
+            rename_map[c] = "Change"
+        elif s in ("FinalBidPrice", "最後揭示買價"):
+            rename_map[c] = "Bid"
+        elif s in ("FinalBidVolume", "最後揭示買量"):
+            rename_map[c] = "BidVol"
+        elif s in ("FinalAskPrice", "最後揭示賣價"):
+            rename_map[c] = "Ask"
+        elif s in ("FinalAskVolume", "最後揭示賣量"):
+            rename_map[c] = "AskVol"
+        elif s in ("PEratio", "本益比"):
+            rename_map[c] = "PE"
+    df = df.rename(columns=rename_map).copy()
+    required = ["Code", "Name", "Open", "High", "Low", "Close"]
+    for c in required:
+        if c not in df.columns:
+            df[c] = ""
+    for c in ["Volume", "Trades", "Amount", "Open", "High", "Low", "Close", "Change", "Bid", "BidVol", "Ask", "AskVol", "PE"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.replace(",", "", regex=False).str.strip()
+    df["Code"] = df["Code"].astype(str).str.strip()
+    df = df[df["Code"].str.fullmatch(r"\d{4}", na=False)].reset_index(drop=True)
+    keep_cols = ["Code", "Name", "Volume", "Trades", "Amount", "Open", "High", "Low", "Close", "UpDown", "Change", "Bid", "BidVol", "Ask", "AskVol", "PE"]
+    for c in keep_cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[keep_cols]
+
+
+def download_twse_official_daily_openapi() -> tuple[pd.DataFrame, str, str]:
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    today_key = datetime.now().strftime("%Y%m%d")
+    endpoint_candidates = [
+        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+        "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX",
+    ]
+    last_error = None
+    for url in endpoint_candidates:
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("records") or []
+            df = _normalize_twse_openapi_df(pd.DataFrame(data))
+            if df.empty:
+                continue
+            raw_json_path = os.path.join(OFFICIAL_RAW_DIR, f"TWSE_OPENAPI_{today_key}.json")
+            with open(raw_json_path, "w", encoding="utf-8-sig") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            return df, raw_json_path, today_key
+        except Exception as e:
+            last_error = e
+            continue
+    raise ValueError(f"TWSE OpenAPI 無有效上市收盤資料，可能該日未開市或端點資料格式異動。{f' / {last_error}' if last_error else ''}")
 
 def filter_category_df(df: pd.DataFrame, category_name: str) -> pd.DataFrame:
     market, start_code, end_code = CATEGORY_OPTIONS.get(category_name, ("listed", None, None))
@@ -1713,9 +1779,9 @@ def analyze_snapshot_row(row: dict) -> dict:
         "change": round_price(change), "change_pct": change_pct, "signal": signal, "advice": advice, "score": score,
         "trend_score": trend_score, "intraday_score": intraday_score,
         "support": support, "resistance": resistance, "rsi": rsi, "ma5": ma5, "ma10": ma10,
-        "ma20": ma20, "ma60": ma60, "comment": "；".join(comments) + f"；盤中={intraday_comment}；來源=TWSE 官方當日收盤 CSV",
+        "ma20": ma20, "ma60": ma60, "comment": "；".join(comments) + f"；盤中={intraday_comment}；來源=TWSE OpenAPI 官方收盤資料",
         "risk_note": build_risk_note(close, support, resistance, rsi, score, change_pct),
-        "source": "TWSE 官方當日收盤 CSV", "fibo": fibo, "bid_prices": bid_prices,
+        "source": "TWSE OpenAPI 官方收盤資料", "fibo": fibo, "bid_prices": bid_prices,
         "ask_prices": ask_prices, "bid_vols": bid_vols, "ask_vols": ask_vols, "buy_qty": ob["buy_qty"],
         "sell_qty": ob["sell_qty"], "orderbook_ratio": ob["ratio"], "orderbook_bias": ob["bias"], "quote_time": "",
         "state_bucket": state_bucket,
@@ -1835,7 +1901,7 @@ class GTCProApp:
         self.category_combo = ttk.Combobox(toolbar_frame, textvariable=self.category_var, values=list(CATEGORY_OPTIONS.keys()), width=16, state="readonly")
         self.category_combo.pack(side="left", padx=(0, 6))
         self.category_combo.set("上市全部")
-        ttk.Button(toolbar_frame, text="下載官方CSV", command=self.download_selected_category_snapshot).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_frame, text="下載官方API", command=self.download_selected_category_snapshot).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar_frame, text="分析目前分類A級", command=self.analyze_selected_category_snapshot).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar_frame, text="啟用自動刷新", command=self.enable_auto_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar_frame, text="停止自動刷新", command=self.disable_auto_refresh).pack(side="left", padx=(0, 6))
@@ -1996,16 +2062,16 @@ class GTCProApp:
 
     def _download_selected_category_snapshot_worker(self, category_name: str):
         try:
-            self.set_status(f"開始下載官方 CSV 並建立分類快照：{category_name}")
-            df, raw_csv_path, use_date = download_twse_official_daily_csv()
+            self.set_status(f"開始下載官方 API 並建立分類快照：{category_name}")
+            df, raw_json_path, use_date = download_twse_official_daily_openapi()
             category_df = filter_category_df(df, category_name)
             if category_df.empty:
                 raise ValueError(f"{category_name} 沒有符合的官方當日收盤資料。")
             csv_path, json_path, _ = self._get_category_snapshot_paths(category_name)
             category_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
             category_df.to_json(json_path, orient="records", force_ascii=False, indent=2)
-            self.snapshot_info_var.set(f"快照：{category_name} / {len(category_df)} 檔 / 日期={use_date} / {os.path.basename(csv_path)}")
-            self.set_status(f"下載完成：{category_name} 共 {len(category_df)} 檔，已存到本地快照。")
+            self.snapshot_info_var.set(f"快照：{category_name} / {len(category_df)} 檔 / 日期={use_date} / {os.path.basename(json_path)}")
+            self.set_status(f"下載完成：{category_name} 共 {len(category_df)} 檔，已存到本地快照（API）。")
         except Exception as e:
             self.set_status(f"下載失敗：{category_name} / {e}")
             try:
@@ -2021,8 +2087,8 @@ class GTCProApp:
         try:
             csv_path, json_path, date_str = self._get_category_snapshot_paths(category_name)
             if not os.path.exists(csv_path):
-                raise FileNotFoundError(f"找不到分類快照：{os.path.basename(csv_path)}，請先下載官方 CSV。")
-            snap_df = pd.read_csv(csv_path, dtype=str).fillna("")
+                raise FileNotFoundError(f"找不到分類快照：{os.path.basename(json_path)}，請先下載官方 API。")
+            snap_df = pd.read_json(json_path, dtype=False).fillna("") if os.path.exists(json_path) else pd.read_csv(csv_path, dtype=str).fillna("")
             if snap_df.empty:
                 raise ValueError("分類快照為空，無法分析。")
             self.set_status(f"開始本地分析：{category_name} / {len(snap_df)} 檔")
