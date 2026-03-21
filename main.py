@@ -23,7 +23,7 @@ import re
 import threading
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.2.3-OPENAPI-DATA-ENGINE"
+APP_VERSION = "v5.2.3.2-DATA-FLOW-FIX"
 AUTO_REFRESH_MS = 30000
 
 CACHE_ROOT = os.path.join(os.path.expanduser("~"), "GTC_A_SCANNER_CACHE")
@@ -1684,6 +1684,32 @@ def filter_category_df(df: pd.DataFrame, category_name: str) -> pd.DataFrame:
 def category_safe_name(category_name: str) -> str:
     return category_name.replace("上市", "listed_").replace("上櫃", "otc_").replace("全部", "all").replace("-", "_").replace("/", "_").replace(" ", "")
 
+def load_local_category_snapshot(category_name: str) -> tuple[pd.DataFrame, str, str]:
+    safe_name = category_safe_name(category_name)
+    candidates = []
+    for fname in os.listdir(CATEGORY_SNAPSHOT_DIR):
+        if not fname.startswith(safe_name + "_"):
+            continue
+        fpath = os.path.join(CATEGORY_SNAPSHOT_DIR, fname)
+        if os.path.isfile(fpath):
+            candidates.append((os.path.getmtime(fpath), fpath))
+    if not candidates:
+        raise FileNotFoundError(f"找不到分類快照：{category_name}，請先下載官方 API。")
+    candidates.sort(reverse=True)
+    latest = candidates[0][1]
+    ext = os.path.splitext(latest)[1].lower()
+    if ext == ".json":
+        df = pd.read_json(latest, dtype=False).fillna("")
+    elif ext == ".csv":
+        df = pd.read_csv(latest, dtype=str).fillna("")
+    else:
+        raise ValueError(f"不支援的快照格式：{latest}")
+    if df.empty:
+        raise ValueError(f"分類快照為空：{os.path.basename(latest)}")
+    date_match = re.search(r"(20\d{6})", os.path.basename(latest))
+    date_str = date_match.group(1) if date_match else datetime.now().strftime("%Y%m%d")
+    return df, latest, date_str
+
 def calc_local_rsi_like(close: float, low: float, high: float, prev_close: float) -> float:
     rng = max(high - low, 0.01)
     pos = (close - low) / rng
@@ -2085,19 +2111,19 @@ class GTCProApp:
 
     def _analyze_selected_category_snapshot_worker(self, category_name: str):
         try:
-            csv_path, json_path, date_str = self._get_category_snapshot_paths(category_name)
-            if not os.path.exists(csv_path):
-                raise FileNotFoundError(f"找不到分類快照：{os.path.basename(json_path)}，請先下載官方 API。")
-            snap_df = pd.read_json(json_path, dtype=False).fillna("") if os.path.exists(json_path) else pd.read_csv(csv_path, dtype=str).fillna("")
-            if snap_df.empty:
-                raise ValueError("分類快照為空，無法分析。")
-            self.set_status(f"開始本地分析：{category_name} / {len(snap_df)} 檔")
+            snap_df, snapshot_path, date_str = load_local_category_snapshot(category_name)
+            self.snapshot_info_var.set(f"快照：{category_name} / {len(snap_df)} 檔 / 日期={date_str} / {os.path.basename(snapshot_path)}")
+            self.set_status(f"開始本地分析：{category_name} / {len(snap_df)} 檔 / 來源={os.path.basename(snapshot_path)}")
             local_results = []
+            failed_rows = 0
             for _, row in snap_df.iterrows():
                 try:
                     local_results.append(analyze_snapshot_row(row.to_dict()))
                 except Exception:
+                    failed_rows += 1
                     continue
+            if not local_results:
+                raise ValueError("本地快照已讀取，但沒有任何資料可成功轉入分析引擎，請檢查欄位 mapping。")
             market = get_market_data(local_results) if local_results else {}
             market_mode = get_market_mode(market) if local_results else ""
             for r in local_results:
@@ -2121,7 +2147,7 @@ class GTCProApp:
                 self.tree.selection_set(first_id)
                 self.tree.focus(first_id)
                 self.on_row_select()
-            self.set_status(f"本地分析完成：{category_name} / {len(self.results)} 檔")
+            self.set_status(f"本地分析完成：{category_name} / 成功 {len(self.results)} 檔 / 失敗 {failed_rows} 檔")
         except Exception as e:
             self.set_status(f"本地分析失敗：{category_name} / {e}")
             try:
