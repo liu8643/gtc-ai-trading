@@ -19,7 +19,7 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.7.4-UPGRADE2-Institutional-Decision-System"
+APP_VERSION = "v5.1.7.5-UPGRADE2-FIXED-Institutional-Decision-System"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -806,6 +806,10 @@ def get_strategy_level(score: int) -> str:
         return "C"
     return "D"
 
+def get_strategy_level_score(level: str) -> int:
+    mapping = {"A": 4, "B": 3, "C": 2, "D": 1}
+    return mapping.get(str(level).strip().upper(), 0)
+
 
 def calc_trade_plan(data: dict) -> dict:
     support = float(data.get("support", 0) or 0)
@@ -815,15 +819,15 @@ def calc_trade_plan(data: dict) -> dict:
 
     if state == "strong":
         entry_low = support * 1.002
-        entry_high = min(support * 1.012, resistance * 0.995)
+        entry_high = min(support * 1.012, resistance * 0.995) if resistance > 0 else support * 1.012
         stop = support * 0.982
     elif state == "bullish":
         entry_low = support * 1.000
-        entry_high = min(support * 1.010, resistance * 0.992)
+        entry_high = min(support * 1.010, resistance * 0.992) if resistance > 0 else support * 1.010
         stop = support * 0.978
     elif state == "range":
         entry_low = support * 0.998
-        entry_high = min(support * 1.006, resistance * 0.988)
+        entry_high = min(support * 1.006, resistance * 0.988) if resistance > 0 else support * 1.006
         stop = support * 0.972
     else:
         entry_low = 0.0
@@ -831,9 +835,10 @@ def calc_trade_plan(data: dict) -> dict:
         stop = support * 0.968 if support else 0.0
 
     target = max(resistance, fibo_target) if state in ("strong", "bullish") else resistance
-    rr = 0.0
-    if entry_high > stop > 0 and target > entry_high:
-        rr = round((target - entry_high) / (entry_high - stop), 2)
+
+    risk = entry_high - stop
+    reward = target - entry_high
+    rr = round(reward / risk, 2) if (entry_high > 0 and stop > 0 and risk > 0 and reward > 0) else 0.0
 
     return {
         "entry_low": round_price(entry_low) if entry_low else 0.0,
@@ -1071,12 +1076,20 @@ def analyze_symbol(symbol: str) -> dict:
         "orderbook_bias": rt.get("orderbook_bias", "無"), "quote_time": rt.get("quote_time", ""),
         "state_bucket": state_bucket,
         "strategy_level": get_strategy_level(score),
+        "strategy_level_score": get_strategy_level_score(get_strategy_level(score)),
         "target_price": fibo.get("next_target", resistance),
     }
     result["trade_type"] = classify_trade_type(state_bucket, signal, advice)
     result["light"] = get_light(result["signal"], result["score"], result["change_pct"], intraday_score=result["intraday_score"])
-    result["rank_score"] = result["trend_score"] * 0.35 + result["intraday_score"] * 0.45 + result["change_pct"] * 2.0
     result["leader_candidate"] = classify_leader_stage(result)
+    result["rank_score"] = (
+        result["score"] * 0.4 +
+        result["trend_score"] * 0.3 +
+        result["intraday_score"] * 0.2 +
+        result["change_pct"] * 1.5 +
+        (10 if result["leader_candidate"] == "是" else 0) +
+        (4 if result["leader_candidate"] == "觀察" else 0)
+    )
     result.update(calc_trade_plan(result))
     result["summary_block"] = "\n".join([
         "【速讀摘要】",
@@ -1401,6 +1414,10 @@ class GTCProApp:
         self.tree.tag_configure("strong", background="#fff2b3")
         self.tree.tag_configure("watch", background="#eef5ff")
         self.tree.tag_configure("danger", background="#ffd9d9")
+        self.tree.tag_configure("level_a", background="#fff2b3")
+        self.tree.tag_configure("level_b", background="#eef5ff")
+        self.tree.tag_configure("level_c", background="#f3f3f3")
+        self.tree.tag_configure("level_d", background="#fce8e8")
         self.tree.bind("<<TreeviewSelect>>", self.on_row_select)
         yscroll = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
         xscroll = ttk.Scrollbar(parent, orient="horizontal", command=self.tree.xview)
@@ -1520,6 +1537,15 @@ class GTCProApp:
                 tags.append("strong")
             elif r["score"] >= 65:
                 tags.append("watch")
+
+            level_tag_map = {
+                "A": "level_a",
+                "B": "level_b",
+                "C": "level_c",
+                "D": "level_d",
+            }
+            if r.get("strategy_level") in level_tag_map:
+                tags.append(level_tag_map[r["strategy_level"]])
 
             light = self.get_light(r["signal"], r["score"], r["change_pct"], r["intraday_score"])
             self.tree.insert(
@@ -1796,7 +1822,7 @@ class GTCProApp:
             "訊號": "signal",
             "建議": "advice",
             "分數": "score",
-            "等級": "strategy_level",
+            "等級": "strategy_level_score",
             "目標價": "target_price",
             "RR": "rr",
             "主升候選": "leader_candidate",
