@@ -16,6 +16,7 @@ GitHub ready build version
 import sqlite3
 import traceback
 import requests
+import sys
 import csv
 import io
 import re
@@ -38,14 +39,26 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-APP_NAME = "GTC AI Trading System v5.3.7 PRO-MASTER-FIX"
-BASE_DIR = Path(__file__).resolve().parent
+APP_NAME = "GTC AI Trading System v5.3.8 PRO-PATH-FIX"
+
+def get_base_dir() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
+def get_runtime_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+BASE_DIR = get_base_dir()          # 讀取打包資源（data）
+RUNTIME_DIR = get_runtime_dir()    # 執行目錄（db / charts）
+
 DATA_DIR = BASE_DIR / "data"
-CHART_DIR = BASE_DIR / "charts"
-DATA_DIR.mkdir(exist_ok=True)
+CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = DATA_DIR / "stock_system_v5_3_7.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v5_3_8.db"
 MASTER_CSV = DATA_DIR / "stocks_master.csv"
 
 
@@ -561,6 +574,7 @@ class AppUI:
         self._build_ui()
         self.refresh_filters()
         self.refresh_all_tables()
+        self.set_status(f"BASE={BASE_DIR} | DATA={DATA_DIR} | CSV={MASTER_CSV}")
 
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=8)
@@ -636,7 +650,7 @@ class AppUI:
     def init_master_data(self):
         try:
             if not MASTER_CSV.exists():
-                return messagebox.showerror("錯誤", f"找不到主檔：\n{MASTER_CSV}")
+                return messagebox.showerror("錯誤", f"找不到主檔：\n{MASTER_CSV}\n\nBASE_DIR={BASE_DIR}\nRUNTIME_DIR={RUNTIME_DIR}")
             self.db.import_master_csv(MASTER_CSV)
             master = self.db.get_master()
             self.refresh_filters()
@@ -792,7 +806,10 @@ class AppUI:
         return out
 
 
+LAST_BOOTSTRAP_MESSAGE = ""
+
 def bootstrap():
+    global LAST_BOOTSTRAP_MESSAGE
     db = DBManager(DB_PATH)
     db.init_db()
 
@@ -807,7 +824,7 @@ def bootstrap():
             master = db.get_master()
             init_message = f"已自動初始化股票主檔，共 {len(master)} 檔"
         elif master.empty and not csv_exists:
-            init_message = "找不到 stocks_master.csv，尚未初始化股票主檔"
+            init_message = f"找不到 stocks_master.csv：{MASTER_CSV}"
         else:
             init_message = f"股票主檔已載入，共 {len(master)} 檔"
     except Exception as e:
