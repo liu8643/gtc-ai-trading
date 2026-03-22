@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.4.2 PRO-ONE-CLICK-UPDATE
+GTC AI Trading System v5.5.0 PRO-MASTER-SELECTION-ENGINE
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -39,7 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v5.4.2 PRO-ONE-CLICK-UPDATE"
+APP_NAME = "GTC AI Trading System v5.5.0 PRO-MASTER-SELECTION-ENGINE"
 
 
 def get_base_dir() -> Path:
@@ -102,7 +102,7 @@ DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = RUNTIME_DIR / "stock_system_v5_4_2.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v5_5_0.db"
 MASTER_CSV = resolve_master_csv()
 
 
@@ -621,6 +621,89 @@ class RankingEngine:
         return len(df)
 
 
+
+class SelectionEngine:
+    @staticmethod
+    def prepare(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df.copy()
+
+        x = df.copy()
+        x["is_etf"] = x["market"].eq("ETF").astype(int)
+
+        def classify_bucket(row):
+            signal = str(row.get("signal", ""))
+            action = str(row.get("action", ""))
+            ai = float(row.get("ai_score", 0) or 0)
+            total = float(row.get("total_score", 0) or 0)
+            is_etf = int(row.get("is_etf", 0) or 0)
+
+            if is_etf:
+                if ai >= 55 and total >= 50:
+                    return "防守"
+                return "觀察"
+
+            if signal == "強勢追蹤" and action == "拉回加碼" and ai >= 65 and total >= 70:
+                return "主攻"
+            if signal in ("整理偏多", "強勢追蹤") and action in ("低接布局", "拉回加碼") and ai >= 55 and total >= 60:
+                return "次強"
+            if signal in ("區間整理", "中性觀察") and ai >= 45 and total >= 45:
+                return "觀察"
+            return "排除"
+
+        def selection_score(row):
+            ai = float(row.get("ai_score", 0) or 0)
+            total = float(row.get("total_score", 0) or 0)
+            signal = str(row.get("signal", ""))
+            action = str(row.get("action", ""))
+
+            bonus = 0.0
+            if signal == "強勢追蹤":
+                bonus += 8
+            elif signal == "整理偏多":
+                bonus += 4
+
+            if action == "拉回加碼":
+                bonus += 6
+            elif action == "低接布局":
+                bonus += 3
+            elif action == "區間操作":
+                bonus -= 2
+
+            return round(total * 0.55 + ai * 0.45 + bonus, 2)
+
+        x["bucket"] = x.apply(classify_bucket, axis=1)
+        x["selection_score"] = x.apply(selection_score, axis=1)
+        return x
+
+    @staticmethod
+    def build_trade_pool(df: pd.DataFrame) -> dict:
+        x = SelectionEngine.prepare(df)
+        if x.empty:
+            return {"master_top5": x, "attack": x, "watch": x, "defense": x}
+
+        attack = x[x["bucket"] == "主攻"].sort_values(["selection_score", "ai_score", "total_score"], ascending=False)
+        watch = x[x["bucket"].isin(["次強", "觀察"]) & (x["is_etf"] == 0)].sort_values(["selection_score", "ai_score", "total_score"], ascending=False)
+        defense = x[x["bucket"] == "防守"].sort_values(["selection_score", "ai_score", "total_score"], ascending=False)
+
+        master_top5 = pd.concat([attack.head(3), watch.head(2)], ignore_index=True)
+
+        if len(master_top5) < 5:
+            need = 5 - len(master_top5)
+            used = set(master_top5["stock_id"].tolist()) if not master_top5.empty else set()
+            extra = x[(~x["stock_id"].isin(list(used))) & (x["is_etf"] == 0)].sort_values(
+                ["selection_score", "ai_score", "total_score"], ascending=False
+            ).head(need)
+            master_top5 = pd.concat([master_top5, extra], ignore_index=True)
+
+        return {
+            "master_top5": master_top5.head(5),
+            "attack": attack.head(5),
+            "watch": watch.head(5),
+            "defense": defense.head(3),
+        }
+
+
 class AppUI:
     def __init__(self, root, db: DBManager):
         self.root = root
@@ -799,7 +882,10 @@ class AppUI:
                 r["theme"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name
             ))
 
-        self.set_status(f"已載入資料，共 {len(df)} 檔。")
+        pool = SelectionEngine.build_trade_pool(df)
+        attack_cnt = len(pool["attack"])
+        defense_cnt = len(pool["defense"])
+        self.set_status(f"已載入資料，共 {len(df)} 檔｜主攻 {attack_cnt}｜防守 {defense_cnt}")
 
     def update_data(self):
         try:
@@ -813,7 +899,7 @@ class AppUI:
             self.refresh_all_tables()
 
             self.set_status(
-                f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。"
+                f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔｜可查看 AI選股TOP5。"
             )
             messagebox.showinfo(
                 "完成",
@@ -842,11 +928,51 @@ class AppUI:
         df = self._filtered_ranking()
         if df.empty:
             return messagebox.showwarning("提醒", "尚無資料")
-        top5 = df.sort_values(["ai_score", "total_score"], ascending=False).head(5)
-        text = ["AI 選股 TOP5\n"]
-        for _, r in top5.iterrows():
-            text.append(f"{r['stock_id']} {r['stock_name']} | {r['industry']} | AI={r['ai_score']:.2f} | {r['action']}")
-        messagebox.showinfo("AI 選股 TOP5", "\n".join(text))
+
+        pool = SelectionEngine.build_trade_pool(df)
+        master_top5 = pool["master_top5"]
+        attack = pool["attack"]
+        watch = pool["watch"]
+        defense = pool["defense"]
+
+        lines = ["《大師級選股引擎》交易池", ""]
+
+        lines.append("【主攻 TOP5】")
+        if master_top5.empty:
+            lines.append("暫無符合條件個股")
+        else:
+            for i, (_, r) in enumerate(master_top5.iterrows(), start=1):
+                lines.append(
+                    f"{i}. {r['stock_id']} {r['stock_name']}｜{r['industry']}｜"
+                    f"總分={r['total_score']:.2f}｜AI={r['ai_score']:.2f}｜"
+                    f"選股分={r['selection_score']:.2f}｜{r['action']}"
+                )
+
+        lines.append("")
+        lines.append("【主攻候選】")
+        if attack.empty:
+            lines.append("暫無")
+        else:
+            for _, r in attack.iterrows():
+                lines.append(f"- {r['stock_id']} {r['stock_name']}｜{r['signal']}｜{r['action']}")
+
+        lines.append("")
+        lines.append("【次強觀察】")
+        if watch.empty:
+            lines.append("暫無")
+        else:
+            for _, r in watch.iterrows():
+                lines.append(f"- {r['stock_id']} {r['stock_name']}｜總分={r['total_score']:.2f}｜AI={r['ai_score']:.2f}")
+
+        lines.append("")
+        lines.append("【防守ETF】")
+        if defense.empty:
+            lines.append("暫無")
+        else:
+            for _, r in defense.iterrows():
+                lines.append(f"- {r['stock_id']} {r['stock_name']}｜AI={r['ai_score']:.2f}｜{r['action']}")
+
+        messagebox.showinfo("AI 選股 TOP5", "\n".join(lines))
 
     def on_select_stock(self, event=None):
         sel = self.rank_tree.selection()
