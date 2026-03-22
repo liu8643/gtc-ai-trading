@@ -27,7 +27,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="GTC_AI_Trading_System_v5_3_8_PRO_PATH_FIX",
+    name="main",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
