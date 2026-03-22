@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v6.0 FULL-INTEGRATED-TRADING
+GTC AI Trading System v6.0.1 FULL-INTEGRATED-TRADING-FIX
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -43,7 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v6.0 FULL-INTEGRATED-TRADING"
+APP_NAME = "GTC AI Trading System v6.0.1 FULL-INTEGRATED-TRADING-FIX"
 
 
 def get_base_dir() -> Path:
@@ -106,7 +106,7 @@ DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = RUNTIME_DIR / "stock_system_v6_0.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
 MASTER_CSV = resolve_master_csv()
 
 
@@ -533,108 +533,112 @@ class DataEngine:
         return pd.DataFrame()
 
     
-def download_history(self, stock_id: str, market: str, period: str = "2y") -> pd.DataFrame:
-    if yf is None:
-        return pd.DataFrame()
-    symbols = []
-    primary = self.yahoo_symbol(stock_id, market)
-    if primary:
-        symbols.append(primary)
-    if f"{stock_id}.TW" not in symbols:
-        symbols.append(f"{stock_id}.TW")
-    if f"{stock_id}.TWO" not in symbols:
-        symbols.append(f"{stock_id}.TWO")
-    seen = set()
-    for symbol in symbols:
-        if symbol in seen:
-            continue
-        seen.add(symbol)
-        try:
-            hist = yf.Ticker(symbol).history(period=period, auto_adjust=False)
-            if hist is None or hist.empty:
+
+
+    def download_history(self, stock_id: str, market: str, period: str = "2y") -> pd.DataFrame:
+        if yf is None:
+            return pd.DataFrame()
+        symbols = []
+        primary = self.yahoo_symbol(stock_id, market)
+        if primary:
+            symbols.append(primary)
+        if f"{stock_id}.TW" not in symbols:
+            symbols.append(f"{stock_id}.TW")
+        if f"{stock_id}.TWO" not in symbols:
+            symbols.append(f"{stock_id}.TWO")
+        seen = set()
+        for symbol in symbols:
+            if symbol in seen:
                 continue
-            hist = hist.rename(columns={
-                "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
-            }).reset_index()
-            date_col = "Date" if "Date" in hist.columns else "Datetime"
-            hist["date"] = pd.to_datetime(hist[date_col]).dt.strftime("%Y-%m-%d")
-            hist["turnover"] = hist["close"] * hist["volume"]
-            out = hist[["date", "open", "high", "low", "close", "volume", "turnover"]].copy()
-            for c in ["open", "high", "low", "close", "volume", "turnover"]:
-                out[c] = pd.to_numeric(out[c], errors="coerce")
-            out = out.dropna(subset=["close"])
-            if not out.empty:
-                return out
-        except Exception:
-            continue
-    return pd.DataFrame()
+            seen.add(symbol)
+            try:
+                hist = yf.Ticker(symbol).history(period=period, auto_adjust=False)
+                if hist is None or hist.empty:
+                    continue
+                hist = hist.rename(columns={
+                    "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
+                }).reset_index()
+                date_col = "Date" if "Date" in hist.columns else "Datetime"
+                hist["date"] = pd.to_datetime(hist[date_col]).dt.strftime("%Y-%m-%d")
+                hist["turnover"] = hist["close"] * hist["volume"]
+                out = hist[["date", "open", "high", "low", "close", "volume", "turnover"]].copy()
+                for c in ["open", "high", "low", "close", "volume", "turnover"]:
+                    out[c] = pd.to_numeric(out[c], errors="coerce")
+                out = out.dropna(subset=["close"])
+                if not out.empty:
+                    return out
+            except Exception:
+                continue
+        return pd.DataFrame()
 
-def build_full_history(self, min_days: int = 240, batch_size: int = 20, sleep_sec: float = 1.0, progress_cb=None) -> Tuple[int, int]:
-    master = self.db.get_master()
-    if master.empty:
-        return 0, 0
-    success = 0
-    rows = 0
-    total = len(master)
-    for idx, (_, row) in enumerate(master.iterrows(), start=1):
-        stock_id = str(row["stock_id"])
-        market = str(row["market"])
-        existing = self.db.get_price_history_count(stock_id)
-        if existing < min_days:
-            hist_df = self.download_history(stock_id, market, period="2y")
-            if not hist_df.empty:
-                self.db.upsert_price_history(stock_id, hist_df)
-                success += 1
-                rows += len(hist_df)
-        if progress_cb:
-            progress_cb(idx, total, stock_id)
-        if idx % batch_size == 0:
-            time.sleep(sleep_sec)
-    return success, rows
-
-def update_incremental(self) -> Tuple[int, int]:
+    def build_full_history(self, min_days: int = 240, batch_size: int = 20, sleep_sec: float = 1.0, progress_cb=None) -> Tuple[int, int]:
         master = self.db.get_master()
         if master.empty:
             return 0, 0
-
-        twse_df = self.fetch_twse_daily()
-        tpex_df = self.fetch_tpex_daily()
-
-        official_map = {}
-        if not twse_df.empty:
-            for _, row in twse_df.iterrows():
-                official_map[str(row["stock_id"])] = pd.DataFrame([row])
-        if not tpex_df.empty:
-            for _, row in tpex_df.iterrows():
-                official_map[str(row["stock_id"])] = pd.DataFrame([row])
-
         success = 0
         rows = 0
-
-        for _, row in master.iterrows():
+        total = len(master)
+        for idx, (_, row) in enumerate(master.iterrows(), start=1):
             stock_id = str(row["stock_id"])
             market = str(row["market"])
-            wrote_any = False
-
-            hist_count = self.db.get_price_history_count(stock_id)
-            if hist_count < 120:
-                hist_df = self.download_history(stock_id, market)
+            existing = self.db.get_price_history_count(stock_id)
+            if existing < min_days:
+                hist_df = self.download_history(stock_id, market, period="2y")
                 if not hist_df.empty:
                     self.db.upsert_price_history(stock_id, hist_df)
+                    success += 1
                     rows += len(hist_df)
-                    wrote_any = True
-
-            official_df = official_map.get(stock_id, pd.DataFrame())
-            if not official_df.empty:
-                self.db.upsert_price_history(stock_id, official_df)
-                rows += len(official_df)
-                wrote_any = True
-
-            if wrote_any:
-                success += 1
-
+            if progress_cb:
+                progress_cb(idx, total, stock_id)
+            if idx % batch_size == 0:
+                time.sleep(sleep_sec)
         return success, rows
 
+    def update_incremental(self, progress_cb=None) -> Tuple[int, int]:
+            master = self.db.get_master()
+            if master.empty:
+                return 0, 0
+
+            twse_df = self.fetch_twse_daily()
+            tpex_df = self.fetch_tpex_daily()
+
+            official_map = {}
+            if not twse_df.empty:
+                for _, row in twse_df.iterrows():
+                    official_map[str(row["stock_id"])] = pd.DataFrame([row])
+            if not tpex_df.empty:
+                for _, row in tpex_df.iterrows():
+                    official_map[str(row["stock_id"])] = pd.DataFrame([row])
+
+            success = 0
+            rows = 0
+
+            total = len(master)
+            for idx, (_, row) in enumerate(master.iterrows(), start=1):
+                stock_id = str(row["stock_id"])
+                market = str(row["market"])
+                wrote_any = False
+
+                hist_count = self.db.get_price_history_count(stock_id)
+                if hist_count < 120:
+                    hist_df = self.download_history(stock_id, market)
+                    if not hist_df.empty:
+                        self.db.upsert_price_history(stock_id, hist_df)
+                        rows += len(hist_df)
+                        wrote_any = True
+
+                official_df = official_map.get(stock_id, pd.DataFrame())
+                if not official_df.empty:
+                    self.db.upsert_price_history(stock_id, official_df)
+                    rows += len(official_df)
+                    wrote_any = True
+
+                if wrote_any:
+                    success += 1
+                if progress_cb:
+                    progress_cb(idx, total, stock_id)
+
+            return success, rows
 
 class IndicatorEngine:
     @staticmethod
