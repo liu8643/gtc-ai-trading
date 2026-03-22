@@ -1,5 +1,5 @@
-pandas
-yfinance
-reportlab
-lxml
-requests
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+yfinance>=0.2
+pyinstaller>=6.0
