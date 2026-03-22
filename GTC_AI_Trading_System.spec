@@ -8,7 +8,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ("data", "data"),
+        ("data/stocks_master.csv", "data"),
         ("charts", "charts"),
     ],
     hiddenimports=hiddenimports,
@@ -27,7 +27,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="GTC_AI_Trading_System_v5_3_7_PRO_MASTER_FIX",
+    name="GTC_AI_Trading_System_v5_3_8_PRO_PATH_FIX",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
