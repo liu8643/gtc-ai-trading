@@ -1,7 +1,7 @@
+
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.3.7 PRO-MASTER-FIX
-GitHub ready build version
+GTC AI Trading System v5.3.9 PRO-DATA-DUAL-FIX
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -18,7 +18,6 @@ import traceback
 import requests
 import sys
 import csv
-import io
 import re
 from datetime import datetime
 from pathlib import Path
@@ -39,29 +38,45 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-APP_NAME = "GTC AI Trading System v5.3.8 PRO-PATH-FIX"
+
+APP_NAME = "GTC AI Trading System v5.3.9 PRO-DATA-DUAL-FIX"
+
 
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS)
     return Path(__file__).resolve().parent
 
+
 def get_runtime_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
-BASE_DIR = get_base_dir()          # 讀取打包資源（data）
-RUNTIME_DIR = get_runtime_dir()    # 執行目錄（db / charts）
 
-DATA_DIR = BASE_DIR / "data"
+BASE_DIR = get_base_dir()
+RUNTIME_DIR = get_runtime_dir()
+
+PACKED_DATA_DIR = BASE_DIR / "data"
+EXTERNAL_DATA_DIR = RUNTIME_DIR / "data"
+
+
+def resolve_master_csv() -> Path:
+    packed_csv = PACKED_DATA_DIR / "stocks_master.csv"
+    external_csv = EXTERNAL_DATA_DIR / "stocks_master.csv"
+    if packed_csv.exists():
+        return packed_csv
+    if external_csv.exists():
+        return external_csv
+    return external_csv  # 優先顯示 exe 同層應放的位置
+
+
+DATA_DIR = PACKED_DATA_DIR if (PACKED_DATA_DIR / "stocks_master.csv").exists() else EXTERNAL_DATA_DIR
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = RUNTIME_DIR / "stock_system_v5_3_8.db"
-MASTER_CSV = DATA_DIR / "stocks_master.csv"
-
-
+DB_PATH = RUNTIME_DIR / "stock_system_v5_3_9.db"
+MASTER_CSV = resolve_master_csv()
 
 
 def normalize_csv_cell(v: str) -> str:
@@ -69,6 +84,7 @@ def normalize_csv_cell(v: str) -> str:
     if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
         s = s[1:-1]
     return s.strip()
+
 
 def parse_twse_mi_index_csv(csv_text: str) -> pd.DataFrame:
     rows = []
@@ -109,6 +125,7 @@ def parse_twse_mi_index_csv(csv_text: str) -> pd.DataFrame:
     df["turnover"] = df["close"] * df["volume"].fillna(0)
     return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
 
+
 def download_twse_official_daily_csv(date_str: str | None = None, fallback_days: int = 10) -> pd.DataFrame:
     base_date = datetime.strptime(date_str, "%Y%m%d") if date_str else datetime.now()
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
@@ -124,6 +141,7 @@ def download_twse_official_daily_csv(date_str: str | None = None, fallback_days:
         except Exception:
             continue
     return pd.DataFrame()
+
 
 class DBManager:
     def __init__(self, db_path: Path):
@@ -233,8 +251,14 @@ class DBManager:
                 volume=excluded.volume,
                 turnover=excluded.turnover
             """, (
-                stock_id, r["date"], float(r["open"]), float(r["high"]), float(r["low"]),
-                float(r["close"]), float(r["volume"]), float(r["turnover"])
+                stock_id,
+                str(r["date"]),
+                float(r["open"]) if pd.notna(r["open"]) else None,
+                float(r["high"]) if pd.notna(r["high"]) else None,
+                float(r["low"]) if pd.notna(r["low"]) else None,
+                float(r["close"]) if pd.notna(r["close"]) else None,
+                float(r["volume"]) if pd.notna(r["volume"]) else None,
+                float(r["turnover"]) if pd.notna(r["turnover"]) else None,
             ))
         self.conn.commit()
 
@@ -260,9 +284,6 @@ class DBManager:
         ORDER BY rr.rank_all ASC
         """
         return pd.read_sql_query(q, self.conn)
-
-
-
 
 
 class DataEngine:
@@ -384,8 +405,6 @@ class DataEngine:
 
 
 class IndicatorEngine:
-
-
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
         x = df.copy()
@@ -411,8 +430,8 @@ class IndicatorEngine:
         low_min = x["low"].rolling(9).min()
         high_max = x["high"].rolling(9).max()
         rsv = (x["close"] - low_min) / (high_max - low_min).replace(0, np.nan) * 100
-        x["k"] = rsv.ewm(alpha=1/3, adjust=False).mean()
-        x["d"] = x["k"].ewm(alpha=1/3, adjust=False).mean()
+        x["k"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
+        x["d"] = x["k"].ewm(alpha=1 / 3, adjust=False).mean()
         return x
 
 
@@ -459,8 +478,8 @@ class StrategyEngine:
         vol20 = 0.02 if pd.isna(vol20) else float(vol20)
         risk = StrategyEngine._clamp(100 - vol20 * 1500)
 
-        ai = StrategyEngine._clamp(momentum*0.2 + trend*0.25 + reversal*0.15 + volume*0.15 + risk*0.25)
-        total = StrategyEngine._clamp(momentum*0.22 + trend*0.28 + reversal*0.15 + volume*0.15 + risk*0.1 + ai*0.1)
+        ai = StrategyEngine._clamp(momentum * 0.2 + trend * 0.25 + reversal * 0.15 + volume * 0.15 + risk * 0.25)
+        total = StrategyEngine._clamp(momentum * 0.22 + trend * 0.28 + reversal * 0.15 + volume * 0.15 + risk * 0.10 + ai * 0.10)
 
         signal, action = StrategyEngine.signal_action(last, total)
         return {
@@ -574,7 +593,7 @@ class AppUI:
         self._build_ui()
         self.refresh_filters()
         self.refresh_all_tables()
-        self.set_status(f"BASE={BASE_DIR} | DATA={DATA_DIR} | CSV={MASTER_CSV}")
+        self.set_status(f"PACKED={PACKED_DATA_DIR} | EXTERNAL={EXTERNAL_DATA_DIR} | CSV={MASTER_CSV}")
 
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=8)
@@ -619,17 +638,17 @@ class AppUI:
         left.add(self.tab_sector, text="類股熱度")
         left.add(self.tab_theme, text="題材輪動")
 
-        self.rank_tree = self._make_tree(self.tab_rank, ("rank","id","name","industry","theme","total","ai","signal","action"), {
-            "rank":"排名","id":"代號","name":"名稱","industry":"產業","theme":"題材","total":"總分","ai":"AI分","signal":"訊號","action":"建議"
+        self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "industry", "theme", "total", "ai", "signal", "action"), {
+            "rank": "排名", "id": "代號", "name": "名稱", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
         })
         self.rank_tree.bind("<<TreeviewSelect>>", self.on_select_stock)
 
-        self.sector_tree = self._make_tree(self.tab_sector, ("industry","count","avg_total","avg_ai","top_name"), {
-            "industry":"產業","count":"檔數","avg_total":"平均總分","avg_ai":"平均AI分","top_name":"代表股"
+        self.sector_tree = self._make_tree(self.tab_sector, ("industry", "count", "avg_total", "avg_ai", "top_name"), {
+            "industry": "產業", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.theme_tree = self._make_tree(self.tab_theme, ("theme","count","avg_total","avg_ai","top_name"), {
-            "theme":"題材","count":"檔數","avg_total":"平均總分","avg_ai":"平均AI分","top_name":"代表股"
+        self.theme_tree = self._make_tree(self.tab_theme, ("theme", "count", "avg_total", "avg_ai", "top_name"), {
+            "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
         self.detail = tk.Text(right, wrap="word", font=("Consolas", 11))
@@ -639,7 +658,7 @@ class AppUI:
         tree = ttk.Treeview(parent, columns=cols, show="headings", height=28)
         for c in cols:
             tree.heading(c, text=headers[c])
-            tree.column(c, width=140 if c not in ("rank","count","avg_total","avg_ai","id","total","ai") else 90, anchor="center")
+            tree.column(c, width=140 if c not in ("rank", "count", "avg_total", "avg_ai", "id", "total", "ai") else 90, anchor="center")
         tree.pack(fill="both", expand=True)
         return tree
 
@@ -649,14 +668,23 @@ class AppUI:
 
     def init_master_data(self):
         try:
-            if not MASTER_CSV.exists():
-                return messagebox.showerror("錯誤", f"找不到主檔：\n{MASTER_CSV}\n\nBASE_DIR={BASE_DIR}\nRUNTIME_DIR={RUNTIME_DIR}")
-            self.db.import_master_csv(MASTER_CSV)
+            csv_path = resolve_master_csv()
+            if not csv_path.exists():
+                return messagebox.showerror(
+                    "錯誤",
+                    f"找不到主檔：\n{csv_path}\n\n"
+                    f"PACKED_DATA_DIR={PACKED_DATA_DIR}\n"
+                    f"EXTERNAL_DATA_DIR={EXTERNAL_DATA_DIR}\n"
+                    f"BASE_DIR={BASE_DIR}\n"
+                    f"RUNTIME_DIR={RUNTIME_DIR}"
+                )
+
+            self.db.import_master_csv(csv_path)
             master = self.db.get_master()
             self.refresh_filters()
             self.refresh_all_tables()
-            messagebox.showinfo("完成", f"股票清單初始化完成\n共 {len(master)} 檔")
-            self.set_status(f"股票清單初始化完成，共 {len(master)} 檔。")
+            messagebox.showinfo("完成", f"股票清單初始化完成\n共 {len(master)} 檔\n\n使用主檔：{csv_path}")
+            self.set_status(f"股票清單初始化完成，共 {len(master)} 檔。主檔：{csv_path}")
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("錯誤", f"初始化失敗：\n{e}")
@@ -705,8 +733,8 @@ class AppUI:
 
         sector = (
             df.groupby("industry", as_index=False)
-            .agg(count=("stock_id","count"), avg_total=("total_score","mean"), avg_ai=("ai_score","mean"))
-            .sort_values(["avg_total","avg_ai"], ascending=False)
+            .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
+            .sort_values(["avg_total", "avg_ai"], ascending=False)
         )
         for _, r in sector.iterrows():
             top_name = df[df["industry"] == r["industry"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
@@ -716,8 +744,8 @@ class AppUI:
 
         theme = (
             df.groupby("theme", as_index=False)
-            .agg(count=("stock_id","count"), avg_total=("total_score","mean"), avg_ai=("ai_score","mean"))
-            .sort_values(["avg_total","avg_ai"], ascending=False)
+            .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
+            .sort_values(["avg_total", "avg_ai"], ascending=False)
         )
         for _, r in theme.iterrows():
             top_name = df[df["theme"] == r["theme"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
@@ -751,7 +779,7 @@ class AppUI:
         df = self._filtered_ranking()
         if df.empty:
             return messagebox.showwarning("提醒", "尚無資料")
-        top5 = df.sort_values(["ai_score","total_score"], ascending=False).head(5)
+        top5 = df.sort_values(["ai_score", "total_score"], ascending=False).head(5)
         text = ["AI 選股 TOP5\n"]
         for _, r in top5.iterrows():
             text.append(f"{r['stock_id']} {r['stock_name']} | {r['industry']} | AI={r['ai_score']:.2f} | {r['action']}")
@@ -806,25 +834,24 @@ class AppUI:
         return out
 
 
-LAST_BOOTSTRAP_MESSAGE = ""
-
 def bootstrap():
-    global LAST_BOOTSTRAP_MESSAGE
     db = DBManager(DB_PATH)
     db.init_db()
 
     init_message = "股票主檔已就緒"
     try:
         master = db.get_master()
-        csv_exists = MASTER_CSV.exists()
+        csv_path = resolve_master_csv()
 
-        # 自動初始化 master：只要 DB 為空且 CSV 存在，就自動匯入
-        if master.empty and csv_exists:
-            db.import_master_csv(MASTER_CSV)
+        if master.empty and csv_path.exists():
+            db.import_master_csv(csv_path)
             master = db.get_master()
-            init_message = f"已自動初始化股票主檔，共 {len(master)} 檔"
-        elif master.empty and not csv_exists:
-            init_message = f"找不到 stocks_master.csv：{MASTER_CSV}"
+            init_message = f"已自動初始化股票主檔，共 {len(master)} 檔 | {csv_path}"
+        elif master.empty and not csv_path.exists():
+            init_message = (
+                f"找不到 stocks_master.csv | "
+                f"PACKED={PACKED_DATA_DIR} | EXTERNAL={EXTERNAL_DATA_DIR}"
+            )
         else:
             init_message = f"股票主檔已載入，共 {len(master)} 檔"
     except Exception as e:
@@ -845,6 +872,7 @@ def main():
 
     root.protocol("WM_DELETE_WINDOW", _close)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
