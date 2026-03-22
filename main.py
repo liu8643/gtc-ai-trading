@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.3.9 PRO-DATA-DUAL-FIX
+GTC AI Trading System v5.4.0 PRO-AUTO-MASTER-FIX
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -39,7 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v5.3.9 PRO-DATA-DUAL-FIX"
+APP_NAME = "GTC AI Trading System v5.4.0 PRO-AUTO-MASTER-FIX"
 
 
 def get_base_dir() -> Path:
@@ -57,25 +57,52 @@ def get_runtime_dir() -> Path:
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
 
+
 PACKED_DATA_DIR = BASE_DIR / "data"
 EXTERNAL_DATA_DIR = RUNTIME_DIR / "data"
 
+DEFAULT_MASTER_CSV = """stock_id,stock_name,market,industry,theme,sub_theme,is_etf,is_active,update_date
+2330,台積電,上市,半導體,AI/晶圓代工,高權值,0,1,2026-03-22
+2454,聯發科,上市,半導體,IC設計,高權值,0,1,2026-03-22
+2317,鴻海,上市,電子代工,AI伺服器,高權值,0,1,2026-03-22
+3231,緯創,上市,電子代工,AI伺服器,伺服器,0,1,2026-03-22
+2382,廣達,上市,電子代工,AI伺服器,伺服器,0,1,2026-03-22
+6669,緯穎,上市,電子代工,AI伺服器,伺服器,0,1,2026-03-22
+2308,台達電,上市,電源/電機,電源/HVDC,電源,0,1,2026-03-22
+3017,奇鋐,上市,散熱,AI散熱,液冷,0,1,2026-03-22
+3324,雙鴻,上市,散熱,AI散熱,液冷,0,1,2026-03-22
+3596,智易,上市,網通,網通,寬頻,0,1,2026-03-22
+2345,智邦,上市,網通,資料中心交換器,高階網通,0,1,2026-03-22
+4979,華星光,上櫃,光通訊,CPO/光模組,高速光通訊,0,1,2026-03-22
+3443,創意,上市,半導體,ASIC,AI ASIC,0,1,2026-03-22
+6533,晶心科,上市,半導體,RISC-V,IP,0,1,2026-03-22
+0050,元大台灣50,ETF,ETF,大型權值,ETF,1,1,2026-03-22
+0056,元大高股息,ETF,ETF,高股息,ETF,1,1,2026-03-22
+00919,群益台灣精選高息,ETF,ETF,高股息,ETF,1,1,2026-03-22
+00929,復華台灣科技優息,ETF,ETF,科技高息,ETF,1,1,2026-03-22
+"""
+
+def ensure_external_master_csv() -> Path:
+    EXTERNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    external_csv = EXTERNAL_DATA_DIR / "stocks_master.csv"
+    if not external_csv.exists():
+        external_csv.write_text(DEFAULT_MASTER_CSV, encoding="utf-8-sig")
+    return external_csv
 
 def resolve_master_csv() -> Path:
-    packed_csv = PACKED_DATA_DIR / "stocks_master.csv"
     external_csv = EXTERNAL_DATA_DIR / "stocks_master.csv"
-    if packed_csv.exists():
-        return packed_csv
+    packed_csv = PACKED_DATA_DIR / "stocks_master.csv"
     if external_csv.exists():
         return external_csv
-    return external_csv  # 優先顯示 exe 同層應放的位置
+    if packed_csv.exists():
+        return packed_csv
+    return ensure_external_master_csv()
 
-
-DATA_DIR = PACKED_DATA_DIR if (PACKED_DATA_DIR / "stocks_master.csv").exists() else EXTERNAL_DATA_DIR
+DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists() else PACKED_DATA_DIR
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = RUNTIME_DIR / "stock_system_v5_3_9.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v5_4_0.db"
 MASTER_CSV = resolve_master_csv()
 
 
@@ -268,6 +295,11 @@ class DBManager:
             self.conn, params=[stock_id]
         )
 
+    def get_price_history_count(self, stock_id: str) -> int:
+        cur = self.conn.cursor()
+        row = cur.execute("SELECT COUNT(*) FROM price_history WHERE stock_id=?", (stock_id,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
     def replace_ranking(self, df: pd.DataFrame):
         today = datetime.now().strftime("%Y-%m-%d")
         cur = self.conn.cursor()
@@ -373,35 +405,49 @@ class DataEngine:
         except Exception:
             return pd.DataFrame()
 
-    def update_all(self) -> Tuple[int, int]:
-        master = self.db.get_master()
-        if master.empty:
-            return 0, 0
 
-        twse_df = self.fetch_twse_daily()
-        tpex_df = self.fetch_tpex_daily()
+def update_all(self) -> Tuple[int, int]:
+    master = self.db.get_master()
+    if master.empty:
+        return 0, 0
 
-        official_map = {}
-        if not twse_df.empty:
-            for _, row in twse_df.iterrows():
-                official_map[str(row["stock_id"])] = pd.DataFrame([row])
-        if not tpex_df.empty:
-            for _, row in tpex_df.iterrows():
-                official_map[str(row["stock_id"])] = pd.DataFrame([row])
+    twse_df = self.fetch_twse_daily()
+    tpex_df = self.fetch_tpex_daily()
 
-        success = 0
-        rows = 0
-        for _, row in master.iterrows():
-            stock_id = str(row["stock_id"])
-            market = str(row["market"])
-            df = official_map.get(stock_id, pd.DataFrame())
-            if df.empty:
-                df = self.download_history(stock_id, market)
-            if not df.empty:
-                self.db.upsert_price_history(stock_id, df)
-                success += 1
-                rows += len(df)
-        return success, rows
+    official_map = {}
+    if not twse_df.empty:
+        for _, row in twse_df.iterrows():
+            official_map[str(row["stock_id"])] = pd.DataFrame([row])
+    if not tpex_df.empty:
+        for _, row in tpex_df.iterrows():
+            official_map[str(row["stock_id"])] = pd.DataFrame([row])
+
+    success = 0
+    rows = 0
+
+    for _, row in master.iterrows():
+        stock_id = str(row["stock_id"])
+        market = str(row["market"])
+        wrote_any = False
+
+        hist_count = self.db.get_price_history_count(stock_id)
+        if hist_count < 120:
+            hist_df = self.download_history(stock_id, market)
+            if not hist_df.empty:
+                self.db.upsert_price_history(stock_id, hist_df)
+                rows += len(hist_df)
+                wrote_any = True
+
+        official_df = official_map.get(stock_id, pd.DataFrame())
+        if not official_df.empty:
+            self.db.upsert_price_history(stock_id, official_df)
+            rows += len(official_df)
+            wrote_any = True
+
+        if wrote_any:
+            success += 1
+
+    return success, rows
 
 
 class IndicatorEngine:
@@ -843,17 +889,12 @@ def bootstrap():
         master = db.get_master()
         csv_path = resolve_master_csv()
 
-        if master.empty and csv_path.exists():
+        if master.empty:
             db.import_master_csv(csv_path)
             master = db.get_master()
             init_message = f"已自動初始化股票主檔，共 {len(master)} 檔 | {csv_path}"
-        elif master.empty and not csv_path.exists():
-            init_message = (
-                f"找不到 stocks_master.csv | "
-                f"PACKED={PACKED_DATA_DIR} | EXTERNAL={EXTERNAL_DATA_DIR}"
-            )
         else:
-            init_message = f"股票主檔已載入，共 {len(master)} 檔"
+            init_message = f"股票主檔已載入，共 {len(master)} 檔 | {csv_path}"
     except Exception as e:
         init_message = f"股票主檔初始化失敗：{e}"
 
