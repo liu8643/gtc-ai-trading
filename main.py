@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.7.0 PRO-REAL-INTEGRATED-TRADING
+GTC AI Trading System v5.8.0 PRO-FULL-UNIVERSE
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -39,7 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v5.7.0 PRO-REAL-INTEGRATED-TRADING"
+APP_NAME = "GTC AI Trading System v5.8.0 PRO-FULL-UNIVERSE"
 
 
 def get_base_dir() -> Path:
@@ -102,7 +102,7 @@ DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = RUNTIME_DIR / "stock_system_v5_7_0.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v5_8_0.db"
 MASTER_CSV = resolve_master_csv()
 
 
@@ -168,6 +168,130 @@ def download_twse_official_daily_csv(date_str: str | None = None, fallback_days:
         except Exception:
             continue
     return pd.DataFrame()
+
+
+def _normalize_master_df(df: pd.DataFrame, market_label: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+
+    df = df.copy()
+    rename_map = {
+        "Code": "stock_id",
+        "證券代號": "stock_id",
+        "SecuritiesCompanyCode": "stock_id",
+        "CompanyCode": "stock_id",
+        "Name": "stock_name",
+        "證券名稱": "stock_name",
+        "CompanyName": "stock_name",
+        "股票名稱": "stock_name",
+        "股票代號": "stock_id",
+    }
+    df = df.rename(columns=rename_map)
+
+    if "stock_id" not in df.columns:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+
+    if "stock_name" not in df.columns:
+        df["stock_name"] = df["stock_id"]
+
+    df["stock_id"] = df["stock_id"].astype(str).str.strip()
+    df["stock_name"] = df["stock_name"].astype(str).str.strip()
+    df = df[df["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+
+    df["market"] = market_label
+    df["industry"] = "未分類"
+    df["theme"] = "全市場"
+    df["sub_theme"] = "系統掃描"
+    df["is_etf"] = df["stock_id"].astype(str).str.startswith("00").astype(int)
+    df["is_active"] = 1
+    df["update_date"] = datetime.now().strftime("%Y-%m-%d")
+
+    df.loc[df["is_etf"] == 1, "market"] = "ETF"
+    df.loc[df["is_etf"] == 1, "industry"] = "ETF"
+    df.loc[df["is_etf"] == 1, "theme"] = "ETF"
+
+    name_series = df["stock_name"].fillna("").astype(str)
+    df.loc[name_series.str.contains("台灣50|高股息|ETF|科技優息|精選高息", regex=True), ["market", "industry", "theme", "is_etf"]] = ["ETF", "ETF", "ETF", 1]
+    df.loc[name_series.str.contains("電|控|達", regex=True), "industry"] = df["industry"].where(~name_series.str.contains("電|控|達", regex=True), "電源/電機")
+    df.loc[name_series.str.contains("光|網|智邦|智易|聯亞", regex=True), "industry"] = df["industry"].where(~name_series.str.contains("光|網|智邦|智易|聯亞", regex=True), "網通/光通訊")
+    df.loc[name_series.str.contains("積電|聯發科|創意|晶心|半導體", regex=True), "industry"] = df["industry"].where(~name_series.str.contains("積電|聯發科|創意|晶心|半導體", regex=True), "半導體")
+
+    df = df[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]]
+    return df.drop_duplicates(subset=["stock_id"]).sort_values(["market", "stock_id"]).reset_index(drop=True)
+
+
+def fetch_twse_universe() -> pd.DataFrame:
+    urls = [
+        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+        "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json",
+    ]
+    for url in urls:
+        try:
+            res = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            res.raise_for_status()
+            data = res.json()
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("records") or []
+            df = pd.DataFrame(data)
+            if df.empty:
+                continue
+            return _normalize_master_df(df, "上市")
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def fetch_tpex_universe() -> pd.DataFrame:
+    urls = [
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+        "https://www.tpex.org.tw/openapi/v1/tpex_esb_quotes",
+    ]
+    for url in urls:
+        try:
+            res = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            res.raise_for_status()
+            data = res.json()
+            df = pd.DataFrame(data)
+            if df.empty:
+                continue
+            x = _normalize_master_df(df, "上櫃")
+            if not x.empty:
+                return x
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def build_full_market_universe() -> pd.DataFrame:
+    twse = fetch_twse_universe()
+    tpex = fetch_tpex_universe()
+    all_df = pd.concat([twse, tpex], ignore_index=True)
+    if all_df.empty:
+        return all_df
+
+    all_df = all_df.drop_duplicates(subset=["stock_id"]).reset_index(drop=True)
+
+    try:
+        csv_path = resolve_master_csv()
+        if csv_path.exists():
+            csv_df = pd.read_csv(csv_path, dtype={"stock_id": str}).fillna("")
+            csv_df["stock_id"] = csv_df["stock_id"].astype(str).str.strip()
+            csv_df = csv_df[csv_df["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+            keep_cols = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
+            for c in keep_cols:
+                if c not in csv_df.columns:
+                    csv_df[c] = ""
+            csv_df = csv_df[keep_cols].drop_duplicates(subset=["stock_id"])
+            all_df = all_df.set_index("stock_id")
+            csv_df = csv_df.set_index("stock_id")
+            all_df.update(csv_df)
+            all_df = all_df.reset_index()
+    except Exception:
+        pass
+
+    return all_df.sort_values(["market", "industry", "stock_id"]).reset_index(drop=True)
 
 
 class DBManager:
@@ -248,6 +372,32 @@ class DBManager:
         df["is_active"] = pd.to_numeric(df["is_active"], errors="coerce").fillna(1).astype(int)
         df = df[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]]
         df.to_sql("stocks_master", self.conn, if_exists="replace", index=False)
+        self.conn.commit()
+
+    def import_master_df(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+        x = df.copy().fillna("")
+        required_defaults = {
+            "stock_id": "",
+            "stock_name": "",
+            "market": "",
+            "industry": "",
+            "theme": "",
+            "sub_theme": "",
+            "is_etf": 0,
+            "is_active": 1,
+            "update_date": datetime.now().strftime("%Y-%m-%d"),
+        }
+        for col, default in required_defaults.items():
+            if col not in x.columns:
+                x[col] = default
+        x["stock_id"] = x["stock_id"].astype(str).str.strip()
+        x = x[x["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+        x["is_etf"] = pd.to_numeric(x["is_etf"], errors="coerce").fillna(0).astype(int)
+        x["is_active"] = pd.to_numeric(x["is_active"], errors="coerce").fillna(1).astype(int)
+        x = x[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]]
+        x.to_sql("stocks_master", self.conn, if_exists="replace", index=False)
         self.conn.commit()
 
     def get_master(self) -> pd.DataFrame:
@@ -1053,7 +1203,7 @@ class AppUI:
         ttk.Entry(top, textvariable=self.search_var, width=16).pack(side="left", padx=4)
 
         ttk.Button(top, text="套用篩選", command=self.refresh_all_tables).pack(side="left", padx=4)
-        ttk.Button(top, text="初始化股票清單", command=self.init_master_data).pack(side="left", padx=4)
+        ttk.Button(top, text="初始化全市場", command=self.init_master_data).pack(side="left", padx=4)
         ttk.Button(top, text="更新資料", command=self.update_data).pack(side="left", padx=4)
         ttk.Button(top, text="重建排行", command=self.rebuild_ranking).pack(side="left", padx=4)
         ttk.Button(top, text="AI選股TOP5", command=self.show_top5).pack(side="left", padx=4)
@@ -1106,28 +1256,33 @@ class AppUI:
 
     def init_master_data(self):
         try:
-            csv_path = resolve_master_csv()
-            if not csv_path.exists():
-                return messagebox.showerror(
-                    "錯誤",
-                    f"找不到主檔：\n{csv_path}\n\n"
-                    f"PACKED_DATA_DIR={PACKED_DATA_DIR}\n"
-                    f"EXTERNAL_DATA_DIR={EXTERNAL_DATA_DIR}\n"
-                    f"BASE_DIR={BASE_DIR}\n"
-                    f"RUNTIME_DIR={RUNTIME_DIR}"
-                )
+            self.set_status("開始建立全市場股票清單...")
+            universe = build_full_market_universe()
 
-            self.db.import_master_csv(csv_path)
+            if universe.empty:
+                csv_path = resolve_master_csv()
+                if csv_path.exists():
+                    self.db.import_master_csv(csv_path)
+                    master = self.db.get_master()
+                    self.refresh_filters()
+                    self.refresh_all_tables()
+                    messagebox.showinfo("完成", "全市場抓取失敗，已改用本地主檔\n共 {} 檔\n\n使用主檔：{}".format(len(master), csv_path))
+                    self.set_status("已改用本地主檔，共 {} 檔。".format(len(master)))
+                    return
+                return messagebox.showerror("錯誤", "全市場股票清單建立失敗，且找不到可用本地主檔。")
+
+            self.db.import_master_df(universe)
             master = self.db.get_master()
             self.refresh_filters()
             self.refresh_all_tables()
-            messagebox.showinfo("完成", f"股票清單初始化完成\n共 {len(master)} 檔\n\n使用主檔：{csv_path}")
-            self.set_status(f"股票清單初始化完成，共 {len(master)} 檔。主檔：{csv_path}")
+            messagebox.showinfo("完成", "全市場股票清單初始化完成\n共 {} 檔".format(len(master)))
+            self.set_status("全市場股票清單初始化完成，共 {} 檔。".format(len(master)))
         except Exception as e:
             traceback.print_exc()
-            messagebox.showerror("錯誤", f"初始化失敗：\n{e}")
+            messagebox.showerror("錯誤", "初始化失敗：\n{}".format(e))
 
     def refresh_filters(self):
+
         master = self.db.get_master()
         if master.empty:
             self.market_cb["values"] = ["全部"]
@@ -1370,16 +1525,21 @@ def bootstrap():
     init_message = "股票主檔已就緒"
     try:
         master = db.get_master()
-        csv_path = resolve_master_csv()
-
         if master.empty:
-            db.import_master_csv(csv_path)
-            master = db.get_master()
-            init_message = f"已自動初始化股票主檔，共 {len(master)} 檔 | {csv_path}"
+            universe = build_full_market_universe()
+            if universe is not None and not universe.empty:
+                db.import_master_df(universe)
+                master = db.get_master()
+                init_message = "已自動建立全市場股票主檔，共 {} 檔".format(len(master))
+            else:
+                csv_path = resolve_master_csv()
+                db.import_master_csv(csv_path)
+                master = db.get_master()
+                init_message = "已改用本地主檔，共 {} 檔 | {}".format(len(master), csv_path)
         else:
-            init_message = f"股票主檔已載入，共 {len(master)} 檔 | {csv_path}"
+            init_message = "股票主檔已載入，共 {} 檔".format(len(master))
     except Exception as e:
-        init_message = f"股票主檔初始化失敗：{e}"
+        init_message = "股票主檔初始化失敗：{}".format(e)
 
     return db, init_message
 
