@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.4.1 PRO-AUTO-MASTER-FIX2
+GTC AI Trading System v5.4.2 PRO-ONE-CLICK-UPDATE
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -39,7 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v5.4.1 PRO-AUTO-MASTER-FIX2"
+APP_NAME = "GTC AI Trading System v5.4.2 PRO-ONE-CLICK-UPDATE"
 
 
 def get_base_dir() -> Path:
@@ -102,7 +102,7 @@ DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = RUNTIME_DIR / "stock_system_v5_4_1.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v5_4_2.db"
 MASTER_CSV = resolve_master_csv()
 
 
@@ -805,8 +805,24 @@ class AppUI:
         try:
             self.set_status("開始更新資料（TWSE CSV 官方優先，Yahoo 備援）...")
             success, rows = self.data_engine.update_all()
-            self.set_status(f"完成：成功 {success} 檔，寫入 {rows} 筆（官方優先 / Yahoo 備援）。")
-            messagebox.showinfo("完成", f"成功 {success} 檔\n寫入 {rows} 筆\n（TWSE CSV 官方優先，Yahoo 備援）")
+
+            self.set_status("資料更新完成，開始重建排行...")
+            rank_count = self.rank_engine.rebuild()
+
+            self.refresh_filters()
+            self.refresh_all_tables()
+
+            self.set_status(
+                f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。"
+            )
+            messagebox.showinfo(
+                "完成",
+                f"一鍵更新完成\n"
+                f"成功 {success} 檔\n"
+                f"寫入 {rows} 筆\n"
+                f"排行 {rank_count} 檔\n"
+                f"（TWSE CSV 官方優先，Yahoo 備援）"
+            )
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("錯誤", str(e))
@@ -815,6 +831,7 @@ class AppUI:
         try:
             self.set_status("開始重建排行...")
             count = self.rank_engine.rebuild()
+            self.refresh_filters()
             self.refresh_all_tables()
             messagebox.showinfo("完成", f"排行已完成，共 {count} 檔")
         except Exception as e:
