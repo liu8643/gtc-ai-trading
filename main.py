@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.3.6 PRO-CSV-FIX
+GTC AI Trading System v5.3.7 PRO-MASTER-FIX
 GitHub ready build version
 
 功能：
@@ -38,14 +38,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-APP_NAME = "GTC AI Trading System v5.3.6 PRO-CSV-FIX"
+APP_NAME = "GTC AI Trading System v5.3.7 PRO-MASTER-FIX"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 CHART_DIR = BASE_DIR / "charts"
 DATA_DIR.mkdir(exist_ok=True)
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = DATA_DIR / "stock_system_v5_3_6.db"
+DB_PATH = DATA_DIR / "stock_system_v5_3_7.db"
 MASTER_CSV = DATA_DIR / "stocks_master.csv"
 
 
@@ -169,9 +169,26 @@ class DBManager:
         self.conn.commit()
 
     def import_master_csv(self, csv_path: Path):
-        df = pd.read_csv(csv_path, dtype={"stock_id": str})
-        if "update_date" not in df.columns:
-            df["update_date"] = datetime.now().strftime("%Y-%m-%d")
+        df = pd.read_csv(csv_path, dtype={"stock_id": str}).fillna("")
+        required_defaults = {
+            "stock_id": "",
+            "stock_name": "",
+            "market": "",
+            "industry": "",
+            "theme": "",
+            "sub_theme": "",
+            "is_etf": 0,
+            "is_active": 1,
+            "update_date": datetime.now().strftime("%Y-%m-%d"),
+        }
+        for col, default in required_defaults.items():
+            if col not in df.columns:
+                df[col] = default
+        df["stock_id"] = df["stock_id"].astype(str).str.strip()
+        df = df[df["stock_id"] != ""].copy()
+        df["is_etf"] = pd.to_numeric(df["is_etf"], errors="coerce").fillna(0).astype(int)
+        df["is_active"] = pd.to_numeric(df["is_active"], errors="coerce").fillna(1).astype(int)
+        df = df[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]]
         df.to_sql("stocks_master", self.conn, if_exists="replace", index=False)
         self.conn.commit()
 
@@ -565,6 +582,7 @@ class AppUI:
         ttk.Entry(top, textvariable=self.search_var, width=16).pack(side="left", padx=4)
 
         ttk.Button(top, text="套用篩選", command=self.refresh_all_tables).pack(side="left", padx=4)
+        ttk.Button(top, text="初始化股票清單", command=self.init_master_data).pack(side="left", padx=4)
         ttk.Button(top, text="更新資料", command=self.update_data).pack(side="left", padx=4)
         ttk.Button(top, text="重建排行", command=self.rebuild_ranking).pack(side="left", padx=4)
         ttk.Button(top, text="AI選股TOP5", command=self.show_top5).pack(side="left", padx=4)
@@ -615,11 +633,30 @@ class AppUI:
         self.status_label.config(text=text)
         self.root.update_idletasks()
 
+    def init_master_data(self):
+        try:
+            if not MASTER_CSV.exists():
+                return messagebox.showerror("錯誤", f"找不到主檔：\n{MASTER_CSV}")
+            self.db.import_master_csv(MASTER_CSV)
+            master = self.db.get_master()
+            self.refresh_filters()
+            self.refresh_all_tables()
+            messagebox.showinfo("完成", f"股票清單初始化完成\n共 {len(master)} 檔")
+            self.set_status(f"股票清單初始化完成，共 {len(master)} 檔。")
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("錯誤", f"初始化失敗：\n{e}")
+
     def refresh_filters(self):
         master = self.db.get_master()
-        self.market_cb["values"] = ["全部"] + sorted(master["market"].dropna().unique().tolist())
-        self.industry_cb["values"] = ["全部"] + sorted(master["industry"].dropna().unique().tolist())
-        self.theme_cb["values"] = ["全部"] + sorted(master["theme"].dropna().unique().tolist())
+        if master.empty:
+            self.market_cb["values"] = ["全部"]
+            self.industry_cb["values"] = ["全部"]
+            self.theme_cb["values"] = ["全部"]
+            return
+        self.market_cb["values"] = ["全部"] + sorted([x for x in master["market"].dropna().unique().tolist() if str(x).strip() != ""])
+        self.industry_cb["values"] = ["全部"] + sorted([x for x in master["industry"].dropna().unique().tolist() if str(x).strip() != ""])
+        self.theme_cb["values"] = ["全部"] + sorted([x for x in master["theme"].dropna().unique().tolist() if str(x).strip() != ""])
 
     def _filtered_ranking(self):
         df = self.db.get_latest_ranking()
@@ -754,18 +791,36 @@ class AppUI:
         plt.close(fig)
         return out
 
+
 def bootstrap():
     db = DBManager(DB_PATH)
     db.init_db()
-    master = db.get_master()
-    if master.empty and MASTER_CSV.exists():
-        db.import_master_csv(MASTER_CSV)
-    return db
+
+    init_message = "股票主檔已就緒"
+    try:
+        master = db.get_master()
+        csv_exists = MASTER_CSV.exists()
+
+        # 自動初始化 master：只要 DB 為空且 CSV 存在，就自動匯入
+        if master.empty and csv_exists:
+            db.import_master_csv(MASTER_CSV)
+            master = db.get_master()
+            init_message = f"已自動初始化股票主檔，共 {len(master)} 檔"
+        elif master.empty and not csv_exists:
+            init_message = "找不到 stocks_master.csv，尚未初始化股票主檔"
+        else:
+            init_message = f"股票主檔已載入，共 {len(master)} 檔"
+    except Exception as e:
+        init_message = f"股票主檔初始化失敗：{e}"
+
+    return db, init_message
+
 
 def main():
-    db = bootstrap()
+    db, init_message = bootstrap()
     root = tk.Tk()
-    AppUI(root, db)
+    app = AppUI(root, db)
+    app.set_status(init_message)
 
     def _close():
         db.close()
