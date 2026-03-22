@@ -497,6 +497,7 @@ class DataEngine:
             "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
             "https://www.tpex.org.tw/openapi/v1/tpex_esb_quotes",
         ]
+        parts = []
         for url in urls:
             try:
                 res = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
@@ -527,14 +528,12 @@ class DataEngine:
                     continue
                 df["date"] = datetime.now().strftime("%Y-%m-%d")
                 df["turnover"] = df["close"] * df["volume"]
-                return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
+                parts.append(df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]])
             except Exception:
                 continue
-        return pd.DataFrame()
-
-    
-
-
+        if not parts:
+            return pd.DataFrame()
+        return pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id"])
     def download_history(self, stock_id: str, market: str, period: str = "2y") -> pd.DataFrame:
         if yf is None:
             return pd.DataFrame()
@@ -595,52 +594,38 @@ class DataEngine:
         return success, rows
 
     def update_incremental(self, progress_cb=None) -> Tuple[int, int]:
-            master = self.db.get_master()
-            if master.empty:
-                return 0, 0
+        master = self.db.get_master()
+        if master.empty:
+            return 0, 0
 
-            twse_df = self.fetch_twse_daily()
-            tpex_df = self.fetch_tpex_daily()
+        twse_df = self.fetch_twse_daily()
+        tpex_df = self.fetch_tpex_daily()
 
-            official_map = {}
-            if not twse_df.empty:
-                for _, row in twse_df.iterrows():
-                    official_map[str(row["stock_id"])] = pd.DataFrame([row])
-            if not tpex_df.empty:
-                for _, row in tpex_df.iterrows():
-                    official_map[str(row["stock_id"])] = pd.DataFrame([row])
+        official_map = {}
+        if not twse_df.empty:
+            for _, row in twse_df.iterrows():
+                official_map[str(row["stock_id"])] = pd.DataFrame([row])
+        if not tpex_df.empty:
+            for _, row in tpex_df.iterrows():
+                official_map[str(row["stock_id"])] = pd.DataFrame([row])
 
-            success = 0
-            rows = 0
+        success = 0
+        rows = 0
 
-            total = len(master)
-            for idx, (_, row) in enumerate(master.iterrows(), start=1):
-                stock_id = str(row["stock_id"])
-                market = str(row["market"])
-                wrote_any = False
+        total = len(master)
+        for idx, (_, row) in enumerate(master.iterrows(), start=1):
+            stock_id = str(row["stock_id"])
+            official_df = official_map.get(stock_id, pd.DataFrame())
 
-                hist_count = self.db.get_price_history_count(stock_id)
-                if hist_count < 120:
-                    hist_df = self.download_history(stock_id, market)
-                    if not hist_df.empty:
-                        self.db.upsert_price_history(stock_id, hist_df)
-                        rows += len(hist_df)
-                        wrote_any = True
+            if not official_df.empty:
+                self.db.upsert_price_history(stock_id, official_df)
+                rows += len(official_df)
+                success += 1
 
-                official_df = official_map.get(stock_id, pd.DataFrame())
-                if not official_df.empty:
-                    self.db.upsert_price_history(stock_id, official_df)
-                    rows += len(official_df)
-                    wrote_any = True
+            if progress_cb:
+                progress_cb(idx, total, stock_id)
 
-                if wrote_any:
-                    success += 1
-                if progress_cb:
-                    progress_cb(idx, total, stock_id)
-
-            return success, rows
-
-class IndicatorEngine:
+        return success, rows
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
         x = df.copy()
@@ -1249,15 +1234,28 @@ class AppUI:
         ttk.Label(top, text="搜尋").pack(side="left")
         ttk.Entry(top, textvariable=self.search_var, width=16).pack(side="left", padx=4)
 
-        ttk.Button(top, text="套用篩選", command=self.refresh_all_tables).pack(side="left", padx=4)
-        ttk.Button(top, text="初始化全市場", command=self.init_master_data).pack(side="left", padx=4)
-        ttk.Button(top, text="建立完整歷史（一次）", command=self.build_full_history_once).pack(side="left", padx=4)
-        ttk.Button(top, text="每日增量更新", command=self.update_data).pack(side="left", padx=4)
-        ttk.Button(top, text="重建排行", command=self.rebuild_ranking).pack(side="left", padx=4)
-        ttk.Button(top, text="AI選股TOP5", command=self.show_top5).pack(side="left", padx=4)
-        ttk.Button(top, text="下載TOP5", command=self.export_top5).pack(side="left", padx=4)
-        ttk.Button(top, text="匯出分析Excel", command=self.export_analysis_excel).pack(side="left", padx=4)
-        ttk.Button(top, text="開啟圖表", command=self.open_current_chart).pack(side="left", padx=4)
+        self.btn_filter = ttk.Button(top, text="套用篩選", command=self.refresh_all_tables)
+        self.btn_filter.pack(side="left", padx=4)
+        self.btn_init = ttk.Button(top, text="初始化全市場", command=self.init_master_data)
+        self.btn_init.pack(side="left", padx=4)
+        self.btn_build = ttk.Button(top, text="建立完整歷史（一次）", command=self.build_full_history_once)
+        self.btn_build.pack(side="left", padx=4)
+        self.btn_update = ttk.Button(top, text="每日增量更新", command=self.update_data)
+        self.btn_update.pack(side="left", padx=4)
+        self.btn_rebuild = ttk.Button(top, text="重建排行", command=self.rebuild_ranking)
+        self.btn_rebuild.pack(side="left", padx=4)
+        self.btn_top5 = ttk.Button(top, text="AI選股TOP5", command=self.show_top5)
+        self.btn_top5.pack(side="left", padx=4)
+        self.btn_export_top5 = ttk.Button(top, text="下載TOP5", command=self.export_top5)
+        self.btn_export_top5.pack(side="left", padx=4)
+        self.btn_export_excel = ttk.Button(top, text="匯出分析Excel", command=self.export_analysis_excel)
+        self.btn_export_excel.pack(side="left", padx=4)
+        self.btn_open_chart = ttk.Button(top, text="開啟圖表", command=self.open_current_chart)
+        self.btn_open_chart.pack(side="left", padx=4)
+
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress = ttk.Progressbar(top, variable=self.progress_var, maximum=100, length=180, mode="determinate")
+        self.progress.pack(side="left", padx=6)
 
         self.status_label = ttk.Label(top, text="系統就緒")
         self.status_label.pack(side="right")
@@ -1305,6 +1303,30 @@ class AppUI:
         self.status_label.config(text=text)
         self.root.update_idletasks()
 
+    def set_progress(self, current=0, total=100):
+        total = max(int(total), 1)
+        current = max(0, min(int(current), total))
+        self.progress.configure(maximum=total)
+        self.progress_var.set(current)
+        self.root.update_idletasks()
+
+    def reset_progress(self):
+        self.progress.configure(maximum=100)
+        self.progress_var.set(0)
+        self.root.update_idletasks()
+
+    def set_busy(self, busy: bool):
+        state = "disabled" if busy else "normal"
+        for btn in [
+            self.btn_filter, self.btn_init, self.btn_build, self.btn_update,
+            self.btn_rebuild, self.btn_top5, self.btn_export_top5,
+            self.btn_export_excel, self.btn_open_chart
+        ]:
+            try:
+                btn.config(state=state)
+            except Exception:
+                pass
+        self.root.update_idletasks()
 
     def ui_call(self, func, *args, **kwargs):
         self.root.after(0, lambda: func(*args, **kwargs))
@@ -1313,7 +1335,16 @@ class AppUI:
         if self.worker is not None and self.worker.is_alive():
             messagebox.showwarning("提醒", "背景作業進行中，請稍候。")
             return
-        self.worker = threading.Thread(target=target, name=name, daemon=True)
+
+        def runner():
+            self.ui_call(self.set_busy, True)
+            self.ui_call(self.reset_progress)
+            try:
+                target()
+            finally:
+                self.ui_call(self.set_busy, False)
+
+        self.worker = threading.Thread(target=runner, name=name, daemon=True)
         self.worker.start()
 
     def open_current_chart(self):
@@ -1358,43 +1389,75 @@ class AppUI:
         messagebox.showinfo("完成", f"分析報告已輸出：\n{out}")
 
     def build_full_history_once(self):
+        master = self.db.get_master()
+        if master.empty:
+            return messagebox.showwarning("提醒", "請先初始化全市場。")
+
+        counts = master["stock_id"].astype(str).apply(self.db.get_price_history_count)
+        ready = int((counts >= 240).sum())
+        total = len(master)
+        if ready >= int(total * 0.9):
+            ok = messagebox.askyesno("確認", f"已有 {ready}/{total} 檔具備完整歷史資料。\n再次執行將只補缺漏資料，是否繼續？")
+            if not ok:
+                return
+        else:
+            ok = messagebox.askyesno("確認", f"將建立完整歷史資料。\n目前完整檔數：{ready}/{total}\n是否開始？")
+            if not ok:
+                return
+
         def worker():
             try:
                 self.ui_call(self.set_status, "開始建立完整歷史資料（一次）...")
-                def progress(idx, total, sid):
-                    if idx % 10 == 0 or idx == total:
-                        self.ui_call(self.set_status, f"建立歷史中 {idx}/{total}｜{sid}")
+                self.ui_call(self.set_progress, 0, total)
+
+                def progress(idx, total_count, sid):
+                    self.ui_call(self.set_progress, idx, total_count)
+                    if idx % 10 == 0 or idx == total_count:
+                        self.ui_call(self.set_status, f"建立歷史中 {idx}/{total_count}｜{sid}")
+
                 success, rows = self.data_engine.build_full_history(progress_cb=progress)
+                self.ui_call(self.set_progress, total, total)
                 self.ui_call(self.set_status, f"完整歷史建立完成：成功 {success} 檔，寫入 {rows} 筆。")
                 self.ui_call(messagebox.showinfo, "完成", f"完整歷史建立完成\n成功 {success} 檔\n寫入 {rows} 筆")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
+
         self._run_in_thread(worker, "build_history")
 
     def init_master_data(self):
+        master = self.db.get_master()
+        if not master.empty and len(master) > 500:
+            ok = messagebox.askyesno("確認", f"目前已存在 {len(master)} 檔股票主檔。\n重新初始化將覆蓋現有主檔，是否繼續？")
+            if not ok:
+                return
+
         def worker():
             try:
                 self.ui_call(self.set_status, "開始初始化全市場股票清單...")
+                self.ui_call(self.set_progress, 10, 100)
                 universe = build_full_market_universe()
                 if universe is None or universe.empty:
                     csv_path = resolve_master_csv()
                     self.db.import_master_csv(csv_path)
-                    master = self.db.get_master()
+                    master2 = self.db.get_master()
                     self.ui_call(self.refresh_filters)
                     self.ui_call(self.refresh_all_tables)
-                    self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master)} 檔。")
-                    self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master)} 檔\n\n使用主檔：{csv_path}")
+                    self.ui_call(self.set_progress, 100, 100)
+                    self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master2)} 檔。")
+                    self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master2)} 檔\n\n使用主檔：{csv_path}")
                     return
                 self.db.import_master_df(universe)
-                master = self.db.get_master()
+                master2 = self.db.get_master()
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
-                self.ui_call(self.set_status, f"全市場初始化完成，共 {len(master)} 檔。")
-                self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master)} 檔")
+                self.ui_call(self.set_progress, 100, 100)
+                self.ui_call(self.set_status, f"全市場初始化完成，共 {len(master2)} 檔。")
+                self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", f"初始化失敗：\n{e}")
+
         self._run_in_thread(worker, "init_market")
 
     def refresh_filters(self):
@@ -1469,37 +1532,55 @@ class AppUI:
         )
 
     def update_data(self):
+        last_date = self.db.get_last_price_date()
+        today = datetime.now().strftime("%Y-%m-%d")
+        if last_date == today:
+            ok = messagebox.askyesno("確認", f"今日資料（{today}）可能已更新過。\n再次執行會覆蓋今日官方資料，是否繼續？")
+            if not ok:
+                return
+
         def worker():
             try:
-                self.ui_call(self.set_status, "開始每日增量更新（官方優先）...")
-                def progress(idx, total, sid):
-                    if idx % 50 == 0 or idx == total:
-                        self.ui_call(self.set_status, f"每日更新中 {idx}/{total}｜{sid}")
+                self.ui_call(self.set_status, "開始每日增量更新（官方優先，只更新今日）...")
+                master = self.db.get_master()
+                total = len(master) if not master.empty else 1
+                self.ui_call(self.set_progress, 0, total)
+
+                def progress(idx, total_count, sid):
+                    self.ui_call(self.set_progress, idx, total_count)
+                    if idx % 50 == 0 or idx == total_count:
+                        self.ui_call(self.set_status, f"每日更新中 {idx}/{total_count}｜{sid}")
+
                 success, rows = self.data_engine.update_incremental(progress_cb=progress)
                 self.ui_call(self.set_status, "資料更新完成，開始重建排行...")
                 rank_count = self.rank_engine.rebuild()
+                self.ui_call(self.set_progress, total, total)
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
                 self.ui_call(self.set_status, f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。")
-                self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n排行 {rank_count} 檔\n（TWSE/TPEX 官方優先）")
+                self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n排行 {rank_count} 檔\n（TWSE/TPEX 官方優先，只更新今日）")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
+
         self._run_in_thread(worker, "update_daily")
 
     def rebuild_ranking(self):
         def worker():
             try:
                 self.ui_call(self.set_status, "開始重建排行...")
+                self.ui_call(self.set_progress, 10, 100)
                 count = self.rank_engine.rebuild()
+                self.ui_call(self.set_progress, 90, 100)
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
+                self.ui_call(self.set_progress, 100, 100)
                 self.ui_call(messagebox.showinfo, "完成", f"排行已完成，共 {count} 檔")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
-        self._run_in_thread(worker, "rebuild_rank")
 
+        self._run_in_thread(worker, "rebuild_rank")
 
     def show_top5(self):
         df = self._filtered_ranking()
