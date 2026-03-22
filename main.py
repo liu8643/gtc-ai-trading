@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.4.0 PRO-AUTO-MASTER-FIX
+GTC AI Trading System v5.4.1 PRO-AUTO-MASTER-FIX2
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -39,7 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v5.4.0 PRO-AUTO-MASTER-FIX"
+APP_NAME = "GTC AI Trading System v5.4.1 PRO-AUTO-MASTER-FIX2"
 
 
 def get_base_dir() -> Path:
@@ -102,7 +102,7 @@ DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = RUNTIME_DIR / "stock_system_v5_4_0.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v5_4_1.db"
 MASTER_CSV = resolve_master_csv()
 
 
@@ -406,48 +406,48 @@ class DataEngine:
             return pd.DataFrame()
 
 
-def update_all(self) -> Tuple[int, int]:
-    master = self.db.get_master()
-    if master.empty:
-        return 0, 0
+    def update_all(self) -> Tuple[int, int]:
+        master = self.db.get_master()
+        if master.empty:
+            return 0, 0
 
-    twse_df = self.fetch_twse_daily()
-    tpex_df = self.fetch_tpex_daily()
+        twse_df = self.fetch_twse_daily()
+        tpex_df = self.fetch_tpex_daily()
 
-    official_map = {}
-    if not twse_df.empty:
-        for _, row in twse_df.iterrows():
-            official_map[str(row["stock_id"])] = pd.DataFrame([row])
-    if not tpex_df.empty:
-        for _, row in tpex_df.iterrows():
-            official_map[str(row["stock_id"])] = pd.DataFrame([row])
+        official_map = {}
+        if not twse_df.empty:
+            for _, row in twse_df.iterrows():
+                official_map[str(row["stock_id"])] = pd.DataFrame([row])
+        if not tpex_df.empty:
+            for _, row in tpex_df.iterrows():
+                official_map[str(row["stock_id"])] = pd.DataFrame([row])
 
-    success = 0
-    rows = 0
+        success = 0
+        rows = 0
 
-    for _, row in master.iterrows():
-        stock_id = str(row["stock_id"])
-        market = str(row["market"])
-        wrote_any = False
+        for _, row in master.iterrows():
+            stock_id = str(row["stock_id"])
+            market = str(row["market"])
+            wrote_any = False
 
-        hist_count = self.db.get_price_history_count(stock_id)
-        if hist_count < 120:
-            hist_df = self.download_history(stock_id, market)
-            if not hist_df.empty:
-                self.db.upsert_price_history(stock_id, hist_df)
-                rows += len(hist_df)
+            hist_count = self.db.get_price_history_count(stock_id)
+            if hist_count < 120:
+                hist_df = self.download_history(stock_id, market)
+                if not hist_df.empty:
+                    self.db.upsert_price_history(stock_id, hist_df)
+                    rows += len(hist_df)
+                    wrote_any = True
+
+            official_df = official_map.get(stock_id, pd.DataFrame())
+            if not official_df.empty:
+                self.db.upsert_price_history(stock_id, official_df)
+                rows += len(official_df)
                 wrote_any = True
 
-        official_df = official_map.get(stock_id, pd.DataFrame())
-        if not official_df.empty:
-            self.db.upsert_price_history(stock_id, official_df)
-            rows += len(official_df)
-            wrote_any = True
+            if wrote_any:
+                success += 1
 
-        if wrote_any:
-            success += 1
-
-    return success, rows
+        return success, rows
 
 
 class IndicatorEngine:
