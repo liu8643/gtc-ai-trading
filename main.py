@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.3.4 PRO
+GTC AI Trading System v5.3.5 PRO-TWSE-FIX
 GitHub ready build version
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
 - 本地 SQLite 歷史資料庫
-- Yahoo Finance 收盤資料更新
+- TWSE/TPEX 官方資料 + Yahoo Finance 備援更新
 - 技術指標：MA / MACD / RSI / KD
 - 排行榜 / 類股熱度 / 題材輪動
 - AI 選股 TOP5
@@ -15,6 +15,7 @@ GitHub ready build version
 
 import sqlite3
 import traceback
+import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -34,14 +35,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-APP_NAME = "GTC AI Trading System v5.3.4 PRO"
+APP_NAME = "GTC AI Trading System v5.3.5 PRO-TWSE-FIX"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 CHART_DIR = BASE_DIR / "charts"
 DATA_DIR.mkdir(exist_ok=True)
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = DATA_DIR / "stock_system_v5_3_4.db"
+DB_PATH = DATA_DIR / "stock_system_v5_3_5.db"
 MASTER_CSV = DATA_DIR / "stocks_master.csv"
 
 
@@ -165,6 +166,7 @@ class DBManager:
         return pd.read_sql_query(q, self.conn)
 
 
+
 class DataEngine:
     def __init__(self, db: DBManager):
         self.db = db
@@ -176,6 +178,97 @@ class DataEngine:
         if market == "上櫃":
             return f"{stock_id}.TWO"
         return stock_id
+
+    @staticmethod
+    def _to_num(series: pd.Series) -> pd.Series:
+        return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+
+    def fetch_twse_daily(self) -> pd.DataFrame:
+        urls = [
+            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+            "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json",
+        ]
+        for url in urls:
+            try:
+                res = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+                res.raise_for_status()
+                data = res.json()
+                if isinstance(data, dict):
+                    data = data.get("data") or data.get("records") or []
+                df = pd.DataFrame(data)
+                if df.empty:
+                    continue
+                rename_map = {
+                    "Code": "stock_id", "證券代號": "stock_id",
+                    "Name": "stock_name", "證券名稱": "stock_name",
+                    "Open": "open", "開盤價": "open",
+                    "High": "high", "最高價": "high",
+                    "Low": "low", "最低價": "low",
+                    "Close": "close", "收盤價": "close",
+                    "Volume": "volume", "成交股數": "volume", "成交數量": "volume", "TradeVolume": "volume",
+                }
+                df = df.rename(columns=rename_map)
+                required = ["stock_id", "open", "high", "low", "close", "volume"]
+                if not all(c in df.columns for c in required):
+                    continue
+
+                df["stock_id"] = df["stock_id"].astype(str).str.strip()
+                df = df[df["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+                for c in ["open", "high", "low", "close", "volume"]:
+                    df[c] = self._to_num(df[c])
+                df = df.dropna(subset=["close"])
+                if df.empty:
+                    continue
+
+                df["date"] = datetime.now().strftime("%Y-%m-%d")
+                df["turnover"] = df["close"] * df["volume"]
+                return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
+            except Exception:
+                continue
+        return pd.DataFrame()
+
+    def fetch_tpex_daily(self) -> pd.DataFrame:
+        urls = [
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+            "https://www.tpex.org.tw/openapi/v1/tpex_esb_quotes",
+        ]
+        for url in urls:
+            try:
+                res = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+                res.raise_for_status()
+                data = res.json()
+                df = pd.DataFrame(data)
+                if df.empty:
+                    continue
+                rename_map = {
+                    "SecuritiesCompanyCode": "stock_id", "CompanyCode": "stock_id", "股票代號": "stock_id", "證券代號": "stock_id",
+                    "CompanyName": "stock_name", "股票名稱": "stock_name",
+                    "Open": "open", "開盤價": "open",
+                    "High": "high", "最高價": "high",
+                    "Low": "low", "最低價": "low",
+                    "Close": "close", "收盤價": "close",
+                    "TradingShares": "volume", "成交股數": "volume", "成交數量": "volume", "Volume": "volume",
+                }
+                df = df.rename(columns=rename_map)
+                if "stock_id" not in df.columns:
+                    continue
+                if not all(c in df.columns for c in ["open", "high", "low", "close", "volume"]):
+                    continue
+
+                df["stock_id"] = df["stock_id"].astype(str).str.strip()
+                df = df[df["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+                for c in ["open", "high", "low", "close", "volume"]:
+                    df[c] = self._to_num(df[c])
+                df = df.dropna(subset=["close"])
+                if df.empty:
+                    continue
+
+                df["date"] = datetime.now().strftime("%Y-%m-%d")
+                df["turnover"] = df["close"] * df["volume"]
+                return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
+            except Exception:
+                continue
+        return pd.DataFrame()
 
     def download_history(self, stock_id: str, market: str, period: str = "2y") -> pd.DataFrame:
         if yf is None:
@@ -191,24 +284,48 @@ class DataEngine:
             date_col = "Date" if "Date" in hist.columns else "Datetime"
             hist["date"] = pd.to_datetime(hist[date_col]).dt.strftime("%Y-%m-%d")
             hist["turnover"] = hist["close"] * hist["volume"]
-            return hist[["date", "open", "high", "low", "close", "volume", "turnover"]]
+            out = hist[["date", "open", "high", "low", "close", "volume", "turnover"]].copy()
+            for c in ["open", "high", "low", "close", "volume", "turnover"]:
+                out[c] = pd.to_numeric(out[c], errors="coerce")
+            out = out.dropna(subset=["close"])
+            return out
         except Exception:
             return pd.DataFrame()
 
     def update_all(self) -> Tuple[int, int]:
         master = self.db.get_master()
+        if master.empty:
+            return 0, 0
+
+        twse_df = self.fetch_twse_daily()
+        tpex_df = self.fetch_tpex_daily()
+
+        official_map = {}
+        if not twse_df.empty:
+            for _, row in twse_df.iterrows():
+                official_map[str(row["stock_id"])] = pd.DataFrame([row])
+        if not tpex_df.empty:
+            for _, row in tpex_df.iterrows():
+                official_map[str(row["stock_id"])] = pd.DataFrame([row])
+
         success = 0
         rows = 0
         for _, row in master.iterrows():
-            df = self.download_history(str(row["stock_id"]), row["market"])
+            stock_id = str(row["stock_id"])
+            market = str(row["market"])
+            df = official_map.get(stock_id, pd.DataFrame())
+            if df.empty:
+                df = self.download_history(stock_id, market)
             if not df.empty:
-                self.db.upsert_price_history(str(row["stock_id"]), df)
+                self.db.upsert_price_history(stock_id, df)
                 success += 1
                 rows += len(df)
+
         return success, rows
 
 
 class IndicatorEngine:
+
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
         x = df.copy()
@@ -531,10 +648,10 @@ class AppUI:
 
     def update_data(self):
         try:
-            self.set_status("開始下載歷史資料...")
+            self.set_status("開始更新資料（TWSE/TPEX 官方優先，Yahoo 備援）...")
             success, rows = self.data_engine.update_all()
-            self.set_status(f"完成：成功 {success} 檔，寫入 {rows} 筆。")
-            messagebox.showinfo("完成", f"成功 {success} 檔\n寫入 {rows} 筆")
+            self.set_status(f"完成：成功 {success} 檔，寫入 {rows} 筆（官方優先 / Yahoo 備援）。")
+            messagebox.showinfo("完成", f"成功 {success} 檔\n寫入 {rows} 筆\n（TWSE/TPEX 官方優先，Yahoo 備援）")
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("錯誤", str(e))
@@ -579,10 +696,10 @@ class AppUI:
             f"股票：{stock['stock_name']} ({stock_id})",
             f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
             f"最新收盤：{last['close']:.2f}",
-            f"MA20 / MA60：{last['ma20']:.2f if pd.notna(last['ma20']) else float('nan')} / {last['ma60']:.2f if pd.notna(last['ma60']) else float('nan')}",
-            f"RSI14：{last['rsi14']:.2f if pd.notna(last['rsi14']) else float('nan')}",
-            f"MACD Hist：{last['macd_hist']:.4f if pd.notna(last['macd_hist']) else float('nan')}",
-            f"K / D：{last['k']:.2f if pd.notna(last['k']) else float('nan')} / {last['d']:.2f if pd.notna(last['d']) else float('nan')}",
+            "MA20 / MA60：{:.2f} / {:.2f}".format(last["ma20"], last["ma60"]) if pd.notna(last["ma20"]) and pd.notna(last["ma60"]) else "MA20 / MA60：資料不足",
+            "RSI14：{:.2f}".format(last["rsi14"]) if pd.notna(last["rsi14"]) else "RSI14：資料不足",
+            "MACD Hist：{:.4f}".format(last["macd_hist"]) if pd.notna(last["macd_hist"]) else "MACD Hist：資料不足",
+            "K / D：{:.2f} / {:.2f}".format(last["k"], last["d"]) if pd.notna(last["k"]) and pd.notna(last["d"]) else "K / D：資料不足",
             "",
             f"波浪階段：{wave}",
             f"Fib 1.0 / 1.382 / 1.618：{fib1:.2f} / {fib2:.2f} / {fib3:.2f}",
