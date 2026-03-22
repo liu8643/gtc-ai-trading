@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v5.3.5 PRO-TWSE-FIX
+GTC AI Trading System v5.3.6 PRO-CSV-FIX
 GitHub ready build version
 
 功能：
@@ -16,6 +16,9 @@ GitHub ready build version
 import sqlite3
 import traceback
 import requests
+import csv
+import io
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -35,16 +38,79 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-APP_NAME = "GTC AI Trading System v5.3.5 PRO-TWSE-FIX"
+APP_NAME = "GTC AI Trading System v5.3.6 PRO-CSV-FIX"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 CHART_DIR = BASE_DIR / "charts"
 DATA_DIR.mkdir(exist_ok=True)
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = DATA_DIR / "stock_system_v5_3_5.db"
+DB_PATH = DATA_DIR / "stock_system_v5_3_6.db"
 MASTER_CSV = DATA_DIR / "stocks_master.csv"
 
+
+
+
+def normalize_csv_cell(v: str) -> str:
+    s = str(v).strip().replace("=", "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    return s.strip()
+
+def parse_twse_mi_index_csv(csv_text: str) -> pd.DataFrame:
+    rows = []
+    for raw in csv_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("=") and "證券代號" in line:
+            line = line.replace("=", "")
+        if not re.match(r'^[="]?\d{4}', line):
+            continue
+        try:
+            cols = next(csv.reader([line]))
+        except Exception:
+            continue
+        cols = [normalize_csv_cell(x) for x in cols]
+        if len(cols) < 11:
+            continue
+        code = cols[0]
+        if not (code.isdigit() and len(code) == 4):
+            continue
+        rows.append({
+            "stock_id": code,
+            "stock_name": cols[1] if len(cols) > 1 else "",
+            "volume": cols[2] if len(cols) > 2 else "",
+            "open": cols[5] if len(cols) > 5 else "",
+            "high": cols[6] if len(cols) > 6 else "",
+            "low": cols[7] if len(cols) > 7 else "",
+            "close": cols[8] if len(cols) > 8 else "",
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    for c in ["volume", "open", "high", "low", "close"]:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    df = df.dropna(subset=["close"])
+    df["date"] = datetime.now().strftime("%Y-%m-%d")
+    df["turnover"] = df["close"] * df["volume"].fillna(0)
+    return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
+
+def download_twse_official_daily_csv(date_str: str | None = None, fallback_days: int = 10) -> pd.DataFrame:
+    base_date = datetime.strptime(date_str, "%Y%m%d") if date_str else datetime.now()
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
+    for offset in range(fallback_days + 1):
+        use_date = (base_date - pd.Timedelta(days=offset)).strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={use_date}&type=ALLBUT0999"
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            df = parse_twse_mi_index_csv(resp.text)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 class DBManager:
     def __init__(self, db_path: Path):
@@ -167,6 +233,8 @@ class DBManager:
 
 
 
+
+
 class DataEngine:
     def __init__(self, db: DBManager):
         self.db = db
@@ -184,47 +252,12 @@ class DataEngine:
         return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
 
     def fetch_twse_daily(self) -> pd.DataFrame:
-        urls = [
-            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-            "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json",
-        ]
-        for url in urls:
-            try:
-                res = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-                res.raise_for_status()
-                data = res.json()
-                if isinstance(data, dict):
-                    data = data.get("data") or data.get("records") or []
-                df = pd.DataFrame(data)
-                if df.empty:
-                    continue
-                rename_map = {
-                    "Code": "stock_id", "證券代號": "stock_id",
-                    "Name": "stock_name", "證券名稱": "stock_name",
-                    "Open": "open", "開盤價": "open",
-                    "High": "high", "最高價": "high",
-                    "Low": "low", "最低價": "low",
-                    "Close": "close", "收盤價": "close",
-                    "Volume": "volume", "成交股數": "volume", "成交數量": "volume", "TradeVolume": "volume",
-                }
-                df = df.rename(columns=rename_map)
-                required = ["stock_id", "open", "high", "low", "close", "volume"]
-                if not all(c in df.columns for c in required):
-                    continue
-
-                df["stock_id"] = df["stock_id"].astype(str).str.strip()
-                df = df[df["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
-                for c in ["open", "high", "low", "close", "volume"]:
-                    df[c] = self._to_num(df[c])
-                df = df.dropna(subset=["close"])
-                if df.empty:
-                    continue
-
-                df["date"] = datetime.now().strftime("%Y-%m-%d")
-                df["turnover"] = df["close"] * df["volume"]
-                return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
-            except Exception:
-                continue
+        try:
+            df = download_twse_official_daily_csv()
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
         return pd.DataFrame()
 
     def fetch_tpex_daily(self) -> pd.DataFrame:
@@ -250,11 +283,9 @@ class DataEngine:
                     "TradingShares": "volume", "成交股數": "volume", "成交數量": "volume", "Volume": "volume",
                 }
                 df = df.rename(columns=rename_map)
-                if "stock_id" not in df.columns:
+                required = ["stock_id", "open", "high", "low", "close", "volume"]
+                if not all(c in df.columns for c in required):
                     continue
-                if not all(c in df.columns for c in ["open", "high", "low", "close", "volume"]):
-                    continue
-
                 df["stock_id"] = df["stock_id"].astype(str).str.strip()
                 df = df[df["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
                 for c in ["open", "high", "low", "close", "volume"]:
@@ -262,7 +293,6 @@ class DataEngine:
                 df = df.dropna(subset=["close"])
                 if df.empty:
                     continue
-
                 df["date"] = datetime.now().strftime("%Y-%m-%d")
                 df["turnover"] = df["close"] * df["volume"]
                 return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
@@ -320,11 +350,11 @@ class DataEngine:
                 self.db.upsert_price_history(stock_id, df)
                 success += 1
                 rows += len(df)
-
         return success, rows
 
 
 class IndicatorEngine:
+
 
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
@@ -648,10 +678,10 @@ class AppUI:
 
     def update_data(self):
         try:
-            self.set_status("開始更新資料（TWSE/TPEX 官方優先，Yahoo 備援）...")
+            self.set_status("開始更新資料（TWSE CSV 官方優先，Yahoo 備援）...")
             success, rows = self.data_engine.update_all()
             self.set_status(f"完成：成功 {success} 檔，寫入 {rows} 筆（官方優先 / Yahoo 備援）。")
-            messagebox.showinfo("完成", f"成功 {success} 檔\n寫入 {rows} 筆\n（TWSE/TPEX 官方優先，Yahoo 備援）")
+            messagebox.showinfo("完成", f"成功 {success} 檔\n寫入 {rows} 筆\n（TWSE CSV 官方優先，Yahoo 備援）")
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("錯誤", str(e))
