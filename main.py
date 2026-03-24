@@ -9,7 +9,7 @@ GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM
 - TWSE/TPEX 官方資料 + Yahoo Finance 備援更新
 - 技術指標：MA / MACD / RSI / KD
 - 排行榜 / 類股熱度 / 題材輪動
-- AI 選股 TOP5
+- AI 選股 TOP20
 - Tkinter 桌面 UI
 """
 
@@ -61,7 +61,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM"
+APP_NAME = "GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM TOP20"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_4.json"
 
 
@@ -1117,7 +1117,7 @@ class MasterTradingEngine:
     def get_trade_pool(self, filtered_df: pd.DataFrame) -> dict:
         if filtered_df.empty:
             empty = pd.DataFrame()
-            return {"market": self.market_engine.get_market_regime(), "trade_top5": empty, "attack": empty, "watch": empty, "defense": empty, "theme_summary": empty}
+            return {"market": self.market_engine.get_market_regime(), "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty, "theme_summary": empty}
 
         base = filtered_df.copy()
         hot_themes = ThemeStrengthEngine.get_hot_themes(base)
@@ -1129,7 +1129,7 @@ class MasterTradingEngine:
 
         if plans_df.empty:
             empty = pd.DataFrame()
-            return {"market": self.market_engine.get_market_regime(), "trade_top5": empty, "attack": empty, "watch": empty, "defense": empty, "theme_summary": ThemeStrengthEngine.summarize(base)}
+            return {"market": self.market_engine.get_market_regime(), "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty, "theme_summary": ThemeStrengthEngine.summarize(base)}
 
         if hot_themes:
             hot_mask = plans_df["theme"].isin(hot_themes)
@@ -1147,22 +1147,23 @@ class MasterTradingEngine:
         watch = tradable[tradable["bucket"] == "次強"].sort_values(["selection_score", "rr", "win_rate"], ascending=False)
         defense = plans_df[(plans_df["bucket"] == "防守") & (plans_df["trade_action"].isin(["可買", "區間操作"]))].sort_values(["selection_score", "rr", "win_rate"], ascending=False)
 
-        trade_top5 = pd.concat([attack.head(3), watch.head(2)], ignore_index=True)
-        if len(trade_top5) < 5:
-            used = set(trade_top5["stock_id"].tolist()) if not trade_top5.empty else set()
-            extra = tradable[~tradable["stock_id"].isin(list(used))].sort_values(["selection_score", "rr", "win_rate"], ascending=False).head(5 - len(trade_top5))
-            trade_top5 = pd.concat([trade_top5, extra], ignore_index=True)
-        if len(trade_top5) < 5:
-            used = set(trade_top5["stock_id"].tolist()) if not trade_top5.empty else set()
-            fallback = plans_df[(~plans_df["stock_id"].isin(list(used))) & (plans_df["trade_action"].isin(["可買", "等待", "區間操作"]))].sort_values(["selection_score", "rr", "win_rate"], ascending=False).head(5 - len(trade_top5))
-            trade_top5 = pd.concat([trade_top5, fallback], ignore_index=True)
+        trade_top20 = pd.concat([attack.head(8), watch.head(8), defense.head(4)], ignore_index=True)
+        if len(trade_top20) < 20:
+            used = set(trade_top20["stock_id"].tolist()) if not trade_top20.empty else set()
+            extra = tradable[~tradable["stock_id"].isin(list(used))].sort_values(["selection_score", "rr", "win_rate"], ascending=False).head(20 - len(trade_top20))
+            trade_top20 = pd.concat([trade_top20, extra], ignore_index=True)
+        if len(trade_top20) < 20:
+            used = set(trade_top20["stock_id"].tolist()) if not trade_top20.empty else set()
+            fallback = plans_df[(~plans_df["stock_id"].isin(list(used))) & (plans_df["trade_action"].isin(["可買", "等待", "區間操作"]))].sort_values(["selection_score", "rr", "win_rate"], ascending=False).head(20 - len(trade_top20))
+            trade_top20 = pd.concat([trade_top20, fallback], ignore_index=True)
+        trade_top20 = trade_top20.drop_duplicates(subset=["stock_id"]).head(20)
 
         return {
             "market": self.market_engine.get_market_regime(),
-            "trade_top5": trade_top5.head(5),
-            "attack": attack.head(5),
-            "watch": watch.head(5),
-            "defense": defense.head(3),
+            "trade_top20": trade_top20,
+            "attack": attack.head(10),
+            "watch": watch.head(10),
+            "defense": defense.head(10),
             "theme_summary": ThemeStrengthEngine.summarize(base),
         }
 
@@ -1256,7 +1257,7 @@ class AppUI:
         self.data_engine = DataEngine(db)
         self.rank_engine = RankingEngine(db)
         self.master_trading_engine = MasterTradingEngine(db)
-        self.last_top5_df = pd.DataFrame()
+        self.last_top20_df = pd.DataFrame()
         self.last_theme_summary_df = pd.DataFrame()
         self.last_attack_df = pd.DataFrame()
         self.last_watch_df = pd.DataFrame()
@@ -1299,7 +1300,7 @@ class AppUI:
             "2. 建立完整歷史（第一次建庫）",
             "3. 每日增量更新",
             "4. 重建排行",
-            "5. AI選股TOP5",
+            "5. AI選股TOP20",
             "6. 支援中斷續跑 / 分批建庫 / 即時Log",
         ]
         self.detail.delete("1.0", tk.END)
@@ -1350,10 +1351,15 @@ class AppUI:
         self.btn_update.pack(side="left", padx=4)
         self.btn_rebuild = ttk.Button(top, text="重建排行", command=self.rebuild_ranking)
         self.btn_rebuild.pack(side="left", padx=4)
-        self.btn_top5 = ttk.Button(top, text="AI選股TOP5", command=self.show_top5)
-        self.btn_top5.pack(side="left", padx=4)
-        self.btn_export_top5 = ttk.Button(top, text="下載TOP5", command=self.export_top5)
-        self.btn_export_top5.pack(side="left", padx=4)
+        self.btn_top20 = ttk.Button(top, text="AI選股TOP20", command=self.show_top20)
+        self.btn_top20.pack(side="left", padx=4)
+
+        self.download_target_var = tk.StringVar(value="TOP20")
+        self.download_target_cb = ttk.Combobox(top, textvariable=self.download_target_var, width=10, state="readonly")
+        self.download_target_cb["values"] = ["TOP20", "主攻", "次強", "防守", "排行", "類股", "題材"]
+        self.download_target_cb.pack(side="left", padx=4)
+        self.btn_export_data = ttk.Button(top, text="下載資料", command=self.export_selected_data)
+        self.btn_export_data.pack(side="left", padx=4)
         self.btn_export_excel = ttk.Button(top, text="匯出分析Excel", command=self.export_analysis_excel)
         self.btn_export_excel.pack(side="left", padx=4)
         self.btn_open_chart = ttk.Button(top, text="開啟圖表", command=self.open_current_chart)
@@ -1475,7 +1481,7 @@ class AppUI:
     def set_busy(self, busy: bool):
         normal_buttons = [
             self.btn_filter, self.btn_init, self.btn_build, self.btn_resume, self.btn_update,
-            self.btn_rebuild, self.btn_top5, self.btn_export_top5,
+            self.btn_rebuild, self.btn_top20, self.btn_export_data, self.download_target_cb,
             self.btn_export_excel, self.btn_open_chart
         ]
         for btn in normal_buttons:
@@ -1516,13 +1522,24 @@ class AppUI:
             return messagebox.showwarning("提醒", "目前沒有可開啟的圖表，請先點選股票。")
         open_path(Path(self.current_chart_path))
 
-    def export_top5(self):
-        if self.last_top5_df is None or self.last_top5_df.empty:
-            return messagebox.showwarning("提醒", "目前沒有 TOP5 可下載，請先執行 AI選股TOP5。")
-        out = RUNTIME_DIR / f"AI_TOP5_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    def export_selected_data(self):
+        target = self.download_target_var.get().strip() or "TOP20"
+        mapping = {
+            "TOP20": getattr(self, "last_top20_df", pd.DataFrame()),
+            "主攻": self.last_attack_df,
+            "次強": self.last_watch_df,
+            "防守": self.last_defense_df,
+            "排行": self._filtered_ranking(),
+            "類股": pd.DataFrame([(self.sector_tree.item(i, "values")) for i in self.sector_tree.get_children()], columns=["產業", "檔數", "平均總分", "平均AI分", "代表股"]) if self.sector_tree.get_children() else pd.DataFrame(),
+            "題材": pd.DataFrame([(self.theme_tree.item(i, "values")) for i in self.theme_tree.get_children()], columns=["題材", "檔數", "平均總分", "平均AI分", "代表股"]) if self.theme_tree.get_children() else pd.DataFrame(),
+        }
+        df = mapping.get(target, pd.DataFrame())
+        if df is None or df.empty:
+            return messagebox.showwarning("提醒", f"目前沒有可下載的【{target}】資料。")
+        out = RUNTIME_DIR / f"{target}_Data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            self.last_top5_df.to_excel(writer, sheet_name="TOP5", index=False)
-        messagebox.showinfo("完成", f"AI TOP5 已輸出：\n{out}")
+            df.to_excel(writer, sheet_name=target[:31], index=False)
+        messagebox.showinfo("完成", f"{target} 資料已輸出：\n{out}")
 
     def export_analysis_excel(self):
         ranking = self._filtered_ranking()
@@ -1540,8 +1557,8 @@ class AppUI:
                 sector.to_excel(writer, sheet_name="Sector", index=False)
             if not theme.empty:
                 theme.to_excel(writer, sheet_name="Theme", index=False)
-            if self.last_top5_df is not None and not self.last_top5_df.empty:
-                self.last_top5_df.to_excel(writer, sheet_name="Trade_TOP5", index=False)
+            if self.last_top20_df is not None and not self.last_top20_df.empty:
+                self.last_top20_df.to_excel(writer, sheet_name="Trade_TOP20", index=False)
             if self.last_attack_df is not None and not self.last_attack_df.empty:
                 self.last_attack_df.to_excel(writer, sheet_name="Attack", index=False)
             if self.last_watch_df is not None and not self.last_watch_df.empty:
@@ -1811,7 +1828,7 @@ class AppUI:
 
         self._run_in_thread(worker, "rebuild_rank")
 
-    def show_top5(self):
+    def show_top20(self):
         if not self.ensure_ranking_ready(auto_rebuild=True):
             return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
         df = self._filtered_ranking()
@@ -1820,13 +1837,13 @@ class AppUI:
 
         trade = self.master_trading_engine.get_trade_pool(df)
         market = trade["market"]
-        trade_top5 = trade["trade_top5"]
+        trade_top20 = trade["trade_top20"]
         attack = trade["attack"]
         watch = trade["watch"]
         defense = trade["defense"]
         theme_summary = trade["theme_summary"]
 
-        self.last_top5_df = trade_top5.copy()
+        self.last_top20_df = trade_top20.copy()
         self.last_attack_df = attack.copy()
         self.last_watch_df = watch.copy()
         self.last_defense_df = defense.copy()
@@ -1839,11 +1856,11 @@ class AppUI:
             ""
         ]
 
-        lines.append("【可下單 TOP5】")
-        if trade_top5.empty:
+        lines.append("【可下單 TOP20】")
+        if trade_top20.empty:
             lines.append("目前無符合條件標的")
         else:
-            for i, (_, r) in enumerate(trade_top5.iterrows(), start=1):
+            for i, (_, r) in enumerate(trade_top20.iterrows(), start=1):
                 lines.append(
                     f"{i}. {r['stock_id']} {r['stock_name']}｜{r['theme']}｜{r['trade_action']}\n"
                     f"   進場: {r['entry_zone']}｜停損: {r['stop_loss']}｜目標: {r['target_price']}\n"
@@ -1882,7 +1899,7 @@ class AppUI:
             for _, r in theme_summary.head(5).iterrows():
                 lines.append(f"- {r['theme']}｜檔數 {int(r['count'])}｜總分 {r['avg_total']:.1f}｜AI {r['avg_ai']:.1f}")
 
-        messagebox.showinfo("AI選股TOP5", "\n".join(lines))
+        messagebox.showinfo("AI選股TOP20", "\n".join(lines))
 
     def on_select_stock(self, event=None):
         sel = self.rank_tree.selection()
