@@ -1369,7 +1369,7 @@ class AppUI:
             "3. 每日增量更新",
             "4. 重建排行",
             "5. AI選股TOP20",
-            "6. 支援中斷續跑 / 分批建庫 / 即時Log / 下單清單",
+            "6. 功能列改為下拉選單 / 支援中斷續跑 / 分批建庫 / 即時Log / 下單清單",
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
@@ -1407,20 +1407,24 @@ class AppUI:
 
         self.btn_filter = ttk.Button(top, text="套用篩選", command=self.refresh_all_tables)
         self.btn_filter.pack(side="left", padx=4)
-        self.btn_init = ttk.Button(top, text="初始化全市場", command=self.init_master_data)
-        self.btn_init.pack(side="left", padx=4)
-        self.btn_build = ttk.Button(top, text="建立完整歷史（一次）", command=self.build_full_history_once)
-        self.btn_build.pack(side="left", padx=4)
-        self.btn_resume = ttk.Button(top, text="續跑建庫", command=self.resume_full_history)
-        self.btn_resume.pack(side="left", padx=4)
-        self.btn_cancel = ttk.Button(top, text="中斷作業", command=self.cancel_current_job, state="disabled")
-        self.btn_cancel.pack(side="left", padx=4)
-        self.btn_update = ttk.Button(top, text="每日增量更新", command=self.update_data)
-        self.btn_update.pack(side="left", padx=4)
-        self.btn_rebuild = ttk.Button(top, text="重建排行", command=self.rebuild_ranking)
-        self.btn_rebuild.pack(side="left", padx=4)
-        self.btn_top20 = ttk.Button(top, text="AI選股TOP20", command=self.show_top20)
-        self.btn_top20.pack(side="left", padx=4)
+
+        ttk.Label(top, text="功能").pack(side="left", padx=(10, 2))
+        self.action_var = tk.StringVar(value="AI選股TOP20")
+        self.action_cb = ttk.Combobox(top, textvariable=self.action_var, width=18, state="readonly")
+        self.action_cb["values"] = [
+            "AI選股TOP20",
+            "初始化全市場",
+            "建立完整歷史（一次）",
+            "續跑建庫",
+            "每日增量更新",
+            "重建排行",
+            "中斷作業",
+            "匯出分析Excel",
+            "開啟圖表",
+        ]
+        self.action_cb.pack(side="left", padx=4)
+        self.btn_run_action = ttk.Button(top, text="執行功能", command=self.execute_action)
+        self.btn_run_action.pack(side="left", padx=4)
 
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(top, textvariable=self.download_target_var, width=10, state="readonly")
@@ -1563,20 +1567,37 @@ class AppUI:
 
     def set_busy(self, busy: bool):
         normal_buttons = [
-            self.btn_filter, self.btn_init, self.btn_build, self.btn_resume, self.btn_update,
-            self.btn_rebuild, self.btn_top20, self.btn_export_data, self.download_target_cb,
+            self.btn_filter, self.action_cb, self.btn_run_action,
+            self.btn_export_data, self.download_target_cb,
             self.btn_export_excel, self.btn_open_chart
         ]
         for btn in normal_buttons:
             try:
-                btn.config(state="disabled" if busy else "normal")
+                btn.config(state="disabled" if busy else "readonly" if btn in (self.action_cb, self.download_target_cb) else "normal")
             except Exception:
                 pass
-        try:
-            self.btn_cancel.config(state="normal" if busy else "disabled")
-        except Exception:
-            pass
+        if busy:
+            if self.action_var.get() == "中斷作業":
+                self.action_var.set("AI選股TOP20")
         self.root.update_idletasks()
+
+    def execute_action(self):
+        action = (self.action_var.get() or "").strip()
+        mapping = {
+            "初始化全市場": self.init_master_data,
+            "建立完整歷史（一次）": self.build_full_history_once,
+            "續跑建庫": self.resume_full_history,
+            "每日增量更新": self.update_data,
+            "重建排行": self.rebuild_ranking,
+            "AI選股TOP20": self.show_top20,
+            "匯出分析Excel": self.export_analysis_excel,
+            "開啟圖表": self.open_current_chart,
+            "中斷作業": self.cancel_current_job,
+        }
+        func = mapping.get(action)
+        if func is None:
+            return messagebox.showwarning("提醒", "請先選擇功能。")
+        func()
 
     def ui_call(self, func, *args, **kwargs):
         self.root.after(0, lambda: func(*args, **kwargs))
