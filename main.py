@@ -1357,7 +1357,7 @@ class AppUI:
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
         lines = [
-            "《GTC AI Trading System v6.0.4 專業交易系統版》",
+            "《GTC AI Trading System v6.0.5 交易等級系統版》",
             "",
             f"主檔狀態：{len(self.db.get_master())} 檔",
             f"歷史資料：{price_rows} 筆｜最後交易日：{last_date}",
@@ -1387,30 +1387,38 @@ class AppUI:
         return False
 
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=8)
-        top.pack(fill="x")
+        toolbar = ttk.Frame(self.root, padding=8)
+        toolbar.pack(fill="x")
 
-        ttk.Label(top, text="市場").pack(side="left")
-        self.market_cb = ttk.Combobox(top, textvariable=self.market_var, width=12, state="readonly")
+        row1 = ttk.Frame(toolbar)
+        row1.pack(fill="x", pady=(0, 6))
+        row2 = ttk.Frame(toolbar)
+        row2.pack(fill="x")
+
+        ttk.Label(row1, text="市場").pack(side="left")
+        self.market_cb = ttk.Combobox(row1, textvariable=self.market_var, width=12, state="readonly")
         self.market_cb.pack(side="left", padx=4)
 
-        ttk.Label(top, text="產業").pack(side="left")
-        self.industry_cb = ttk.Combobox(top, textvariable=self.industry_var, width=16, state="readonly")
+        ttk.Label(row1, text="產業").pack(side="left")
+        self.industry_cb = ttk.Combobox(row1, textvariable=self.industry_var, width=16, state="readonly")
         self.industry_cb.pack(side="left", padx=4)
 
-        ttk.Label(top, text="題材").pack(side="left")
-        self.theme_cb = ttk.Combobox(top, textvariable=self.theme_var, width=18, state="readonly")
+        ttk.Label(row1, text="題材").pack(side="left")
+        self.theme_cb = ttk.Combobox(row1, textvariable=self.theme_var, width=18, state="readonly")
         self.theme_cb.pack(side="left", padx=4)
 
-        ttk.Label(top, text="搜尋").pack(side="left")
-        ttk.Entry(top, textvariable=self.search_var, width=16).pack(side="left", padx=4)
+        ttk.Label(row1, text="搜尋").pack(side="left")
+        ttk.Entry(row1, textvariable=self.search_var, width=16).pack(side="left", padx=4)
 
-        self.btn_filter = ttk.Button(top, text="套用篩選", command=self.refresh_all_tables)
+        self.btn_filter = ttk.Button(row1, text="套用篩選", command=self.refresh_all_tables)
         self.btn_filter.pack(side="left", padx=4)
 
-        ttk.Label(top, text="功能").pack(side="left", padx=(10, 2))
+        self.status_label = ttk.Label(row1, text="系統就緒")
+        self.status_label.pack(side="right")
+
+        ttk.Label(row2, text="功能").pack(side="left")
         self.action_var = tk.StringVar(value="AI選股TOP20")
-        self.action_cb = ttk.Combobox(top, textvariable=self.action_var, width=18, state="readonly")
+        self.action_cb = ttk.Combobox(row2, textvariable=self.action_var, width=18, state="readonly")
         self.action_cb["values"] = [
             "AI選股TOP20",
             "初始化全市場",
@@ -1423,29 +1431,28 @@ class AppUI:
             "開啟圖表",
         ]
         self.action_cb.pack(side="left", padx=4)
-        self.btn_run_action = ttk.Button(top, text="執行功能", command=self.execute_action)
-        self.btn_run_action.pack(side="left", padx=4)
+        self.btn_run_action = ttk.Button(row2, text="執行功能", command=self.execute_action)
+        self.btn_run_action.pack(side="left", padx=(4, 12))
 
+        ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
-        self.download_target_cb = ttk.Combobox(top, textvariable=self.download_target_var, width=10, state="readonly")
+        self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
         self.download_target_cb["values"] = ["TOP20", "主攻", "次強", "防守", "下單清單", "排行", "類股", "題材"]
         self.download_target_cb.pack(side="left", padx=4)
-        self.btn_export_data = ttk.Button(top, text="下載資料", command=self.export_selected_data)
-        self.btn_export_data.pack(side="left", padx=4)
-        self.btn_export_excel = ttk.Button(top, text="匯出分析Excel", command=self.export_analysis_excel)
+        self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
+        self.btn_export_data.pack(side="left", padx=(4, 12))
+
+        self.btn_export_excel = ttk.Button(row2, text="匯出分析Excel", command=self.export_analysis_excel)
         self.btn_export_excel.pack(side="left", padx=4)
-        self.btn_open_chart = ttk.Button(top, text="開啟圖表", command=self.open_current_chart)
+        self.btn_open_chart = ttk.Button(row2, text="開啟圖表", command=self.open_current_chart)
         self.btn_open_chart.pack(side="left", padx=4)
 
         self.progress_var = tk.DoubleVar(value=0)
-        self.progress = ttk.Progressbar(top, variable=self.progress_var, maximum=100, length=180, mode="determinate")
-        self.progress.pack(side="left", padx=6)
+        self.progress = ttk.Progressbar(row2, variable=self.progress_var, maximum=100, length=180, mode="determinate")
+        self.progress.pack(side="left", padx=(12, 6))
         self.progress_text_var = tk.StringVar(value="0% | 0/0 | 成功 0 | 失敗 0")
-        self.progress_text_label = ttk.Label(top, textvariable=self.progress_text_var, width=28)
+        self.progress_text_label = ttk.Label(row2, textvariable=self.progress_text_var, width=28)
         self.progress_text_label.pack(side="left", padx=4)
-
-        self.status_label = ttk.Label(top, text="系統就緒")
-        self.status_label.pack(side="right")
 
         main = ttk.Panedwindow(self.root, orient="horizontal")
         main.pack(fill="both", expand=True, padx=8, pady=8)
