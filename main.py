@@ -43,7 +43,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v6.0.3 FULL-INTEGRATED-TRADING-FIX"
+APP_NAME = "GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM"
+STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_4.json"
+
+
+class OperationCancelled(Exception):
+    pass
+
 
 
 def get_base_dir() -> Path:
@@ -583,30 +589,56 @@ class DataEngine:
                 continue
         return pd.DataFrame()
 
-    def build_full_history(self, min_days: int = 240, batch_size: int = 20, sleep_sec: float = 1.0, progress_cb=None) -> Tuple[int, int]:
+    def build_full_history(self, min_days: int = 240, batch_size: int = 25, sleep_sec: float = 0.6, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
         master = self.db.get_master()
         if master.empty:
-            return 0, 0
+            return 0, 0, 0
         success = 0
+        failed = 0
         rows = 0
         total = len(master)
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
+            if cancel_cb and cancel_cb():
+                raise OperationCancelled("使用者中斷完整歷史建庫")
             stock_id = str(row["stock_id"])
             market = str(row["market"])
             existing = self.db.get_price_history_count(stock_id)
-            if existing < min_days:
+            if existing >= min_days:
+                if progress_cb:
+                    progress_cb(idx, total, stock_id, existing, "skip")
+                if log_cb and (idx % 25 == 0 or idx == total):
+                    log_cb(f"[{idx}/{total}] {stock_id} 已具備 {existing} 筆歷史，跳過")
+                continue
+            try:
                 hist_df = self.download_history(stock_id, market, period="2y")
-                if not hist_df.empty:
+                if hist_df is not None and not hist_df.empty:
                     self.db.upsert_price_history(stock_id, hist_df)
                     success += 1
                     rows += len(hist_df)
-            if progress_cb:
-                progress_cb(idx, total, stock_id)
+                    current_count = self.db.get_price_history_count(stock_id)
+                    if log_cb:
+                        log_cb(f"[{idx}/{total}] {stock_id} 補建成功，新增/覆蓋 {len(hist_df)} 筆，累計 {current_count} 筆")
+                    if progress_cb:
+                        progress_cb(idx, total, stock_id, current_count, "ok")
+                else:
+                    failed += 1
+                    if log_cb:
+                        log_cb(f"[{idx}/{total}] {stock_id} 無可用歷史資料")
+                    if progress_cb:
+                        progress_cb(idx, total, stock_id, existing, "fail")
+            except Exception as e:
+                failed += 1
+                if log_cb:
+                    log_cb(f"[{idx}/{total}] {stock_id} 下載失敗：{e}")
+                if progress_cb:
+                    progress_cb(idx, total, stock_id, existing, "error")
             if idx % batch_size == 0:
+                if log_cb:
+                    log_cb(f"--- 分批節點：已處理 {idx}/{total}，暫停 {sleep_sec:.1f} 秒，避免介面卡住 ---")
                 time.sleep(sleep_sec)
-        return success, rows
+        return success, failed, rows
 
-    def update_incremental(self, progress_cb=None) -> Tuple[int, int]:
+    def update_incremental(self, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
         master = self.db.get_master()
         if master.empty:
             return 0, 0
@@ -623,10 +655,13 @@ class DataEngine:
                 official_map[str(row["stock_id"])] = pd.DataFrame([row])
 
         success = 0
+        failed = 0
         rows = 0
 
         total = len(master)
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
+            if cancel_cb and cancel_cb():
+                raise OperationCancelled("使用者中斷每日增量更新")
             stock_id = str(row["stock_id"])
             official_df = official_map.get(stock_id, pd.DataFrame())
 
@@ -634,11 +669,16 @@ class DataEngine:
                 self.db.upsert_price_history(stock_id, official_df)
                 rows += len(official_df)
                 success += 1
+                if log_cb and (idx % 20 == 0 or idx == total):
+                    log_cb(f"[{idx}/{total}] {stock_id} 每日資料更新 {len(official_df)} 筆")
+                if progress_cb:
+                    progress_cb(idx, total, stock_id, len(official_df), "ok")
+            else:
+                failed += 1
+                if progress_cb:
+                    progress_cb(idx, total, stock_id, 0, "skip")
 
-            if progress_cb:
-                progress_cb(idx, total, stock_id)
-
-        return success, rows
+        return success, failed, rows
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
         x = df.copy()
@@ -1226,6 +1266,11 @@ class AppUI:
         self.last_defense_df = pd.DataFrame()
         self.current_chart_path = None
         self.worker = None
+        self.cancel_event = threading.Event()
+        self.current_job = None
+        self.history_batch_size = 25
+        self.history_sleep_sec = 0.6
+        self.last_job_summary = {}
 
         self.root.title(APP_NAME)
         self.root.geometry("1580x920")
@@ -1246,7 +1291,7 @@ class AppUI:
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
         lines = [
-            "《GTC AI Trading System v6.0.3》",
+            "《GTC AI Trading System v6.0.4 專業交易系統版》",
             "",
             f"主檔狀態：{len(self.db.get_master())} 檔",
             f"歷史資料：{price_rows} 筆｜最後交易日：{last_date}",
@@ -1258,6 +1303,7 @@ class AppUI:
             "3. 每日增量更新",
             "4. 重建排行",
             "5. AI選股TOP5",
+            "6. 支援中斷續跑 / 分批建庫 / 即時Log",
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
@@ -1299,6 +1345,10 @@ class AppUI:
         self.btn_init.pack(side="left", padx=4)
         self.btn_build = ttk.Button(top, text="建立完整歷史（一次）", command=self.build_full_history_once)
         self.btn_build.pack(side="left", padx=4)
+        self.btn_resume = ttk.Button(top, text="續跑建庫", command=self.resume_full_history)
+        self.btn_resume.pack(side="left", padx=4)
+        self.btn_cancel = ttk.Button(top, text="中斷作業", command=self.cancel_current_job, state="disabled")
+        self.btn_cancel.pack(side="left", padx=4)
         self.btn_update = ttk.Button(top, text="每日增量更新", command=self.update_data)
         self.btn_update.pack(side="left", padx=4)
         self.btn_rebuild = ttk.Button(top, text="重建排行", command=self.rebuild_ranking)
@@ -1315,6 +1365,9 @@ class AppUI:
         self.progress_var = tk.DoubleVar(value=0)
         self.progress = ttk.Progressbar(top, variable=self.progress_var, maximum=100, length=180, mode="determinate")
         self.progress.pack(side="left", padx=6)
+        self.progress_text_var = tk.StringVar(value="0% | 0/0 | 成功 0 | 失敗 0")
+        self.progress_text_label = ttk.Label(top, textvariable=self.progress_text_var, width=28)
+        self.progress_text_label.pack(side="left", padx=4)
 
         self.status_label = ttk.Label(top, text="系統就緒")
         self.status_label.pack(side="right")
@@ -1347,8 +1400,15 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.detail = tk.Text(right, wrap="word", font=("Consolas", 11))
+        upper = ttk.LabelFrame(right, text="個股 / 系統說明", padding=6)
+        upper.pack(fill="both", expand=True)
+        self.detail = tk.Text(upper, wrap="word", font=("Consolas", 11), height=18)
         self.detail.pack(fill="both", expand=True)
+
+        lower = ttk.LabelFrame(right, text="即時 Log 視窗", padding=6)
+        lower.pack(fill="both", expand=True, pady=(8, 0))
+        self.log_text = tk.Text(lower, wrap="word", font=("Consolas", 10), height=14)
+        self.log_text.pack(fill="both", expand=True)
 
     def _make_tree(self, parent, cols, headers):
         tree = ttk.Treeview(parent, columns=cols, show="headings", height=28)
@@ -1362,29 +1422,74 @@ class AppUI:
         self.status_label.config(text=text)
         self.root.update_idletasks()
 
-    def set_progress(self, current=0, total=100):
+    def set_progress(self, current=0, total=100, success=0, failed=0, sid=""):
         total = max(int(total), 1)
         current = max(0, min(int(current), total))
         self.progress.configure(maximum=total)
         self.progress_var.set(current)
+        pct = (current / total) * 100 if total else 0
+        sid_part = f" | {sid}" if sid else ""
+        self.progress_text_var.set(f"{pct:5.1f}% | {current}/{total} | 成功 {success} | 失敗 {failed}{sid_part}")
         self.root.update_idletasks()
 
     def reset_progress(self):
         self.progress.configure(maximum=100)
         self.progress_var.set(0)
+        self.progress_text_var.set("0% | 0/0 | 成功 0 | 失敗 0")
         self.root.update_idletasks()
 
+    def append_log(self, text):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{ts}] {text}\n")
+        self.log_text.see(tk.END)
+        self.root.update_idletasks()
+
+    def clear_log(self):
+        self.log_text.delete("1.0", tk.END)
+
+    def save_history_state(self, state: dict):
+        try:
+            STATE_PATH.write_text(pd.Series(state).to_json(force_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def load_history_state(self) -> dict:
+        try:
+            if STATE_PATH.exists():
+                return pd.read_json(STATE_PATH, typ="series").to_dict()
+        except Exception:
+            pass
+        return {}
+
+    def clear_history_state(self):
+        try:
+            if STATE_PATH.exists():
+                STATE_PATH.unlink()
+        except Exception:
+            pass
+
+    def cancel_current_job(self):
+        if self.worker is None or not self.worker.is_alive():
+            return messagebox.showinfo("提醒", "目前沒有執行中的背景作業。")
+        self.cancel_event.set()
+        self.append_log("已收到中斷要求，將於本批或本檔完成後停止。")
+        self.set_status("已發出中斷要求，請稍候…")
+
     def set_busy(self, busy: bool):
-        state = "disabled" if busy else "normal"
-        for btn in [
-            self.btn_filter, self.btn_init, self.btn_build, self.btn_update,
+        normal_buttons = [
+            self.btn_filter, self.btn_init, self.btn_build, self.btn_resume, self.btn_update,
             self.btn_rebuild, self.btn_top5, self.btn_export_top5,
             self.btn_export_excel, self.btn_open_chart
-        ]:
+        ]
+        for btn in normal_buttons:
             try:
-                btn.config(state=state)
+                btn.config(state="disabled" if busy else "normal")
             except Exception:
                 pass
+        try:
+            self.btn_cancel.config(state="normal" if busy else "disabled")
+        except Exception:
+            pass
         self.root.update_idletasks()
 
     def ui_call(self, func, *args, **kwargs):
@@ -1396,11 +1501,14 @@ class AppUI:
             return
 
         def runner():
+            self.cancel_event.clear()
+            self.current_job = name
             self.ui_call(self.set_busy, True)
             self.ui_call(self.reset_progress)
             try:
                 target()
             finally:
+                self.current_job = None
                 self.ui_call(self.set_busy, False)
 
         self.worker = threading.Thread(target=runner, name=name, daemon=True)
@@ -1448,6 +1556,12 @@ class AppUI:
         messagebox.showinfo("完成", f"分析報告已輸出：\n{out}")
 
     def build_full_history_once(self):
+        self._start_build_history(resume=False)
+
+    def resume_full_history(self):
+        self._start_build_history(resume=True)
+
+    def _start_build_history(self, resume: bool = False):
         master = self.db.get_master()
         if master.empty:
             return messagebox.showwarning("提醒", "請先初始化全市場。")
@@ -1455,31 +1569,70 @@ class AppUI:
         counts = master["stock_id"].astype(str).apply(self.db.get_price_history_count)
         ready = int((counts >= 240).sum())
         total = len(master)
-        if ready >= int(total * 0.9):
+        state = self.load_history_state()
+
+        if resume:
+            if not state:
+                self.append_log("未找到上次中斷狀態，改為一般補建模式。")
+            ok = messagebox.askyesno("確認", f"將執行續跑建庫。\n目前完整檔數：{ready}/{total}\n系統會自動跳過已完成股票，是否開始？")
+        elif ready >= int(total * 0.9):
             ok = messagebox.askyesno("確認", f"已有 {ready}/{total} 檔具備完整歷史資料。\n再次執行將只補缺漏資料，是否繼續？")
-            if not ok:
-                return
         else:
             ok = messagebox.askyesno("確認", f"將建立完整歷史資料。\n目前完整檔數：{ready}/{total}\n是否開始？")
-            if not ok:
-                return
+        if not ok:
+            return
 
         def worker():
             try:
-                self.ui_call(self.set_status, "開始建立完整歷史資料（一次）...")
-                self.ui_call(self.set_progress, 0, total)
+                self.ui_call(self.clear_log)
+                self.ui_call(self.append_log, f"開始完整建庫，模式={'續跑' if resume else '一般'}，主檔 {total} 檔")
+                self.ui_call(self.set_status, "開始建立完整歷史資料（分批 / 可中斷 / 可續跑）...")
+                self.ui_call(self.set_progress, 0, total, 0, 0, "準備中")
+                counters = {"ok": 0, "fail": 0}
 
-                def progress(idx, total_count, sid):
-                    self.ui_call(self.set_progress, idx, total_count)
+                def progress(idx, total_count, sid, existing_count, flag):
+                    if flag in ("fail", "error"):
+                        counters["fail"] += 1
+                    elif flag == "ok":
+                        counters["ok"] += 1
+                    self.ui_call(self.set_progress, idx, total_count, counters["ok"], counters["fail"], sid)
+                    self.save_history_state({
+                        "mode": "build_history",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "current_index": idx,
+                        "total": total_count,
+                        "stock_id": sid,
+                        "completed_ready": int((master["stock_id"].astype(str).apply(self.db.get_price_history_count) >= 240).sum()),
+                        "success": counters["ok"],
+                        "failed": counters["fail"],
+                        "existing_count": int(existing_count),
+                    })
                     if idx % 10 == 0 or idx == total_count:
-                        self.ui_call(self.set_status, f"建立歷史中 {idx}/{total_count}｜{sid}")
+                        self.ui_call(self.set_status, f"建立歷史中 {idx}/{total_count}｜{sid}｜成功 {counters['ok']}｜失敗 {counters['fail']}")
 
-                success, rows = self.data_engine.build_full_history(progress_cb=progress)
-                self.ui_call(self.set_progress, total, total)
-                self.ui_call(self.set_status, f"完整歷史建立完成：成功 {success} 檔，寫入 {rows} 筆。")
-                self.ui_call(messagebox.showinfo, "完成", f"完整歷史建立完成\n成功 {success} 檔\n寫入 {rows} 筆")
+                success, failed, rows = self.data_engine.build_full_history(
+                    batch_size=self.history_batch_size,
+                    sleep_sec=self.history_sleep_sec,
+                    progress_cb=progress,
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                    cancel_cb=lambda: self.cancel_event.is_set(),
+                )
+                self.clear_history_state()
+                self.ui_call(self.set_progress, total, total, success, failed, "完成")
+                self.ui_call(self.set_status, f"完整歷史建立完成：成功 {success} 檔，失敗 {failed} 檔，寫入 {rows} 筆。")
+                self.ui_call(self.append_log, f"完整建庫完成：成功 {success} 檔｜失敗 {failed} 檔｜寫入 {rows} 筆")
+                self.ui_call(messagebox.showinfo, "完成", f"完整歷史建立完成\n成功 {success} 檔\n失敗 {failed} 檔\n寫入 {rows} 筆\n\n已支援分批抓取 / 中斷續跑")
+            except OperationCancelled:
+                state2 = self.load_history_state()
+                sid = state2.get("stock_id", "")
+                idx = state2.get("current_index", 0)
+                total_count = state2.get("total", total)
+                self.ui_call(self.append_log, f"作業已中斷：停在 {idx}/{total_count}｜{sid}")
+                self.ui_call(self.set_status, f"建庫已中斷：停在 {idx}/{total_count}｜{sid}，可按『續跑建庫』")
+                self.ui_call(messagebox.showwarning, "已中斷", f"完整建庫已中斷\n目前停在 {idx}/{total_count}｜{sid}\n\n下次請按『續跑建庫』，系統會自動跳過已完成資料。")
             except Exception as e:
                 traceback.print_exc()
+                self.ui_call(self.append_log, f"完整建庫發生錯誤：{e}")
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
 
         self._run_in_thread(worker, "build_history")
@@ -1636,6 +1789,8 @@ class AppUI:
     def rebuild_ranking(self):
         def worker():
             try:
+                self.ui_call(self.clear_log)
+                self.ui_call(self.append_log, "開始重建排行...")
                 self.ui_call(self.set_status, "開始重建排行...")
                 self.ui_call(self.set_progress, 10, 100)
                 count = self.rank_engine.rebuild()
@@ -1675,7 +1830,7 @@ class AppUI:
         self.last_theme_summary_df = theme_summary.copy()
 
         lines = [
-            "《v6.0.3 FULL 整合升級版》",
+            "《v6.0.4 專業交易系統版》",
             f"市場判斷：{market['regime']}（{market['score']:.2f}）",
             f"市場說明：{market['memo']}",
             ""
