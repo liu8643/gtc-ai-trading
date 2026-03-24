@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM
+GTC AI Trading System v6.0.5 TRADING-GRADE-SYSTEM
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -10,6 +10,8 @@ GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM
 - 技術指標：MA / MACD / RSI / KD
 - 排行榜 / 類股熱度 / 題材輪動
 - AI 選股 TOP20
+- 每日更新官方優先 + Yahoo 備援
+- 自動產生下單清單
 - Tkinter 桌面 UI
 """
 
@@ -61,8 +63,8 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM TOP20"
-STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_4.json"
+APP_NAME = "GTC AI Trading System v6.0.5 TRADING-GRADE-SYSTEM TOP20"
+STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_5.json"
 
 
 PACKED_DATA_DIR = BASE_DIR / "data"
@@ -110,8 +112,11 @@ CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
 LEGACY_DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
-DB_PATH = RUNTIME_DIR / "stock_system_v6_0_3.db"
-if (not DB_PATH.exists()) and LEGACY_DB_PATH.exists():
+DB_PATH = RUNTIME_DIR / "stock_system_v6_0_5.db"
+LEGACY_DB_PATH_V603 = RUNTIME_DIR / "stock_system_v6_0_3.db"
+if (not DB_PATH.exists()) and LEGACY_DB_PATH_V603.exists():
+    DB_PATH = LEGACY_DB_PATH_V603
+elif (not DB_PATH.exists()) and LEGACY_DB_PATH.exists():
     DB_PATH = LEGACY_DB_PATH
 MASTER_CSV = resolve_master_csv()
 
@@ -586,6 +591,46 @@ class DataEngine:
                 continue
         return pd.DataFrame()
 
+    def download_latest_bar_yahoo(self, stock_id: str, market: str, days: str = "7d") -> pd.DataFrame:
+        if yf is None:
+            return pd.DataFrame()
+        symbols = []
+        primary = self.yahoo_symbol(stock_id, market)
+        if primary:
+            symbols.append(primary)
+        if f"{stock_id}.TW" not in symbols:
+            symbols.append(f"{stock_id}.TW")
+        if f"{stock_id}.TWO" not in symbols:
+            symbols.append(f"{stock_id}.TWO")
+
+        seen = set()
+        latest = pd.DataFrame()
+        for symbol in symbols:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            try:
+                hist = yf.Ticker(symbol).history(period=days, auto_adjust=False)
+                if hist is None or hist.empty:
+                    continue
+                hist = hist.rename(columns={
+                    "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
+                }).reset_index()
+                date_col = "Date" if "Date" in hist.columns else "Datetime"
+                hist["date"] = pd.to_datetime(hist[date_col]).dt.strftime("%Y-%m-%d")
+                hist["turnover"] = hist["close"] * hist["volume"]
+                out = hist[["date", "open", "high", "low", "close", "volume", "turnover"]].copy()
+                for c in ["open", "high", "low", "close", "volume", "turnover"]:
+                    out[c] = pd.to_numeric(out[c], errors="coerce")
+                out = out.dropna(subset=["close"]).sort_values("date")
+                if not out.empty:
+                    latest = out.tail(1).copy()
+                    break
+            except Exception:
+                continue
+        return latest
+
+
     def build_full_history(self, min_days: int = 240, batch_size: int = 25, sleep_sec: float = 0.6, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
         master = self.db.get_master()
         if master.empty:
@@ -638,7 +683,7 @@ class DataEngine:
     def update_incremental(self, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
         master = self.db.get_master()
         if master.empty:
-            return 0, 0
+            return 0, 0, 0
 
         twse_df = self.fetch_twse_daily()
         tpex_df = self.fetch_tpex_daily()
@@ -654,27 +699,48 @@ class DataEngine:
         success = 0
         failed = 0
         rows = 0
+        source_summary = {"official": 0, "yahoo": 0, "none": 0}
 
         total = len(master)
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷每日增量更新")
             stock_id = str(row["stock_id"])
+            market = str(row["market"])
             official_df = official_map.get(stock_id, pd.DataFrame())
+            used_source = ""
+            write_df = pd.DataFrame()
 
             if not official_df.empty:
-                self.db.upsert_price_history(stock_id, official_df)
-                rows += len(official_df)
+                write_df = official_df.copy()
+                used_source = "official"
+            else:
+                yahoo_df = self.download_latest_bar_yahoo(stock_id, market, days="7d")
+                if yahoo_df is not None and not yahoo_df.empty:
+                    write_df = yahoo_df.copy()
+                    used_source = "yahoo"
+
+            if not write_df.empty:
+                self.db.upsert_price_history(stock_id, write_df)
+                actual_rows = len(write_df)
+                rows += actual_rows
                 success += 1
-                if log_cb and (idx % 20 == 0 or idx == total):
-                    log_cb(f"[{idx}/{total}] {stock_id} 每日資料更新 {len(official_df)} 筆")
+                source_summary[used_source] += 1
+                if log_cb and (idx % 20 == 0 or idx == total or used_source == "yahoo"):
+                    src_name = "官方" if used_source == "official" else "Yahoo備援"
+                    log_cb(f"[{idx}/{total}] {stock_id} 每日資料更新 {actual_rows} 筆｜來源 {src_name}")
                 if progress_cb:
-                    progress_cb(idx, total, stock_id, len(official_df), "ok")
+                    progress_cb(idx, total, stock_id, actual_rows, used_source)
             else:
                 failed += 1
+                source_summary["none"] += 1
+                if log_cb and (idx % 50 == 0 or idx == total):
+                    log_cb(f"[{idx}/{total}] {stock_id} 今日無官方資料，Yahoo 備援亦未取到")
                 if progress_cb:
                     progress_cb(idx, total, stock_id, 0, "skip")
 
+        if log_cb:
+            log_cb(f"每日更新彙總｜官方 {source_summary['official']} 檔｜Yahoo備援 {source_summary['yahoo']} 檔｜未取到 {source_summary['none']} 檔")
         return success, failed, rows
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
@@ -1262,6 +1328,7 @@ class AppUI:
         self.last_attack_df = pd.DataFrame()
         self.last_watch_df = pd.DataFrame()
         self.last_defense_df = pd.DataFrame()
+        self.last_order_list_df = pd.DataFrame()
         self.current_chart_path = None
         self.worker = None
         self.cancel_event = threading.Event()
@@ -1301,7 +1368,7 @@ class AppUI:
             "3. 每日增量更新",
             "4. 重建排行",
             "5. AI選股TOP20",
-            "6. 支援中斷續跑 / 分批建庫 / 即時Log",
+            "6. 支援中斷續跑 / 分批建庫 / 即時Log / 下單清單",
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
@@ -1356,7 +1423,7 @@ class AppUI:
 
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(top, textvariable=self.download_target_var, width=10, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "主攻", "次強", "防守", "排行", "類股", "題材"]
+        self.download_target_cb["values"] = ["TOP20", "主攻", "次強", "防守", "下單清單", "排行", "類股", "題材"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(top, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=4)
@@ -1529,6 +1596,7 @@ class AppUI:
             "主攻": self.last_attack_df,
             "次強": self.last_watch_df,
             "防守": self.last_defense_df,
+            "下單清單": self.last_order_list_df,
             "排行": self._filtered_ranking(),
             "類股": pd.DataFrame([(self.sector_tree.item(i, "values")) for i in self.sector_tree.get_children()], columns=["產業", "檔數", "平均總分", "平均AI分", "代表股"]) if self.sector_tree.get_children() else pd.DataFrame(),
             "題材": pd.DataFrame([(self.theme_tree.item(i, "values")) for i in self.theme_tree.get_children()], columns=["題材", "檔數", "平均總分", "平均AI分", "代表股"]) if self.theme_tree.get_children() else pd.DataFrame(),
@@ -1565,9 +1633,45 @@ class AppUI:
                 self.last_watch_df.to_excel(writer, sheet_name="Watch", index=False)
             if self.last_defense_df is not None and not self.last_defense_df.empty:
                 self.last_defense_df.to_excel(writer, sheet_name="Defense", index=False)
+            if self.last_order_list_df is not None and not self.last_order_list_df.empty:
+                self.last_order_list_df.to_excel(writer, sheet_name="Order_List", index=False)
             detail_text = self.detail.get("1.0", tk.END).strip()
             pd.DataFrame({"detail": [detail_text]}).to_excel(writer, sheet_name="Detail", index=False)
         messagebox.showinfo("完成", f"分析報告已輸出：\n{out}")
+
+    def build_order_list(self, trade_top20: pd.DataFrame) -> pd.DataFrame:
+        if trade_top20 is None or trade_top20.empty:
+            return pd.DataFrame(columns=["優先級", "代號", "名稱", "分類", "建議動作", "進場區", "停損", "目標價", "RR", "勝率", "建議張數", "風險備註"])
+
+        rows = []
+        for i, (_, r) in enumerate(trade_top20.iterrows(), start=1):
+            action = str(r.get("trade_action", "觀望"))
+            bucket = str(r.get("bucket", "觀察"))
+            rr = float(r.get("rr", 0) or 0)
+            win_rate = float(r.get("win_rate", 0) or 0)
+            if action == "可買":
+                qty = 2 if rr >= 2.0 and win_rate >= 58 else 1
+            elif action == "等待":
+                qty = 1
+            else:
+                qty = 0
+            risk_note = "防守ETF" if bucket == "防守" else ("等待拉回" if action == "等待" else ("可直接評估進場" if action == "可買" else "觀察"))
+            rows.append({
+                "優先級": i,
+                "代號": r.get("stock_id", ""),
+                "名稱": r.get("stock_name", ""),
+                "分類": bucket,
+                "建議動作": action,
+                "進場區": r.get("entry_zone", "-"),
+                "停損": r.get("stop_loss", "-"),
+                "目標價": r.get("target_price", "-"),
+                "RR": rr,
+                "勝率": win_rate,
+                "建議張數": qty,
+                "風險備註": risk_note,
+            })
+        return pd.DataFrame(rows)
+
 
     def build_full_history_once(self):
         self._start_build_history(resume=False)
@@ -1635,6 +1739,7 @@ class AppUI:
                 self.ui_call(self.set_progress, total, total, success, failed, "完成")
                 self.ui_call(self.set_status, f"完整歷史建立完成：成功 {success} 檔，失敗 {failed} 檔，寫入 {rows} 筆。")
                 self.ui_call(self.append_log, f"完整建庫完成：成功 {success} 檔｜失敗 {failed} 檔｜寫入 {rows} 筆")
+                self.ui_call(self.show_welcome_message)
                 self.ui_call(messagebox.showinfo, "完成", f"完整歷史建立完成\n成功 {success} 檔\n失敗 {failed} 檔\n寫入 {rows} 筆\n\n已支援分批抓取 / 中斷續跑")
             except OperationCancelled:
                 state2 = self.load_history_state()
@@ -1677,6 +1782,7 @@ class AppUI:
                 master2 = self.db.get_master()
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
+                self.ui_call(self.show_welcome_message)
                 self.ui_call(self.set_progress, 100, 100)
                 self.ui_call(self.set_status, f"全市場初始化完成，共 {len(master2)} 檔。")
                 self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔")
@@ -1817,6 +1923,7 @@ class AppUI:
                 self.ui_call(self.set_progress, 90, 100)
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
+                self.ui_call(self.show_welcome_message)
                 self.ui_call(self.set_progress, 100, 100)
                 if count <= 0:
                     self.ui_call(messagebox.showwarning, "提醒", "排行重建完成，但目前可計算檔數為 0。\n請先建立至少 70 根以上歷史K線資料。")
@@ -1848,9 +1955,10 @@ class AppUI:
         self.last_watch_df = watch.copy()
         self.last_defense_df = defense.copy()
         self.last_theme_summary_df = theme_summary.copy()
+        self.last_order_list_df = self.build_order_list(trade_top20)
 
         lines = [
-            "《v6.0.4 專業交易系統版》",
+            "《v6.0.5 交易等級版》",
             f"市場判斷：{market['regime']}（{market['score']:.2f}）",
             f"市場說明：{market['memo']}",
             ""
@@ -1861,26 +1969,45 @@ class AppUI:
             lines.append("目前無符合條件標的")
         else:
             for i, (_, r) in enumerate(trade_top20.iterrows(), start=1):
+                ui_action = "防守" if str(r['bucket']) == '防守' else str(r['trade_action'])
                 lines.append(
-                    f"{i}. {r['stock_id']} {r['stock_name']}｜{r['theme']}｜{r['trade_action']}\n"
+                    f"{i}. {r['stock_id']} {r['stock_name']}｜{r['theme']}｜{ui_action}\n"
                     f"   進場: {r['entry_zone']}｜停損: {r['stop_loss']}｜目標: {r['target_price']}\n"
                     f"   RR: {r['rr']:.2f}｜勝率: {r['win_grade']}({r['win_rate']:.1f}%)｜理由: {r['reason']}"
                 )
+
+        lines.append("")
+        lines.append("【UI 交易狀態】")
+        if trade_top20.empty:
+            lines.append("無")
+        else:
+            buy_cnt = int((trade_top20['trade_action'] == '可買').sum())
+            wait_cnt = int((trade_top20['trade_action'] == '等待').sum())
+            defense_cnt = int((trade_top20['bucket'] == '防守').sum())
+            lines.append(f"可買：{buy_cnt} 檔｜等待：{wait_cnt} 檔｜防守：{defense_cnt} 檔")
+
+        lines.append("")
+        lines.append("【自動下單清單（前10）】")
+        if self.last_order_list_df.empty:
+            lines.append("無")
+        else:
+            for _, r in self.last_order_list_df.head(10).iterrows():
+                lines.append(f"- #{int(r['優先級'])} {r['代號']} {r['名稱']}｜{r['建議動作']}｜{r['進場區']}｜張數 {int(r['建議張數'])}")
 
         lines.append("")
         lines.append("【主攻候選】")
         if attack.empty:
             lines.append("無")
         else:
-            for _, r in attack.iterrows():
-                lines.append(f"- {r['stock_id']} {r['stock_name']}｜RR {r['rr']:.2f}｜{r['trade_action']}")
+            for _, r in attack.head(10).iterrows():
+                lines.append(f"- {r['stock_id']} {r['stock_name']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['trade_action']}")
 
         lines.append("")
         lines.append("【次強觀察】")
         if watch.empty:
             lines.append("無")
         else:
-            for _, r in watch.iterrows():
+            for _, r in watch.head(10).iterrows():
                 lines.append(f"- {r['stock_id']} {r['stock_name']}｜進場 {r['entry_zone']}｜RR {r['rr']:.2f}")
 
         lines.append("")
@@ -1888,8 +2015,8 @@ class AppUI:
         if defense.empty:
             lines.append("無")
         else:
-            for _, r in defense.iterrows():
-                lines.append(f"- {r['stock_id']} {r['stock_name']}｜{r['trade_action']}｜區間 {r['entry_zone']}")
+            for _, r in defense.head(10).iterrows():
+                lines.append(f"- {r['stock_id']} {r['stock_name']}｜防守｜區間 {r['entry_zone']}")
 
         lines.append("")
         lines.append("【主流題材】")
@@ -1899,7 +2026,22 @@ class AppUI:
             for _, r in theme_summary.head(5).iterrows():
                 lines.append(f"- {r['theme']}｜檔數 {int(r['count'])}｜總分 {r['avg_total']:.1f}｜AI {r['avg_ai']:.1f}")
 
-        messagebox.showinfo("AI選股TOP20", "\n".join(lines))
+        detail_lines = [
+            "《自動下單清單》",
+            f"市場：{market['regime']}｜分數 {market['score']:.2f}",
+            ""
+        ]
+        if self.last_order_list_df.empty:
+            detail_lines.append("目前無可下單清單")
+        else:
+            for _, r in self.last_order_list_df.iterrows():
+                detail_lines.append(
+                    f"#{int(r['優先級'])} {r['代號']} {r['名稱']}｜{r['分類']}｜{r['建議動作']}｜進場 {r['進場區']}｜停損 {r['停損']}｜目標 {r['目標價']}｜RR {float(r['RR']):.2f}｜勝率 {float(r['勝率']):.1f}%｜張數 {int(r['建議張數'])}"
+                )
+        self.detail.delete("1.0", tk.END)
+        TEMPJOIN1
+        self.set_status(f"AI選股TOP20 完成｜可買 {(trade_top20['trade_action'] == '可買').sum() if not trade_top20.empty else 0}｜等待 {(trade_top20['trade_action'] == '等待').sum() if not trade_top20.empty else 0}｜防守 {(trade_top20['bucket'] == '防守').sum() if not trade_top20.empty else 0}")
+        TEMPJOIN2
 
     def on_select_stock(self, event=None):
         sel = self.rank_tree.selection()
