@@ -1329,6 +1329,7 @@ class AppUI:
         self.last_watch_df = pd.DataFrame()
         self.last_defense_df = pd.DataFrame()
         self.last_order_list_df = pd.DataFrame()
+        self.last_order_list_df = pd.DataFrame()
         self.current_chart_path = None
         self.worker = None
         self.cancel_event = threading.Event()
@@ -1445,17 +1446,21 @@ class AppUI:
         main = ttk.Panedwindow(self.root, orient="horizontal")
         main.pack(fill="both", expand=True, padx=8, pady=8)
 
-        left = ttk.Notebook(main)
+        self.left_notebook = ttk.Notebook(main)
         right = ttk.Frame(main, padding=8)
-        main.add(left, weight=3)
+        main.add(self.left_notebook, weight=3)
         main.add(right, weight=2)
 
-        self.tab_rank = ttk.Frame(left)
-        self.tab_sector = ttk.Frame(left)
-        self.tab_theme = ttk.Frame(left)
-        left.add(self.tab_rank, text="排行榜")
-        left.add(self.tab_sector, text="類股熱度")
-        left.add(self.tab_theme, text="題材輪動")
+        self.tab_rank = ttk.Frame(self.left_notebook)
+        self.tab_sector = ttk.Frame(self.left_notebook)
+        self.tab_theme = ttk.Frame(self.left_notebook)
+        self.tab_top20 = ttk.Frame(self.left_notebook)
+        self.tab_order = ttk.Frame(self.left_notebook)
+        self.left_notebook.add(self.tab_rank, text="排行榜")
+        self.left_notebook.add(self.tab_sector, text="類股熱度")
+        self.left_notebook.add(self.tab_theme, text="題材輪動")
+        self.left_notebook.add(self.tab_top20, text="AI交易TOP20")
+        self.left_notebook.add(self.tab_order, text="下單清單")
 
         self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "industry", "theme", "total", "ai", "signal", "action"), {
             "rank": "排名", "id": "代號", "name": "名稱", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
@@ -1469,6 +1474,17 @@ class AppUI:
         self.theme_tree = self._make_tree(self.tab_theme, ("theme", "count", "avg_total", "avg_ai", "top_name"), {
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
+
+
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "bucket", "ui_action", "entry", "stop", "target", "rr", "win_rate"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "動作", "entry": "進場區", "stop": "停損", "target": "目標價", "rr": "RR", "win_rate": "勝率%"
+        })
+        self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
+
+        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "bucket", "action", "entry", "stop", "target", "rr", "win_rate", "qty", "risk_note"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "bucket": "分類", "action": "建議", "entry": "進場區", "stop": "停損", "target": "目標價", "rr": "RR", "win_rate": "勝率%", "qty": "建議張數", "risk_note": "風險備註"
+        })
+        self.order_tree.bind("<<TreeviewSelect>>", self.on_select_order)
 
         upper = ttk.LabelFrame(right, text="個股 / 系統說明", padding=6)
         upper.pack(fill="both", expand=True)
@@ -1673,6 +1689,87 @@ class AppUI:
         return pd.DataFrame(rows)
 
 
+    def refresh_top20_and_order_views(self):
+        for tree in (self.top20_tree, self.order_tree):
+            for item in tree.get_children():
+                tree.delete(item)
+
+        if self.last_top20_df is not None and not self.last_top20_df.empty:
+            for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
+                ui_action = "防守" if str(r.get("bucket", "")) == "防守" else str(r.get("trade_action", ""))
+                self.top20_tree.insert("", "end", values=(
+                    i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("bucket", ""), ui_action,
+                    r.get("entry_zone", "-"), r.get("stop_loss", "-"), r.get("target_price", "-"),
+                    f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}"
+                ))
+
+        if self.last_order_list_df is not None and not self.last_order_list_df.empty:
+            for _, r in self.last_order_list_df.iterrows():
+                self.order_tree.insert("", "end", values=(
+                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("分類", ""),
+                    r.get("建議動作", ""), r.get("進場區", "-"), r.get("停損", "-"), r.get("目標價", "-"),
+                    f"{float(r.get('RR', 0) or 0):.2f}", f"{float(r.get('勝率', 0) or 0):.1f}",
+                    int(r.get("建議張數", 0) or 0), r.get("風險備註", "")
+                ))
+
+    def on_select_top20(self, event=None):
+        sel = self.top20_tree.selection()
+        if not sel:
+            return
+        vals = self.top20_tree.item(sel[0], "values")
+        stock_id = str(vals[1])
+        stock = self.db.get_stock_row(stock_id)
+        hist = self.db.get_price_history(stock_id)
+        if stock is None or hist.empty:
+            return
+        hist = DataEngine.attach(hist)
+        last = hist.iloc[-1]
+        trade_plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
+        self.current_chart_path = self.export_chart(stock_id, hist)
+        lines = [
+            f"《AI交易TOP20》",
+            f"股票：{stock['stock_name']} ({stock_id})",
+            f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
+            f"最新收盤：{float(last['close']):.2f}",
+            f"交易分類：{trade_plan['bucket']}｜動作：{trade_plan['trade_action']}",
+            f"進場區：{trade_plan['entry_zone']}",
+            f"停損：{trade_plan['stop_loss']}｜目標價：{trade_plan['target_price']}",
+            f"RR：{float(trade_plan['rr']):.2f}｜勝率：{trade_plan['win_grade']} ({float(trade_plan['win_rate']):.1f}%)",
+            f"理由：{trade_plan['reason']}",
+            f"圖表：{self.current_chart_path}",
+        ]
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+
+    def on_select_order(self, event=None):
+        sel = self.order_tree.selection()
+        if not sel:
+            return
+        vals = self.order_tree.item(sel[0], "values")
+        stock_id = str(vals[1])
+        stock = self.db.get_stock_row(stock_id)
+        hist = self.db.get_price_history(stock_id)
+        if stock is None or hist.empty:
+            return
+        hist = DataEngine.attach(hist)
+        last = hist.iloc[-1]
+        self.current_chart_path = self.export_chart(stock_id, hist)
+        lines = [
+            "《下單清單》",
+            f"優先級：{vals[0]}",
+            f"股票：{stock['stock_name']} ({stock_id})",
+            f"分類 / 建議：{vals[3]} / {vals[4]}",
+            f"進場區：{vals[5]}",
+            f"停損：{vals[6]}｜目標價：{vals[7]}",
+            f"RR：{vals[8]}｜勝率：{vals[9]}%｜建議張數：{vals[10]}",
+            f"風險備註：{vals[11]}",
+            f"最新收盤：{float(last['close']):.2f}",
+            f"圖表：{self.current_chart_path}",
+        ]
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+
+
     def build_full_history_once(self):
         self._start_build_history(resume=False)
 
@@ -1819,7 +1916,7 @@ class AppUI:
         return df.sort_values(["rank_all"]).reset_index(drop=True)
 
     def refresh_all_tables(self):
-        for tree in (self.rank_tree, self.sector_tree, self.theme_tree):
+        for tree in (self.rank_tree, self.sector_tree, self.theme_tree, self.top20_tree, self.order_tree):
             for item in tree.get_children():
                 tree.delete(item)
 
@@ -1957,91 +2054,47 @@ class AppUI:
         self.last_theme_summary_df = theme_summary.copy()
         self.last_order_list_df = self.build_order_list(trade_top20)
 
+        self.refresh_top20_and_order_views()
+        self.left_notebook.select(self.tab_top20)
+
+        buy_cnt = int((trade_top20['trade_action'] == '可買').sum()) if not trade_top20.empty else 0
+        wait_cnt = int((trade_top20['trade_action'] == '等待').sum()) if not trade_top20.empty else 0
+        defense_cnt = int((trade_top20['bucket'] == '防守').sum()) if not trade_top20.empty else 0
+
         lines = [
             "《v6.0.5 交易等級版》",
             f"市場判斷：{market['regime']}（{market['score']:.2f}）",
             f"市場說明：{market['memo']}",
-            ""
+            f"TOP20 已載入到左側【AI交易TOP20】分頁",
+            f"下單清單已載入到左側【下單清單】分頁",
+            "",
+            f"可買：{buy_cnt} 檔｜等待：{wait_cnt} 檔｜防守：{defense_cnt} 檔",
+            "",
+            "【TOP20 前5檔】",
         ]
-
-        lines.append("【可下單 TOP20】")
         if trade_top20.empty:
             lines.append("目前無符合條件標的")
         else:
-            for i, (_, r) in enumerate(trade_top20.iterrows(), start=1):
+            for i, (_, r) in enumerate(trade_top20.head(5).iterrows(), start=1):
                 ui_action = "防守" if str(r['bucket']) == '防守' else str(r['trade_action'])
                 lines.append(
-                    f"{i}. {r['stock_id']} {r['stock_name']}｜{r['theme']}｜{ui_action}\n"
-                    f"   進場: {r['entry_zone']}｜停損: {r['stop_loss']}｜目標: {r['target_price']}\n"
-                    f"   RR: {r['rr']:.2f}｜勝率: {r['win_grade']}({r['win_rate']:.1f}%)｜理由: {r['reason']}"
+                    f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{ui_action}｜進場 {r['entry_zone']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%"
                 )
 
-        lines.append("")
-        lines.append("【UI 交易狀態】")
-        if trade_top20.empty:
-            lines.append("無")
-        else:
-            buy_cnt = int((trade_top20['trade_action'] == '可買').sum())
-            wait_cnt = int((trade_top20['trade_action'] == '等待').sum())
-            defense_cnt = int((trade_top20['bucket'] == '防守').sum())
-            lines.append(f"可買：{buy_cnt} 檔｜等待：{wait_cnt} 檔｜防守：{defense_cnt} 檔")
-
-        lines.append("")
-        lines.append("【自動下單清單（前10）】")
+        lines += ["", "【下單清單 前5筆】"]
         if self.last_order_list_df.empty:
-            lines.append("無")
+            lines.append("目前無可下單清單")
         else:
-            for _, r in self.last_order_list_df.head(10).iterrows():
-                lines.append(f"- #{int(r['優先級'])} {r['代號']} {r['名稱']}｜{r['建議動作']}｜{r['進場區']}｜張數 {int(r['建議張數'])}")
-
-        lines.append("")
-        lines.append("【主攻候選】")
-        if attack.empty:
-            lines.append("無")
-        else:
-            for _, r in attack.head(10).iterrows():
-                lines.append(f"- {r['stock_id']} {r['stock_name']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['trade_action']}")
-
-        lines.append("")
-        lines.append("【次強觀察】")
-        if watch.empty:
-            lines.append("無")
-        else:
-            for _, r in watch.head(10).iterrows():
-                lines.append(f"- {r['stock_id']} {r['stock_name']}｜進場 {r['entry_zone']}｜RR {r['rr']:.2f}")
-
-        lines.append("")
-        lines.append("【防守ETF】")
-        if defense.empty:
-            lines.append("無")
-        else:
-            for _, r in defense.head(10).iterrows():
-                lines.append(f"- {r['stock_id']} {r['stock_name']}｜防守｜區間 {r['entry_zone']}")
-
-        lines.append("")
-        lines.append("【主流題材】")
-        if theme_summary.empty:
-            lines.append("無")
-        else:
-            for _, r in theme_summary.head(5).iterrows():
-                lines.append(f"- {r['theme']}｜檔數 {int(r['count'])}｜總分 {r['avg_total']:.1f}｜AI {r['avg_ai']:.1f}")
-
-        detail_lines = [
-            "《自動下單清單》",
-            f"市場：{market['regime']}｜分數 {market['score']:.2f}",
-            ""
-        ]
-        if self.last_order_list_df.empty:
-            detail_lines.append("目前無可下單清單")
-        else:
-            for _, r in self.last_order_list_df.iterrows():
-                detail_lines.append(
-                    f"#{int(r['優先級'])} {r['代號']} {r['名稱']}｜{r['分類']}｜{r['建議動作']}｜進場 {r['進場區']}｜停損 {r['停損']}｜目標 {r['目標價']}｜RR {float(r['RR']):.2f}｜勝率 {float(r['勝率']):.1f}%｜張數 {int(r['建議張數'])}"
+            for _, r in self.last_order_list_df.head(5).iterrows():
+                lines.append(
+                    f"#{int(r['優先級'])} {r['代號']} {r['名稱']}｜{r['建議動作']}｜{r['進場區']}｜張數 {int(r['建議張數'])}"
                 )
+
         self.detail.delete("1.0", tk.END)
-        TEMPJOIN1
-        self.set_status(f"AI選股TOP20 完成｜可買 {(trade_top20['trade_action'] == '可買').sum() if not trade_top20.empty else 0}｜等待 {(trade_top20['trade_action'] == '等待').sum() if not trade_top20.empty else 0}｜防守 {(trade_top20['bucket'] == '防守').sum() if not trade_top20.empty else 0}")
-        TEMPJOIN2
+        self.detail.insert("1.0", "\n".join(lines))
+        self.set_status(f"AI選股TOP20 完成｜可買 {buy_cnt}｜等待 {wait_cnt}｜防守 {defense_cnt}")
+        messagebox.showinfo("AI選股TOP20", f"TOP20 與下單清單已載入畫面。\n可買 {buy_cnt} 檔｜等待 {wait_cnt} 檔｜防守 {defense_cnt} 檔")
+
 
     def on_select_stock(self, event=None):
         sel = self.rank_tree.selection()
