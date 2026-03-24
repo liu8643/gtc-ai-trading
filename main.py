@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v6.0.1 FULL-INTEGRATED-TRADING-FIX
+GTC AI Trading System v6.0.3 FULL-INTEGRATED-TRADING-FIX
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -43,7 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v6.0.1 FULL-INTEGRATED-TRADING-FIX"
+APP_NAME = "GTC AI Trading System v6.0.3 FULL-INTEGRATED-TRADING-FIX"
 
 
 def get_base_dir() -> Path:
@@ -106,7 +106,10 @@ DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
-DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
+LEGACY_DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v6_0_3.db"
+if (not DB_PATH.exists()) and LEGACY_DB_PATH.exists():
+    DB_PATH = LEGACY_DB_PATH
 MASTER_CSV = resolve_master_csv()
 
 
@@ -446,6 +449,16 @@ class DBManager:
             row = self.conn.cursor().execute("SELECT MAX(date) FROM price_history").fetchone()
         return str(row[0]) if row and row[0] else None
 
+    def get_total_price_rows(self) -> int:
+        with self.lock:
+            row = self.conn.cursor().execute("SELECT COUNT(*) FROM price_history").fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def get_ranking_rows_count(self) -> int:
+        with self.lock:
+            row = self.conn.cursor().execute("SELECT COUNT(*) FROM ranking_result WHERE date = (SELECT MAX(date) FROM ranking_result)").fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
     def replace_ranking(self, df: pd.DataFrame):
         today = datetime.now().strftime("%Y-%m-%d")
         with self.lock:
@@ -656,6 +669,14 @@ class DataEngine:
         return x
 
 
+class IndicatorEngine:
+    """相容層：舊版仍呼叫 IndicatorEngine.attach(...)，統一導向 DataEngine.attach(...)。"""
+
+    @staticmethod
+    def attach(df: pd.DataFrame) -> pd.DataFrame:
+        return DataEngine.attach(df)
+
+
 class StrategyEngine:
     @staticmethod
     def _clamp(v: float) -> float:
@@ -775,7 +796,7 @@ class RankingEngine:
             hist = self.db.get_price_history(stock_id)
             if hist.empty or len(hist) < 70:
                 continue
-            hist = IndicatorEngine.attach(hist)
+            hist = DataEngine.attach(hist)
             score = StrategyEngine.score(hist)
             rows.append({
                 "date": today,
@@ -1094,6 +1115,10 @@ class MasterTradingEngine:
             used = set(trade_top5["stock_id"].tolist()) if not trade_top5.empty else set()
             extra = tradable[~tradable["stock_id"].isin(list(used))].sort_values(["selection_score", "rr", "win_rate"], ascending=False).head(5 - len(trade_top5))
             trade_top5 = pd.concat([trade_top5, extra], ignore_index=True)
+        if len(trade_top5) < 5:
+            used = set(trade_top5["stock_id"].tolist()) if not trade_top5.empty else set()
+            fallback = plans_df[(~plans_df["stock_id"].isin(list(used))) & (plans_df["trade_action"].isin(["可買", "等待", "區間操作"]))].sort_values(["selection_score", "rr", "win_rate"], ascending=False).head(5 - len(trade_top5))
+            trade_top5 = pd.concat([trade_top5, fallback], ignore_index=True)
 
         return {
             "market": self.market_engine.get_market_regime(),
@@ -1212,8 +1237,42 @@ class AppUI:
 
         self._build_ui()
         self.refresh_filters()
+        self.show_welcome_message()
         self.refresh_all_tables()
         self.set_status(f"PACKED={PACKED_DATA_DIR} | EXTERNAL={EXTERNAL_DATA_DIR} | CSV={MASTER_CSV}")
+
+    def show_welcome_message(self):
+        last_date = self.db.get_last_price_date() or "尚未建立"
+        ranking_count = self.db.get_ranking_rows_count()
+        price_rows = self.db.get_total_price_rows()
+        lines = [
+            "《GTC AI Trading System v6.0.3》",
+            "",
+            f"主檔狀態：{len(self.db.get_master())} 檔",
+            f"歷史資料：{price_rows} 筆｜最後交易日：{last_date}",
+            f"最新排行筆數：{ranking_count}",
+            "",
+            "建議操作順序：",
+            "1. 初始化全市場（第一次或要重整主檔時）",
+            "2. 建立完整歷史（第一次建庫）",
+            "3. 每日增量更新",
+            "4. 重建排行",
+            "5. AI選股TOP5",
+        ]
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+
+    def ensure_ranking_ready(self, auto_rebuild: bool = False) -> bool:
+        ranking = self.db.get_latest_ranking()
+        if ranking is not None and not ranking.empty:
+            return True
+        if auto_rebuild and self.db.get_total_price_rows() > 0:
+            try:
+                count = self.rank_engine.rebuild()
+                return count > 0
+            except Exception:
+                return False
+        return False
 
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=8)
@@ -1491,9 +1550,18 @@ class AppUI:
             for item in tree.get_children():
                 tree.delete(item)
 
+        if not self.ensure_ranking_ready(auto_rebuild=True):
+            price_rows = self.db.get_total_price_rows()
+            if price_rows > 0:
+                self.set_status("已有歷史資料，但尚未形成有效排行；請先補足歷史或重建排行。")
+            else:
+                self.set_status("目前尚無排行資料，請先初始化、建立歷史，再重建排行。")
+            self.show_welcome_message()
+            return
+
         df = self._filtered_ranking()
         if df.empty:
-            self.set_status("目前尚無排行資料，請先更新資料並重建排行。")
+            self.set_status("目前篩選條件下沒有資料。")
             return
 
         for i, row in df.iterrows():
@@ -1575,7 +1643,10 @@ class AppUI:
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
                 self.ui_call(self.set_progress, 100, 100)
-                self.ui_call(messagebox.showinfo, "完成", f"排行已完成，共 {count} 檔")
+                if count <= 0:
+                    self.ui_call(messagebox.showwarning, "提醒", "排行重建完成，但目前可計算檔數為 0。\n請先建立至少 70 根以上歷史K線資料。")
+                else:
+                    self.ui_call(messagebox.showinfo, "完成", f"排行已完成，共 {count} 檔")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
@@ -1583,9 +1654,11 @@ class AppUI:
         self._run_in_thread(worker, "rebuild_rank")
 
     def show_top5(self):
+        if not self.ensure_ranking_ready(auto_rebuild=True):
+            return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
         df = self._filtered_ranking()
         if df.empty:
-            return messagebox.showwarning("提醒", "尚無資料")
+            return messagebox.showwarning("提醒", "目前篩選條件下沒有可用資料")
 
         trade = self.master_trading_engine.get_trade_pool(df)
         market = trade["market"]
@@ -1602,7 +1675,7 @@ class AppUI:
         self.last_theme_summary_df = theme_summary.copy()
 
         lines = [
-            "《v6.0 FULL 整合升級版》",
+            "《v6.0.3 FULL 整合升級版》",
             f"市場判斷：{market['regime']}（{market['score']:.2f}）",
             f"市場說明：{market['memo']}",
             ""
@@ -1663,7 +1736,7 @@ class AppUI:
         hist = self.db.get_price_history(stock_id)
         if stock is None or hist.empty:
             return
-        hist = IndicatorEngine.attach(hist)
+        hist = DataEngine.attach(hist)
         last = hist.iloc[-1]
         fib1, fib2, fib3 = StrategyEngine.fib_targets(hist)
         wave = StrategyEngine.wave_stage(hist)
@@ -1735,6 +1808,13 @@ def bootstrap():
                 init_message = f"已改用本地主檔，共 {len(master)} 檔 | {csv_path}"
         else:
             init_message = f"股票主檔已載入，共 {len(master)} 檔"
+
+        if db.get_ranking_rows_count() == 0 and db.get_total_price_rows() > 0:
+            rank_count = RankingEngine(db).rebuild()
+            if rank_count > 0:
+                init_message += f"｜已自動重建排行 {rank_count} 檔"
+            else:
+                init_message += "｜已有歷史資料，但目前不足以形成排行"
     except Exception as e:
         init_message = f"股票主檔初始化失敗：{e}"
 
