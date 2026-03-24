@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v6.0.3 FULL-INTEGRATED-TRADING-FIX
+GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -43,13 +43,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-APP_NAME = "GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM"
-STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_4.json"
-
-
 class OperationCancelled(Exception):
     pass
-
 
 
 def get_base_dir() -> Path:
@@ -66,6 +61,8 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
+APP_NAME = "GTC AI Trading System v6.0.4 PROFESSIONAL-TRADING-SYSTEM"
+STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_4.json"
 
 
 PACKED_DATA_DIR = BASE_DIR / "data"
@@ -1767,12 +1764,18 @@ class AppUI:
                 total = len(master) if not master.empty else 1
                 self.ui_call(self.set_progress, 0, total)
 
-                def progress(idx, total_count, sid):
-                    self.ui_call(self.set_progress, idx, total_count)
-                    if idx % 50 == 0 or idx == total_count:
-                        self.ui_call(self.set_status, f"每日更新中 {idx}/{total_count}｜{sid}")
+                counters = {"ok": 0, "fail": 0}
 
-                success, rows = self.data_engine.update_incremental(progress_cb=progress)
+                def progress(idx, total_count, sid, row_count, flag):
+                    if flag == "ok":
+                        counters["ok"] += 1
+                    elif flag in ("skip", "fail", "error"):
+                        counters["fail"] += 1
+                    self.ui_call(self.set_progress, idx, total_count, counters["ok"], counters["fail"], sid)
+                    if idx % 50 == 0 or idx == total_count:
+                        self.ui_call(self.set_status, f"每日更新中 {idx}/{total_count}｜{sid}｜成功 {counters['ok']}｜未取到 {counters['fail']}")
+
+                success, failed, rows = self.data_engine.update_incremental(progress_cb=progress)
                 self.ui_call(self.set_status, "資料更新完成，開始重建排行...")
                 rank_count = self.rank_engine.rebuild()
                 self.ui_call(self.set_progress, total, total)
