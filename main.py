@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v6.1 SOP-FUSION
+GTC AI Trading System v6.1b FINAL-FIX
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -20,6 +20,7 @@ import traceback
 import requests
 import sys
 import csv
+import io
 import re
 import threading
 import time
@@ -63,8 +64,8 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v6.1 SOP-FUSION"
-STATE_PATH = RUNTIME_DIR / "build_history_state_v6_1.json"
+APP_NAME = "GTC AI Trading System v6.1b FINAL-FIX"
+STATE_PATH = RUNTIME_DIR / "build_history_state_v6_1b.json"
 
 
 PACKED_DATA_DIR = BASE_DIR / "data"
@@ -107,12 +108,249 @@ def resolve_master_csv() -> Path:
         return packed_csv
     return ensure_external_master_csv()
 
+
+CLASSIFICATION_BOOK_CANDIDATES = [
+    RUNTIME_DIR / "股票類別對照表.xlsx",
+    BASE_DIR / "股票類別對照表.xlsx",
+]
+
+
+def normalize_stock_id(v) -> str:
+    s = str(v).strip()
+    if s in ("", "nan", "None"):
+        return ""
+    m = re.search(r"(\d{4,5})", s)
+    if not m:
+        return ""
+    code = m.group(1)
+    return code.zfill(4) if len(code) == 4 else code
+
+
+def resolve_classification_book() -> Optional[Path]:
+    for p in CLASSIFICATION_BOOK_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def load_manual_theme_mapping() -> pd.DataFrame:
+    manual_parts = []
+    try:
+        seed = pd.read_csv(io.StringIO(DEFAULT_MASTER_CSV), dtype={"stock_id": str}).fillna("")
+        manual_parts.append(seed)
+    except Exception:
+        pass
+    try:
+        csv_path = resolve_master_csv()
+        if csv_path.exists():
+            ext = pd.read_csv(csv_path, dtype={"stock_id": str}).fillna("")
+            ext = ext[[c for c in ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf"] if c in ext.columns]]
+            if not ext.empty:
+                manual_parts.append(ext)
+    except Exception:
+        pass
+    if not manual_parts:
+        return pd.DataFrame(columns=["stock_id", "stock_name_manual", "market_manual", "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"])
+    x = pd.concat(manual_parts, ignore_index=True).fillna("")
+    x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id)
+    x = x[x["stock_id"] != ""].copy()
+    for c in ["stock_name", "market", "industry", "theme", "sub_theme", "is_etf"]:
+        if c not in x.columns:
+            x[c] = ""
+    x = x.drop_duplicates(subset=["stock_id"], keep="first")
+    return x.rename(columns={
+        "stock_name": "stock_name_manual",
+        "market": "market_manual",
+        "industry": "industry_manual",
+        "theme": "theme_manual",
+        "sub_theme": "sub_theme_manual",
+        "is_etf": "is_etf_manual",
+    })
+
+
+def load_official_classification_book() -> pd.DataFrame:
+    path = resolve_classification_book()
+    if path is None:
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "market_official", "industry_official"])
+    parts = []
+    try:
+        xl = pd.ExcelFile(path)
+        for sheet in xl.sheet_names:
+            df = xl.parse(sheet).fillna("")
+            market = "上市" if "上市" in sheet else ("上櫃" if "上櫃" in sheet else ("興櫃" if "興櫃" in sheet else ""))
+            rename = {}
+            for c in df.columns:
+                s = str(c).strip()
+                if s in ("代號", "股票代號"):
+                    rename[c] = "stock_id"
+                elif s in ("公司名稱", "公司簡稱"):
+                    rename[c] = "stock_name_official"
+                elif s in ("新產業類別", "新產業別"):
+                    rename[c] = "industry_official"
+            df = df.rename(columns=rename)
+            if "stock_id" not in df.columns or "industry_official" not in df.columns:
+                continue
+            if "stock_name_official" not in df.columns:
+                df["stock_name_official"] = ""
+            df["stock_id"] = df["stock_id"].map(normalize_stock_id)
+            df = df[df["stock_id"] != ""].copy()
+            if df.empty:
+                continue
+            df["market_official"] = market
+            parts.append(df[["stock_id", "stock_name_official", "market_official", "industry_official"]])
+    except Exception:
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "market_official", "industry_official"])
+    if not parts:
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "market_official", "industry_official"])
+    out = pd.concat(parts, ignore_index=True).fillna("")
+    out = out.drop_duplicates(subset=["stock_id"], keep="first")
+    return out
+
+
+THEME_RULES = [
+    (r"台積電|創意|世芯|晶心|聯發科|聯詠|矽力|祥碩", ("半導體", "AI/晶圓代工", "半導體")),
+    (r"智邦|智易|華星光|聯亞|光聖|波若威|上詮|聯鈞|眾達|環宇|前鼎|立碁|中磊|啟碁|正文|建漢|神準", ("網通/光通訊", "CPO/光模組", "高速光通訊")),
+    (r"台達電|光寶科|康舒|群電|全漢|偉訓|順達|AES|新盛力|加百裕|系統電", ("電源/電機", "電源/HVDC", "電源")),
+    (r"奇鋐|雙鴻|建準|超眾|力致|高力", ("散熱", "AI散熱", "液冷")),
+    (r"鴻海|廣達|緯創|緯穎|仁寶|英業達|和碩|技嘉|華碩|微星|神達", ("電子代工", "AI伺服器", "伺服器")),
+]
+
+INDUSTRY_THEME_MAP = {
+    "食品工業": ("食品工業", "民生消費", "食品"),
+    "塑膠工業": ("塑膠工業", "基礎原物料", "塑膠"),
+    "紡織纖維": ("紡織纖維", "傳產", "紡織"),
+    "電機機械": ("電源/電機", "電源/HVDC", "電機"),
+    "電器電纜": ("電源/電機", "電力基建", "電纜"),
+    "化學工業": ("化學工業", "基礎原物料", "化工"),
+    "生技醫療": ("生技醫療", "生技醫療", "醫療"),
+    "玻璃陶瓷": ("玻璃陶瓷", "傳產", "玻璃陶瓷"),
+    "造紙工業": ("造紙工業", "傳產", "造紙"),
+    "鋼鐵工業": ("鋼鐵工業", "基礎原物料", "鋼鐵"),
+    "橡膠工業": ("橡膠工業", "傳產", "橡膠"),
+    "汽車工業": ("汽車工業", "電動車", "車用"),
+    "電子工業": ("電子工業", "電子", "電子"),
+    "半導體業": ("半導體", "半導體", "半導體"),
+    "電腦及週邊設備業": ("電子代工", "AI伺服器", "伺服器"),
+    "光電業": ("光電", "光電", "面板/光學"),
+    "通信網路業": ("網通/光通訊", "網通/光通訊", "網通"),
+    "電子零組件業": ("電子零組件", "電子零組件", "零組件"),
+    "電子通路業": ("電子通路", "電子通路", "通路"),
+    "資訊服務業": ("資訊服務", "軟體/資訊服務", "資訊服務"),
+    "其他電子業": ("其他電子", "電子", "其他電子"),
+    "建材營造": ("建材營造", "傳產", "營造"),
+    "航運業": ("航運業", "運輸", "航運"),
+    "觀光餐旅": ("觀光餐旅", "內需消費", "觀光"),
+    "金融保險": ("金融保險", "金融", "金融"),
+    "貿易百貨": ("貿易百貨", "內需消費", "百貨"),
+    "油電燃氣": ("油電燃氣", "公用事業", "能源"),
+    "居家生活": ("居家生活", "內需消費", "居家"),
+    "綠能環保": ("綠能環保", "綠能環保", "環保"),
+    "數位雲端": ("資訊服務", "軟體/雲端", "雲端"),
+    "運動休閒": ("運動休閒", "內需消費", "運動"),
+    "文化創意業": ("文化創意", "內需消費", "文創"),
+    "農業科技業": ("農業科技", "農業科技", "農業"),
+}
+
+
+def infer_theme_bundle(stock_name: str, industry: str, is_etf: int) -> Tuple[str, str, str]:
+    name = str(stock_name or "")
+    industry = str(industry or "").strip()
+    if int(is_etf or 0) == 1 or re.search(r"ETF|台灣50|高股息|中型100|科技優息|精選高息", name):
+        return "ETF", "ETF", "ETF"
+    for pattern, bundle in THEME_RULES:
+        if re.search(pattern, name):
+            return bundle
+    if industry in INDUSTRY_THEME_MAP:
+        return INDUSTRY_THEME_MAP[industry]
+    if re.search(r"光|通|網|訊", name):
+        return (industry or "網通/光通訊", "網通/光通訊", "網通")
+    if re.search(r"電|控|達|機", name):
+        return (industry or "電源/電機", "電源/HVDC", "電源")
+    if re.search(r"積電|半導體|晶|芯", name):
+        return (industry or "半導體", "半導體", "半導體")
+    return (industry or "未分類", "全市場", "系統掃描")
+
+
+def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
+    x = df.copy().fillna("")
+    official = load_official_classification_book()
+    manual = load_manual_theme_mapping()
+
+    x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id)
+    x = x[x["stock_id"] != ""].copy()
+
+    if not official.empty:
+        x = x.merge(official, on="stock_id", how="left")
+    else:
+        x["stock_name_official"] = ""
+        x["market_official"] = ""
+        x["industry_official"] = ""
+
+    if not manual.empty:
+        x = x.merge(manual, on="stock_id", how="left")
+    else:
+        x["stock_name_manual"] = ""
+        x["market_manual"] = ""
+        x["industry_manual"] = ""
+        x["theme_manual"] = ""
+        x["sub_theme_manual"] = ""
+        x["is_etf_manual"] = ""
+
+    x["stock_name"] = x["stock_name"].replace("", pd.NA)
+    x["stock_name"] = x["stock_name"].fillna(x.get("stock_name_official", "").replace("", pd.NA) if hasattr(x.get("stock_name_official", ""), 'replace') else x.get("stock_name_official", ""))
+    x["stock_name"] = x["stock_name"].fillna(x.get("stock_name_manual", "").replace("", pd.NA) if hasattr(x.get("stock_name_manual", ""), 'replace') else x.get("stock_name_manual", ""))
+    x["stock_name"] = x["stock_name"].fillna(x["stock_id"]).astype(str)
+
+    etf_mask = x["stock_id"].astype(str).str.startswith("00") | x["stock_name"].astype(str).str.contains("ETF|台灣50|高股息|中型100|科技優息|精選高息", regex=True)
+    if "is_etf_manual" in x.columns:
+        etf_mask = etf_mask | pd.to_numeric(x["is_etf_manual"], errors="coerce").fillna(0).astype(int).eq(1)
+    x["is_etf"] = etf_mask.astype(int)
+
+    x["market"] = x["market"].replace("", pd.NA)
+    if "market_official" in x.columns:
+        x["market"] = x["market"].fillna(x["market_official"].replace("", pd.NA))
+    if "market_manual" in x.columns:
+        x["market"] = x["market"].fillna(x["market_manual"].replace("", pd.NA))
+    x["market"] = x["market"].fillna("上市")
+    x.loc[x["is_etf"].eq(1), "market"] = "ETF"
+
+    x["industry"] = x["industry"].replace("", pd.NA)
+    if "industry_official" in x.columns:
+        x["industry"] = x["industry"].fillna(x["industry_official"].replace("", pd.NA))
+    if "industry_manual" in x.columns:
+        x["industry"] = x["industry"].fillna(x["industry_manual"].replace("", pd.NA))
+    x["industry"] = x["industry"].fillna("未分類")
+
+    x["theme"] = x["theme"] if "theme" in x.columns else ""
+    x["sub_theme"] = x["sub_theme"] if "sub_theme" in x.columns else ""
+    if "theme_manual" in x.columns:
+        x["theme"] = x["theme"].replace("", pd.NA).fillna(x["theme_manual"].replace("", pd.NA))
+    if "sub_theme_manual" in x.columns:
+        x["sub_theme"] = x["sub_theme"].replace("", pd.NA).fillna(x["sub_theme_manual"].replace("", pd.NA))
+
+    bundles = x.apply(lambda r: infer_theme_bundle(r.get("stock_name", ""), r.get("industry", ""), r.get("is_etf", 0)), axis=1, result_type="expand")
+    bundles.columns = ["industry_inferred", "theme_inferred", "sub_theme_inferred"]
+    x = pd.concat([x, bundles], axis=1)
+
+    x["industry"] = x["industry"].replace("未分類", pd.NA).fillna(x["industry_inferred"]).fillna("未分類")
+    x["theme"] = x["theme"].replace("", pd.NA).fillna(x["theme_inferred"]).fillna("全市場")
+    x["sub_theme"] = x["sub_theme"].replace("", pd.NA).fillna(x["sub_theme_inferred"]).fillna("系統掃描")
+    x.loc[x["is_etf"].eq(1), ["industry", "theme", "sub_theme"]] = ["ETF", "ETF", "ETF"]
+
+    x["is_active"] = 1
+    x["update_date"] = datetime.now().strftime("%Y-%m-%d")
+    keep = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
+    for c in keep:
+        if c not in x.columns:
+            x[c] = ""
+    return x[keep].drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+
 DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists() else PACKED_DATA_DIR
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
 LEGACY_DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
-DB_PATH = RUNTIME_DIR / "stock_system_v6_1.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v6_1b.db"
 LEGACY_DB_PATH_V606 = RUNTIME_DIR / "stock_system_v6_0_6.db"
 LEGACY_DB_PATH_V603 = RUNTIME_DIR / "stock_system_v6_0_3.db"
 if (not DB_PATH.exists()) and LEGACY_DB_PATH_V606.exists():
@@ -281,30 +519,22 @@ def _normalize_master_df(df: pd.DataFrame, market_label: str) -> pd.DataFrame:
     if "stock_name" not in x.columns:
         x["stock_name"] = x["stock_id"]
 
-    x["stock_id"] = x["stock_id"].astype(str).str.strip()
+    x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id)
     x["stock_name"] = x["stock_name"].astype(str).str.strip()
-    x = x[x["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+    x = x[x["stock_id"] != ""].copy()
+    x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
     if x.empty:
         return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
 
     x["market"] = market_label
-    x["industry"] = "未分類"
-    x["theme"] = "全市場"
-    x["sub_theme"] = "系統掃描"
+    x["industry"] = ""
+    x["theme"] = ""
+    x["sub_theme"] = ""
     x["is_etf"] = x["stock_id"].str.startswith("00").astype(int)
     x["is_active"] = 1
     x["update_date"] = datetime.now().strftime("%Y-%m-%d")
 
-    name_series = x["stock_name"].fillna("").astype(str)
-    etf_mask = x["is_etf"].eq(1) | name_series.str.contains("ETF|台灣50|高股息|科技優息|精選高息", regex=True)
-    x.loc[etf_mask, ["market", "industry", "theme", "is_etf"]] = ["ETF", "ETF", "ETF", 1]
-    semi_mask = name_series.str.contains("積電|聯發科|創意|晶心|半導體", regex=True)
-    net_mask = name_series.str.contains("智邦|智易|光|網|通|聯亞", regex=True)
-    power_mask = name_series.str.contains("台達|電|控|達", regex=True)
-    x.loc[semi_mask & ~etf_mask, "industry"] = "半導體"
-    x.loc[net_mask & ~etf_mask, "industry"] = "網通/光通訊"
-    x.loc[power_mask & ~etf_mask, "industry"] = "電源/電機"
-
+    x = apply_classification_layers(x)
     return x[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]].drop_duplicates(subset=["stock_id"]).reset_index(drop=True)
 
 
@@ -365,7 +595,7 @@ def build_full_market_universe() -> pd.DataFrame:
         if csv_path.exists():
             x = pd.read_csv(csv_path, dtype={"stock_id": str}).fillna("")
             x["stock_id"] = x["stock_id"].astype(str).str.strip()
-            x = x[x["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+            x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
             keep_cols = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
             for c in keep_cols:
                 if c not in x.columns:
@@ -455,7 +685,7 @@ class DBManager:
             if col not in x.columns:
                 x[col] = default
         x["stock_id"] = x["stock_id"].astype(str).str.strip()
-        x = x[x["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+        x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
         x["is_etf"] = pd.to_numeric(x["is_etf"], errors="coerce").fillna(0).astype(int)
         x["is_active"] = pd.to_numeric(x["is_active"], errors="coerce").fillna(1).astype(int)
         x = x[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]]
@@ -608,7 +838,7 @@ class DataEngine:
                 if not all(c in df.columns for c in required):
                     continue
                 df["stock_id"] = df["stock_id"].astype(str).str.strip()
-                df = df[df["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+                df = df[df["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
                 for c in ["open", "high", "low", "close", "volume"]:
                     df[c] = self._to_num(df[c])
                 df = df.dropna(subset=["close"])
@@ -1511,7 +1741,7 @@ class AppUI:
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
         lines = [
-            "《GTC AI Trading System v6.1 SOP-FUSION》",
+            "《GTC AI Trading System v6.1b FINAL-FIX》",
             "",
             f"主檔狀態：{len(self.db.get_master())} 檔",
             f"歷史資料：{price_rows} 筆｜最後交易日：{last_date}",
@@ -1953,7 +2183,7 @@ class AppUI:
                     int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("分類", ""),
                     r.get("建議動作", ""), r.get("進場區", "-"), r.get("停損", "-"), r.get("目標價", "-"),
                     f"{float(r.get('RR', 0) or 0):.2f}", f"{float(r.get('勝率', 0) or 0):.1f}",
-                    int(r.get("建議張數", 0) or 0), r.get("風險備註", "")
+                    (f"{float(r.get('建議張數', 0) or 0):.1f}".rstrip('0').rstrip('.') if pd.notna(r.get('建議張數', 0)) else "0"), r.get("風險備註", "")
                 ))
 
     def on_select_top20(self, event=None):
@@ -2334,7 +2564,7 @@ class AppUI:
 
                 defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
                 lines = [
-                    "《v6.1 SOP-FUSION 交易等級系統》",
+                    "《v6.1b FINAL-FIX 交易等級系統》",
                     f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
                     f"市場說明：{market['memo']}",
                     f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可買 TOP5：{len(today_buy)}｜等待拉回 TOP5：{len(wait_pullback)}｜防守：{defend_cnt}",
