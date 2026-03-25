@@ -1,7 +1,7 @@
- 
+
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v6.0.6b DOWNLOAD-STABLE
+GTC AI Trading System v6.1 SOP-FUSION
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材）
@@ -63,8 +63,8 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v6.0.6b DOWNLOAD-STABLE"
-STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_6b.json"
+APP_NAME = "GTC AI Trading System v6.1 SOP-FUSION"
+STATE_PATH = RUNTIME_DIR / "build_history_state_v6_1.json"
 
 
 PACKED_DATA_DIR = BASE_DIR / "data"
@@ -112,7 +112,7 @@ CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
 LEGACY_DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
-DB_PATH = RUNTIME_DIR / "stock_system_v6_0_6b.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v6_1.db"
 LEGACY_DB_PATH_V606 = RUNTIME_DIR / "stock_system_v6_0_6.db"
 LEGACY_DB_PATH_V603 = RUNTIME_DIR / "stock_system_v6_0_3.db"
 if (not DB_PATH.exists()) and LEGACY_DB_PATH_V606.exists():
@@ -1015,36 +1015,64 @@ class MarketRegimeEngine:
         last = x.iloc[-1]
         score = 0.0
         if pd.notna(last["ma20"]) and last["close"] > last["ma20"]:
-            score += 30
-        if pd.notna(last["ma60"]) and last["close"] > last["ma60"]:
             score += 25
+        if pd.notna(last["ma60"]) and last["close"] > last["ma60"]:
+            score += 20
         if pd.notna(last["ma20"]) and pd.notna(last["ma60"]) and last["ma20"] > last["ma60"]:
             score += 20
         if pd.notna(last["macd_hist"]) and last["macd_hist"] > 0:
+            score += 20
+        if pd.notna(last["rsi14"]) and 50 <= last["rsi14"] <= 72:
             score += 15
-        if pd.notna(last["rsi14"]) and last["rsi14"] > 55:
-            score += 10
-        return score
+        return round(score, 2)
+
+    def _breadth_score(self) -> float:
+        ranking = self.db.get_latest_ranking()
+        if ranking is None or ranking.empty:
+            return 50.0
+        up = float((ranking["signal"].isin(["強勢追蹤", "整理偏多"])).mean() * 100)
+        return round(up, 2)
 
     def get_market_regime(self) -> dict:
         s_2330 = self._score_proxy("2330")
         s_0050 = self._score_proxy("0050")
-        score = round(s_2330 * 0.6 + s_0050 * 0.4, 2)
+        breadth = self._breadth_score()
+        score = round(s_2330 * 0.4 + s_0050 * 0.25 + breadth * 0.35, 2)
 
-        if score >= 70:
+        if score >= 68:
             regime = "多頭"
-            memo = "偏多環境，可主攻強勢題材與趨勢股。"
-        elif score <= 40:
+            memo = "指數與領頭股結構偏強，可放寬門檻並增加出手檔數。"
+            max_positions = 8
+            min_win_rate = 70.0
+            rsi_low, rsi_high = 50.0, 72.0
+        elif score <= 42:
             regime = "空頭"
-            memo = "偏弱環境，防守優先，嚴控風險。"
+            memo = "市場偏弱，防守優先，只保留極少數高勝率或防守型 ETF。"
+            max_positions = 1
+            min_win_rate = 80.0
+            rsi_low, rsi_high = 48.0, 68.0
         else:
             regime = "震盪"
-            memo = "震盪環境，以拉回布局與區間交易為主。"
+            memo = "市場分化，精選出手，不為了湊數而放寬條件。"
+            max_positions = 4
+            min_win_rate = 75.0
+            rsi_low, rsi_high = 50.0, 70.0
 
-        return {"regime": regime, "score": score, "memo": memo}
+        return {
+            "regime": regime,
+            "score": score,
+            "memo": memo,
+            "max_positions": max_positions,
+            "min_win_rate": min_win_rate,
+            "rsi_low": rsi_low,
+            "rsi_high": rsi_high,
+            "breadth": breadth,
+        }
 
 
 class ThemeStrengthEngine:
+    PREFERRED_KEYWORDS = ["AI", "CPO", "Server", "伺服器", "半導體", "晶圓", "ASIC", "RISC-V", "光", "散熱", "HVDC", "網通"]
+
     @staticmethod
     def summarize(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
@@ -1065,7 +1093,12 @@ class ThemeStrengthEngine:
         x = ThemeStrengthEngine.summarize(df)
         if x.empty:
             return []
-        return x[(x["count"] >= 2) & (x["avg_total"] >= 55)]["theme"].tolist()
+        out = x[(x["count"] >= 1) & (x["avg_total"] >= 55)]["theme"].astype(str).tolist()
+        preferred = []
+        for theme in x["theme"].astype(str).tolist():
+            if any(k.lower() in theme.lower() for k in ThemeStrengthEngine.PREFERRED_KEYWORDS):
+                preferred.append(theme)
+        return list(dict.fromkeys(preferred + out))
 
 
 class WinRateEngine:
@@ -1120,20 +1153,12 @@ class TradingPlanEngine:
         hist = self.db.get_price_history(stock_id)
         if stock is None or hist.empty or len(hist) < 70:
             return {
-                "stock_id": stock_id,
-                "stock_name": stock["stock_name"] if stock is not None else stock_id,
-                "theme": stock["theme"] if stock is not None else "",
-                "industry": stock["industry"] if stock is not None else "",
-                "trade_action": "觀望",
-                "entry_zone": "-",
-                "stop_loss": "-",
-                "target_price": "-",
-                "rr": 0.0,
-                "win_grade": "C",
-                "win_rate": 45.0,
-                "selection_score": 0.0,
-                "bucket": "排除",
-                "reason": "資料不足",
+                "stock_id": stock_id, "stock_name": stock["stock_name"] if stock is not None else stock_id,
+                "theme": stock["theme"] if stock is not None else "", "industry": stock["industry"] if stock is not None else "",
+                "trade_action": "觀望", "entry_zone": "-", "stop_loss": "-", "target_price": "-", "rr": 0.0,
+                "win_grade": "C", "win_rate": 45.0, "selection_score": 0.0, "trade_score": 0.0,
+                "bucket": "排除", "reason": "資料不足", "wave": "資料不足", "rsi": 50.0,
+                "trend_ok": 0, "kd_ok": 0, "macd_ok": 0, "volume_ok": 0,
             }
 
         x = IndicatorEngine.attach(hist.copy())
@@ -1149,10 +1174,18 @@ class TradingPlanEngine:
         ma60 = float(last["ma60"]) if pd.notna(last["ma60"]) else close_
         rsi = float(last["rsi14"]) if pd.notna(last["rsi14"]) else 50.0
         macd_hist = float(last["macd_hist"]) if pd.notna(last["macd_hist"]) else 0.0
+        k = float(last["k"]) if pd.notna(last["k"]) else 50.0
+        d = float(last["d"]) if pd.notna(last["d"]) else 50.0
+        wave = StrategyEngine.wave_stage(x)
 
-        breakout = close_ > max(ma20, ma60) and macd_hist > 0
-        trend = ma5 > ma20 > ma60
-        pullback = close_ >= ma20 and close_ <= ma5 * 1.02
+        vol_ma20 = x["volume"].tail(20).mean()
+        vol_ratio = float(last["volume"] / vol_ma20) if vol_ma20 and pd.notna(vol_ma20) else 1.0
+
+        trend_ok = int(close_ > ma5 > ma10 > ma20)
+        macd_ok = int(macd_hist > 0)
+        kd_ok = int(k >= d)
+        volume_ok = int(vol_ratio >= 1.0)
+        strict_ok = trend_ok and macd_ok and kd_ok and volume_ok
 
         recent_high = float(x.tail(30)["high"].max())
         recent_low = float(x.tail(30)["low"].min())
@@ -1160,57 +1193,40 @@ class TradingPlanEngine:
 
         win_grade, win_rate = WinRateEngine.estimate(hist)
 
-        if regime["regime"] == "多頭":
-            if is_etf:
-                trade_action = "區間操作"
-                bucket = "防守"
-                entry_low, entry_high = ma20 * 0.99, ma20 * 1.01
-                stop = ma60 * 0.97
-                target = recent_high
-            elif score["ai_score"] >= 60 and score["total_score"] >= 65 and (breakout or trend):
-                trade_action = "可買"
-                bucket = "主攻"
-                entry_low, entry_high = max(ma5, ma10 * 0.995), close_
-                stop = ma20 * 0.97
-                target = max(fib2, recent_high)
-            elif score["ai_score"] >= 55 and pullback:
+        preferred_theme = any(key.lower() in str(stock.get("theme", "")).lower() for key in ThemeStrengthEngine.PREFERRED_KEYWORDS)
+        breakout = close_ >= recent_high * 0.985 and macd_hist > 0
+        pullback = close_ >= ma20 and close_ <= ma5 * 1.02
+
+        if is_etf:
+            bucket = "防守"
+            trade_action = "區間操作" if regime["regime"] != "空頭" else "可買"
+            entry_low, entry_high = ma20 * 0.99, ma20 * 1.01
+            stop = ma60 * 0.97
+            target = max(recent_high, fib1)
+        else:
+            bucket = "觀察"
+            trade_action = "觀望"
+            entry_low = entry_high = stop = target = np.nan
+
+            if preferred_theme and score["total_score"] >= 70 and score["ai_score"] >= 70 and strict_ok and regime["rsi_low"] <= rsi <= regime["rsi_high"]:
+                if wave == "推動浪" and breakout:
+                    trade_action = "可買"
+                    bucket = "主攻"
+                    entry_low, entry_high = max(ma5 * 0.995, ma10), close_
+                    stop = min(ma10 * 0.97, recent_low * 0.985)
+                    target = max(fib2, recent_high)
+                elif pullback and macd_ok and kd_ok:
+                    trade_action = "等待"
+                    bucket = "次強"
+                    entry_low, entry_high = ma10 * 0.995, ma5 * 1.01
+                    stop = min(ma20 * 0.97, recent_low * 0.985)
+                    target = max(fib1, recent_high)
+            elif preferred_theme and score["total_score"] >= 65 and score["ai_score"] >= 65 and close_ > ma20 and macd_ok:
                 trade_action = "等待"
                 bucket = "次強"
-                entry_low, entry_high = ma20 * 0.99, ma20 * 1.02
-                stop = ma60 * 0.97
-                target = max(recent_high, fib1)
-            else:
-                trade_action = "觀望"
-                bucket = "觀察"
-                entry_low = entry_high = stop = target = np.nan
-        elif regime["regime"] == "空頭":
-            if is_etf:
-                trade_action = "可買"
-                bucket = "防守"
-                entry_low, entry_high = ma20 * 0.99, ma20 * 1.01
-                stop = ma60 * 0.97
-                target = recent_high
-            else:
-                trade_action = "觀望"
-                bucket = "排除"
-                entry_low = entry_high = stop = target = np.nan
-        else:  # 震盪
-            if is_etf:
-                trade_action = "區間操作"
-                bucket = "防守"
-                entry_low, entry_high = ma20 * 0.99, ma20 * 1.01
-                stop = ma60 * 0.97
-                target = recent_high
-            elif score["ai_score"] >= 55 and score["total_score"] >= 58 and (pullback or trend):
-                trade_action = "等待"
-                bucket = "次強"
-                entry_low, entry_high = ma20 * 0.99, ma20 * 1.02
-                stop = recent_low * 0.98
-                target = max(recent_high, fib1)
-            else:
-                trade_action = "觀望"
-                bucket = "觀察"
-                entry_low = entry_high = stop = target = np.nan
+                entry_low, entry_high = ma20 * 0.99, ma10 * 1.01
+                stop = min(ma20 * 0.965, recent_low * 0.98)
+                target = max(fib1, recent_high)
 
         if pd.notna(entry_high) and pd.notna(stop) and pd.notna(target):
             risk = max(entry_high - stop, 0.01)
@@ -1220,10 +1236,10 @@ class TradingPlanEngine:
             rr = 0.0
 
         selection_score = (
-            score["total_score"] * 0.40
-            + score["ai_score"] * 0.30
-            + min(rr, 3.0) * 10
-            + win_rate * 0.20
+            score["total_score"] * 0.40 +
+            score["ai_score"] * 0.30 +
+            min(rr, 3.0) * 10 +
+            win_rate * 0.20
         )
         if trade_action == "可買":
             selection_score += 8
@@ -1234,7 +1250,16 @@ class TradingPlanEngine:
         if is_etf:
             selection_score -= 5
 
-        reason = f"{regime['regime']}｜{score['signal']}｜AI {score['ai_score']:.1f}｜總分 {score['total_score']:.1f}｜RSI {rsi:.1f}"
+        theme_strength = 100.0 if preferred_theme else 40.0
+        trade_score = (
+            win_rate * 0.30 +
+            min(rr, 4.0) * 25 * 0.25 +
+            score["ai_score"] * 0.20 +
+            score["total_score"] * 0.15 +
+            theme_strength * 0.10
+        )
+
+        reason = f"{regime['regime']}｜{score['signal']}｜AI {score['ai_score']:.1f}｜總分 {score['total_score']:.1f}｜RSI {rsi:.1f}｜波浪 {wave}"
 
         return {
             "stock_id": stock_id,
@@ -1251,8 +1276,15 @@ class TradingPlanEngine:
             "win_grade": win_grade,
             "win_rate": win_rate,
             "selection_score": round(selection_score, 2),
+            "trade_score": round(trade_score, 2),
             "bucket": bucket,
             "reason": reason,
+            "wave": wave,
+            "rsi": round(rsi, 2),
+            "trend_ok": trend_ok,
+            "kd_ok": kd_ok,
+            "macd_ok": macd_ok,
+            "volume_ok": volume_ok,
         }
 
 
@@ -1265,7 +1297,11 @@ class MasterTradingEngine:
     def get_trade_pool(self, filtered_df: pd.DataFrame, progress_cb=None, log_cb=None, cancel_cb=None) -> dict:
         if filtered_df.empty:
             empty = pd.DataFrame()
-            return {"market": self.market_engine.get_market_regime(), "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty, "theme_summary": empty}
+            market = self.market_engine.get_market_regime()
+            return {
+                "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
+                "today_buy": empty, "wait_pullback": empty, "theme_summary": empty
+            }
 
         base = filtered_df.copy()
         hot_themes = ThemeStrengthEngine.get_hot_themes(base)
@@ -1283,46 +1319,72 @@ class MasterTradingEngine:
                 log_cb(f"AI選股分析進度 {idx2}/{total}｜{sid}")
         plans_df = pd.DataFrame(plans)
 
+        market = self.market_engine.get_market_regime()
         if plans_df.empty:
             empty = pd.DataFrame()
-            return {"market": self.market_engine.get_market_regime(), "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty, "theme_summary": ThemeStrengthEngine.summarize(base)}
+            return {
+                "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
+                "today_buy": empty, "wait_pullback": empty, "theme_summary": ThemeStrengthEngine.summarize(base)
+            }
 
         if hot_themes:
-            hot_mask = plans_df["theme"].isin(hot_themes)
+            hot_mask = plans_df["theme"].isin(hot_themes) | plans_df["is_etf"].eq(1)
         else:
             hot_mask = pd.Series([True] * len(plans_df), index=plans_df.index)
 
-        tradable = plans_df[
+        radar_pool = plans_df[
             hot_mask &
-            (plans_df["trade_action"].isin(["可買", "等待"])) &
-            (plans_df["win_grade"].isin(["A", "B"])) &
-            (plans_df["rr"] >= 1.2)
+            (plans_df["selection_score"] >= 60) &
+            (plans_df["rr"] >= 1.2) &
+            (plans_df["win_rate"] >= 60) &
+            ((plans_df["trade_action"].isin(["可買", "等待", "區間操作"])) | plans_df["is_etf"].eq(1))
         ].copy()
+        radar_pool = radar_pool[(radar_pool["theme"].isin(hot_themes)) | radar_pool["is_etf"].eq(1)].copy() if hot_themes else radar_pool
+        radar_pool = radar_pool.sort_values(["selection_score", "trade_score", "rr", "win_rate"], ascending=False)
 
-        attack = tradable[(tradable["bucket"] == "主攻") & (tradable["trade_action"] == "可買")].sort_values(["selection_score", "rr", "win_rate"], ascending=False)
-        watch = tradable[tradable["bucket"] == "次強"].sort_values(["selection_score", "rr", "win_rate"], ascending=False)
-        defense = plans_df[(plans_df["bucket"] == "防守") & (plans_df["trade_action"].isin(["可買", "區間操作"]))].sort_values(["selection_score", "rr", "win_rate"], ascending=False)
+        attack = radar_pool[(radar_pool["bucket"] == "主攻")].sort_values(["trade_score", "selection_score", "rr"], ascending=False)
+        watch = radar_pool[(radar_pool["bucket"] == "次強")].sort_values(["trade_score", "selection_score", "rr"], ascending=False)
+        defense = radar_pool[(radar_pool["bucket"] == "防守")].sort_values(["trade_score", "selection_score", "rr"], ascending=False)
 
-        trade_top20 = pd.concat([attack.head(8), watch.head(8), defense.head(4)], ignore_index=True)
-        if len(trade_top20) < 20:
-            used = set(trade_top20["stock_id"].tolist()) if not trade_top20.empty else set()
-            extra = tradable[~tradable["stock_id"].isin(list(used))].sort_values(["selection_score", "rr", "win_rate"], ascending=False).head(20 - len(trade_top20))
-            trade_top20 = pd.concat([trade_top20, extra], ignore_index=True)
-        if len(trade_top20) < 20:
-            used = set(trade_top20["stock_id"].tolist()) if not trade_top20.empty else set()
-            fallback = plans_df[(~plans_df["stock_id"].isin(list(used))) & (plans_df["trade_action"].isin(["可買", "等待", "區間操作"]))].sort_values(["selection_score", "rr", "win_rate"], ascending=False).head(20 - len(trade_top20))
-            trade_top20 = pd.concat([trade_top20, fallback], ignore_index=True)
-        trade_top20 = trade_top20.drop_duplicates(subset=["stock_id"]).head(20)
+        trade_top20 = pd.concat([attack.head(10), watch.head(8), defense.head(4)], ignore_index=True)
+        if not trade_top20.empty:
+            trade_top20 = trade_top20.drop_duplicates(subset=["stock_id"]).sort_values(["selection_score", "trade_score", "rr"], ascending=False).head(20)
+
+        today_buy = plans_df[
+            (plans_df["trade_action"] == "可買") &
+            (plans_df["rr"] >= 1.8) &
+            (plans_df["win_rate"] >= market["min_win_rate"]) &
+            (plans_df["rsi"] >= market["rsi_low"]) &
+            (plans_df["rsi"] <= market["rsi_high"]) &
+            (plans_df["wave"] == "推動浪") &
+            (plans_df["trend_ok"] == 1) &
+            (plans_df["macd_ok"] == 1) &
+            (plans_df["kd_ok"] == 1) &
+            (plans_df["volume_ok"] == 1) &
+            ((plans_df["theme"].isin(hot_themes)) | plans_df["is_etf"].eq(1)) &
+            ((plans_df["bucket"] == "主攻") | plans_df["is_etf"].eq(1))
+        ].copy()
+        today_buy = today_buy.sort_values(["trade_score", "rr", "win_rate", "selection_score"], ascending=False).head(5)
+
+        wait_pullback = plans_df[
+            (plans_df["trade_action"] == "等待") &
+            (plans_df["rr"] >= 1.5) &
+            (plans_df["win_rate"] >= max(60.0, market["min_win_rate"] - 10)) &
+            ((plans_df["wave"] == "推動浪") | (plans_df["bucket"] == "次強")) &
+            ((plans_df["theme"].isin(hot_themes)) | plans_df["is_etf"].eq(1))
+        ].copy()
+        wait_pullback = wait_pullback.sort_values(["trade_score", "rr", "win_rate", "selection_score"], ascending=False).head(5)
 
         return {
-            "market": self.market_engine.get_market_regime(),
+            "market": market,
             "trade_top20": trade_top20,
             "attack": attack.head(10),
             "watch": watch.head(10),
             "defense": defense.head(10),
+            "today_buy": today_buy,
+            "wait_pullback": wait_pullback,
             "theme_summary": ThemeStrengthEngine.summarize(base),
         }
-
 
 
 class SelectionEngine:
@@ -1420,6 +1482,8 @@ class AppUI:
         self.last_watch_df = pd.DataFrame()
         self.last_defense_df = pd.DataFrame()
         self.last_order_list_df = pd.DataFrame()
+        self.last_today_buy_df = pd.DataFrame()
+        self.last_wait_df = pd.DataFrame()
         self.current_chart_path = None
         self.worker = None
         self.cancel_event = threading.Event()
@@ -1447,7 +1511,7 @@ class AppUI:
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
         lines = [
-            "《GTC AI Trading System v6.0.6b DOWNLOAD-STABLE》",
+            "《GTC AI Trading System v6.1 SOP-FUSION》",
             "",
             f"主檔狀態：{len(self.db.get_master())} 檔",
             f"歷史資料：{price_rows} 筆｜最後交易日：{last_date}",
@@ -1527,7 +1591,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "主攻", "次強", "防守", "下單清單", "排行", "類股", "題材"]
+        self.download_target_cb["values"] = ["TOP20", "今日可買TOP5", "等待拉回TOP5", "主攻", "次強", "防守", "下單清單", "排行", "類股", "題材"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -1742,6 +1806,8 @@ class AppUI:
         def worker():
             mapping = {
                 "TOP20": getattr(self, "last_top20_df", pd.DataFrame()),
+                "今日可買TOP5": getattr(self, "last_today_buy_df", pd.DataFrame()),
+                "等待拉回TOP5": getattr(self, "last_wait_df", pd.DataFrame()),
                 "主攻": self.last_attack_df,
                 "次強": self.last_watch_df,
                 "防守": self.last_defense_df,
@@ -1792,6 +1858,10 @@ class AppUI:
                     tables["Theme"] = theme
                 if self.last_top20_df is not None and not self.last_top20_df.empty:
                     tables["Trade_TOP20"] = self.last_top20_df
+                if getattr(self, "last_today_buy_df", pd.DataFrame()) is not None and not getattr(self, "last_today_buy_df", pd.DataFrame()).empty:
+                    tables["Today_Buy_TOP5"] = self.last_today_buy_df
+                if getattr(self, "last_wait_df", pd.DataFrame()) is not None and not getattr(self, "last_wait_df", pd.DataFrame()).empty:
+                    tables["Wait_Pullback_TOP5"] = self.last_wait_df
                 if self.last_attack_df is not None and not self.last_attack_df.empty:
                     tables["Attack"] = self.last_attack_df
                 if self.last_watch_df is not None and not self.last_watch_df.empty:
@@ -1813,38 +1883,54 @@ class AppUI:
 
         self._run_in_thread(worker, "export_analysis")
 
-    def build_order_list(self, trade_top20: pd.DataFrame) -> pd.DataFrame:
-        if trade_top20 is None or trade_top20.empty:
-            return pd.DataFrame(columns=["優先級", "代號", "名稱", "分類", "建議動作", "進場區", "停損", "目標價", "RR", "勝率", "建議張數", "風險備註"])
-
+    def build_order_list(self, today_buy_df: pd.DataFrame, wait_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        cols = ["優先級", "代號", "名稱", "分類", "建議動作", "進場區", "停損", "目標價", "RR", "勝率", "建議張數", "風險備註"]
         rows = []
-        for i, (_, r) in enumerate(trade_top20.iterrows(), start=1):
-            action = str(r.get("trade_action", "觀望"))
-            bucket = str(r.get("bucket", "觀察"))
-            rr = float(r.get("rr", 0) or 0)
-            win_rate = float(r.get("win_rate", 0) or 0)
-            if action == "可買":
-                qty = 2 if rr >= 2.0 and win_rate >= 58 else 1
-            elif action == "等待":
-                qty = 1
-            else:
-                qty = 0
-            risk_note = "防守ETF" if bucket == "防守" else ("等待拉回" if action == "等待" else ("可直接評估進場" if action == "可買" else "觀察"))
-            rows.append({
-                "優先級": i,
-                "代號": r.get("stock_id", ""),
-                "名稱": r.get("stock_name", ""),
-                "分類": bucket,
-                "建議動作": action,
-                "進場區": r.get("entry_zone", "-"),
-                "停損": r.get("stop_loss", "-"),
-                "目標價": r.get("target_price", "-"),
-                "RR": rr,
-                "勝率": win_rate,
-                "建議張數": qty,
-                "風險備註": risk_note,
-            })
-        return pd.DataFrame(rows)
+        if today_buy_df is not None and not today_buy_df.empty:
+            for i, (_, r) in enumerate(today_buy_df.iterrows(), start=1):
+                rr = float(r.get("rr", 0) or 0)
+                win_rate = float(r.get("win_rate", 0) or 0)
+                if rr >= 2.5 and win_rate >= 85:
+                    qty = 2.0
+                    risk_note = "強買：主升段且結構完整"
+                elif rr >= 1.8:
+                    qty = 1.0
+                    risk_note = "一般買：標準可交易標的"
+                else:
+                    qty = 0.5
+                    risk_note = "測試單：僅供追蹤"
+                rows.append({
+                    "優先級": i,
+                    "代號": r.get("stock_id", ""),
+                    "名稱": r.get("stock_name", ""),
+                    "分類": "今日可買",
+                    "建議動作": r.get("trade_action", ""),
+                    "進場區": r.get("entry_zone", "-"),
+                    "停損": r.get("stop_loss", "-"),
+                    "目標價": r.get("target_price", "-"),
+                    "RR": rr,
+                    "勝率": win_rate,
+                    "建議張數": qty,
+                    "風險備註": risk_note,
+                })
+        if wait_df is not None and not wait_df.empty:
+            base_priority = len(rows)
+            for j, (_, r) in enumerate(wait_df.iterrows(), start=1):
+                rows.append({
+                    "優先級": base_priority + j,
+                    "代號": r.get("stock_id", ""),
+                    "名稱": r.get("stock_name", ""),
+                    "分類": "等待拉回",
+                    "建議動作": "等待",
+                    "進場區": r.get("entry_zone", "-"),
+                    "停損": r.get("stop_loss", "-"),
+                    "目標價": r.get("target_price", "-"),
+                    "RR": float(r.get("rr", 0) or 0),
+                    "勝率": float(r.get("win_rate", 0) or 0),
+                    "建議張數": 0,
+                    "風險備註": "等待拉回確認，不直接追價",
+                })
+        return pd.DataFrame(rows, columns=cols)
 
 
     def refresh_top20_and_order_views(self):
@@ -2215,14 +2301,23 @@ class AppUI:
                 total = len(df)
                 self.ui_call(self.clear_log)
                 self.ui_call(self.start_task, "AI選股TOP20", total)
+
                 def progress(idx, total_count, sid):
                     self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
-                trade = self.master_trading_engine.get_trade_pool(df, progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+
+                trade = self.master_trading_engine.get_trade_pool(
+                    df,
+                    progress_cb=progress,
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                    cancel_cb=lambda: self.cancel_event.is_set(),
+                )
                 market = trade["market"]
                 trade_top20 = trade["trade_top20"]
                 attack = trade["attack"]
                 watch = trade["watch"]
                 defense = trade["defense"]
+                today_buy = trade["today_buy"]
+                wait_pullback = trade["wait_pullback"]
                 theme_summary = trade["theme_summary"]
 
                 self.last_top20_df = trade_top20.copy()
@@ -2230,38 +2325,46 @@ class AppUI:
                 self.last_watch_df = watch.copy()
                 self.last_defense_df = defense.copy()
                 self.last_theme_summary_df = theme_summary.copy()
-                self.last_order_list_df = self.build_order_list(trade_top20)
+                self.last_today_buy_df = today_buy.copy()
+                self.last_wait_df = wait_pullback.copy()
+                self.last_order_list_df = self.build_order_list(today_buy, wait_pullback)
 
                 self.ui_call(self.refresh_top20_and_order_views)
                 self.ui_call(self.left_notebook.select, self.tab_top20)
 
-                buy_cnt = int(trade_top20["trade_action"].eq("可買").sum()) if not trade_top20.empty else 0
-                wait_cnt = int(trade_top20["trade_action"].eq("等待").sum()) if not trade_top20.empty else 0
                 defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
-
                 lines = [
-                    "《v6.0.6 交易等級系統版》",
-                    f"市場判斷：{market['regime']}（{market['score']:.2f}）",
+                    "《v6.1 SOP-FUSION 交易等級系統》",
+                    f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
                     f"市場說明：{market['memo']}",
-                    f"TOP20 已載入：{len(trade_top20)} 檔｜下單清單：{len(self.last_order_list_df)} 筆",
-                    f"可買：{buy_cnt}｜等待：{wait_cnt}｜防守：{defend_cnt}",
+                    f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可買 TOP5：{len(today_buy)}｜等待拉回 TOP5：{len(wait_pullback)}｜防守：{defend_cnt}",
+                    f"交易門檻：勝率 ≥ {market['min_win_rate']:.0f}%｜RSI {market['rsi_low']:.0f}~{market['rsi_high']:.0f}",
                     "",
-                    "【TOP20 前5檔】",
+                    "【TOP20 觀察池 前5檔】",
                 ]
                 if trade_top20.empty:
                     lines.append("目前無符合條件標的")
                 else:
                     for i, (_, r) in enumerate(trade_top20.head(5).iterrows(), start=1):
                         lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
-                lines.extend(["", "【下單清單 前5筆】"])
-                if self.last_order_list_df.empty:
+
+                lines.extend(["", "【今日可買 TOP5】"])
+                if today_buy.empty:
+                    lines.append("今日無符合 SOP 的可買名單（允許空白，不為湊數放寬）。")
+                else:
+                    for i, (_, r) in enumerate(today_buy.iterrows(), start=1):
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+
+                lines.extend(["", "【等待拉回 TOP5】"])
+                if wait_pullback.empty:
                     lines.append("無")
                 else:
-                    for _, r in self.last_order_list_df.head(5).iterrows():
-                        lines.append(f"- {r['優先級']}. {r['代號']} {r['名稱']}｜{r['建議動作']}｜張數 {r['建議張數']}｜進場 {r['進場區']}")
+                    for i, (_, r) in enumerate(wait_pullback.iterrows(), start=1):
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜等待｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+
                 self.ui_call(self.detail.delete, "1.0", tk.END)
                 self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
-                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股TOP20 完成，共 {len(trade_top20)} 檔")
+                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：TOP20 {len(trade_top20)}｜今日可買 {len(today_buy)}｜等待 {len(wait_pullback)}")
             except OperationCancelled:
                 self.ui_call(self.finish_task, "AI選股TOP20", "AI選股TOP20 已中斷")
             except Exception as e:
