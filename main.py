@@ -63,8 +63,8 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v6.0.5 TRADING-GRADE-SYSTEM TOP20"
-STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_5.json"
+APP_NAME = "GTC AI Trading System v6.0.6 TRADING-GRADE-SYSTEM FINAL"
+STATE_PATH = RUNTIME_DIR / "build_history_state_v6_0_6.json"
 
 
 PACKED_DATA_DIR = BASE_DIR / "data"
@@ -112,7 +112,7 @@ CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
 LEGACY_DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
-DB_PATH = RUNTIME_DIR / "stock_system_v6_0_5.db"
+DB_PATH = RUNTIME_DIR / "stock_system_v6_0_6.db"
 LEGACY_DB_PATH_V603 = RUNTIME_DIR / "stock_system_v6_0_3.db"
 if (not DB_PATH.exists()) and LEGACY_DB_PATH_V603.exists():
     DB_PATH = LEGACY_DB_PATH_V603
@@ -889,15 +889,23 @@ class RankingEngine:
     def __init__(self, db: DBManager):
         self.db = db
 
-    def rebuild(self):
+    def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None):
         master = self.db.get_master()
         today = datetime.now().strftime("%Y-%m-%d")
         rows = []
+        total = len(master)
+        success = 0
+        skipped = 0
 
-        for _, row in master.iterrows():
+        for idx, (_, row) in enumerate(master.iterrows(), start=1):
+            if cancel_cb and cancel_cb():
+                raise OperationCancelled("使用者中斷重建排行")
             stock_id = str(row["stock_id"])
             hist = self.db.get_price_history(stock_id)
             if hist.empty or len(hist) < 70:
+                skipped += 1
+                if progress_cb:
+                    progress_cb(idx, total, stock_id, success, 0, skipped, "skip")
                 continue
             hist = DataEngine.attach(hist)
             score = StrategyEngine.score(hist)
@@ -908,6 +916,11 @@ class RankingEngine:
                 "rank_all": 0,
                 "rank_industry": 0
             })
+            success += 1
+            if progress_cb:
+                progress_cb(idx, total, stock_id, success, 0, skipped, "ok")
+            if log_cb and (idx % 100 == 0 or idx == total):
+                log_cb(f"重排行進度 {idx}/{total}｜已納入 {success} 檔｜跳過 {skipped} 檔")
 
         if not rows:
             return 0
@@ -918,6 +931,8 @@ class RankingEngine:
         df["rank_industry"] = merged.groupby("industry")["total_score"].rank(method="dense", ascending=False).astype(int)
         self.db.replace_ranking(df)
         return len(df)
+
+
 
 
 
@@ -1180,7 +1195,7 @@ class MasterTradingEngine:
         self.market_engine = MarketRegimeEngine(db)
         self.plan_engine = TradingPlanEngine(db)
 
-    def get_trade_pool(self, filtered_df: pd.DataFrame) -> dict:
+    def get_trade_pool(self, filtered_df: pd.DataFrame, progress_cb=None, log_cb=None, cancel_cb=None) -> dict:
         if filtered_df.empty:
             empty = pd.DataFrame()
             return {"market": self.market_engine.get_market_regime(), "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty, "theme_summary": empty}
@@ -1189,8 +1204,16 @@ class MasterTradingEngine:
         hot_themes = ThemeStrengthEngine.get_hot_themes(base)
 
         plans = []
-        for sid in base["stock_id"].astype(str).tolist():
+        sids = base["stock_id"].astype(str).tolist()
+        total = len(sids)
+        for idx2, sid in enumerate(sids, start=1):
+            if cancel_cb and cancel_cb():
+                raise OperationCancelled("使用者中斷 AI選股TOP20")
             plans.append(self.plan_engine.build_plan(sid))
+            if progress_cb:
+                progress_cb(idx2, total, sid)
+            if log_cb and (idx2 % 100 == 0 or idx2 == total):
+                log_cb(f"AI選股分析進度 {idx2}/{total}｜{sid}")
         plans_df = pd.DataFrame(plans)
 
         if plans_df.empty:
@@ -1232,6 +1255,7 @@ class MasterTradingEngine:
             "defense": defense.head(10),
             "theme_summary": ThemeStrengthEngine.summarize(base),
         }
+
 
 
 class SelectionEngine:
@@ -1329,7 +1353,6 @@ class AppUI:
         self.last_watch_df = pd.DataFrame()
         self.last_defense_df = pd.DataFrame()
         self.last_order_list_df = pd.DataFrame()
-        self.last_order_list_df = pd.DataFrame()
         self.current_chart_path = None
         self.worker = None
         self.cancel_event = threading.Event()
@@ -1357,7 +1380,7 @@ class AppUI:
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
         lines = [
-            "《GTC AI Trading System v6.0.5 交易等級系統版》",
+            "《GTC AI Trading System v6.0.6 交易等級系統版》",
             "",
             f"主檔狀態：{len(self.db.get_master())} 檔",
             f"歷史資料：{price_rows} 筆｜最後交易日：{last_date}",
@@ -1451,7 +1474,7 @@ class AppUI:
         self.progress = ttk.Progressbar(row2, variable=self.progress_var, maximum=100, length=180, mode="determinate")
         self.progress.pack(side="left", padx=(12, 6))
         self.progress_text_var = tk.StringVar(value="0% | 0/0 | 成功 0 | 失敗 0")
-        self.progress_text_label = ttk.Label(row2, textvariable=self.progress_text_var, width=28)
+        self.progress_text_label = ttk.Label(row2, textvariable=self.progress_text_var, width=44)
         self.progress_text_label.pack(side="left", padx=4)
 
         main = ttk.Panedwindow(self.root, orient="horizontal")
@@ -1519,14 +1542,16 @@ class AppUI:
         self.status_label.config(text=text)
         self.root.update_idletasks()
 
-    def set_progress(self, current=0, total=100, success=0, failed=0, sid=""):
+    def set_progress(self, current=0, total=100, success=0, failed=0, sid="", skipped=0, stage=""):
         total = max(int(total), 1)
         current = max(0, min(int(current), total))
         self.progress.configure(maximum=total)
         self.progress_var.set(current)
         pct = (current / total) * 100 if total else 0
+        stage_part = f"[{stage}] " if stage else ""
         sid_part = f" | {sid}" if sid else ""
-        self.progress_text_var.set(f"{pct:5.1f}% | {current}/{total} | 成功 {success} | 失敗 {failed}{sid_part}")
+        skip_part = f" | 跳過 {skipped}" if skipped else ""
+        self.progress_text_var.set(f"{stage_part}{pct:5.1f}% | {current}/{total} | 成功 {success} | 失敗 {failed}{skip_part}{sid_part}")
         self.root.update_idletasks()
 
     def reset_progress(self):
@@ -1534,6 +1559,16 @@ class AppUI:
         self.progress_var.set(0)
         self.progress_text_var.set("0% | 0/0 | 成功 0 | 失敗 0")
         self.root.update_idletasks()
+
+    def start_task(self, stage: str, total: int = 100):
+        self.set_status(f"{stage} 開始...")
+        self.set_progress(0, total, 0, 0, stage=stage)
+
+    def update_task(self, stage: str, current: int, total: int, success: int = 0, failed: int = 0, skipped: int = 0, item: str = ""):
+        self.set_progress(current, total, success, failed, item, skipped=skipped, stage=stage)
+
+    def finish_task(self, stage: str, summary: str = ""):
+        self.set_status(summary or f"{stage} 完成")
 
     def append_log(self, text):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1635,53 +1670,78 @@ class AppUI:
 
     def export_selected_data(self):
         target = self.download_target_var.get().strip() or "TOP20"
-        mapping = {
-            "TOP20": getattr(self, "last_top20_df", pd.DataFrame()),
-            "主攻": self.last_attack_df,
-            "次強": self.last_watch_df,
-            "防守": self.last_defense_df,
-            "下單清單": self.last_order_list_df,
-            "排行": self._filtered_ranking(),
-            "類股": pd.DataFrame([(self.sector_tree.item(i, "values")) for i in self.sector_tree.get_children()], columns=["產業", "檔數", "平均總分", "平均AI分", "代表股"]) if self.sector_tree.get_children() else pd.DataFrame(),
-            "題材": pd.DataFrame([(self.theme_tree.item(i, "values")) for i in self.theme_tree.get_children()], columns=["題材", "檔數", "平均總分", "平均AI分", "代表股"]) if self.theme_tree.get_children() else pd.DataFrame(),
-        }
-        df = mapping.get(target, pd.DataFrame())
-        if df is None or df.empty:
-            return messagebox.showwarning("提醒", f"目前沒有可下載的【{target}】資料。")
-        out = RUNTIME_DIR / f"{target}_Data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name=target[:31], index=False)
-        messagebox.showinfo("完成", f"{target} 資料已輸出：\n{out}")
+
+        def worker():
+            mapping = {
+                "TOP20": getattr(self, "last_top20_df", pd.DataFrame()),
+                "主攻": self.last_attack_df,
+                "次強": self.last_watch_df,
+                "防守": self.last_defense_df,
+                "下單清單": self.last_order_list_df,
+                "排行": self._filtered_ranking(),
+                "類股": pd.DataFrame([(self.sector_tree.item(i, "values")) for i in self.sector_tree.get_children()], columns=["產業", "檔數", "平均總分", "平均AI分", "代表股"]) if self.sector_tree.get_children() else pd.DataFrame(),
+                "題材": pd.DataFrame([(self.theme_tree.item(i, "values")) for i in self.theme_tree.get_children()], columns=["題材", "檔數", "平均總分", "平均AI分", "代表股"]) if self.theme_tree.get_children() else pd.DataFrame(),
+            }
+            df = mapping.get(target, pd.DataFrame())
+            if df is None or df.empty:
+                self.ui_call(messagebox.showwarning, "提醒", f"目前沒有可下載的【{target}】資料。")
+                return
+            try:
+                self.ui_call(self.start_task, f"下載{target}", 3)
+                self.ui_call(self.update_task, f"下載{target}", 1, 3, item="準備資料")
+                out = RUNTIME_DIR / f"{target}_Data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                self.ui_call(self.update_task, f"下載{target}", 2, 3, item="寫入Excel")
+                with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                    df.to_excel(writer, sheet_name=target[:31], index=False)
+                self.ui_call(self.update_task, f"下載{target}", 3, 3, success=1, item=out.name)
+                self.ui_call(self.finish_task, f"下載{target}", f"{target} 資料已輸出：{out.name}")
+                self.ui_call(messagebox.showinfo, "完成", f"{target} 資料已輸出：\n{out}")
+            except Exception as e:
+                self.ui_call(messagebox.showerror, "錯誤", str(e))
+
+        self._run_in_thread(worker, f"export_{target}")
 
     def export_analysis_excel(self):
         ranking = self._filtered_ranking()
         if ranking is None or ranking.empty:
             return messagebox.showwarning("提醒", "目前沒有可匯出的分析資料。")
-        out = RUNTIME_DIR / f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        sector = pd.DataFrame()
-        theme = pd.DataFrame()
-        if not ranking.empty:
-            sector = ranking.groupby("industry", as_index=False).agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean")).sort_values(["avg_total", "avg_ai"], ascending=False)
-            theme = ranking.groupby("theme", as_index=False).agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean")).sort_values(["avg_total", "avg_ai"], ascending=False)
-        with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            ranking.to_excel(writer, sheet_name="Ranking", index=False)
-            if not sector.empty:
-                sector.to_excel(writer, sheet_name="Sector", index=False)
-            if not theme.empty:
-                theme.to_excel(writer, sheet_name="Theme", index=False)
-            if self.last_top20_df is not None and not self.last_top20_df.empty:
-                self.last_top20_df.to_excel(writer, sheet_name="Trade_TOP20", index=False)
-            if self.last_attack_df is not None and not self.last_attack_df.empty:
-                self.last_attack_df.to_excel(writer, sheet_name="Attack", index=False)
-            if self.last_watch_df is not None and not self.last_watch_df.empty:
-                self.last_watch_df.to_excel(writer, sheet_name="Watch", index=False)
-            if self.last_defense_df is not None and not self.last_defense_df.empty:
-                self.last_defense_df.to_excel(writer, sheet_name="Defense", index=False)
-            if self.last_order_list_df is not None and not self.last_order_list_df.empty:
-                self.last_order_list_df.to_excel(writer, sheet_name="Order_List", index=False)
-            detail_text = self.detail.get("1.0", tk.END).strip()
-            pd.DataFrame({"detail": [detail_text]}).to_excel(writer, sheet_name="Detail", index=False)
-        messagebox.showinfo("完成", f"分析報告已輸出：\n{out}")
+
+        def worker():
+            try:
+                out = RUNTIME_DIR / f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                sector = pd.DataFrame()
+                theme = pd.DataFrame()
+                self.ui_call(self.start_task, "匯出分析Excel", 5)
+                self.ui_call(self.update_task, "匯出分析Excel", 1, 5, item="整理排行")
+                if not ranking.empty:
+                    sector = ranking.groupby("industry", as_index=False).agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean")).sort_values(["avg_total", "avg_ai"], ascending=False)
+                    theme = ranking.groupby("theme", as_index=False).agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean")).sort_values(["avg_total", "avg_ai"], ascending=False)
+                detail_text = self.detail.get("1.0", tk.END).strip()
+                self.ui_call(self.update_task, "匯出分析Excel", 3, 5, item="寫入Excel")
+                with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                    ranking.to_excel(writer, sheet_name="Ranking", index=False)
+                    if not sector.empty:
+                        sector.to_excel(writer, sheet_name="Sector", index=False)
+                    if not theme.empty:
+                        theme.to_excel(writer, sheet_name="Theme", index=False)
+                    if self.last_top20_df is not None and not self.last_top20_df.empty:
+                        self.last_top20_df.to_excel(writer, sheet_name="Trade_TOP20", index=False)
+                    if self.last_attack_df is not None and not self.last_attack_df.empty:
+                        self.last_attack_df.to_excel(writer, sheet_name="Attack", index=False)
+                    if self.last_watch_df is not None and not self.last_watch_df.empty:
+                        self.last_watch_df.to_excel(writer, sheet_name="Watch", index=False)
+                    if self.last_defense_df is not None and not self.last_defense_df.empty:
+                        self.last_defense_df.to_excel(writer, sheet_name="Defense", index=False)
+                    if self.last_order_list_df is not None and not self.last_order_list_df.empty:
+                        self.last_order_list_df.to_excel(writer, sheet_name="Order_List", index=False)
+                    pd.DataFrame({"detail": [detail_text]}).to_excel(writer, sheet_name="Detail", index=False)
+                self.ui_call(self.update_task, "匯出分析Excel", 5, 5, success=1, item=out.name)
+                self.ui_call(self.finish_task, "匯出分析Excel", f"分析報告已輸出：{out.name}")
+                self.ui_call(messagebox.showinfo, "完成", f"分析報告已輸出：\n{out}")
+            except Exception as e:
+                self.ui_call(messagebox.showerror, "錯誤", str(e))
+
+        self._run_in_thread(worker, "export_analysis")
 
     def build_order_list(self, trade_top20: pd.DataFrame) -> pd.DataFrame:
         if trade_top20 is None or trade_top20.empty:
@@ -1830,7 +1890,8 @@ class AppUI:
                 self.ui_call(self.clear_log)
                 self.ui_call(self.append_log, f"開始完整建庫，模式={'續跑' if resume else '一般'}，主檔 {total} 檔")
                 self.ui_call(self.set_status, "開始建立完整歷史資料（分批 / 可中斷 / 可續跑）...")
-                self.ui_call(self.set_progress, 0, total, 0, 0, "準備中")
+                self.ui_call(self.start_task, "建立完整歷史", total)
+                self.ui_call(self.update_task, "建立完整歷史", 0, total, 0, 0, 0, "準備中")
                 counters = {"ok": 0, "fail": 0}
 
                 def progress(idx, total_count, sid, existing_count, flag):
@@ -1838,7 +1899,7 @@ class AppUI:
                         counters["fail"] += 1
                     elif flag == "ok":
                         counters["ok"] += 1
-                    self.ui_call(self.set_progress, idx, total_count, counters["ok"], counters["fail"], sid)
+                    self.ui_call(self.update_task, "建立完整歷史", idx, total_count, counters["ok"], counters["fail"], 0, sid)
                     self.save_history_state({
                         "mode": "build_history",
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1861,7 +1922,7 @@ class AppUI:
                     cancel_cb=lambda: self.cancel_event.is_set(),
                 )
                 self.clear_history_state()
-                self.ui_call(self.set_progress, total, total, success, failed, "完成")
+                self.ui_call(self.update_task, "建立完整歷史", total, total, success, failed, 0, "完成")
                 self.ui_call(self.set_status, f"完整歷史建立完成：成功 {success} 檔，失敗 {failed} 檔，寫入 {rows} 筆。")
                 self.ui_call(self.append_log, f"完整建庫完成：成功 {success} 檔｜失敗 {failed} 檔｜寫入 {rows} 筆")
                 self.ui_call(self.show_welcome_message)
@@ -1891,7 +1952,8 @@ class AppUI:
         def worker():
             try:
                 self.ui_call(self.set_status, "開始初始化全市場股票清單...")
-                self.ui_call(self.set_progress, 10, 100)
+                self.ui_call(self.start_task, "初始化全市場", 4)
+                self.ui_call(self.update_task, "初始化全市場", 1, 4, item="抓取主檔")
                 universe = build_full_market_universe()
                 if universe is None or universe.empty:
                     csv_path = resolve_master_csv()
@@ -1899,7 +1961,7 @@ class AppUI:
                     master2 = self.db.get_master()
                     self.ui_call(self.refresh_filters)
                     self.ui_call(self.refresh_all_tables)
-                    self.ui_call(self.set_progress, 100, 100)
+                    self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
                     self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master2)} 檔。")
                     self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master2)} 檔\n\n使用主檔：{csv_path}")
                     return
@@ -1908,7 +1970,7 @@ class AppUI:
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
                 self.ui_call(self.show_welcome_message)
-                self.ui_call(self.set_progress, 100, 100)
+                self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
                 self.ui_call(self.set_status, f"全市場初始化完成，共 {len(master2)} 檔。")
                 self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔")
             except Exception as e:
@@ -1944,7 +2006,7 @@ class AppUI:
         return df.sort_values(["rank_all"]).reset_index(drop=True)
 
     def refresh_all_tables(self):
-        for tree in (self.rank_tree, self.sector_tree, self.theme_tree, self.top20_tree, self.order_tree):
+        for tree in (self.rank_tree, self.sector_tree, self.theme_tree):
             for item in tree.get_children():
                 tree.delete(item)
 
@@ -1996,6 +2058,8 @@ class AppUI:
         self.set_status(
             f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}"
         )
+        if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
+            self.refresh_top20_and_order_views()
 
     def update_data(self):
         last_date = self.db.get_last_price_date()
@@ -2007,30 +2071,36 @@ class AppUI:
 
         def worker():
             try:
-                self.ui_call(self.set_status, "開始每日增量更新（官方優先，只更新今日）...")
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
-                self.ui_call(self.set_progress, 0, total)
-
-                counters = {"ok": 0, "fail": 0}
+                counters = {"ok": 0, "fail": 0, "skip": 0}
+                self.ui_call(self.clear_log)
+                self.ui_call(self.start_task, "每日增量更新", total)
 
                 def progress(idx, total_count, sid, row_count, flag):
                     if flag == "ok":
                         counters["ok"] += 1
-                    elif flag in ("skip", "fail", "error"):
+                    elif flag in ("fail", "error"):
                         counters["fail"] += 1
-                    self.ui_call(self.set_progress, idx, total_count, counters["ok"], counters["fail"], sid)
-                    if idx % 50 == 0 or idx == total_count:
-                        self.ui_call(self.set_status, f"每日更新中 {idx}/{total_count}｜{sid}｜成功 {counters['ok']}｜未取到 {counters['fail']}")
+                    else:
+                        counters["skip"] += 1
+                    self.ui_call(self.update_task, "每日增量更新", idx, total_count, counters["ok"], counters["fail"], counters["skip"], sid)
 
-                success, failed, rows = self.data_engine.update_incremental(progress_cb=progress)
-                self.ui_call(self.set_status, "資料更新完成，開始重建排行...")
-                rank_count = self.rank_engine.rebuild()
-                self.ui_call(self.set_progress, total, total)
+                success, failed, rows = self.data_engine.update_incremental(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+                self.ui_call(self.start_task, "重建排行", total)
+                rank_skip = {"skip": 0}
+                def rank_progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
+                    rank_skip["skip"] = skip_count
+                    self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
+                rank_count = self.rank_engine.rebuild(progress_cb=rank_progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
-                self.ui_call(self.set_status, f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。")
+                self.ui_call(self.show_welcome_message)
+                self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。")
                 self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n排行 {rank_count} 檔\n（TWSE/TPEX 官方優先，只更新今日）")
+            except OperationCancelled:
+                self.ui_call(self.append_log, "每日更新/重排行已中斷")
+                self.ui_call(self.finish_task, "每日增量更新", "作業已中斷")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
@@ -2040,20 +2110,23 @@ class AppUI:
     def rebuild_ranking(self):
         def worker():
             try:
+                master = self.db.get_master()
+                total = len(master) if not master.empty else 1
                 self.ui_call(self.clear_log)
-                self.ui_call(self.append_log, "開始重建排行...")
-                self.ui_call(self.set_status, "開始重建排行...")
-                self.ui_call(self.set_progress, 10, 100)
-                count = self.rank_engine.rebuild()
-                self.ui_call(self.set_progress, 90, 100)
+                self.ui_call(self.start_task, "重建排行", total)
+                def progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
+                    self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
+                count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
                 self.ui_call(self.show_welcome_message)
-                self.ui_call(self.set_progress, 100, 100)
+                self.ui_call(self.finish_task, "重建排行", f"排行已完成，共 {count} 檔")
                 if count <= 0:
                     self.ui_call(messagebox.showwarning, "提醒", "排行重建完成，但目前可計算檔數為 0。\n請先建立至少 70 根以上歷史K線資料。")
                 else:
                     self.ui_call(messagebox.showinfo, "完成", f"排行已完成，共 {count} 檔")
+            except OperationCancelled:
+                self.ui_call(self.finish_task, "重建排行", "重建排行已中斷")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
@@ -2067,62 +2140,65 @@ class AppUI:
         if df.empty:
             return messagebox.showwarning("提醒", "目前篩選條件下沒有可用資料")
 
-        trade = self.master_trading_engine.get_trade_pool(df)
-        market = trade["market"]
-        trade_top20 = trade["trade_top20"]
-        attack = trade["attack"]
-        watch = trade["watch"]
-        defense = trade["defense"]
-        theme_summary = trade["theme_summary"]
+        def worker():
+            try:
+                total = len(df)
+                self.ui_call(self.clear_log)
+                self.ui_call(self.start_task, "AI選股TOP20", total)
+                def progress(idx, total_count, sid):
+                    self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
+                trade = self.master_trading_engine.get_trade_pool(df, progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+                market = trade["market"]
+                trade_top20 = trade["trade_top20"]
+                attack = trade["attack"]
+                watch = trade["watch"]
+                defense = trade["defense"]
+                theme_summary = trade["theme_summary"]
 
-        self.last_top20_df = trade_top20.copy()
-        self.last_attack_df = attack.copy()
-        self.last_watch_df = watch.copy()
-        self.last_defense_df = defense.copy()
-        self.last_theme_summary_df = theme_summary.copy()
-        self.last_order_list_df = self.build_order_list(trade_top20)
+                self.last_top20_df = trade_top20.copy()
+                self.last_attack_df = attack.copy()
+                self.last_watch_df = watch.copy()
+                self.last_defense_df = defense.copy()
+                self.last_theme_summary_df = theme_summary.copy()
+                self.last_order_list_df = self.build_order_list(trade_top20)
 
-        self.refresh_top20_and_order_views()
-        self.left_notebook.select(self.tab_top20)
+                self.ui_call(self.refresh_top20_and_order_views)
+                self.ui_call(self.left_notebook.select, self.tab_top20)
 
-        buy_cnt = int((trade_top20['trade_action'] == '可買').sum()) if not trade_top20.empty else 0
-        wait_cnt = int((trade_top20['trade_action'] == '等待').sum()) if not trade_top20.empty else 0
-        defense_cnt = int((trade_top20['bucket'] == '防守').sum()) if not trade_top20.empty else 0
+                buy_cnt = int(trade_top20["trade_action"].eq("可買").sum()) if not trade_top20.empty else 0
+                wait_cnt = int(trade_top20["trade_action"].eq("等待").sum()) if not trade_top20.empty else 0
+                defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
 
-        lines = [
-            "《v6.0.5 交易等級版》",
-            f"市場判斷：{market['regime']}（{market['score']:.2f}）",
-            f"市場說明：{market['memo']}",
-            f"TOP20 已載入到左側【AI交易TOP20】分頁",
-            f"下單清單已載入到左側【下單清單】分頁",
-            "",
-            f"可買：{buy_cnt} 檔｜等待：{wait_cnt} 檔｜防守：{defense_cnt} 檔",
-            "",
-            "【TOP20 前5檔】",
-        ]
-        if trade_top20.empty:
-            lines.append("目前無符合條件標的")
-        else:
-            for i, (_, r) in enumerate(trade_top20.head(5).iterrows(), start=1):
-                ui_action = "防守" if str(r['bucket']) == '防守' else str(r['trade_action'])
-                lines.append(
-                    f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{ui_action}｜進場 {r['entry_zone']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%"
-                )
+                lines = [
+                    "《v6.0.6 交易等級系統版》",
+                    f"市場判斷：{market['regime']}（{market['score']:.2f}）",
+                    f"市場說明：{market['memo']}",
+                    f"TOP20 已載入：{len(trade_top20)} 檔｜下單清單：{len(self.last_order_list_df)} 筆",
+                    f"可買：{buy_cnt}｜等待：{wait_cnt}｜防守：{defend_cnt}",
+                    "",
+                    "【TOP20 前5檔】",
+                ]
+                if trade_top20.empty:
+                    lines.append("目前無符合條件標的")
+                else:
+                    for i, (_, r) in enumerate(trade_top20.head(5).iterrows(), start=1):
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
+                lines.extend(["", "【下單清單 前5筆】"])
+                if self.last_order_list_df.empty:
+                    lines.append("無")
+                else:
+                    for _, r in self.last_order_list_df.head(5).iterrows():
+                        lines.append(f"- {r['優先級']}. {r['代號']} {r['名稱']}｜{r['建議動作']}｜張數 {r['建議張數']}｜進場 {r['進場區']}")
+                self.ui_call(self.detail.delete, "1.0", tk.END)
+                self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
+                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股TOP20 完成，共 {len(trade_top20)} 檔")
+            except OperationCancelled:
+                self.ui_call(self.finish_task, "AI選股TOP20", "AI選股TOP20 已中斷")
+            except Exception as e:
+                traceback.print_exc()
+                self.ui_call(messagebox.showerror, "錯誤", str(e))
 
-        lines += ["", "【下單清單 前5筆】"]
-        if self.last_order_list_df.empty:
-            lines.append("目前無可下單清單")
-        else:
-            for _, r in self.last_order_list_df.head(5).iterrows():
-                lines.append(
-                    f"#{int(r['優先級'])} {r['代號']} {r['名稱']}｜{r['建議動作']}｜{r['進場區']}｜張數 {int(r['建議張數'])}"
-                )
-
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
-        self.set_status(f"AI選股TOP20 完成｜可買 {buy_cnt}｜等待 {wait_cnt}｜防守 {defense_cnt}")
-        messagebox.showinfo("AI選股TOP20", f"TOP20 與下單清單已載入畫面。\n可買 {buy_cnt} 檔｜等待 {wait_cnt} 檔｜防守 {defense_cnt} 檔")
-
+        self._run_in_thread(worker, "show_top20")
 
     def on_select_stock(self, event=None):
         sel = self.rank_tree.selection()
