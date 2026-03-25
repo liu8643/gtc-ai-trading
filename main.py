@@ -1,4 +1,4 @@
-
+ 
 # -*- coding: utf-8 -*-
 """
 GTC AI Trading System v6.0.6b DOWNLOAD-STABLE
