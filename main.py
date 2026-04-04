@@ -2490,7 +2490,7 @@ class AppUI:
         self.root.geometry("1580x920")
 
         self.market_var = tk.StringVar(value="全部")
-        self.multi_window_var = tk.BooleanVar(value=False)
+        self.multi_window_var = tk.BooleanVar(value=True)
         self.top20_window = None
         self.chart_window = None
         self.plan_window = None
@@ -2605,9 +2605,10 @@ class AppUI:
         self.btn_export_excel.pack(side="left", padx=4)
         self.btn_open_chart = ttk.Button(row2, text="開啟圖表", command=self.open_current_chart)
         self.btn_open_chart.pack(side="left", padx=4)
-        self.multi_window_chk = ttk.Checkbutton(row2, text="多視窗模式", variable=self.multi_window_var)
+        self.multi_window_chk = ttk.Checkbutton(row2, text="同頁三分割交易桌面", variable=self.multi_window_var)
+        self.multi_window_chk.state(["selected", "disabled"])
         self.multi_window_chk.pack(side="left", padx=(8, 2))
-        self.btn_open_3wins = ttk.Button(row2, text="開啟3視窗", command=self.open_three_windows)
+        self.btn_open_3wins = ttk.Button(row2, text="定位交易桌面", command=self.open_three_windows)
         self.btn_open_3wins.pack(side="left", padx=4)
 
         self.progress_var = tk.DoubleVar(value=0)
@@ -2617,13 +2618,19 @@ class AppUI:
         self.progress_text_label = ttk.Label(row2, textvariable=self.progress_text_var, width=44)
         self.progress_text_label.pack(side="left", padx=4)
 
-        main = ttk.Panedwindow(self.root, orient="horizontal")
-        main.pack(fill="both", expand=True, padx=8, pady=8)
+        desktop = ttk.Panedwindow(self.root, orient="vertical")
+        desktop.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.left_notebook = ttk.Notebook(main)
-        right = ttk.Frame(main, padding=8)
-        main.add(self.left_notebook, weight=3)
-        main.add(right, weight=2)
+        upper_main = ttk.Panedwindow(desktop, orient="horizontal")
+        desktop.add(upper_main, weight=3)
+
+        lower_desk = ttk.Panedwindow(desktop, orient="horizontal")
+        desktop.add(lower_desk, weight=2)
+
+        self.left_notebook = ttk.Notebook(upper_main)
+        right = ttk.Frame(upper_main, padding=8)
+        upper_main.add(self.left_notebook, weight=3)
+        upper_main.add(right, weight=2)
 
         self.tab_dashboard = ttk.Frame(self.left_notebook)
         self.tab_rotation = ttk.Frame(self.left_notebook)
@@ -2722,6 +2729,36 @@ class AppUI:
         lower_body.rowconfigure(0, weight=1)
         lower_body.columnconfigure(0, weight=1)
 
+        # 同頁三分割交易桌面
+        desk_left = ttk.LabelFrame(lower_desk, text="TOP20 交易桌面", padding=6)
+        desk_mid = ttk.LabelFrame(lower_desk, text="交易計畫桌面", padding=6)
+        desk_right = ttk.LabelFrame(lower_desk, text="即時 K 線 / 波浪 / 費波 / 多空路徑", padding=6)
+        lower_desk.add(desk_left, weight=2)
+        lower_desk.add(desk_mid, weight=2)
+        lower_desk.add(desk_right, weight=3)
+
+        self.win_top20_tree = self._make_tree(desk_left, ("rank", "id", "name", "bucket", "state", "entry", "rr", "win"), {
+            "rank":"排序","id":"代號","name":"名稱","bucket":"分類","state":"狀態","entry":"進場區","rr":"RR","win":"勝率%"
+        })
+        self.win_top20_tree.bind("<<TreeviewSelect>>", self.on_select_window_top20)
+
+        plan_wrap = ttk.Frame(desk_mid)
+        plan_wrap.pack(fill="both", expand=True)
+        self.win_plan_text = tk.Text(plan_wrap, wrap="none", font=("Consolas", 11))
+        self.win_plan_vsb = ttk.Scrollbar(plan_wrap, orient="vertical", command=self.win_plan_text.yview)
+        self.win_plan_hsb = ttk.Scrollbar(plan_wrap, orient="horizontal", command=self.win_plan_text.xview)
+        self.win_plan_text.configure(yscrollcommand=self.win_plan_vsb.set, xscrollcommand=self.win_plan_hsb.set)
+        self.win_plan_text.grid(row=0, column=0, sticky="nsew")
+        self.win_plan_vsb.grid(row=0, column=1, sticky="ns")
+        self.win_plan_hsb.grid(row=1, column=0, sticky="ew")
+        plan_wrap.rowconfigure(0, weight=1)
+        plan_wrap.columnconfigure(0, weight=1)
+
+        chart_wrap = ttk.Frame(desk_right)
+        chart_wrap.pack(fill="both", expand=True)
+        self.chart_fig = plt.Figure(figsize=(8.6, 4.4), dpi=100)
+        self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, master=chart_wrap)
+        self.chart_canvas.get_tk_widget().pack(fill="both", expand=True)
     def _make_tree(self, parent, cols, headers):
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
@@ -2874,65 +2911,20 @@ class AppUI:
 
 
     def open_three_windows(self):
-        self.ensure_multi_windows()
+        self.left_notebook.select(self.tab_top20)
         self.sync_multi_windows()
-        if self.last_top20_df is not None and not self.last_top20_df.empty:
+        stock_id = self.window_current_stock_id
+        if not stock_id and self.last_top20_df is not None and not self.last_top20_df.empty:
             stock_id = str(self.last_top20_df.iloc[0]["stock_id"])
+        if stock_id:
             self.update_multi_window_stock(stock_id)
-        else:
-            self.set_status("已開啟3視窗，等待 TOP20 分析結果同步。")
+        self.set_status("已定位到同頁三分割交易桌面。")
 
     def ensure_multi_windows(self):
-        if self.top20_window is None or not self.top20_window.winfo_exists():
-            self.top20_window = tk.Toplevel(self.root)
-            self.top20_window.title("TOP20 交易視窗")
-            self.top20_window.geometry("860x720")
-            frame = ttk.Frame(self.top20_window, padding=6)
-            frame.pack(fill="both", expand=True)
-            cols = ("rank", "id", "name", "bucket", "state", "entry", "rr", "win")
-            self.win_top20_tree = ttk.Treeview(frame, columns=cols, show="headings", height=28)
-            headers = {"rank":"排序","id":"代號","name":"名稱","bucket":"分類","state":"狀態","entry":"進場區","rr":"RR","win":"勝率%"}
-            widths = {"rank":60,"id":90,"name":120,"bucket":90,"state":90,"entry":150,"rr":80,"win":80}
-            for c in cols:
-                self.win_top20_tree.heading(c, text=headers[c])
-                self.win_top20_tree.column(c, width=widths[c], anchor="center")
-            ysb = ttk.Scrollbar(frame, orient="vertical", command=self.win_top20_tree.yview)
-            xsb = ttk.Scrollbar(frame, orient="horizontal", command=self.win_top20_tree.xview)
-            self.win_top20_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-            self.win_top20_tree.grid(row=0, column=0, sticky="nsew")
-            ysb.grid(row=0, column=1, sticky="ns")
-            xsb.grid(row=1, column=0, sticky="ew")
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-            self.win_top20_tree.bind("<<TreeviewSelect>>", self.on_select_window_top20)
-
-        if self.chart_window is None or not self.chart_window.winfo_exists():
-            self.chart_window = tk.Toplevel(self.root)
-            self.chart_window.title("即時 K 線 / 波浪 / 費波 / 多空路徑")
-            self.chart_window.geometry("1180x760")
-            wrap = ttk.Frame(self.chart_window, padding=6)
-            wrap.pack(fill="both", expand=True)
-            self.chart_fig = plt.Figure(figsize=(12, 7), dpi=100)
-            self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, master=wrap)
-            self.chart_canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        if self.plan_window is None or not self.plan_window.winfo_exists():
-            self.plan_window = tk.Toplevel(self.root)
-            self.plan_window.title("交易計畫視窗")
-            self.plan_window.geometry("760x760")
-            wrap = ttk.Frame(self.plan_window, padding=6)
-            wrap.pack(fill="both", expand=True)
-            self.win_plan_text = tk.Text(wrap, wrap="none", font=("Consolas", 11))
-            ysb = ttk.Scrollbar(wrap, orient="vertical", command=self.win_plan_text.yview)
-            xsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.win_plan_text.xview)
-            self.win_plan_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-            self.win_plan_text.grid(row=0, column=0, sticky="nsew")
-            ysb.grid(row=0, column=1, sticky="ns")
-            xsb.grid(row=1, column=0, sticky="ew")
-            wrap.rowconfigure(0, weight=1)
-            wrap.columnconfigure(0, weight=1)
+        return
 
     def sync_multi_windows(self):
+
         if self.win_top20_tree is None or not self.win_top20_tree.winfo_exists():
             return
         for item in self.win_top20_tree.get_children():
@@ -3278,10 +3270,9 @@ class AppUI:
                     r.get("投資組合狀態", ""), r.get("風險備註", "")
                 ))
 
-        if self.multi_window_var.get():
-            self.sync_multi_windows()
-            if self.window_current_stock_id:
-                self.update_multi_window_stock(self.window_current_stock_id)
+        self.sync_multi_windows()
+        if self.window_current_stock_id:
+            self.update_multi_window_stock(self.window_current_stock_id)
 
     def on_select_top20(self, event=None):
         sel = self.top20_tree.selection()
@@ -3317,8 +3308,7 @@ class AppUI:
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
-        if self.multi_window_var.get():
-            self.update_multi_window_stock(stock_id)
+        self.update_multi_window_stock(stock_id)
     def on_select_order(self, event=None):
         sel = self.order_tree.selection()
         if not sel:
@@ -3349,8 +3339,7 @@ class AppUI:
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
-        if self.multi_window_var.get():
-            self.update_multi_window_stock(stock_id)
+        self.update_multi_window_stock(stock_id)
 
 
     def show_top5(self):
@@ -3423,8 +3412,7 @@ class AppUI:
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
-        if self.multi_window_var.get():
-            self.update_multi_window_stock(stock_id)
+        self.update_multi_window_stock(stock_id)
 
 
     def on_select_institutional(self, event=None):
@@ -3461,8 +3449,7 @@ class AppUI:
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
-        if self.multi_window_var.get():
-            self.update_multi_window_stock(stock_id)
+        self.update_multi_window_stock(stock_id)
 
     def build_full_history_once(self):
         self._start_build_history(resume=False)
@@ -3810,8 +3797,7 @@ class AppUI:
 
                 self.ui_call(self.refresh_top20_and_order_views)
                 self.ui_call(self.left_notebook.select, self.tab_top20)
-                if self.multi_window_var.get():
-                    self.ui_call(self.open_three_windows)
+                self.ui_call(self.open_three_windows)
 
                 defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
                 lines = [
@@ -3972,8 +3958,7 @@ class AppUI:
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
-        if self.multi_window_var.get():
-            self.update_multi_window_stock(stock_id)
+        self.update_multi_window_stock(stock_id)
 
     def export_chart(self, stock_id: str, hist: pd.DataFrame):
         x = DataEngine.attach(hist.copy()).tail(120).reset_index(drop=True)
