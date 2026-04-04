@@ -2605,10 +2605,10 @@ class AppUI:
         self.btn_export_excel.pack(side="left", padx=4)
         self.btn_open_chart = ttk.Button(row2, text="開啟圖表", command=self.open_current_chart)
         self.btn_open_chart.pack(side="left", padx=4)
-        self.multi_window_chk = ttk.Checkbutton(row2, text="左清單＋右上下交易桌面", variable=self.multi_window_var)
+        self.multi_window_chk = ttk.Checkbutton(row2, text="左主區＋右上分析＋右下圖表/Log", variable=self.multi_window_var)
         self.multi_window_chk.state(["selected", "disabled"])
         self.multi_window_chk.pack(side="left", padx=(8, 2))
-        self.btn_open_3wins = ttk.Button(row2, text="同步交易桌面", command=self.open_three_windows)
+        self.btn_open_3wins = ttk.Button(row2, text="同步右側面板", command=self.open_three_windows)
         self.btn_open_3wins.pack(side="left", padx=4)
 
         self.progress_var = tk.DoubleVar(value=0)
@@ -2618,19 +2618,13 @@ class AppUI:
         self.progress_text_label = ttk.Label(row2, textvariable=self.progress_text_var, width=44)
         self.progress_text_label.pack(side="left", padx=4)
 
-        desktop = ttk.Panedwindow(self.root, orient="vertical")
-        desktop.pack(fill="both", expand=True, padx=8, pady=8)
+        main = ttk.Panedwindow(self.root, orient="horizontal")
+        main.pack(fill="both", expand=True, padx=8, pady=8)
 
-        upper_main = ttk.Panedwindow(desktop, orient="horizontal")
-        desktop.add(upper_main, weight=3)
-
-        lower_desk = ttk.Panedwindow(desktop, orient="horizontal")
-        desktop.add(lower_desk, weight=2)
-
-        self.left_notebook = ttk.Notebook(upper_main)
-        right = ttk.Frame(upper_main, padding=8)
-        upper_main.add(self.left_notebook, weight=3)
-        upper_main.add(right, weight=2)
+        self.left_notebook = ttk.Notebook(main)
+        right = ttk.Frame(main, padding=8)
+        main.add(self.left_notebook, weight=5)
+        main.add(right, weight=2)
 
         self.tab_dashboard = ttk.Frame(self.left_notebook)
         self.tab_rotation = ttk.Frame(self.left_notebook)
@@ -2653,7 +2647,6 @@ class AppUI:
         self.left_notebook.add(self.tab_inst, text="機構交易計畫")
         self.left_notebook.add(self.tab_backtest, text="回測視覺化")
 
-
         self.dashboard_tree = self._make_tree(self.tab_dashboard, ("metric", "value", "desc"), {
             "metric": "指標", "value": "數值", "desc": "說明"
         })
@@ -2674,7 +2667,6 @@ class AppUI:
         self.theme_tree = self._make_tree(self.tab_theme, ("theme", "count", "avg_total", "avg_ai", "top_name"), {
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
-
 
         self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "bucket", "ui_action", "entry", "stop", "target1382", "target1618", "rr", "win_rate"), {
             "rank": "排序", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "狀態", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%"
@@ -2701,8 +2693,14 @@ class AppUI:
         })
         self.backtest_tree.bind("<<TreeviewSelect>>", self.on_select_backtest)
 
-        upper = ttk.LabelFrame(right, text="個股 / 系統說明", padding=6)
-        upper.pack(fill="both", expand=True)
+        right_split = ttk.Panedwindow(right, orient="vertical")
+        right_split.pack(fill="both", expand=True)
+
+        upper = ttk.LabelFrame(right_split, text="個股分析 / 交易計畫", padding=6)
+        right_lower = ttk.LabelFrame(right_split, text="圖表 / Log", padding=6)
+        right_split.add(upper, weight=3)
+        right_split.add(right_lower, weight=2)
+
         upper_body = ttk.Frame(upper)
         upper_body.pack(fill="both", expand=True)
         self.detail = tk.Text(upper_body, wrap="none", font=("Consolas", 11), height=18)
@@ -2715,48 +2713,35 @@ class AppUI:
         upper_body.rowconfigure(0, weight=1)
         upper_body.columnconfigure(0, weight=1)
 
-        lower = ttk.LabelFrame(right, text="即時 Log 視窗", padding=6)
-        lower.pack(fill="both", expand=True, pady=(8, 0))
-        lower_body = ttk.Frame(lower)
-        lower_body.pack(fill="both", expand=True)
-        self.log_text = tk.Text(lower_body, wrap="none", font=("Consolas", 10), height=14)
-        self.log_vsb = ttk.Scrollbar(lower_body, orient="vertical", command=self.log_text.yview)
-        self.log_hsb = ttk.Scrollbar(lower_body, orient="horizontal", command=self.log_text.xview)
+        self.win_plan_text = None
+        self.win_top20_tree = None
+
+        self.right_lower_notebook = ttk.Notebook(right_lower)
+        self.right_lower_notebook.pack(fill="both", expand=True)
+
+        self.chart_tab = ttk.Frame(self.right_lower_notebook)
+        self.log_tab = ttk.Frame(self.right_lower_notebook)
+        self.right_lower_notebook.add(self.chart_tab, text="圖表")
+        self.right_lower_notebook.add(self.log_tab, text="Log")
+
+        chart_wrap = ttk.Frame(self.chart_tab)
+        chart_wrap.pack(fill="both", expand=True)
+        self.chart_fig = plt.Figure(figsize=(8.6, 4.8), dpi=100)
+        self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, master=chart_wrap)
+        self.chart_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        log_body = ttk.Frame(self.log_tab)
+        log_body.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_body, wrap="none", font=("Consolas", 10), height=12)
+        self.log_vsb = ttk.Scrollbar(log_body, orient="vertical", command=self.log_text.yview)
+        self.log_hsb = ttk.Scrollbar(log_body, orient="horizontal", command=self.log_text.xview)
         self.log_text.configure(yscrollcommand=self.log_vsb.set, xscrollcommand=self.log_hsb.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         self.log_vsb.grid(row=0, column=1, sticky="ns")
         self.log_hsb.grid(row=1, column=0, sticky="ew")
-        lower_body.rowconfigure(0, weight=1)
-        lower_body.columnconfigure(0, weight=1)
+        log_body.rowconfigure(0, weight=1)
+        log_body.columnconfigure(0, weight=1)
 
-        # 同頁交易桌面：刪除下方重複 TOP20，只保留右側上下分割（上=交易計畫，下=圖表）
-        desk_right_split = ttk.Panedwindow(lower_desk, orient="vertical")
-        desk_mid = ttk.LabelFrame(desk_right_split, text="交易計畫桌面", padding=6)
-        desk_right = ttk.LabelFrame(desk_right_split, text="即時 K 線 / 波浪 / 費波 / 多空路徑", padding=6)
-        lower_desk.add(desk_right_split, weight=1)
-
-        desk_right_split.add(desk_mid, weight=2)
-        desk_right_split.add(desk_right, weight=3)
-
-        self.win_top20_tree = None
-
-        plan_wrap = ttk.Frame(desk_mid)
-        plan_wrap.pack(fill="both", expand=True)
-        self.win_plan_text = tk.Text(plan_wrap, wrap="none", font=("Consolas", 11))
-        self.win_plan_vsb = ttk.Scrollbar(plan_wrap, orient="vertical", command=self.win_plan_text.yview)
-        self.win_plan_hsb = ttk.Scrollbar(plan_wrap, orient="horizontal", command=self.win_plan_text.xview)
-        self.win_plan_text.configure(yscrollcommand=self.win_plan_vsb.set, xscrollcommand=self.win_plan_hsb.set)
-        self.win_plan_text.grid(row=0, column=0, sticky="nsew")
-        self.win_plan_vsb.grid(row=0, column=1, sticky="ns")
-        self.win_plan_hsb.grid(row=1, column=0, sticky="ew")
-        plan_wrap.rowconfigure(0, weight=1)
-        plan_wrap.columnconfigure(0, weight=1)
-
-        chart_wrap = ttk.Frame(desk_right)
-        chart_wrap.pack(fill="both", expand=True)
-        self.chart_fig = plt.Figure(figsize=(8.6, 4.4), dpi=100)
-        self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, master=chart_wrap)
-        self.chart_canvas.get_tk_widget().pack(fill="both", expand=True)
     def _make_tree(self, parent, cols, headers):
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
@@ -2918,7 +2903,7 @@ class AppUI:
             stock_id = str(self.last_top20_df.iloc[0]["stock_id"])
         if stock_id:
             self.update_multi_window_stock(stock_id)
-        self.set_status("已同步到左清單＋右上下交易桌面。")
+        self.set_status("已同步到右側分析 / 圖表面板。")
 
     def ensure_multi_windows(self):
         return
@@ -3131,11 +3116,11 @@ class AppUI:
     def update_multi_window_stock(self, stock_id: str):
         self.ensure_multi_windows()
         self.window_current_stock_id = stock_id
-        if self.win_plan_text is not None and self.win_plan_text.winfo_exists():
-            lines = self.build_window_plan_lines(stock_id)
-            self.win_plan_text.delete("1.0", tk.END)
-            self.win_plan_text.insert("1.0", "\n".join(lines))
         self.draw_live_chart(stock_id)
+        try:
+            self.right_lower_notebook.select(self.chart_tab)
+        except Exception:
+            pass
 
     def draw_live_chart(self, stock_id: str):
         if self.chart_fig is None or self.chart_canvas is None:
