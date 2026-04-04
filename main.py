@@ -2605,10 +2605,10 @@ class AppUI:
         self.btn_export_excel.pack(side="left", padx=4)
         self.btn_open_chart = ttk.Button(row2, text="開啟圖表", command=self.open_current_chart)
         self.btn_open_chart.pack(side="left", padx=4)
-        self.multi_window_chk = ttk.Checkbutton(row2, text="同頁三分割交易桌面", variable=self.multi_window_var)
+        self.multi_window_chk = ttk.Checkbutton(row2, text="左清單＋右上下交易桌面", variable=self.multi_window_var)
         self.multi_window_chk.state(["selected", "disabled"])
         self.multi_window_chk.pack(side="left", padx=(8, 2))
-        self.btn_open_3wins = ttk.Button(row2, text="定位交易桌面", command=self.open_three_windows)
+        self.btn_open_3wins = ttk.Button(row2, text="同步交易桌面", command=self.open_three_windows)
         self.btn_open_3wins.pack(side="left", padx=4)
 
         self.progress_var = tk.DoubleVar(value=0)
@@ -2729,18 +2729,16 @@ class AppUI:
         lower_body.rowconfigure(0, weight=1)
         lower_body.columnconfigure(0, weight=1)
 
-        # 同頁三分割交易桌面
-        desk_left = ttk.LabelFrame(lower_desk, text="TOP20 交易桌面", padding=6)
-        desk_mid = ttk.LabelFrame(lower_desk, text="交易計畫桌面", padding=6)
-        desk_right = ttk.LabelFrame(lower_desk, text="即時 K 線 / 波浪 / 費波 / 多空路徑", padding=6)
-        lower_desk.add(desk_left, weight=2)
-        lower_desk.add(desk_mid, weight=2)
-        lower_desk.add(desk_right, weight=3)
+        # 同頁交易桌面：刪除下方重複 TOP20，只保留右側上下分割（上=交易計畫，下=圖表）
+        desk_right_split = ttk.Panedwindow(lower_desk, orient="vertical")
+        desk_mid = ttk.LabelFrame(desk_right_split, text="交易計畫桌面", padding=6)
+        desk_right = ttk.LabelFrame(desk_right_split, text="即時 K 線 / 波浪 / 費波 / 多空路徑", padding=6)
+        lower_desk.add(desk_right_split, weight=1)
 
-        self.win_top20_tree = self._make_tree(desk_left, ("rank", "id", "name", "bucket", "state", "entry", "rr", "win"), {
-            "rank":"排序","id":"代號","name":"名稱","bucket":"分類","state":"狀態","entry":"進場區","rr":"RR","win":"勝率%"
-        })
-        self.win_top20_tree.bind("<<TreeviewSelect>>", self.on_select_window_top20)
+        desk_right_split.add(desk_mid, weight=2)
+        desk_right_split.add(desk_right, weight=3)
+
+        self.win_top20_tree = None
 
         plan_wrap = ttk.Frame(desk_mid)
         plan_wrap.pack(fill="both", expand=True)
@@ -2914,44 +2912,182 @@ class AppUI:
         self.left_notebook.select(self.tab_top20)
         self.sync_multi_windows()
         stock_id = self.window_current_stock_id
+        if not stock_id:
+            stock_id = self.get_current_selected_stock_id()
         if not stock_id and self.last_top20_df is not None and not self.last_top20_df.empty:
             stock_id = str(self.last_top20_df.iloc[0]["stock_id"])
         if stock_id:
             self.update_multi_window_stock(stock_id)
-        self.set_status("已定位到同頁三分割交易桌面。")
+        self.set_status("已同步到左清單＋右上下交易桌面。")
 
     def ensure_multi_windows(self):
         return
 
     def sync_multi_windows(self):
-
-        if self.win_top20_tree is None or not self.win_top20_tree.winfo_exists():
-            return
-        for item in self.win_top20_tree.get_children():
-            self.win_top20_tree.delete(item)
-        if self.last_top20_df is None or self.last_top20_df.empty:
-            return
-        for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
-            self.win_top20_tree.insert("", "end", values=(
-                i,
-                r.get("stock_id", ""),
-                r.get("stock_name", ""),
-                r.get("bucket", ""),
-                r.get("ui_state", "-"),
-                r.get("entry_zone", "-"),
-                f"{float(r.get('rr', 0) or 0):.2f}",
-                f"{float(r.get('win_rate', 0) or 0):.1f}",
-            ))
+        return
 
     def on_select_window_top20(self, event=None):
-        if self.win_top20_tree is None:
+        stock_id = self.get_current_selected_stock_id()
+        if stock_id:
+            self.sync_all_views(stock_id, source="桌面同步")
+        return
+
+    def _tree_selected_stock_id(self, tree, value_index: int = 1):
+        try:
+            if tree is None:
+                return None
+            sel = tree.selection()
+            if not sel:
+                return None
+            vals = tree.item(sel[0], "values")
+            if vals and len(vals) > value_index:
+                sid = str(vals[value_index]).strip()
+                return sid or None
+        except Exception:
+            return None
+        return None
+
+    def _row_lookup(self, df: pd.DataFrame, stock_id: str):
+        if df is None or df.empty or not stock_id:
+            return None
+        try:
+            row = df[df["stock_id"].astype(str) == str(stock_id)]
+            if row.empty:
+                return None
+            return row.iloc[0]
+        except Exception:
+            return None
+
+    def get_current_selected_stock_id(self):
+        for tree, idx in [
+            (self.top20_tree, 1),
+            (self.top5_tree, 1),
+            (self.order_tree, 1),
+            (self.inst_tree, 1),
+            (self.backtest_tree, 1),
+            (self.rank_tree, 1),
+        ]:
+            sid = self._tree_selected_stock_id(tree, idx)
+            if sid:
+                return sid
+        if self.window_current_stock_id:
+            return self.window_current_stock_id
+        if self.last_top20_df is not None and not self.last_top20_df.empty:
+            return str(self.last_top20_df.iloc[0]["stock_id"])
+        ranking = self._filtered_ranking()
+        if ranking is not None and not ranking.empty:
+            return str(ranking.iloc[0]["stock_id"])
+        return None
+
+    def _set_tree_selection_by_stock_id(self, tree, stock_id: str, value_index: int = 1):
+        try:
+            if tree is None or not stock_id:
+                return
+            found = None
+            for item in tree.get_children():
+                vals = tree.item(item, "values")
+                if vals and len(vals) > value_index and str(vals[value_index]) == str(stock_id):
+                    found = item
+                    break
+            if found is not None:
+                tree.selection_set(found)
+                tree.focus(found)
+                tree.see(found)
+        except Exception:
+            pass
+
+    def sync_multi_windows_selectors(self, stock_id: str):
+        if not stock_id:
             return
-        sel = self.win_top20_tree.selection()
-        if not sel:
+        for tree, idx in [
+            (self.top20_tree, 1),
+            (self.top5_tree, 1),
+            (self.order_tree, 1),
+            (self.inst_tree, 1),
+            (self.backtest_tree, 1),
+            (self.rank_tree, 1),
+        ]:
+            self._set_tree_selection_by_stock_id(tree, stock_id, idx)
+
+    def build_unified_detail_lines(self, stock_id: str, source: str = ""):
+        stock = self.db.get_stock_row(stock_id)
+        hist = self.db.get_price_history(stock_id)
+        if stock is None or hist.empty:
+            return [f"《{source or '同步檢視'}》", f"股票：{stock_id}", "無資料"]
+
+        hist = DataEngine.attach(hist.copy())
+        last = hist.iloc[-1]
+        trade_plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
+        bt = self.backtest_engine.estimate_trade_quality(stock_id)
+        wave = WaveEngine.detect_wave_label(hist)
+        ranking = self._filtered_ranking()
+        rank_text = "-"
+        try:
+            if ranking is not None and not ranking.empty:
+                row = ranking[ranking["stock_id"].astype(str) == str(stock_id)]
+                if not row.empty:
+                    rank_text = str(int(row.iloc[0]["rank_all"]))
+        except Exception:
+            pass
+
+        top20_row = self._row_lookup(getattr(self, "last_top20_df", pd.DataFrame()), stock_id)
+        top5_row = self._row_lookup(getattr(self, "last_top5_df", pd.DataFrame()), stock_id)
+        inst_row = None
+        if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not self.last_institutional_plan_df.empty:
+            try:
+                tmp = self.last_institutional_plan_df[self.last_institutional_plan_df["代號"].astype(str) == str(stock_id)]
+                if not tmp.empty:
+                    inst_row = tmp.iloc[0]
+            except Exception:
+                inst_row = None
+
+        lines = [
+            f"《{source or '專業交易終端版'}》",
+            f"股票：{stock['stock_name']} ({stock_id})｜排行：{rank_text}",
+            f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
+            f"最新收盤：{float(last['close']):.2f}",
+            "MA20 / MA60：{:.2f} / {:.2f}".format(last["ma20"], last["ma60"]) if pd.notna(last["ma20"]) and pd.notna(last["ma60"]) else "MA20 / MA60：資料不足",
+            "RSI14：{:.2f}".format(last["rsi14"]) if pd.notna(last["rsi14"]) else "RSI14：資料不足",
+            "MACD Hist：{:.4f}".format(last["macd_hist"]) if pd.notna(last["macd_hist"]) else "MACD Hist：資料不足",
+            "",
+            f"波浪：{wave}｜訊號：{trade_plan.get('signal','-')}｜交易型態：{trade_plan.get('trade_type','-')}",
+            f"狀態：{trade_plan.get('ui_state','-')}｜決策：{trade_plan.get('trade_action','-')}｜分類：{trade_plan.get('bucket','-')}",
+            f"支撐 / 壓力：{float(trade_plan.get('support',0) or 0):.2f} / {float(trade_plan.get('resistance',0) or 0):.2f}",
+            f"進場區：{trade_plan.get('entry_zone','-')}",
+            f"停損：{trade_plan.get('stop_loss','-')}",
+            f"1.382 / 1.618：{float(trade_plan.get('target_1382',0) or 0):.2f} / {float(trade_plan.get('target_1618',0) or 0):.2f}",
+            f"RR：{float(trade_plan.get('rr',0) or 0):.2f}｜模型勝率：{float(trade_plan.get('win_rate',0) or 0):.1f}%",
+            f"六模組：K {trade_plan.get('kline_score',0):.1f}｜波 {trade_plan.get('wave_score',0):.1f}｜費 {trade_plan.get('fib_score',0):.1f}｜阪 {trade_plan.get('sakata_score',0):.1f}｜量 {trade_plan.get('volume_score',0):.1f}｜指 {trade_plan.get('indicator_score',0):.1f}",
+            f"回測：勝率 {float(bt.get('backtest_win_rate',0) or 0):.1f}%｜平均報酬 {float(bt.get('avg_return',0) or 0):.2f}%｜CAGR {float(bt.get('cagr',0) or 0):.2f}%｜MDD {float(bt.get('mdd',0) or 0):.2f}%｜Sharpe {float(bt.get('sharpe',0) or 0):.2f}",
+        ]
+        if top20_row is not None:
+            lines.append(f"TOP20：{top20_row.get('bucket','-')}｜{top20_row.get('ui_state','-')}")
+        if top5_row is not None:
+            lines.append(f"TOP5：回測勝率 {float(top5_row.get('backtest_win_rate',0) or 0):.1f}%｜CAGR {float(top5_row.get('cagr',0) or 0):.2f}%")
+        if inst_row is not None:
+            lines.append(f"機構計畫：建議張數 {inst_row.get('建議張數',0)}｜建議金額 {inst_row.get('建議金額',0)}｜投資組合狀態 {inst_row.get('投資組合狀態','-')}")
+            lines.append(f"機構備註：{inst_row.get('風險備註','-')}")
+        lines.extend([
+            f"理由：{trade_plan.get('reason','-')}",
+            f"圖表：{self.current_chart_path or '-'}",
+        ])
+        return lines
+
+    def sync_all_views(self, stock_id: str, source: str = ""):
+        if not stock_id:
             return
-        vals = self.win_top20_tree.item(sel[0], "values")
-        if len(vals) >= 2:
-            self.update_multi_window_stock(str(vals[1]))
+        stock = self.db.get_stock_row(stock_id)
+        hist = self.db.get_price_history(stock_id)
+        if stock is None or hist.empty:
+            return
+        hist = DataEngine.attach(hist.copy())
+        self.window_current_stock_id = stock_id
+        self.current_chart_path = self.export_chart(stock_id, hist)
+        lines = self.build_unified_detail_lines(stock_id, source=source or "多來源同步模式")
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+        self.sync_multi_windows_selectors(stock_id)
+        self.update_multi_window_stock(stock_id)
 
     def _candlestick(self, ax, x_vals, opens, highs, lows, closes):
         width = 0.55
@@ -3280,66 +3416,14 @@ class AppUI:
             return
         vals = self.top20_tree.item(sel[0], "values")
         stock_id = str(vals[1])
-        stock = self.db.get_stock_row(stock_id)
-        hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
-            return
-        hist = DataEngine.attach(hist)
-        last = hist.iloc[-1]
-        trade_plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
-        self.current_chart_path = self.export_chart(stock_id, hist)
-        bt = self.backtest_engine.estimate_trade_quality(stock_id)
-        lines = [
-            f"《AI交易TOP20 / v9.2 FINAL-RELEASE》",
-            f"股票：{stock['stock_name']} ({stock_id})",
-            f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
-            f"最新收盤：{float(last['close']):.2f}",
-            f"交易分類：{trade_plan['bucket']}｜決策：{trade_plan['trade_action']}｜狀態：{trade_plan.get('ui_state', '-')}",
-            f"支撐 / 壓力：{float(trade_plan.get('support', 0) or 0):.2f} / {float(trade_plan.get('resistance', 0) or 0):.2f}",
-            f"進場區：{trade_plan['entry_zone']}",
-            f"停損：{trade_plan['stop_loss']}",
-            f"1.382 / 1.618：{float(trade_plan.get('target_1382', 0) or 0):.2f} / {float(trade_plan.get('target_1618', 0) or 0):.2f}",
-            f"RR：{float(trade_plan['rr']):.2f}｜勝率：{trade_plan['win_grade']} ({float(trade_plan['win_rate']):.1f}%)",
-            f"六模組總分：{float(trade_plan.get('model_score', 0) or 0):.2f}",
-            f"六模組：K {trade_plan.get('kline_score',0):.1f}｜波 {trade_plan.get('wave_score',0):.1f}｜費 {trade_plan.get('fib_score',0):.1f}｜阪 {trade_plan.get('sakata_score',0):.1f}｜量 {trade_plan.get('volume_score',0):.1f}｜指 {trade_plan.get('indicator_score',0):.1f}",
-            f"回測：勝率 {float(bt.get('backtest_win_rate',0) or 0):.1f}%｜CAGR {float(bt.get('cagr',0) or 0):.2f}%｜MDD {float(bt.get('mdd',0) or 0):.2f}%｜Sharpe {float(bt.get('sharpe',0) or 0):.2f}",
-            f"理由：{trade_plan['reason']}",
-            f"圖表：{self.current_chart_path}",
-        ]
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
-        self.update_multi_window_stock(stock_id)
+        self.sync_all_views(stock_id, source="AI交易TOP20")
     def on_select_order(self, event=None):
         sel = self.order_tree.selection()
         if not sel:
             return
         vals = self.order_tree.item(sel[0], "values")
         stock_id = str(vals[1])
-        stock = self.db.get_stock_row(stock_id)
-        hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
-            return
-        hist = DataEngine.attach(hist)
-        last = hist.iloc[-1]
-        self.current_chart_path = self.export_chart(stock_id, hist)
-        lines = [
-            "《下單清單 / v9.2 FINAL-RELEASE》",
-            f"優先級：{vals[0]}",
-            f"股票：{stock['stock_name']} ({stock_id})",
-            f"分類 / 狀態：{vals[3]} / {vals[4]}",
-            f"進場區：{vals[5]}",
-            f"停損：{vals[6]}",
-            f"1.382 / 1.618：{vals[7]} / {vals[8]}",
-            f"RR：{vals[9]}｜勝率：{vals[10]}%｜ATR：{vals[11]}%｜Kelly：{vals[12]}%",
-            f"建議張數：{vals[13]}｜建議金額：{vals[14]}｜單檔曝險：{vals[15]}%",
-            f"組合狀態：{vals[16]}",
-            f"風險備註：{vals[17]}",
-            f"最新收盤：{float(last['close']):.2f}",
-            f"圖表：{self.current_chart_path}",
-        ]
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
-        self.update_multi_window_stock(stock_id)
+        self.sync_all_views(stock_id, source="下單清單")
 
 
     def show_top5(self):
@@ -3383,36 +3467,7 @@ class AppUI:
             return
         vals = self.top5_tree.item(sel[0], "values")
         stock_id = str(vals[1])
-        stock = self.db.get_stock_row(stock_id)
-        hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
-            return
-        hist = DataEngine.attach(hist)
-        last = hist.iloc[-1]
-        trade_plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
-        bt = self.backtest_engine.estimate_trade_quality(stock_id)
-        self.current_chart_path = self.export_chart(stock_id, hist)
-        inst_plan = self.portfolio_engine.build_institutional_plan(pd.DataFrame([trade_plan]))
-        inst_qty = 0 if inst_plan.empty else inst_plan.iloc[0]["建議張數"]
-        inst_amt = 0 if inst_plan.empty else inst_plan.iloc[0]["建議金額"]
-        lines = [
-            f"《AI選股TOP5 / v9.2 FINAL-RELEASE》",
-            f"股票：{stock['stock_name']} ({stock_id})",
-            f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
-            f"最新收盤：{float(last['close']):.2f}",
-            f"狀態：{trade_plan.get('ui_state','-')}｜決策：{trade_plan.get('trade_action','-')}",
-            f"進場區：{trade_plan.get('entry_zone','-')}",
-            f"停損：{trade_plan.get('stop_loss','-')}",
-            f"1.382 / 1.618：{float(trade_plan.get('target_1382',0) or 0):.2f} / {float(trade_plan.get('target_1618',0) or 0):.2f}",
-            f"RR：{float(trade_plan.get('rr',0) or 0):.2f}｜模型勝率：{float(trade_plan.get('win_rate',0) or 0):.1f}%",
-            f"回測勝率：{float(bt.get('backtest_win_rate',0) or 0):.1f}%｜平均報酬：{float(bt.get('avg_return',0) or 0):.2f}%｜CAGR：{float(bt.get('cagr',0) or 0):.2f}%｜MDD：{float(bt.get('mdd',0) or 0):.2f}%｜Sharpe：{float(bt.get('sharpe',0) or 0):.2f}｜樣本數：{int(bt.get('samples',0) or 0)}",
-            f"六模組總分：{float(trade_plan.get('model_score',0) or 0):.2f}",
-            f"機構建議：{inst_qty} 張｜建議金額：{inst_amt:.0f}",
-            f"圖表：{self.current_chart_path}",
-        ]
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
-        self.update_multi_window_stock(stock_id)
+        self.sync_all_views(stock_id, source="AI選股TOP5")
 
 
     def on_select_institutional(self, event=None):
@@ -3421,35 +3476,7 @@ class AppUI:
             return
         vals = self.inst_tree.item(sel[0], "values")
         stock_id = str(vals[1])
-        stock = self.db.get_stock_row(stock_id)
-        hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
-            return
-        hist = DataEngine.attach(hist)
-        last = hist.iloc[-1]
-        self.current_chart_path = self.export_chart(stock_id, hist)
-        row = self.last_institutional_plan_df[self.last_institutional_plan_df["代號"].astype(str) == stock_id]
-        risk_note = row.iloc[0]["風險備註"] if not row.empty else ""
-        lines = [
-            "《機構交易計畫 / v9.2 FINAL-RELEASE》",
-            f"優先級：{vals[0]}",
-            f"股票：{stock['stock_name']} ({stock_id})",
-            f"市場 / 產業 / 題材：{vals[3]} / {vals[4]} / {vals[5]}",
-            f"分類 / 狀態：{vals[6]} / {vals[7]}",
-            f"進場區：{vals[8]}",
-            f"停損：{vals[9]}",
-            f"RR：{vals[10]}｜勝率：{vals[11]}%｜模型分數：{vals[12]}｜交易分數：{vals[13]}",
-            f"ATR / Kelly：{vals[14]}% / {vals[15]}%",
-            f"建議張數：{vals[16]}｜建議金額：{vals[17]}",
-            f"單檔 / 題材 / 產業曝險：{vals[18]}% / {vals[19]}% / {vals[20]}%",
-            f"投資組合狀態：{vals[21]}",
-            f"風險備註：{risk_note}",
-            f"最新收盤：{float(last['close']):.2f}",
-            f"圖表：{self.current_chart_path}",
-        ]
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
-        self.update_multi_window_stock(stock_id)
+        self.sync_all_views(stock_id, source="機構交易計畫")
 
     def build_full_history_once(self):
         self._start_build_history(resume=False)
@@ -3896,21 +3923,13 @@ class AppUI:
             return
         vals = self.backtest_tree.item(sel[0], "values")
         stock_id = str(vals[1])
-        stock = self.db.get_stock_row(stock_id)
         hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
+        if hist is None or hist.empty:
             return
         eq_path = self.export_equity_curve_chart(stock_id, hist)
-        lines = [
-            "《回測視覺化 / v9.2 FINAL-RELEASE》",
-            f"股票：{stock['stock_name']} ({stock_id})",
-            f"勝率：{vals[3]}%｜平均報酬：{vals[4]}%｜CAGR：{vals[5]}%｜MDD：{vals[6]}%｜Sharpe：{vals[7]}｜樣本數：{vals[8]}",
-            f"Equity Curve：{eq_path if eq_path else '無足夠資料'}",
-        ]
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
         if eq_path:
             self.current_chart_path = eq_path
+        self.sync_all_views(stock_id, source="回測視覺化")
 
     def on_select_stock(self, event=None):
         sel = self.rank_tree.selection()
@@ -3918,47 +3937,8 @@ class AppUI:
             return
         vals = self.rank_tree.item(sel[0], "values")
         stock_id = str(vals[1])
-        stock = self.db.get_stock_row(stock_id)
-        hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
-            return
-        hist = DataEngine.attach(hist)
-        last = hist.iloc[-1]
-        _fib_score_sel, fib2, fib3 = FibEngine.score_and_targets(float(last['close']), float(hist.tail(60)['low'].min()), float(hist.tail(60)['high'].max()))
-        fib1 = float(hist.tail(60)['high'].max())
-        wave = WaveEngine.detect_wave_label(DataEngine.attach(hist.copy()))
-        chart_path = self.export_chart(stock_id, hist)
-        self.current_chart_path = chart_path
+        self.sync_all_views(stock_id, source="排行榜")
 
-        trade_plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
-
-        lines = [
-            f"股票：{stock['stock_name']} ({stock_id})",
-            f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
-            f"最新收盤：{last['close']:.2f}",
-            "MA20 / MA60：{:.2f} / {:.2f}".format(last["ma20"], last["ma60"]) if pd.notna(last["ma20"]) and pd.notna(last["ma60"]) else "MA20 / MA60：資料不足",
-            "RSI14：{:.2f}".format(last["rsi14"]) if pd.notna(last["rsi14"]) else "RSI14：資料不足",
-            "MACD Hist：{:.4f}".format(last["macd_hist"]) if pd.notna(last["macd_hist"]) else "MACD Hist：資料不足",
-            "K / D：{:.2f} / {:.2f}".format(last["k"], last["d"]) if pd.notna(last["k"]) and pd.notna(last["d"]) else "K / D：資料不足",
-            "",
-            f"波浪階段：{wave}",
-            f"Fib 1.0 / 1.382 / 1.618：{fib1:.2f} / {fib2:.2f} / {fib3:.2f}",
-            "",
-            "【交易計畫】",
-            f"動作：{trade_plan['trade_action']}",
-            f"進場區：{trade_plan['entry_zone']}",
-            f"停損：{trade_plan['stop_loss']}",
-            f"目標價：{trade_plan['target_price']}",
-            f"RR：{trade_plan['rr']:.2f}",
-            f"勝率：{trade_plan['win_grade']} ({trade_plan['win_rate']:.1f}%)",
-            f"六模組：K {trade_plan.get('kline_score',0):.1f}｜波 {trade_plan.get('wave_score',0):.1f}｜費 {trade_plan.get('fib_score',0):.1f}｜阪 {trade_plan.get('sakata_score',0):.1f}｜量 {trade_plan.get('volume_score',0):.1f}｜指 {trade_plan.get('indicator_score',0):.1f}",
-            f"理由：{trade_plan['reason']}",
-            "",
-            f"圖表輸出：{chart_path}",
-        ]
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
-        self.update_multi_window_stock(stock_id)
 
     def export_chart(self, stock_id: str, hist: pd.DataFrame):
         x = DataEngine.attach(hist.copy()).tail(120).reset_index(drop=True)
