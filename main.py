@@ -2634,6 +2634,8 @@ class AppUI:
         self.chart_updating = False
         self.pending_stock_id = None
         self.chart_update_job = None
+        self.pending_chart_image = None
+        self.chart_image_job = None
         self.selection_chart_pending_token = 0
         self.industry_var = tk.StringVar(value="全部")
         self.theme_var = tk.StringVar(value="全部")
@@ -3281,9 +3283,13 @@ class AppUI:
 
         lines = self.build_unified_detail_lines(stock_id, source=(source or "快速顯示"), quick_only=True)
         lines.append("")
-        lines.append("圖表狀態：背景分析完成後再更新一次，避免點股時主畫面卡住。")
+        lines.append("圖表狀態：背景輸出 PNG 後再載入右下圖表，避免點股時主畫面卡住。")
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
+        try:
+            self.show_chart_loading(stock_id)
+        except Exception:
+            pass
 
         t = threading.Thread(target=self._selection_analysis_worker, args=(str(stock_id), str(source or ""), token), daemon=True, name=f"select_{stock_id}")
         t.start()
@@ -3346,7 +3352,10 @@ class AppUI:
                 if token != self.selection_chart_pending_token:
                     return
                 try:
-                    self._schedule_chart_update(stock_id)
+                    if chart_path:
+                        self._schedule_chart_file_update(stock_id, chart_path)
+                    else:
+                        self.show_chart_message("圖表產生失敗，請改用『開啟圖表』或重新點選。")
                 except Exception as e:
                     self.append_log(f"背景圖表更新失敗：{stock_id}｜{e}")
 
@@ -3451,11 +3460,10 @@ class AppUI:
 
     def update_chart_panel(self, stock_id: str):
         self.window_current_stock_id = stock_id
-        stock = self.db.get_stock_row(stock_id)
-        hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
+        if self.current_chart_path and Path(self.current_chart_path).exists():
+            self._schedule_chart_file_update(stock_id, self.current_chart_path)
             return
-        self._schedule_chart_update(stock_id)
+        self.show_chart_loading(stock_id)
 
     def safe_sync_stock_views(self, stock_id: str, source: str = ""):
         if not stock_id:
@@ -3492,6 +3500,52 @@ class AppUI:
         if not stock_id:
             return
         self.update_multi_window_stock(stock_id)
+
+    def _schedule_chart_file_update(self, stock_id: str, chart_path):
+        self.pending_chart_image = (str(stock_id), str(chart_path))
+        try:
+            if self.chart_image_job is not None:
+                self.root.after_cancel(self.chart_image_job)
+        except Exception:
+            pass
+        self.chart_image_job = self.root.after(80, self._flush_chart_file_update)
+
+    def _flush_chart_file_update(self):
+        self.chart_image_job = None
+        payload = self.pending_chart_image
+        self.pending_chart_image = None
+        if not payload:
+            return
+        stock_id, chart_path = payload
+        self.update_multi_window_stock(stock_id, chart_path=chart_path)
+
+    def show_chart_message(self, message: str):
+        if self.chart_fig is None or self.chart_canvas is None:
+            return
+        self.chart_fig.clear()
+        ax = self.chart_fig.add_subplot(111)
+        ax.axis("off")
+        ax.text(0.5, 0.5, safe_plot_text(message, fallback="圖表訊息"), ha="center", va="center", transform=ax.transAxes, fontfamily=SELECTED_PLOT_FONT, fontsize=12)
+        self.chart_fig.tight_layout()
+        self.chart_canvas.draw_idle()
+
+    def show_chart_loading(self, stock_id: str):
+        self.show_chart_message(f"{stock_id} 圖表背景載入中…")
+
+    def show_chart_file(self, chart_path):
+        if self.chart_fig is None or self.chart_canvas is None:
+            return
+        p = Path(chart_path)
+        if not p.exists():
+            self.show_chart_message("找不到圖表檔案")
+            return
+        self.chart_fig.clear()
+        ax = self.chart_fig.add_subplot(111)
+        ax.axis("off")
+        img = plt.imread(str(p))
+        ax.imshow(img)
+        self.chart_fig.tight_layout()
+        self.chart_canvas.draw_idle()
 
     def _candlestick(self, ax, x_vals, opens, highs, lows, closes):
         width = 0.55
@@ -3532,14 +3586,16 @@ class AppUI:
             f"理由：{trade_plan.get('reason','-')}",
         ]
 
-    def update_multi_window_stock(self, stock_id: str):
+    def update_multi_window_stock(self, stock_id: str, chart_path: str | None = None):
         self.ensure_multi_windows()
         self.window_current_stock_id = stock_id
-        if self.chart_updating:
-            self.pending_stock_id = stock_id
-            return
         try:
-            self.draw_live_chart(stock_id)
+            if chart_path and Path(chart_path).exists():
+                self.show_chart_file(chart_path)
+            elif self.current_chart_path and Path(self.current_chart_path).exists():
+                self.show_chart_file(self.current_chart_path)
+            else:
+                self.show_chart_loading(stock_id)
             try:
                 self.right_lower_notebook.select(self.chart_tab)
             except Exception:
@@ -3845,8 +3901,8 @@ class AppUI:
                 ))
 
         self.sync_multi_windows()
-        if self.window_current_stock_id:
-            self.update_multi_window_stock(self.window_current_stock_id)
+        if self.window_current_stock_id and self.current_chart_path and Path(self.current_chart_path).exists():
+            self.update_multi_window_stock(self.window_current_stock_id, chart_path=str(self.current_chart_path))
 
     def on_select_top20(self, event=None):
         sel = self.top20_tree.selection()
