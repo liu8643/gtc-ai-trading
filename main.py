@@ -2607,6 +2607,10 @@ class AppUI:
         self.last_wait_df = pd.DataFrame()
         self.last_operation_sop_df = pd.DataFrame()
         self.current_chart_path = None
+        self.plan_cache = {}
+        self.backtest_cache = {}
+        self.selection_job_token = 0
+        self.selection_source = ""
         self.worker = None
         self.cancel_event = threading.Event()
         self.current_job = None
@@ -3135,7 +3139,217 @@ class AppUI:
         ]:
             self._set_tree_selection_by_stock_id(tree, stock_id, idx)
 
-    def build_unified_detail_lines(self, stock_id: str, source: str = ""):
+
+    def cache_trade_dataframe(self, df: pd.DataFrame):
+        if df is None or df.empty or "stock_id" not in df.columns:
+            return
+        try:
+            for _, row in df.iterrows():
+                sid = str(row.get("stock_id", "")).strip()
+                if not sid:
+                    continue
+                payload = row.to_dict()
+                payload["_cached_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.plan_cache[sid] = payload
+        except Exception:
+            pass
+
+    def cache_backtest_dataframe(self, df: pd.DataFrame):
+        if df is None or df.empty or "stock_id" not in df.columns:
+            return
+        try:
+            for _, row in df.iterrows():
+                sid = str(row.get("stock_id", "")).strip()
+                if not sid:
+                    continue
+                payload = row.to_dict()
+                payload["_cached_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.backtest_cache[sid] = payload
+        except Exception:
+            pass
+
+    def get_cached_trade_plan(self, stock_id: str):
+        sid = str(stock_id).strip()
+        if not sid:
+            return None
+        plan = self.plan_cache.get(sid)
+        if plan:
+            return plan
+        for df in [getattr(self, "last_top20_df", pd.DataFrame()), getattr(self, "last_top5_df", pd.DataFrame()),
+                   getattr(self, "last_today_buy_df", pd.DataFrame()), getattr(self, "last_wait_df", pd.DataFrame()),
+                   getattr(self, "last_attack_df", pd.DataFrame()), getattr(self, "last_watch_df", pd.DataFrame()),
+                   getattr(self, "last_defense_df", pd.DataFrame())]:
+            row = self._row_lookup(df, sid)
+            if row is not None:
+                payload = row.to_dict()
+                self.plan_cache[sid] = payload
+                return payload
+        return None
+
+    def get_cached_backtest(self, stock_id: str):
+        sid = str(stock_id).strip()
+        if not sid:
+            return None
+        bt = self.backtest_cache.get(sid)
+        if bt:
+            return bt
+        row = self._row_lookup(getattr(self, "last_top5_df", pd.DataFrame()), sid)
+        if row is not None and "backtest_win_rate" in row.index:
+            payload = {
+                "backtest_win_rate": float(row.get("backtest_win_rate", 0) or 0),
+                "avg_return": float(row.get("avg_return", 0) or 0),
+                "cagr": float(row.get("cagr", 0) or 0),
+                "mdd": float(row.get("mdd", 0) or 0),
+                "sharpe": float(row.get("sharpe", 0) or 0),
+                "samples": int(row.get("samples", 0) or 0),
+            }
+            self.backtest_cache[sid] = payload
+            return payload
+        return None
+
+    def build_lightweight_plan(self, stock_id: str, hist: pd.DataFrame, stock=None) -> dict:
+        if hist is None or hist.empty:
+            return {
+                "stock_id": stock_id, "stock_name": stock.get("stock_name", stock_id) if stock is not None else stock_id,
+                "market": stock.get("market", "") if stock is not None else "",
+                "industry": stock.get("industry", "") if stock is not None else "",
+                "theme": stock.get("theme", "") if stock is not None else "",
+                "ui_state": "觀察", "trade_action": "HOLD", "entry_zone": "-", "stop_loss": "-",
+                "target_1382": 0.0, "target_1618": 0.0, "support": 0.0, "resistance": 0.0, "rr": 0.0,
+                "win_rate": 0.0, "wave": "資料不足", "signal": "載入中", "trade_type": "快速模式", "bucket": "觀察",
+                "reason": "使用快速模式顯示，背景計算完成後會自動更新。", "kline_score": 0.0, "wave_score": 0.0,
+                "fib_score": 0.0, "sakata_score": 0.0, "volume_score": 0.0, "indicator_score": 0.0
+            }
+        x = hist.copy()
+        if "ma20" not in x.columns:
+            x = DataEngine.attach(x)
+        last = x.iloc[-1]
+        close_ = float(last["close"])
+        ma20 = float(last["ma20"]) if pd.notna(last.get("ma20")) else close_
+        ma60 = float(last["ma60"]) if pd.notna(last.get("ma60")) else close_
+        recent = x.tail(60)
+        support = float(min(ma20, recent["low"].tail(20).min())) if not recent.empty else close_
+        resistance = float(recent["high"].max()) if not recent.empty else close_
+        fib_score, fib1382, fib1618 = FibEngine.score_and_targets(close_, support, resistance)
+        signal = "偏多觀察" if close_ >= ma20 >= ma60 else "區間整理" if close_ >= ma20 else "轉弱警戒"
+        wave = WaveEngine.detect_wave_label(x)
+        entry_low = support * 1.002 if support > 0 else close_ * 0.99
+        entry_high = entry_low * 1.01
+        stop = support * 0.97 if support > 0 else close_ * 0.95
+        risk = max(entry_high - stop, 0.01)
+        reward = max(fib1382 - entry_high, 0.0)
+        rr = round(reward / risk, 2)
+        ui_state = "觀察" if signal in ("偏多觀察", "區間整理") else "不可買"
+        return {
+            "stock_id": stock_id,
+            "stock_name": stock.get("stock_name", stock_id) if stock is not None else stock_id,
+            "market": stock.get("market", "") if stock is not None else "",
+            "industry": stock.get("industry", "") if stock is not None else "",
+            "theme": stock.get("theme", "") if stock is not None else "",
+            "ui_state": ui_state, "trade_action": "HOLD" if ui_state == "觀察" else "AVOID",
+            "entry_zone": f"{entry_low:.2f} ~ {entry_high:.2f}",
+            "entry_low": round(entry_low, 2), "entry_high": round(entry_high, 2),
+            "stop_loss": f"{stop:.2f}",
+            "target_1382": round(fib1382, 2), "target_1618": round(fib1618, 2),
+            "support": round(support, 2), "resistance": round(resistance, 2), "rr": rr,
+            "win_rate": 0.0, "wave": wave, "signal": signal, "trade_type": "快速模式", "bucket": "觀察",
+            "reason": "已先顯示快速資料，完整交易計畫與回測由背景更新。", "kline_score": 0.0,
+            "wave_score": 0.0, "fib_score": round(fib_score, 2), "sakata_score": 0.0,
+            "volume_score": 0.0, "indicator_score": 0.0
+        }
+
+    def start_selection_analysis(self, stock_id: str, source: str = ""):
+        if not stock_id:
+            return
+        self.selection_job_token += 1
+        token = self.selection_job_token
+        self.selection_source = source or ""
+        stock = self.db.get_stock_row(stock_id)
+        hist = self.db.get_price_history(stock_id)
+        if stock is None or hist.empty:
+            return
+
+        quick_plan = self.get_cached_trade_plan(stock_id)
+        if quick_plan is None:
+            try:
+                quick_plan = self.build_lightweight_plan(stock_id, DataEngine.attach(hist.copy()), stock=stock)
+                self.plan_cache[str(stock_id)] = quick_plan
+            except Exception:
+                quick_plan = None
+
+        lines = self.build_unified_detail_lines(stock_id, source=source or "快速顯示", quick_only=True)
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+        self._schedule_chart_update(stock_id)
+
+        t = threading.Thread(target=self._selection_analysis_worker, args=(str(stock_id), str(source or ""), token), daemon=True, name=f"select_{stock_id}")
+        t.start()
+
+    def _selection_analysis_worker(self, stock_id: str, source: str, token: int):
+        try:
+            if token != self.selection_job_token:
+                return
+
+            stock = self.db.get_stock_row(stock_id)
+            hist = self.db.get_price_history(stock_id)
+            if stock is None or hist is None or hist.empty:
+                return
+
+            hist_attached = None
+            try:
+                hist_attached = DataEngine.attach(hist.copy())
+            except Exception:
+                hist_attached = hist.copy()
+
+            plan = self.get_cached_trade_plan(stock_id)
+            plan_is_full = bool(plan) and str(plan.get("trade_type", "")) != "快速模式" and float(plan.get("model_score", 0) or 0) > 0
+            if not plan_is_full:
+                try:
+                    plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
+                except Exception as e:
+                    self.ui_call(self.append_log, f"完整交易計畫失敗，改用快速模式：{stock_id}｜{e}")
+                    plan = self.build_lightweight_plan(stock_id, hist_attached, stock=stock)
+                self.plan_cache[str(stock_id)] = plan
+
+            if token != self.selection_job_token:
+                return
+
+            bt = self.get_cached_backtest(stock_id)
+            bt_ready = bool(bt) and int(bt.get("samples", 0) or 0) >= 0
+            if not bt_ready:
+                try:
+                    bt = self.backtest_engine.estimate_trade_quality(stock_id)
+                except Exception as e:
+                    self.ui_call(self.append_log, f"背景回測失敗：{stock_id}｜{e}")
+                    bt = {"backtest_win_rate": 0.0, "avg_return": 0.0, "avg_rr": 0.0, "cagr": 0.0, "mdd": 0.0, "sharpe": 0.0, "samples": 0}
+                self.backtest_cache[str(stock_id)] = bt
+
+            chart_path = None
+            if token == self.selection_job_token:
+                try:
+                    chart_path = self.export_chart(stock_id, hist)
+                except Exception as e:
+                    self.ui_call(self.append_log, f"背景圖檔輸出失敗：{stock_id}｜{e}")
+
+            def apply_result():
+                if token != self.selection_job_token:
+                    return
+                if chart_path:
+                    self.current_chart_path = chart_path
+                try:
+                    self.update_detail_panel(stock_id, source=source or "背景完成")
+                except Exception as e:
+                    self.append_log(f"背景分析更新失敗：{stock_id}｜{e}")
+                try:
+                    self._schedule_chart_update(stock_id)
+                except Exception as e:
+                    self.append_log(f"背景圖表更新失敗：{stock_id}｜{e}")
+
+            self.ui_call(apply_result)
+        except Exception as e:
+            self.ui_call(self.append_log, f"背景選股分析失敗：{stock_id}｜{e}")
+
+    def build_unified_detail_lines(self, stock_id: str, source: str = "", quick_only: bool = False):
         stock = self.db.get_stock_row(stock_id)
         hist = self.db.get_price_history(stock_id)
         if stock is None or hist.empty:
@@ -3143,9 +3357,14 @@ class AppUI:
 
         hist = DataEngine.attach(hist.copy())
         last = hist.iloc[-1]
-        trade_plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
-        bt = self.backtest_engine.estimate_trade_quality(stock_id)
-        wave = WaveEngine.detect_wave_label(hist)
+        trade_plan = self.get_cached_trade_plan(stock_id)
+        if trade_plan is None:
+            trade_plan = self.build_lightweight_plan(stock_id, hist, stock=stock)
+            self.plan_cache[str(stock_id)] = trade_plan
+        bt = self.get_cached_backtest(stock_id)
+        if bt is None:
+            bt = {"backtest_win_rate": 0.0, "avg_return": 0.0, "cagr": 0.0, "mdd": 0.0, "sharpe": 0.0, "samples": 0}
+        wave = str(trade_plan.get("wave", WaveEngine.detect_wave_label(hist)))
         ranking = self._filtered_ranking()
         rank_text = "-"
         try:
@@ -3178,6 +3397,7 @@ class AppUI:
             "【功能定位】",
             "這個畫面不是只看指標，而是把『可不可以買、為什麼買、買了怎麼控風險』一次講清楚。",
             f"決策流程：{decision_flow}",
+            "背景狀態：快速顯示（先出基本判斷）" if quick_only else "背景狀態：完整分析已完成",
             "",
             "【目前判斷】",
             f"最新收盤：{float(last['close']):.2f}",
@@ -3230,12 +3450,6 @@ class AppUI:
         hist = self.db.get_price_history(stock_id)
         if stock is None or hist.empty:
             return
-        hist = DataEngine.attach(hist.copy())
-        try:
-            self.current_chart_path = self.export_chart(stock_id, hist)
-        except Exception as e:
-            self.current_chart_path = None
-            self.append_log(f"匯出圖表失敗：{stock_id}｜{e}")
         self._schedule_chart_update(stock_id)
 
     def safe_sync_stock_views(self, stock_id: str, source: str = ""):
@@ -3246,17 +3460,13 @@ class AppUI:
         if stock is None or hist.empty:
             return
         self.window_current_stock_id = stock_id
-        try:
-            self.update_detail_panel(stock_id, source=source)
-        except Exception as e:
-            self.detail.delete("1.0", tk.END)
-            self.detail.insert("1.0", f"股票：{stock_id}\n右側分析更新失敗：{e}")
-            self.append_log(f"右側分析更新失敗：{stock_id}｜{e}")
         self.sync_multi_windows_selectors(stock_id)
         try:
-            self.update_chart_panel(stock_id)
+            self.start_selection_analysis(stock_id, source=source)
         except Exception as e:
-            self.append_log(f"圖表排程失敗：{stock_id}｜{e}")
+            self.detail.delete("1.0", tk.END)
+            self.detail.insert("1.0", f"股票：{stock_id}\n選股同步更新失敗：{e}")
+            self.append_log(f"選股同步更新失敗：{stock_id}｜{e}")
 
     def sync_all_views(self, stock_id: str, source: str = ""):
         self.safe_sync_stock_views(stock_id, source=source)
@@ -3348,7 +3558,10 @@ class AppUI:
             if hist.empty:
                 return
 
-            plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
+            plan = self.get_cached_trade_plan(stock_id)
+            if plan is None:
+                plan = self.build_lightweight_plan(stock_id, hist, stock=stock)
+                self.plan_cache[str(stock_id)] = plan
             wave = WaveEngine.detect_wave_label(hist)
             x = list(range(len(hist)))
             self.chart_fig.clear()
@@ -4066,6 +4279,7 @@ class AppUI:
                 theme_summary = trade["theme_summary"]
 
                 self.last_top20_df = trade_top20.copy()
+                self.cache_trade_dataframe(self.last_top20_df)
                 top5 = trade_top20.head(5).copy()
                 if not top5.empty:
                     bt_rows = []
@@ -4075,12 +4289,19 @@ class AppUI:
                     bt_df = pd.DataFrame(bt_rows)
                     top5 = pd.concat([top5.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
                 self.last_top5_df = top5.copy()
+                self.cache_trade_dataframe(self.last_top5_df)
+                self.cache_backtest_dataframe(self.last_top5_df)
                 self.last_attack_df = attack.copy()
+                self.cache_trade_dataframe(self.last_attack_df)
                 self.last_watch_df = watch.copy()
+                self.cache_trade_dataframe(self.last_watch_df)
                 self.last_defense_df = defense.copy()
+                self.cache_trade_dataframe(self.last_defense_df)
                 self.last_theme_summary_df = theme_summary.copy()
                 self.last_today_buy_df = today_buy.copy()
+                self.cache_trade_dataframe(self.last_today_buy_df)
                 self.last_wait_df = wait_pullback.copy()
+                self.cache_trade_dataframe(self.last_wait_df)
                 self.last_order_list_df = self.build_order_list(today_buy, wait_pullback)
                 self.last_institutional_plan_df = self.portfolio_engine.build_institutional_plan(pd.concat([today_buy.copy(), wait_pullback.copy()], ignore_index=True))
 
@@ -4213,7 +4434,11 @@ class AppUI:
         ax.plot(xs, x["ma20"], label="MA20", linewidth=1.2)
         ax.plot(xs, x["ma60"], label="MA60", linewidth=1.2)
 
-        plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
+        plan = self.get_cached_trade_plan(stock_id)
+        if plan is None:
+            stock = self.db.get_stock_row(stock_id)
+            plan = self.build_lightweight_plan(stock_id, x, stock=stock)
+            self.plan_cache[str(stock_id)] = plan
         support = float(plan.get("support", 0) or 0)
         fib1 = float(plan.get("resistance", 0) or 0)
         fib1382 = float(plan.get("target_1382", 0) or 0)
