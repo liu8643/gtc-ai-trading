@@ -61,34 +61,43 @@ PREFERRED_CJK_FONTS = [
     "Source Han Sans TW", "Source Han Sans CN", "SimHei", "Arial Unicode MS",
 ]
 
+def load_font_from_runtime(font_path: Path) -> Optional[str]:
+    try:
+        if font_path and Path(font_path).exists():
+            font_manager.fontManager.addfont(str(font_path))
+            return font_manager.FontProperties(fname=str(font_path)).get_name()
+    except Exception:
+        return None
+    return None
 
 def resolve_cjk_font_path() -> Optional[Path]:
-    search_dirs = [RUNTIME_DIR / "fonts" if 'RUNTIME_DIR' in globals() else None,
-                   BASE_DIR / "fonts" if 'BASE_DIR' in globals() else None,
-                   Path(__file__).resolve().parent / "fonts"]
-    candidates = [
-        "NotoSansCJK-Regular.ttc", "NotoSansCJKtc-Regular.otf", "NotoSansTC-Regular.ttf",
-        "msjh.ttc", "msyh.ttc", "simhei.ttf"
+    search_dirs = [
+        (RUNTIME_DIR / "fonts") if "RUNTIME_DIR" in globals() else None,
+        (BASE_DIR / "fonts") if "BASE_DIR" in globals() else None,
+        Path(__file__).resolve().parent / "fonts",
     ]
-    for d in search_dirs:
-        if not d:
+    candidates = [
+        "NotoSansCJK-Regular.ttc",
+        "NotoSansCJKtc-Regular.otf",
+        "NotoSansTC-Regular.ttf",
+        "msjh.ttc",
+        "msyh.ttc",
+        "simhei.ttf",
+    ]
+    for folder in search_dirs:
+        if folder is None:
             continue
         for name in candidates:
-            p = d / name
+            p = folder / name
             if p.exists():
                 return p
     return None
-
 
 def configure_matplotlib_cjk_font() -> str:
     chosen = None
     font_path = resolve_cjk_font_path()
     if font_path is not None:
-        try:
-            font_manager.fontManager.addfont(str(font_path))
-            chosen = font_manager.FontProperties(fname=str(font_path)).get_name()
-        except Exception:
-            chosen = None
+        chosen = load_font_from_runtime(font_path)
     if chosen is None:
         available = {f.name for f in font_manager.fontManager.ttflist}
         for name in PREFERRED_CJK_FONTS:
@@ -101,7 +110,6 @@ def configure_matplotlib_cjk_font() -> str:
     plt.rcParams["axes.unicode_minus"] = False
     return chosen
 
-
 def safe_plot_text(value, fallback: str = "-") -> str:
     if value is None:
         return fallback
@@ -112,11 +120,10 @@ def safe_plot_text(value, fallback: str = "-") -> str:
         "｜": " | ", "【": "[", "】": "]", "（": "(", "）": ")",
         "：": ": ", "，": ", ", "／": "/", "～": "~",
     }
-    for a, b in replacements.items():
-        s = s.replace(a, b)
+    for old, new in replacements.items():
+        s = s.replace(old, new)
     s = re.sub(r"\s+", " ", s).strip()
     return s or fallback
-
 
 SELECTED_PLOT_FONT = None
 
@@ -2620,7 +2627,7 @@ class AppUI:
         self.chart_fig = None
         self.chart_canvas = None
         self.window_current_stock_id = None
-        self.chart_rendering = False
+        self.chart_updating = False
         self.pending_stock_id = None
         self.chart_update_job = None
         self.industry_var = tk.StringVar(value="全部")
@@ -3212,10 +3219,47 @@ class AppUI:
         ])
         return lines
 
-    def _render_detail_only(self, stock_id: str, source: str = ""):
+    def update_detail_panel(self, stock_id: str, source: str = ""):
         lines = self.build_unified_detail_lines(stock_id, source=source or "多來源同步模式")
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
+
+    def update_chart_panel(self, stock_id: str):
+        self.window_current_stock_id = stock_id
+        stock = self.db.get_stock_row(stock_id)
+        hist = self.db.get_price_history(stock_id)
+        if stock is None or hist.empty:
+            return
+        hist = DataEngine.attach(hist.copy())
+        try:
+            self.current_chart_path = self.export_chart(stock_id, hist)
+        except Exception as e:
+            self.current_chart_path = None
+            self.append_log(f"匯出圖表失敗：{stock_id}｜{e}")
+        self._schedule_chart_update(stock_id)
+
+    def safe_sync_stock_views(self, stock_id: str, source: str = ""):
+        if not stock_id:
+            return
+        stock = self.db.get_stock_row(stock_id)
+        hist = self.db.get_price_history(stock_id)
+        if stock is None or hist.empty:
+            return
+        self.window_current_stock_id = stock_id
+        try:
+            self.update_detail_panel(stock_id, source=source)
+        except Exception as e:
+            self.detail.delete("1.0", tk.END)
+            self.detail.insert("1.0", f"股票：{stock_id}\n右側分析更新失敗：{e}")
+            self.append_log(f"右側分析更新失敗：{stock_id}｜{e}")
+        self.sync_multi_windows_selectors(stock_id)
+        try:
+            self.update_chart_panel(stock_id)
+        except Exception as e:
+            self.append_log(f"圖表排程失敗：{stock_id}｜{e}")
+
+    def sync_all_views(self, stock_id: str, source: str = ""):
+        self.safe_sync_stock_views(stock_id, source=source)
 
     def _schedule_chart_update(self, stock_id: str):
         self.pending_stock_id = stock_id
@@ -3233,27 +3277,6 @@ class AppUI:
         if not stock_id:
             return
         self.update_multi_window_stock(stock_id)
-
-    def sync_all_views(self, stock_id: str, source: str = ""):
-        if not stock_id:
-            return
-        stock = self.db.get_stock_row(stock_id)
-        hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
-            return
-        hist = DataEngine.attach(hist.copy())
-        self.window_current_stock_id = stock_id
-        try:
-            self.current_chart_path = self.export_chart(stock_id, hist)
-        except Exception:
-            self.current_chart_path = None
-        try:
-            self._render_detail_only(stock_id, source=source or "多來源同步模式")
-        except Exception as e:
-            self.detail.delete("1.0", tk.END)
-            self.detail.insert("1.0", f"股票：{stock_id}\n右側分析更新失敗：{e}")
-        self.sync_multi_windows_selectors(stock_id)
-        self._schedule_chart_update(stock_id)
 
     def _candlestick(self, ax, x_vals, opens, highs, lows, closes):
         width = 0.55
@@ -3297,7 +3320,7 @@ class AppUI:
     def update_multi_window_stock(self, stock_id: str):
         self.ensure_multi_windows()
         self.window_current_stock_id = stock_id
-        if self.chart_rendering:
+        if self.chart_updating:
             self.pending_stock_id = stock_id
             return
         try:
@@ -3312,10 +3335,10 @@ class AppUI:
     def draw_live_chart(self, stock_id: str):
         if self.chart_fig is None or self.chart_canvas is None:
             return
-        if self.chart_rendering:
+        if self.chart_updating:
             self.pending_stock_id = stock_id
             return
-        self.chart_rendering = True
+        self.chart_updating = True
         try:
             stock = self.db.get_stock_row(stock_id)
             hist = self.db.get_price_history(stock_id)
@@ -3382,12 +3405,9 @@ class AppUI:
             title_signal = safe_plot_text(plan.get("signal", "-"), fallback="-")
             ax.set_title(f"{title_stock}({stock_id}) | {title_wave} | {title_signal}", fontfamily=SELECTED_PLOT_FONT)
             info_text = (
-                f"Wave: {title_wave}
-"
-                f"Entry: {safe_plot_text(plan.get('entry_zone','-'))}
-"
-                f"Stop: {safe_plot_text(plan.get('stop_loss','-'))}
-"
+                f"Wave: {title_wave}\n"
+                f"Entry: {safe_plot_text(plan.get('entry_zone','-'))}\n"
+                f"Stop: {safe_plot_text(plan.get('stop_loss','-'))}\n"
                 f"RR: {float(plan.get('rr',0) or 0):.2f}"
             )
             ax.text(
@@ -3401,7 +3421,7 @@ class AppUI:
             self.chart_fig.tight_layout()
             self.chart_canvas.draw_idle()
         finally:
-            self.chart_rendering = False
+            self.chart_updating = False
             if self.pending_stock_id and self.pending_stock_id != stock_id:
                 next_stock = self.pending_stock_id
                 self.pending_stock_id = None
@@ -4225,22 +4245,38 @@ class AppUI:
         try:
             peak_idx = recent["high"].idxmax()
             trough_idx = recent["low"].idxmin()
-            ax.scatter([peak_idx], [float(x.loc[peak_idx, "high"])], s=36)
-            ax.scatter([trough_idx], [float(x.loc[trough_idx, "low"])], s=36)
+            peak_y = float(x.loc[peak_idx, "high"])
+            trough_y = float(x.loc[trough_idx, "low"])
+            ax.scatter([peak_idx], [peak_y], s=36)
+            ax.scatter([trough_idx], [trough_y], s=36)
+            ax.annotate("Wave Peak", xy=(peak_idx, peak_y), xytext=(peak_idx, peak_y * 1.02), fontfamily=SELECTED_PLOT_FONT)
+            ax.annotate("Wave Trough", xy=(trough_idx, trough_y), xytext=(trough_idx, trough_y * 0.98), fontfamily=SELECTED_PLOT_FONT)
         except Exception:
             pass
 
         ax.set_xlim(0, max(path_x) + 2)
-        ax.set_title(f"{stock_id} | {wave} | {plan.get('signal','-')}")
-        ax.text(0.01, 0.98, f"波浪: {wave}\n進場: {plan.get('entry_zone','-')}\n停損: {plan.get('stop_loss','-')}\nRR: {float(plan.get('rr',0) or 0):.2f}",
-                transform=ax.transAxes, va="top", ha="left", bbox=dict(boxstyle="round", alpha=0.15))
+        title_wave = safe_plot_text(wave, fallback="Wave")
+        title_signal = safe_plot_text(plan.get("signal", "-"), fallback="-")
+        ax.set_title(f"{stock_id} | {title_wave} | {title_signal}", fontfamily=SELECTED_PLOT_FONT)
+        info_text = (
+            f"Wave: {title_wave}\n"
+            f"Entry: {safe_plot_text(plan.get('entry_zone','-'))}\n"
+            f"Stop: {safe_plot_text(plan.get('stop_loss','-'))}\n"
+            f"RR: {float(plan.get('rr',0) or 0):.2f}"
+        )
+        ax.text(
+            0.01, 0.98, info_text,
+            transform=ax.transAxes, va="top", ha="left", fontfamily=SELECTED_PLOT_FONT,
+            bbox=dict(boxstyle="round", alpha=0.15)
+        )
         ax.grid(alpha=0.2)
-        ax.legend(loc="upper left", fontsize=8)
+        ax.legend(loc="upper left", fontsize=8, prop={"family": SELECTED_PLOT_FONT, "size": 8})
         fig.tight_layout()
         out = CHART_DIR / f"{stock_id}_chart.png"
         fig.savefig(out, dpi=140, bbox_inches="tight")
         plt.close(fig)
         return out
+
 
 
 def bootstrap():
