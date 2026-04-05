@@ -2660,6 +2660,10 @@ class AppUI:
         self.backtest_cache = {}
         self.selection_job_token = 0
         self.selection_source = ""
+        self.selector_syncing = False
+        self.last_selected_stock_id = None
+        self.last_selected_source = ""
+        self.last_selected_ts = 0.0
         self.worker = None
         self.cancel_event = threading.Event()
         self.current_job = None
@@ -3107,6 +3111,25 @@ class AppUI:
             return messagebox.showwarning("提醒", "目前沒有可開啟的圖表，請先點選股票。")
         open_path(Path(self.current_chart_path))
 
+    def _should_ignore_select_event(self, stock_id: str, source: str) -> bool:
+        sid = str(stock_id or "").strip()
+        src = str(source or "").strip()
+        if not sid:
+            return True
+        if getattr(self, "selector_syncing", False):
+            log_info(f"忽略程式性選取事件：{sid}｜來源={src}")
+            return True
+        now = time.time()
+        last_sid = str(getattr(self, "last_selected_stock_id", "") or "")
+        last_src = str(getattr(self, "last_selected_source", "") or "")
+        last_ts = float(getattr(self, "last_selected_ts", 0.0) or 0.0)
+        if sid == last_sid and src != last_src and (now - last_ts) <= 0.8:
+            log_info(f"忽略短時間重複點股事件：{sid}｜來源={src}｜前次來源={last_src}")
+            return True
+        self.last_selected_stock_id = sid
+        self.last_selected_source = src
+        self.last_selected_ts = now
+        return False
 
 
     def open_three_windows(self):
@@ -3129,7 +3152,7 @@ class AppUI:
 
     def on_select_window_top20(self, event=None):
         stock_id = self.get_current_selected_stock_id()
-        if stock_id:
+        if stock_id and not self._should_ignore_select_event(stock_id, "桌面同步"):
             self.sync_all_views(stock_id, source="桌面同步")
         return
 
@@ -3200,15 +3223,22 @@ class AppUI:
     def sync_multi_windows_selectors(self, stock_id: str):
         if not stock_id:
             return
-        for tree, idx in [
-            (self.top20_tree, 1),
-            (self.top5_tree, 1),
-            (self.order_tree, 1),
-            (self.inst_tree, 1),
-            (self.backtest_tree, 1),
-            (self.rank_tree, 1),
-        ]:
-            self._set_tree_selection_by_stock_id(tree, stock_id, idx)
+        self.selector_syncing = True
+        try:
+            for tree, idx in [
+                (self.top20_tree, 1),
+                (self.top5_tree, 1),
+                (self.order_tree, 1),
+                (self.inst_tree, 1),
+                (self.backtest_tree, 1),
+                (self.rank_tree, 1),
+            ]:
+                self._set_tree_selection_by_stock_id(tree, stock_id, idx)
+        finally:
+            try:
+                self.root.after(120, lambda: setattr(self, "selector_syncing", False))
+            except Exception:
+                self.selector_syncing = False
 
 
     def cache_trade_dataframe(self, df: pd.DataFrame):
@@ -3554,6 +3584,7 @@ class AppUI:
     def safe_sync_stock_views(self, stock_id: str, source: str = ""):
         if not stock_id:
             return
+        log_info(f"同步個股檢視：{stock_id}｜來源={source or '-'}")
         stock = self.db.get_stock_row(stock_id)
         hist = self.db.get_price_history(stock_id)
         if stock is None or hist.empty:
@@ -3998,6 +4029,8 @@ class AppUI:
             return
         vals = self.top20_tree.item(sel[0], "values")
         stock_id = str(vals[1])
+        if self._should_ignore_select_event(stock_id, "AI交易TOP20"):
+            return
         self.sync_all_views(stock_id, source="AI交易TOP20")
     def on_select_order(self, event=None):
         sel = self.order_tree.selection()
@@ -4005,6 +4038,8 @@ class AppUI:
             return
         vals = self.order_tree.item(sel[0], "values")
         stock_id = str(vals[1])
+        if self._should_ignore_select_event(stock_id, "下單清單"):
+            return
         self.sync_all_views(stock_id, source="下單清單")
 
 
@@ -4049,6 +4084,8 @@ class AppUI:
             return
         vals = self.top5_tree.item(sel[0], "values")
         stock_id = str(vals[1])
+        if self._should_ignore_select_event(stock_id, "AI選股TOP5"):
+            return
         self.sync_all_views(stock_id, source="AI選股TOP5")
 
 
@@ -4058,6 +4095,8 @@ class AppUI:
             return
         vals = self.inst_tree.item(sel[0], "values")
         stock_id = str(vals[1])
+        if self._should_ignore_select_event(stock_id, "機構交易計畫"):
+            return
         self.sync_all_views(stock_id, source="機構交易計畫")
 
     def build_full_history_once(self):
@@ -4572,6 +4611,8 @@ class AppUI:
             return
         vals = self.rank_tree.item(sel[0], "values")
         stock_id = str(vals[1])
+        if self._should_ignore_select_event(stock_id, "排行榜"):
+            return
         self.sync_all_views(stock_id, source="排行榜")
 
 
