@@ -28,6 +28,7 @@ import threading
 import time
 import os
 import subprocess
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -46,8 +47,78 @@ from tkinter import ttk, messagebox
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from matplotlib.patches import Rectangle
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+warnings.filterwarnings("ignore", message=r"Glyph .* missing from font")
+warnings.filterwarnings("ignore", message=r"Matplotlib is currently using agg")
+
+PREFERRED_CJK_FONTS = [
+    "Microsoft JhengHei", "Microsoft YaHei", "PingFang TC", "PingFang SC",
+    "Noto Sans CJK TC", "Noto Sans CJK SC", "Noto Sans CJK JP",
+    "Source Han Sans TW", "Source Han Sans CN", "SimHei", "Arial Unicode MS",
+]
+
+
+def resolve_cjk_font_path() -> Optional[Path]:
+    search_dirs = [RUNTIME_DIR / "fonts" if 'RUNTIME_DIR' in globals() else None,
+                   BASE_DIR / "fonts" if 'BASE_DIR' in globals() else None,
+                   Path(__file__).resolve().parent / "fonts"]
+    candidates = [
+        "NotoSansCJK-Regular.ttc", "NotoSansCJKtc-Regular.otf", "NotoSansTC-Regular.ttf",
+        "msjh.ttc", "msyh.ttc", "simhei.ttf"
+    ]
+    for d in search_dirs:
+        if not d:
+            continue
+        for name in candidates:
+            p = d / name
+            if p.exists():
+                return p
+    return None
+
+
+def configure_matplotlib_cjk_font() -> str:
+    chosen = None
+    font_path = resolve_cjk_font_path()
+    if font_path is not None:
+        try:
+            font_manager.fontManager.addfont(str(font_path))
+            chosen = font_manager.FontProperties(fname=str(font_path)).get_name()
+        except Exception:
+            chosen = None
+    if chosen is None:
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        for name in PREFERRED_CJK_FONTS:
+            if name in available:
+                chosen = name
+                break
+    if chosen is None:
+        chosen = "DejaVu Sans"
+    plt.rcParams["font.sans-serif"] = [chosen, "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+    return chosen
+
+
+def safe_plot_text(value, fallback: str = "-") -> str:
+    if value is None:
+        return fallback
+    s = str(value).replace("\n", " ").replace("\r", " ").strip()
+    if not s:
+        return fallback
+    replacements = {
+        "｜": " | ", "【": "[", "】": "]", "（": "(", "）": ")",
+        "：": ": ", "，": ", ", "／": "/", "～": "~",
+    }
+    for a, b in replacements.items():
+        s = s.replace(a, b)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or fallback
+
+
+SELECTED_PLOT_FONT = None
 
 
 class OperationCancelled(Exception):
@@ -70,6 +141,8 @@ BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
 APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V3.5 OPERATION"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
+
+SELECTED_PLOT_FONT = configure_matplotlib_cjk_font()
 
 
 PACKED_DATA_DIR = BASE_DIR / "data"
@@ -2547,6 +2620,9 @@ class AppUI:
         self.chart_fig = None
         self.chart_canvas = None
         self.window_current_stock_id = None
+        self.chart_rendering = False
+        self.pending_stock_id = None
+        self.chart_update_job = None
         self.industry_var = tk.StringVar(value="全部")
         self.theme_var = tk.StringVar(value="全部")
         self.search_var = tk.StringVar(value="")
@@ -2576,6 +2652,7 @@ class AppUI:
             "5. AI選股TOP20",
             "6. 採用 v9.2 FINAL-RELEASE：唯一核心策略引擎 / 波浪費波模型 / Kelly+ATR / Equity Curve",
             "7. V3.5操作版重點：先看市場，再看輪動，再看今日可買 / 預掛單，最後才下單",
+            f"8. 圖表字型：{SELECTED_PLOT_FONT}",
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
@@ -3135,6 +3212,28 @@ class AppUI:
         ])
         return lines
 
+    def _render_detail_only(self, stock_id: str, source: str = ""):
+        lines = self.build_unified_detail_lines(stock_id, source=source or "多來源同步模式")
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+
+    def _schedule_chart_update(self, stock_id: str):
+        self.pending_stock_id = stock_id
+        try:
+            if self.chart_update_job is not None:
+                self.root.after_cancel(self.chart_update_job)
+        except Exception:
+            pass
+        self.chart_update_job = self.root.after(180, self._flush_chart_update)
+
+    def _flush_chart_update(self):
+        self.chart_update_job = None
+        stock_id = self.pending_stock_id
+        self.pending_stock_id = None
+        if not stock_id:
+            return
+        self.update_multi_window_stock(stock_id)
+
     def sync_all_views(self, stock_id: str, source: str = ""):
         if not stock_id:
             return
@@ -3144,12 +3243,17 @@ class AppUI:
             return
         hist = DataEngine.attach(hist.copy())
         self.window_current_stock_id = stock_id
-        self.current_chart_path = self.export_chart(stock_id, hist)
-        lines = self.build_unified_detail_lines(stock_id, source=source or "多來源同步模式")
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
+        try:
+            self.current_chart_path = self.export_chart(stock_id, hist)
+        except Exception:
+            self.current_chart_path = None
+        try:
+            self._render_detail_only(stock_id, source=source or "多來源同步模式")
+        except Exception as e:
+            self.detail.delete("1.0", tk.END)
+            self.detail.insert("1.0", f"股票：{stock_id}\n右側分析更新失敗：{e}")
         self.sync_multi_windows_selectors(stock_id)
-        self.update_multi_window_stock(stock_id)
+        self._schedule_chart_update(stock_id)
 
     def _candlestick(self, ax, x_vals, opens, highs, lows, closes):
         width = 0.55
@@ -3193,86 +3297,118 @@ class AppUI:
     def update_multi_window_stock(self, stock_id: str):
         self.ensure_multi_windows()
         self.window_current_stock_id = stock_id
-        self.draw_live_chart(stock_id)
+        if self.chart_rendering:
+            self.pending_stock_id = stock_id
+            return
         try:
-            self.right_lower_notebook.select(self.chart_tab)
-        except Exception:
-            pass
+            self.draw_live_chart(stock_id)
+            try:
+                self.right_lower_notebook.select(self.chart_tab)
+            except Exception:
+                pass
+        except Exception as e:
+            self.append_log(f"圖表更新失敗：{stock_id}｜{e}")
 
     def draw_live_chart(self, stock_id: str):
         if self.chart_fig is None or self.chart_canvas is None:
             return
-        stock = self.db.get_stock_row(stock_id)
-        hist = self.db.get_price_history(stock_id)
-        if stock is None or hist.empty:
+        if self.chart_rendering:
+            self.pending_stock_id = stock_id
             return
-        hist = DataEngine.attach(hist.copy()).tail(90).reset_index(drop=True)
-        if hist.empty:
-            return
-
-        plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
-        wave = WaveEngine.detect_wave_label(hist)
-        x = list(range(len(hist)))
-        self.chart_fig.clear()
-        ax = self.chart_fig.add_subplot(111)
-
-        self._candlestick(ax, x, hist["open"], hist["high"], hist["low"], hist["close"])
-        ax.plot(x, hist["ma20"], label="MA20", linewidth=1.2)
-        ax.plot(x, hist["ma60"], label="MA60", linewidth=1.2)
-
-        support = float(plan.get("support", 0) or 0)
-        fib1 = float(plan.get("resistance", 0) or 0)
-        fib1382 = float(plan.get("target_1382", 0) or 0)
-        fib1618 = float(plan.get("target_1618", 0) or 0)
+        self.chart_rendering = True
         try:
-            stop = float(plan.get("stop_loss", 0) or 0)
-        except Exception:
-            stop = 0.0
+            stock = self.db.get_stock_row(stock_id)
+            hist = self.db.get_price_history(stock_id)
+            if stock is None or hist.empty:
+                return
+            hist = DataEngine.attach(hist.copy()).tail(90).reset_index(drop=True)
+            if hist.empty:
+                return
 
-        if support > 0:
-            ax.axhline(support, linestyle="--", linewidth=1.0, label=f"Support {support:.2f}")
-        if fib1 > 0:
-            ax.axhline(fib1, linestyle="--", linewidth=1.0, label=f"Fib 1.0 {fib1:.2f}")
-        if fib1382 > 0:
-            ax.axhline(fib1382, linestyle=":", linewidth=1.0, label=f"Fib 1.382 {fib1382:.2f}")
-        if fib1618 > 0:
-            ax.axhline(fib1618, linestyle=":", linewidth=1.0, label=f"Fib 1.618 {fib1618:.2f}")
+            plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
+            wave = WaveEngine.detect_wave_label(hist)
+            x = list(range(len(hist)))
+            self.chart_fig.clear()
+            ax = self.chart_fig.add_subplot(111)
 
-        recent = hist.tail(55)
-        try:
-            peak_idx = recent["high"].idxmax()
-            trough_idx = recent["low"].idxmin()
-            peak_y = float(hist.loc[peak_idx, "high"])
-            trough_y = float(hist.loc[trough_idx, "low"])
-            ax.scatter([peak_idx], [peak_y], s=45, marker="o")
-            ax.scatter([trough_idx], [trough_y], s=45, marker="o")
-            ax.annotate("Wave Peak", xy=(peak_idx, peak_y), xytext=(peak_idx, peak_y * 1.02))
-            ax.annotate("Wave Trough", xy=(trough_idx, trough_y), xytext=(trough_idx, trough_y * 0.98))
-        except Exception:
-            pass
+            self._candlestick(ax, x, hist["open"], hist["high"], hist["low"], hist["close"])
+            ax.plot(x, hist["ma20"], label="MA20", linewidth=1.2)
+            ax.plot(x, hist["ma60"], label="MA60", linewidth=1.2)
 
-        last_close = float(hist.iloc[-1]["close"])
-        last_x = x[-1]
-        bull_target = fib1382 if fib1382 > 0 else last_close * 1.08
-        bear_target = stop if stop > 0 else last_close * 0.95
-        path_x = [last_x, last_x + 4, last_x + 9]
-        bull_y = [last_close, (last_close + bull_target) / 2.0, bull_target]
-        bear_y = [last_close, (last_close + bear_target) / 2.0, bear_target]
-        ax.plot(path_x, bull_y, "--", linewidth=1.6, label="Bull Path")
-        ax.plot(path_x, bear_y, "--", linewidth=1.6, label="Bear Path")
+            support = float(plan.get("support", 0) or 0)
+            fib1 = float(plan.get("resistance", 0) or 0)
+            fib1382 = float(plan.get("target_1382", 0) or 0)
+            fib1618 = float(plan.get("target_1618", 0) or 0)
+            try:
+                stop = float(plan.get("stop_loss", 0) or 0)
+            except Exception:
+                stop = 0.0
 
-        ax.set_xlim(0, max(path_x) + 2)
-        ax.set_title(f"{stock['stock_name']}({stock_id})｜{wave}｜{plan.get('signal','-')}")
-        ax.text(
-            0.01, 0.98,
-            f"波浪: {wave}\n進場: {plan.get('entry_zone','-')}\n停損: {plan.get('stop_loss','-')}\nRR: {float(plan.get('rr',0) or 0):.2f}",
-            transform=ax.transAxes, va="top", ha="left",
-            bbox=dict(boxstyle="round", alpha=0.15)
-        )
-        ax.grid(alpha=0.2)
-        ax.legend(loc="upper left", fontsize=8)
-        self.chart_fig.tight_layout()
-        self.chart_canvas.draw()
+            if support > 0:
+                ax.axhline(support, linestyle="--", linewidth=1.0, label=f"Support {support:.2f}")
+            if fib1 > 0:
+                ax.axhline(fib1, linestyle="--", linewidth=1.0, label=f"Fib 1.0 {fib1:.2f}")
+            if fib1382 > 0:
+                ax.axhline(fib1382, linestyle=":", linewidth=1.0, label=f"Fib 1.382 {fib1382:.2f}")
+            if fib1618 > 0:
+                ax.axhline(fib1618, linestyle=":", linewidth=1.0, label=f"Fib 1.618 {fib1618:.2f}")
+
+            recent = hist.tail(55)
+            try:
+                peak_idx = recent["high"].idxmax()
+                trough_idx = recent["low"].idxmin()
+                peak_y = float(hist.loc[peak_idx, "high"])
+                trough_y = float(hist.loc[trough_idx, "low"])
+                ax.scatter([peak_idx], [peak_y], s=45, marker="o")
+                ax.scatter([trough_idx], [trough_y], s=45, marker="o")
+                ax.annotate("Wave Peak", xy=(peak_idx, peak_y), xytext=(peak_idx, peak_y * 1.02), fontfamily=SELECTED_PLOT_FONT)
+                ax.annotate("Wave Trough", xy=(trough_idx, trough_y), xytext=(trough_idx, trough_y * 0.98), fontfamily=SELECTED_PLOT_FONT)
+            except Exception:
+                pass
+
+            last_close = float(hist.iloc[-1]["close"])
+            last_x = x[-1]
+            bull_target = fib1382 if fib1382 > 0 else last_close * 1.08
+            bear_target = stop if stop > 0 else last_close * 0.95
+            path_x = [last_x, last_x + 4, last_x + 9]
+            bull_y = [last_close, (last_close + bull_target) / 2.0, bull_target]
+            bear_y = [last_close, (last_close + bear_target) / 2.0, bear_target]
+            ax.plot(path_x, bull_y, "--", linewidth=1.6, label="Bull Path")
+            ax.plot(path_x, bear_y, "--", linewidth=1.6, label="Bear Path")
+
+            ax.set_xlim(0, max(path_x) + 2)
+            title_stock = safe_plot_text(stock.get("stock_name", stock_id), fallback=str(stock_id))
+            title_wave = safe_plot_text(wave, fallback="Wave")
+            title_signal = safe_plot_text(plan.get("signal", "-"), fallback="-")
+            ax.set_title(f"{title_stock}({stock_id}) | {title_wave} | {title_signal}", fontfamily=SELECTED_PLOT_FONT)
+            info_text = (
+                f"Wave: {title_wave}
+"
+                f"Entry: {safe_plot_text(plan.get('entry_zone','-'))}
+"
+                f"Stop: {safe_plot_text(plan.get('stop_loss','-'))}
+"
+                f"RR: {float(plan.get('rr',0) or 0):.2f}"
+            )
+            ax.text(
+                0.01, 0.98,
+                info_text,
+                transform=ax.transAxes, va="top", ha="left", fontfamily=SELECTED_PLOT_FONT,
+                bbox=dict(boxstyle="round", alpha=0.15)
+            )
+            ax.grid(alpha=0.2)
+            ax.legend(loc="upper left", fontsize=8, prop={"family": SELECTED_PLOT_FONT, "size": 8})
+            self.chart_fig.tight_layout()
+            self.chart_canvas.draw_idle()
+        finally:
+            self.chart_rendering = False
+            if self.pending_stock_id and self.pending_stock_id != stock_id:
+                next_stock = self.pending_stock_id
+                self.pending_stock_id = None
+                try:
+                    self.root.after(50, lambda s=next_stock: self.update_multi_window_stock(s))
+                except Exception:
+                    pass
 
     def export_selected_data(self):
         target = self.download_target_var.get().strip() or "TOP20"
