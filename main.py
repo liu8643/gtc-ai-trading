@@ -2634,6 +2634,7 @@ class AppUI:
         self.chart_updating = False
         self.pending_stock_id = None
         self.chart_update_job = None
+        self.selection_chart_pending_token = 0
         self.industry_var = tk.StringVar(value="全部")
         self.theme_var = tk.StringVar(value="全部")
         self.search_var = tk.StringVar(value="")
@@ -3263,6 +3264,7 @@ class AppUI:
             return
         self.selection_job_token += 1
         token = self.selection_job_token
+        self.selection_chart_pending_token = token
         self.selection_source = source or ""
         stock = self.db.get_stock_row(stock_id)
         hist = self.db.get_price_history(stock_id)
@@ -3277,10 +3279,11 @@ class AppUI:
             except Exception:
                 quick_plan = None
 
-        lines = self.build_unified_detail_lines(stock_id, source=source or "快速顯示", quick_only=True)
+        lines = self.build_unified_detail_lines(stock_id, source=(source or "快速顯示"), quick_only=True)
+        lines.append("")
+        lines.append("圖表狀態：背景分析完成後再更新一次，避免點股時主畫面卡住。")
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
-        self._schedule_chart_update(stock_id)
 
         t = threading.Thread(target=self._selection_analysis_worker, args=(str(stock_id), str(source or ""), token), daemon=True, name=f"select_{stock_id}")
         t.start()
@@ -3340,6 +3343,8 @@ class AppUI:
                     self.update_detail_panel(stock_id, source=source or "背景完成")
                 except Exception as e:
                     self.append_log(f"背景分析更新失敗：{stock_id}｜{e}")
+                if token != self.selection_chart_pending_token:
+                    return
                 try:
                     self._schedule_chart_update(stock_id)
                 except Exception as e:
