@@ -29,6 +29,7 @@ import time
 import os
 import subprocess
 import warnings
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -48,8 +49,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 
 warnings.filterwarnings("ignore", message=r"Glyph .* missing from font")
@@ -128,6 +131,58 @@ def safe_plot_text(value, fallback: str = "-") -> str:
 SELECTED_PLOT_FONT = None
 
 
+def run_with_timeout(timeout_sec: float, func, *args, **kwargs):
+    result = {"value": None, "error": None}
+    done = threading.Event()
+
+    def runner():
+        try:
+            result["value"] = func(*args, **kwargs)
+        except Exception as e:
+            result["error"] = e
+        finally:
+            done.set()
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    done.wait(max(0.1, float(timeout_sec)))
+    if not done.is_set():
+        return False, None, TimeoutError(f"timeout>{timeout_sec}s")
+    return True, result["value"], result["error"]
+
+
+
+
+def thread_safe_runner(label: str, ui_log=None):
+    def decorator(func):
+        def wrapped(*args, **kwargs):
+            try:
+                log_info(f"[START] {label}")
+                if callable(ui_log):
+                    try:
+                        ui_log(f"[START] {label}")
+                    except Exception:
+                        pass
+                result = func(*args, **kwargs)
+                log_info(f"[DONE] {label}")
+                if callable(ui_log):
+                    try:
+                        ui_log(f"[DONE] {label}")
+                    except Exception:
+                        pass
+                return result
+            except Exception as exc:
+                log_exception(f"[EXCEPTION] {label}", exc)
+                if callable(ui_log):
+                    try:
+                        ui_log(f"[EXCEPTION] {label}: {exc}")
+                    except Exception:
+                        pass
+                raise
+        return wrapped
+    return decorator
+
+
 class OperationCancelled(Exception):
     pass
 
@@ -148,6 +203,60 @@ BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
 APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V3.5 OPERATION"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
+LOG_DIR = RUNTIME_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = LOG_DIR / f"gtc_ai_trading_{datetime.now().strftime('%Y%m%d')}.log"
+
+
+def configure_app_logger() -> logging.Logger:
+    logger = logging.getLogger("gtc_ai_trading")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.propagate = False
+    return logger
+
+
+APP_LOGGER = configure_app_logger()
+
+
+def log_info(message: str):
+    try:
+        APP_LOGGER.info(str(message))
+    except Exception:
+        pass
+
+
+def log_warning(message: str):
+    try:
+        APP_LOGGER.warning(str(message))
+    except Exception:
+        pass
+
+
+def log_error(message: str):
+    try:
+        APP_LOGGER.error(str(message))
+    except Exception:
+        pass
+
+
+def log_exception(message: str, exc: Exception | None = None):
+    try:
+        if exc is None:
+            APP_LOGGER.exception(str(message))
+        else:
+            APP_LOGGER.exception(f"{message} | {exc}")
+    except Exception:
+        pass
+
 
 SELECTED_PLOT_FONT = configure_matplotlib_cjk_font()
 
@@ -2620,6 +2729,7 @@ class AppUI:
 
         self.root.title(APP_NAME)
         self.root.geometry("1580x920")
+        log_info(f"應用程式啟動｜DB={DB_PATH}｜LOG={LOG_PATH}")
 
         self.market_var = tk.StringVar(value="全部")
         self.multi_window_var = tk.BooleanVar(value=True)
@@ -2637,6 +2747,9 @@ class AppUI:
         self.pending_chart_image = None
         self.chart_image_job = None
         self.selection_chart_pending_token = 0
+        self.chart_watchdog_job = None
+        self.chart_loading_token = 0
+        self.chart_loading_stock_id = None
         self.industry_var = tk.StringVar(value="全部")
         self.theme_var = tk.StringVar(value="全部")
         self.search_var = tk.StringVar(value="")
@@ -2667,6 +2780,7 @@ class AppUI:
             "6. 採用 v9.2 FINAL-RELEASE：唯一核心策略引擎 / 波浪費波模型 / Kelly+ATR / Equity Curve",
             "7. V3.5操作版重點：先看市場，再看輪動，再看今日可買 / 預掛單，最後才下單",
             f"8. 圖表字型：{SELECTED_PLOT_FONT}",
+            f"9. Bug Log：{LOG_PATH}",
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
@@ -2938,9 +3052,20 @@ class AppUI:
     def finish_task(self, stage: str, summary: str = ""):
         self.set_status(summary or f"{stage} 完成")
 
-    def append_log(self, text):
+    def append_log(self, text, level: str = "INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{ts}] {text}\n")
+        msg = f"[{ts}] [{level}] {text}"
+        try:
+            level_upper = str(level or "INFO").upper()
+            if level_upper == "ERROR":
+                log_error(text)
+            elif level_upper == "WARNING":
+                log_warning(text)
+            else:
+                log_info(text)
+        except Exception:
+            pass
+        self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
 
@@ -3010,6 +3135,7 @@ class AppUI:
         func = mapping.get(action)
         if func is None:
             return messagebox.showwarning("提醒", "請先選擇功能。")
+        self.append_log(f"執行功能：{action}")
         func()
 
     def ui_call(self, func, *args, **kwargs):
@@ -3025,8 +3151,15 @@ class AppUI:
             self.current_job = name
             self.ui_call(self.set_busy, True)
             self.ui_call(self.reset_progress)
+            self.ui_call(self.append_log, f"背景作業啟動：{name}")
+            log_info(f"背景作業啟動：{name}")
             try:
                 target()
+                self.ui_call(self.append_log, f"背景作業完成：{name}")
+            except Exception as exc:
+                log_exception(f"背景作業失敗：{name}", exc)
+                self.ui_call(self.append_log, f"背景作業失敗：{name}｜{exc}", "ERROR")
+                self.ui_call(messagebox.showerror, "背景作業錯誤", f"{name} 執行失敗：\n{exc}")
             finally:
                 self.current_job = None
                 self.ui_call(self.set_busy, False)
@@ -3261,9 +3394,32 @@ class AppUI:
             "volume_score": 0.0, "indicator_score": 0.0
         }
 
+    def build_quick_detail_lines(self, stock_id: str, source: str = ""):
+        stock = self.db.get_stock_row(stock_id)
+        if stock is None:
+            return [f"《{source or '快速顯示'}》", f"股票：{stock_id}", "無資料"]
+        plan = self.get_cached_trade_plan(stock_id) or {}
+        lines = [
+            f"《{source or '快速顯示'}》",
+            f"股票：{stock.get('stock_name', stock_id)} ({stock_id})",
+            f"市場 / 產業 / 題材：{stock.get('market','')} / {stock.get('industry','')} / {stock.get('theme','')}",
+            "",
+            "【快速資訊】",
+            f"狀態：{plan.get('ui_state', '背景載入中')}",
+            f"進場區：{plan.get('entry_zone', '-')}",
+            f"停損：{plan.get('stop_loss', '-')}",
+            f"1.382 / 1.618：{float(plan.get('target_1382', 0) or 0):.2f} / {float(plan.get('target_1618', 0) or 0):.2f}",
+            f"RR：{float(plan.get('rr', 0) or 0):.2f}",
+            "",
+            "說明：點股後先顯示快速資訊；完整圖表改由背景輸出 PNG，避免主畫面卡住。",
+        ]
+        return lines
+
+
     def start_selection_analysis(self, stock_id: str, source: str = ""):
         if not stock_id:
             return
+        self.append_log(f"點股分析啟動：{stock_id}｜來源 {source or '-'}")
         self.selection_job_token += 1
         token = self.selection_job_token
         self.selection_chart_pending_token = token
@@ -3286,23 +3442,35 @@ class AppUI:
         lines.append("圖表狀態：背景輸出 PNG 後再載入右下圖表，避免點股時主畫面卡住。")
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
+        self.current_chart_path = None
         try:
             self.show_chart_loading(stock_id)
+            self.start_chart_watchdog(stock_id, token, timeout_ms=12000)
         except Exception:
             pass
 
-        t = threading.Thread(target=self._selection_analysis_worker, args=(str(stock_id), str(source or ""), token), daemon=True, name=f"select_{stock_id}")
+        t = threading.Thread(
+            target=self._selection_analysis_worker,
+            args=(str(stock_id), str(source or ""), token),
+            daemon=True,
+            name=f"select_{stock_id}"
+        )
         t.start()
 
     def _selection_analysis_worker(self, stock_id: str, source: str, token: int):
         try:
+            log_info(f"點股背景分析開始：{stock_id}｜token={token}｜來源={source or '-'}")
             if token != self.selection_job_token:
+                log_warning(f"點股背景分析略過（token過期）：{stock_id}｜token={token}")
                 return
 
             stock = self.db.get_stock_row(stock_id)
             hist = self.db.get_price_history(stock_id)
             if stock is None or hist is None or hist.empty:
+                log_warning(f"點股背景分析無資料：{stock_id}")
+                self.ui_call(self.append_log, f"點股背景分析無資料：{stock_id}", "WARNING")
                 return
+            log_info(f"點股背景分析讀取資料完成：{stock_id}｜rows={len(hist)}")
 
             hist_attached = None
             try:
@@ -3314,9 +3482,11 @@ class AppUI:
             plan_is_full = bool(plan) and str(plan.get("trade_type", "")) != "快速模式" and float(plan.get("model_score", 0) or 0) > 0
             if not plan_is_full:
                 try:
+                    log_info(f"建立完整交易計畫：{stock_id}")
                     plan = self.master_trading_engine.plan_engine.build_plan(stock_id)
                 except Exception as e:
-                    self.ui_call(self.append_log, f"完整交易計畫失敗，改用快速模式：{stock_id}｜{e}")
+                    log_exception(f"完整交易計畫失敗，改用快速模式：{stock_id}", e)
+                    self.ui_call(self.append_log, f"完整交易計畫失敗，改用快速模式：{stock_id}｜{e}", "WARNING")
                     plan = self.build_lightweight_plan(stock_id, hist_attached, stock=stock)
                 self.plan_cache[str(stock_id)] = plan
 
@@ -3327,22 +3497,36 @@ class AppUI:
             bt_ready = bool(bt) and int(bt.get("samples", 0) or 0) >= 0
             if not bt_ready:
                 try:
+                    log_info(f"背景回測開始：{stock_id}")
                     bt = self.backtest_engine.estimate_trade_quality(stock_id)
+                    log_info(f"背景回測完成：{stock_id}｜samples={bt.get('samples',0)}")
                 except Exception as e:
-                    self.ui_call(self.append_log, f"背景回測失敗：{stock_id}｜{e}")
+                    log_exception(f"背景回測失敗：{stock_id}", e)
+                    self.ui_call(self.append_log, f"背景回測失敗：{stock_id}｜{e}", "WARNING")
                     bt = {"backtest_win_rate": 0.0, "avg_return": 0.0, "avg_rr": 0.0, "cagr": 0.0, "mdd": 0.0, "sharpe": 0.0, "samples": 0}
                 self.backtest_cache[str(stock_id)] = bt
 
             chart_path = None
+            chart_error = None
             if token == self.selection_job_token:
-                try:
-                    chart_path = self.export_chart(stock_id, hist)
-                except Exception as e:
-                    self.ui_call(self.append_log, f"背景圖檔輸出失敗：{stock_id}｜{e}")
+                self.ui_call(self.append_log, f"背景圖表輸出開始：{stock_id}")
+                log_info(f"背景圖表輸出開始：{stock_id}")
+                ok, chart_path, chart_error = run_with_timeout(8.0, self.export_chart, stock_id, hist)
+                if not ok:
+                    chart_path = None
+                    chart_error = chart_error or TimeoutError("background chart timeout")
+                if chart_error is not None:
+                    log_exception(f"背景圖檔輸出失敗：{stock_id}", chart_error)
+                    self.ui_call(self.append_log, f"背景圖檔輸出失敗：{stock_id}｜{chart_error}", "ERROR")
+                else:
+                    self.ui_call(self.append_log, f"背景圖表輸出完成：{stock_id}")
+                    log_info(f"背景圖表輸出完成：{stock_id}｜{chart_path}")
 
             def apply_result():
                 if token != self.selection_job_token:
+                    log_warning(f"套用點股結果略過（token過期）：{stock_id}｜token={token}")
                     return
+                log_info(f"套用點股結果：{stock_id}｜token={token}")
                 if chart_path:
                     self.current_chart_path = chart_path
                 try:
@@ -3355,13 +3539,15 @@ class AppUI:
                     if chart_path:
                         self._schedule_chart_file_update(stock_id, chart_path)
                     else:
-                        self.show_chart_message("圖表產生失敗，請改用『開啟圖表』或重新點選。")
+                        self.cancel_chart_watchdog()
+                        self.show_chart_message(f"{stock_id} 圖表產生失敗，已略過背景圖。")
                 except Exception as e:
                     self.append_log(f"背景圖表更新失敗：{stock_id}｜{e}")
 
             self.ui_call(apply_result)
         except Exception as e:
-            self.ui_call(self.append_log, f"背景選股分析失敗：{stock_id}｜{e}")
+            log_exception(f"背景選股分析失敗：{stock_id}", e)
+            self.ui_call(self.append_log, f"背景選股分析失敗：{stock_id}｜{e}", "ERROR")
 
     def build_unified_detail_lines(self, stock_id: str, source: str = "", quick_only: bool = False):
         stock = self.db.get_stock_row(stock_id)
@@ -3520,6 +3706,7 @@ class AppUI:
         self.update_multi_window_stock(stock_id, chart_path=chart_path)
 
     def show_chart_message(self, message: str):
+        log_info(f"圖表訊息：{message}")
         if self.chart_fig is None or self.chart_canvas is None:
             return
         self.chart_fig.clear()
@@ -3530,9 +3717,36 @@ class AppUI:
         self.chart_canvas.draw_idle()
 
     def show_chart_loading(self, stock_id: str):
+        self.append_log(f"圖表載入中：{stock_id}")
         self.show_chart_message(f"{stock_id} 圖表背景載入中…")
 
+    def cancel_chart_watchdog(self):
+        try:
+            if self.chart_watchdog_job is not None:
+                self.root.after_cancel(self.chart_watchdog_job)
+        except Exception:
+            pass
+        self.chart_watchdog_job = None
+
+    def start_chart_watchdog(self, stock_id: str, token: int, timeout_ms: int = 12000):
+        self.cancel_chart_watchdog()
+        self.chart_loading_token = token
+        self.chart_loading_stock_id = str(stock_id)
+
+        def on_timeout():
+            self.chart_watchdog_job = None
+            if token != self.chart_loading_token:
+                return
+            if self.current_chart_path and Path(self.current_chart_path).exists():
+                return
+            self.show_chart_message(f"{stock_id} 圖表載入逾時，已略過背景圖。")
+            self.append_log(f"圖表背景輸出逾時：{stock_id}", "ERROR")
+
+        self.chart_watchdog_job = self.root.after(timeout_ms, on_timeout)
+
     def show_chart_file(self, chart_path):
+        self.cancel_chart_watchdog()
+        self.append_log(f"載入圖表檔：{chart_path}")
         if self.chart_fig is None or self.chart_canvas is None:
             return
         p = Path(chart_path)
@@ -3588,6 +3802,7 @@ class AppUI:
 
     def update_multi_window_stock(self, stock_id: str, chart_path: str | None = None):
         self.ensure_multi_windows()
+        log_info(f"更新右下圖表面板：{stock_id}｜chart_path={chart_path or self.current_chart_path or '-'}")
         self.window_current_stock_id = stock_id
         try:
             if chart_path and Path(chart_path).exists():
@@ -4487,130 +4702,76 @@ class AppUI:
 
 
     def export_chart(self, stock_id: str, hist: pd.DataFrame):
-        x = DataEngine.attach(hist.copy()).tail(120).reset_index(drop=True)
-        fig = plt.figure(figsize=(11, 5.8))
-        ax = fig.add_subplot(111)
-        xs = list(range(len(x)))
-        self._candlestick(ax, xs, x["open"], x["high"], x["low"], x["close"])
-        ax.plot(xs, x["ma20"], label="MA20", linewidth=1.2)
-        ax.plot(xs, x["ma60"], label="MA60", linewidth=1.2)
+        try:
+            log_info(f"export_chart 開始：{stock_id}")
+            if hist is None or hist.empty:
+                raise ValueError(f"{stock_id} 無歷史資料可輸出圖表")
+            x = DataEngine.attach(hist.copy()).tail(120).reset_index(drop=True)
+            fig = Figure(figsize=(11, 5.8), dpi=140)
+            FigureCanvasAgg(fig)
+            ax = fig.add_subplot(111)
+            xs = list(range(len(x)))
+            self._candlestick(ax, xs, x["open"], x["high"], x["low"], x["close"])
+            ax.plot(xs, x["ma20"], label="MA20", linewidth=1.2)
+            ax.plot(xs, x["ma60"], label="MA60", linewidth=1.2)
 
-        plan = self.get_cached_trade_plan(stock_id)
-        if plan is None:
+            plan = self.get_cached_trade_plan(stock_id)
+            if plan is None:
+                stock = self.db.get_stock_row(stock_id)
+                plan = self.build_lightweight_plan(stock_id, x, stock=stock)
+                self.plan_cache[str(stock_id)] = plan
+
+            support = float(plan.get("support", 0) or 0)
+            fib1 = float(plan.get("resistance", 0) or 0)
+            fib1382 = float(plan.get("target_1382", 0) or 0)
+            fib1618 = float(plan.get("target_1618", 0) or 0)
+            try:
+                stop = float(plan.get("stop_loss", 0) or 0)
+            except Exception:
+                stop = 0.0
+
+            if support > 0:
+                ax.axhline(support, linestyle="--", linewidth=1, label=f"Support {support:.2f}")
+            if fib1 > 0:
+                ax.axhline(fib1, linestyle="--", linewidth=1, label=f"Fib 1.0 {fib1:.2f}")
+            if fib1382 > 0:
+                ax.axhline(fib1382, linestyle=":", linewidth=1, label=f"Fib 1.382 {fib1382:.2f}")
+            if fib1618 > 0:
+                ax.axhline(fib1618, linestyle=":", linewidth=1, label=f"Fib 1.618 {fib1618:.2f}")
+
+            wave = WaveEngine.detect_wave_label(x)
+            last_close = float(x.iloc[-1]["close"])
+            last_x = xs[-1]
+            bull_target = fib1382 if fib1382 > 0 else last_close * 1.08
+            bear_target = stop if stop > 0 else last_close * 0.95
+            path_x = [last_x, last_x + 4, last_x + 9]
+            bull_y = [last_close, (last_close + bull_target) / 2.0, bull_target]
+            bear_y = [last_close, (last_close + bear_target) / 2.0, bear_target]
+            ax.plot(path_x, bull_y, "--", linewidth=1.6, label="Bull Path")
+            ax.plot(path_x, bear_y, "--", linewidth=1.6, label="Bear Path")
+            ax.set_xlim(0, max(path_x) + 2)
+
             stock = self.db.get_stock_row(stock_id)
-            plan = self.build_lightweight_plan(stock_id, x, stock=stock)
-            self.plan_cache[str(stock_id)] = plan
-        support = float(plan.get("support", 0) or 0)
-        fib1 = float(plan.get("resistance", 0) or 0)
-        fib1382 = float(plan.get("target_1382", 0) or 0)
-        fib1618 = float(plan.get("target_1618", 0) or 0)
-        try:
-            stop = float(plan.get("stop_loss", 0) or 0)
-        except Exception:
-            stop = 0.0
-
-        if support > 0:
-            ax.axhline(support, linestyle="--", linewidth=1, label=f"Support {support:.2f}")
-        if fib1 > 0:
-            ax.axhline(fib1, linestyle="--", linewidth=1, label=f"Fib 1.0 {fib1:.2f}")
-        if fib1382 > 0:
-            ax.axhline(fib1382, linestyle=":", linewidth=1, label=f"Fib 1.382 {fib1382:.2f}")
-        if fib1618 > 0:
-            ax.axhline(fib1618, linestyle=":", linewidth=1, label=f"Fib 1.618 {fib1618:.2f}")
-
-        wave = WaveEngine.detect_wave_label(x)
-        last_close = float(x.iloc[-1]["close"])
-        last_x = xs[-1]
-        bull_target = fib1382 if fib1382 > 0 else last_close * 1.08
-        bear_target = stop if stop > 0 else last_close * 0.95
-        path_x = [last_x, last_x + 4, last_x + 9]
-        ax.plot(path_x, [last_close, (last_close + bull_target) / 2.0, bull_target], "--", linewidth=1.5, label="Bull Path")
-        ax.plot(path_x, [last_close, (last_close + bear_target) / 2.0, bear_target], "--", linewidth=1.5, label="Bear Path")
-
-        recent = x.tail(55)
-        try:
-            peak_idx = recent["high"].idxmax()
-            trough_idx = recent["low"].idxmin()
-            peak_y = float(x.loc[peak_idx, "high"])
-            trough_y = float(x.loc[trough_idx, "low"])
-            ax.scatter([peak_idx], [peak_y], s=36)
-            ax.scatter([trough_idx], [trough_y], s=36)
-            ax.annotate("Wave Peak", xy=(peak_idx, peak_y), xytext=(peak_idx, peak_y * 1.02), fontfamily=SELECTED_PLOT_FONT)
-            ax.annotate("Wave Trough", xy=(trough_idx, trough_y), xytext=(trough_idx, trough_y * 0.98), fontfamily=SELECTED_PLOT_FONT)
-        except Exception:
-            pass
-
-        ax.set_xlim(0, max(path_x) + 2)
-        title_wave = safe_plot_text(wave, fallback="Wave")
-        title_signal = safe_plot_text(plan.get("signal", "-"), fallback="-")
-        ax.set_title(f"{stock_id} | {title_wave} | {title_signal}", fontfamily=SELECTED_PLOT_FONT)
-        info_text = (
-            f"Wave: {title_wave}\n"
-            f"Entry: {safe_plot_text(plan.get('entry_zone','-'))}\n"
-            f"Stop: {safe_plot_text(plan.get('stop_loss','-'))}\n"
-            f"RR: {float(plan.get('rr',0) or 0):.2f}"
-        )
-        ax.text(
-            0.01, 0.98, info_text,
-            transform=ax.transAxes, va="top", ha="left", fontfamily=SELECTED_PLOT_FONT,
-            bbox=dict(boxstyle="round", alpha=0.15)
-        )
-        ax.grid(alpha=0.2)
-        ax.legend(loc="upper left", fontsize=8, prop={"family": SELECTED_PLOT_FONT, "size": 8})
-        fig.tight_layout()
-        out = CHART_DIR / f"{stock_id}_chart.png"
-        fig.savefig(out, dpi=140, bbox_inches="tight")
-        plt.close(fig)
-        return out
-
-
-
-def bootstrap():
-    db = DBManager(DB_PATH)
-    db.init_db()
-
-    init_message = "股票主檔已就緒"
-    try:
-        master = db.get_master()
-        if master.empty:
-            universe = build_full_market_universe()
-            if universe is not None and not universe.empty:
-                db.import_master_df(universe)
-                master = db.get_master()
-                init_message = f"已自動建立全市場股票主檔，共 {len(master)} 檔"
-            else:
-                csv_path = resolve_master_csv()
-                db.import_master_csv(csv_path)
-                master = db.get_master()
-                init_message = f"已改用本地主檔，共 {len(master)} 檔 | {csv_path}"
-        else:
-            init_message = f"股票主檔已載入，共 {len(master)} 檔"
-
-        if db.get_ranking_rows_count() == 0 and db.get_total_price_rows() > 0:
-            rank_count = RankingEngine(db).rebuild()
-            if rank_count > 0:
-                init_message += f"｜已自動重建排行 {rank_count} 檔"
-            else:
-                init_message += "｜已有歷史資料，但目前不足以形成排行"
-    except Exception as e:
-        init_message = f"股票主檔初始化失敗：{e}"
-
-    return db, init_message
-
-
-def main():
-    db, init_message = bootstrap()
-    root = tk.Tk()
-    app = AppUI(root, db)
-    app.set_status(init_message)
-
-    def _close():
-        db.close()
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", _close)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+            title_stock = safe_plot_text(stock.get("stock_name", stock_id) if stock is not None else stock_id, fallback=str(stock_id))
+            title_wave = safe_plot_text(wave, fallback="Wave")
+            title_signal = safe_plot_text(plan.get("signal", "-"), fallback="-")
+            ax.set_title(f"{title_stock}({stock_id}) | {title_wave} | {title_signal}", fontfamily=SELECTED_PLOT_FONT)
+            info_text = (
+                f"Wave: {title_wave}\n"
+                f"Entry: {safe_plot_text(plan.get('entry_zone','-'))}\n"
+                f"Stop: {safe_plot_text(plan.get('stop_loss','-'))}\n"
+                f"RR: {float(plan.get('rr',0) or 0):.2f}"
+            )
+            ax.text(0.01, 0.98, info_text, transform=ax.transAxes, va="top", ha="left", fontfamily=SELECTED_PLOT_FONT,
+                    bbox=dict(boxstyle="round", alpha=0.15))
+            ax.grid(alpha=0.2)
+            ax.legend(loc="upper left", fontsize=8, prop={"family": SELECTED_PLOT_FONT, "size": 8})
+            fig.tight_layout()
+            out = CHART_DIR / f"chart_{stock_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+            fig.savefig(out, bbox_inches="tight")
+            fig.clear()
+            log_info(f"export_chart 完成：{stock_id}｜{out}")
+            return str(out)
+        except Exception as exc:
+            log_exception(f"export_chart 失敗：{stock_id}", exc)
+            raise
