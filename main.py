@@ -68,7 +68,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE"
+APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V3.5 OPERATION"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 
@@ -2459,6 +2459,53 @@ class PortfolioEngine:
         return pd.DataFrame(rows, columns=cols)
 
 
+class OperationGuideEngine:
+    """V3.5 操作版：把資料轉成可執行的日內/波段操作 SOP。"""
+
+    @staticmethod
+    def build_playbook(market: dict, trade_top20: pd.DataFrame, today_buy: pd.DataFrame, wait_pullback: pd.DataFrame, attack: pd.DataFrame, defense: pd.DataFrame) -> pd.DataFrame:
+        regime = str((market or {}).get("regime", "未定義"))
+        memo = str((market or {}).get("memo", ""))
+        top20_count = len(trade_top20) if trade_top20 is not None else 0
+        buy_count = len(today_buy) if today_buy is not None else 0
+        wait_count = len(wait_pullback) if wait_pullback is not None else 0
+        attack_count = len(attack) if attack is not None else 0
+        defense_count = len(defense) if defense is not None else 0
+
+        regime_rule = {
+            "多頭": "先做主攻股，再看預掛單；可接受拉回承接，不追高到 1.382 上方。",
+            "震盪": "先挑 RR 與勝率都高的標的；沒有明確進場區就不買。",
+            "空頭": "先看防守 ETF；個股只保留極高勝率與低 ATR 的 setup。",
+        }.get(regime, "先確認市場狀態，再選股。")
+
+        top_pick = "-"
+        if trade_top20 is not None and not trade_top20.empty:
+            r = trade_top20.iloc[0]
+            top_pick = f"{r['stock_id']} {r['stock_name']}｜{r.get('ui_state','-')}｜進場 {r.get('entry_zone','-')}"
+
+        rows = [
+            {"step": 1, "module": "先看市場", "focus": f"市場狀態＝{regime}", "rule": regime_rule, "purpose": "先決定今天偏攻擊、偏等待、還是偏防守", "output": memo or "依市場狀態決定倉位"},
+            {"step": 2, "module": "再看輪動", "focus": f"主攻 {attack_count} 檔 / 防守 {defense_count} 檔", "rule": "只做有族群與題材支持的標的；不要逆勢單打獨鬥。", "purpose": "確認今天是做主流股，還是退守 ETF", "output": f"TOP20 候選 {top20_count} 檔"},
+            {"step": 3, "module": "看今日可買", "focus": f"今日可買 {buy_count} 檔", "rule": "決策需為 BUY，且支撐 > 0、壓力 > 支撐、RR 夠大。", "purpose": "找出今天真正可以下手的標的", "output": top_pick},
+            {"step": 4, "module": "看預掛單", "focus": f"預掛單 {wait_count} 檔", "rule": "未進入進場區前不追價，只能預掛，不可提前亂買。", "purpose": "把看好的股票留在觀察名單，等價格到位", "output": "價格進入進場區才升級為準備買"},
+            {"step": 5, "module": "核對六模組", "focus": "K線 / 波浪 / 費波 / 阪田 / 量能 / 指標", "rule": "至少確認波浪位置、1.382/1.618 目標、RR、ATR%、Kelly%。", "purpose": "避免只有題材沒有結構，或只有指標沒有風險控管", "output": "決定可買 / 預掛單 / 觀察 / 不可買"},
+            {"step": 6, "module": "下單與倉位", "focus": "下單清單 / 機構交易計畫", "rule": "先看 Kelly% 與建議張數；有風險備註就縮小倉位。", "purpose": "把分析轉成可執行部位", "output": "建議張數、建議金額、單檔曝險%"},
+            {"step": 7, "module": "盤後驗證", "focus": "回測視覺化 / Log", "rule": "看勝率、CAGR、MDD、Sharpe，不好的 setup 下次降權。", "purpose": "讓系統愈用愈準，而不是每天重複犯錯", "output": "策略保留 / 降權 / 淘汰"},
+        ]
+        return pd.DataFrame(rows, columns=["step", "module", "focus", "rule", "purpose", "output"])
+
+    @staticmethod
+    def explain_state(ui_state: str) -> str:
+        mapping = {
+            "可買": "已同時滿足決策、進場區與風險報酬條件，可執行。",
+            "準備買": "條件接近完成，通常代表進場價快到位，可小倉位等待。",
+            "預掛單": "只列入名單，不追價，等價格回到進場區再動作。",
+            "觀察": "可以追蹤，但目前不應出手。",
+            "不可買": "不符合 SOP，應直接排除。",
+        }
+        return mapping.get(str(ui_state or ""), "依 SOP 判斷，不做主觀硬拗。")
+
+
 class AppUI:
     def __init__(self, root, db: DBManager):
         self.root = root
@@ -2478,6 +2525,7 @@ class AppUI:
         self.last_institutional_plan_df = pd.DataFrame()
         self.last_today_buy_df = pd.DataFrame()
         self.last_wait_df = pd.DataFrame()
+        self.last_operation_sop_df = pd.DataFrame()
         self.current_chart_path = None
         self.worker = None
         self.cancel_event = threading.Event()
@@ -2527,6 +2575,7 @@ class AppUI:
             "4. 重建排行",
             "5. AI選股TOP20",
             "6. 採用 v9.2 FINAL-RELEASE：唯一核心策略引擎 / 波浪費波模型 / Kelly+ATR / Equity Curve",
+            "7. V3.5操作版重點：先看市場，再看輪動，再看今日可買 / 預掛單，最後才下單",
         ]
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
@@ -2579,6 +2628,7 @@ class AppUI:
         self.action_cb["values"] = [
             "AI選股TOP20",
             "AI選股TOP5",
+            "V3.5操作說明",
             "v9策略回測",
             "初始化全市場",
             "建立完整歷史（一次）",
@@ -2596,7 +2646,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "下單清單", "機構交易計畫", "排行", "類股", "題材"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "下單清單", "機構交易計畫", "操作SOP", "排行", "類股", "題材"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -2627,6 +2677,7 @@ class AppUI:
         main.add(right, weight=2)
 
         self.tab_dashboard = ttk.Frame(self.left_notebook)
+        self.tab_sop = ttk.Frame(self.left_notebook)
         self.tab_rotation = ttk.Frame(self.left_notebook)
         self.tab_rank = ttk.Frame(self.left_notebook)
         self.tab_sector = ttk.Frame(self.left_notebook)
@@ -2637,6 +2688,7 @@ class AppUI:
         self.tab_inst = ttk.Frame(self.left_notebook)
         self.tab_backtest = ttk.Frame(self.left_notebook)
         self.left_notebook.add(self.tab_dashboard, text="交易儀表板")
+        self.left_notebook.add(self.tab_sop, text="V3.5操作SOP")
         self.left_notebook.add(self.tab_rotation, text="產業輪動")
         self.left_notebook.add(self.tab_rank, text="排行榜")
         self.left_notebook.add(self.tab_sector, text="類股熱度")
@@ -2649,6 +2701,10 @@ class AppUI:
 
         self.dashboard_tree = self._make_tree(self.tab_dashboard, ("metric", "value", "desc"), {
             "metric": "指標", "value": "數值", "desc": "說明"
+        })
+
+        self.sop_tree = self._make_tree(self.tab_sop, ("step", "module", "focus", "rule", "purpose", "output"), {
+            "step": "步驟", "module": "模組", "focus": "先看什麼", "rule": "判斷規則", "purpose": "用途", "output": "輸出"
         })
 
         self.rotation_tree = self._make_tree(self.tab_rotation, ("industry", "count", "avg_total", "avg_ai", "trend_count", "hot_score", "rotation"), {
@@ -2854,6 +2910,7 @@ class AppUI:
             "重建排行": self.rebuild_ranking,
             "AI選股TOP20": self.show_top20,
             "AI選股TOP5": self.show_top5,
+            "V3.5操作說明": self.show_operation_guide,
             "v9策略回測": self.show_strategy_backtest,
             "匯出分析Excel": self.export_analysis_excel,
             "開啟圖表": self.open_current_chart,
@@ -3026,33 +3083,53 @@ class AppUI:
             except Exception:
                 inst_row = None
 
+        ui_state = str(trade_plan.get("ui_state", "-"))
+        state_help = OperationGuideEngine.explain_state(ui_state)
+        decision_flow = "市場→輪動→今日可買→下單清單→回測驗證"
         lines = [
             f"《{source or '專業交易終端版'}》",
             f"股票：{stock['stock_name']} ({stock_id})｜排行：{rank_text}",
             f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
-            f"最新收盤：{float(last['close']):.2f}",
-            "MA20 / MA60：{:.2f} / {:.2f}".format(last["ma20"], last["ma60"]) if pd.notna(last["ma20"]) and pd.notna(last["ma60"]) else "MA20 / MA60：資料不足",
-            "RSI14：{:.2f}".format(last["rsi14"]) if pd.notna(last["rsi14"]) else "RSI14：資料不足",
-            "MACD Hist：{:.4f}".format(last["macd_hist"]) if pd.notna(last["macd_hist"]) else "MACD Hist：資料不足",
             "",
+            "【功能定位】",
+            "這個畫面不是只看指標，而是把『可不可以買、為什麼買、買了怎麼控風險』一次講清楚。",
+            f"決策流程：{decision_flow}",
+            "",
+            "【目前判斷】",
+            f"最新收盤：{float(last['close']):.2f}",
+            "MA20 / MA60：{:.2f} / {:.2f}".format(last['ma20'], last['ma60']) if pd.notna(last['ma20']) and pd.notna(last['ma60']) else "MA20 / MA60：資料不足",
+            "RSI14：{:.2f}".format(last['rsi14']) if pd.notna(last['rsi14']) else "RSI14：資料不足",
+            "MACD Hist：{:.4f}".format(last['macd_hist']) if pd.notna(last['macd_hist']) else "MACD Hist：資料不足",
             f"波浪：{wave}｜訊號：{trade_plan.get('signal','-')}｜交易型態：{trade_plan.get('trade_type','-')}",
-            f"狀態：{trade_plan.get('ui_state','-')}｜決策：{trade_plan.get('trade_action','-')}｜分類：{trade_plan.get('bucket','-')}",
+            f"狀態：{ui_state}｜決策：{trade_plan.get('trade_action','-')}｜分類：{trade_plan.get('bucket','-')}",
+            f"狀態用途：{state_help}",
+            "",
+            "【怎麼操作】",
             f"支撐 / 壓力：{float(trade_plan.get('support',0) or 0):.2f} / {float(trade_plan.get('resistance',0) or 0):.2f}",
             f"進場區：{trade_plan.get('entry_zone','-')}",
             f"停損：{trade_plan.get('stop_loss','-')}",
             f"1.382 / 1.618：{float(trade_plan.get('target_1382',0) or 0):.2f} / {float(trade_plan.get('target_1618',0) or 0):.2f}",
             f"RR：{float(trade_plan.get('rr',0) or 0):.2f}｜模型勝率：{float(trade_plan.get('win_rate',0) or 0):.1f}%",
-            f"六模組：K {trade_plan.get('kline_score',0):.1f}｜波 {trade_plan.get('wave_score',0):.1f}｜費 {trade_plan.get('fib_score',0):.1f}｜阪 {trade_plan.get('sakata_score',0):.1f}｜量 {trade_plan.get('volume_score',0):.1f}｜指 {trade_plan.get('indicator_score',0):.1f}",
+            "操作原則：可買＝可執行；準備買＝小倉位等待；預掛單＝等價到位；觀察 / 不可買＝不下單。",
+            "",
+            "【六模組評估】",
+            f"K線 {trade_plan.get('kline_score',0):.1f}｜波浪 {trade_plan.get('wave_score',0):.1f}｜費波 {trade_plan.get('fib_score',0):.1f}｜阪田 {trade_plan.get('sakata_score',0):.1f}｜量能 {trade_plan.get('volume_score',0):.1f}｜指標 {trade_plan.get('indicator_score',0):.1f}",
+            "六模組用途：避免只憑單一指標下單，必須同時確認結構、位置、量能與風險報酬。",
+            "",
+            "【回測驗證】",
             f"回測：勝率 {float(bt.get('backtest_win_rate',0) or 0):.1f}%｜平均報酬 {float(bt.get('avg_return',0) or 0):.2f}%｜CAGR {float(bt.get('cagr',0) or 0):.2f}%｜MDD {float(bt.get('mdd',0) or 0):.2f}%｜Sharpe {float(bt.get('sharpe',0) or 0):.2f}",
+            "回測用途：用歷史結果過濾掉看起來很強、實際很差的 setup。",
         ]
         if top20_row is not None:
-            lines.append(f"TOP20：{top20_row.get('bucket','-')}｜{top20_row.get('ui_state','-')}")
+            lines.append(f"TOP20：{top20_row.get('bucket','-')}｜{top20_row.get('ui_state','-')}｜用途＝今日優先追蹤池")
         if top5_row is not None:
-            lines.append(f"TOP5：回測勝率 {float(top5_row.get('backtest_win_rate',0) or 0):.1f}%｜CAGR {float(top5_row.get('cagr',0) or 0):.2f}%")
+            lines.append(f"TOP5：回測勝率 {float(top5_row.get('backtest_win_rate',0) or 0):.1f}%｜CAGR {float(top5_row.get('cagr',0) or 0):.2f}｜用途＝核心觀察名單")
         if inst_row is not None:
             lines.append(f"機構計畫：建議張數 {inst_row.get('建議張數',0)}｜建議金額 {inst_row.get('建議金額',0)}｜投資組合狀態 {inst_row.get('投資組合狀態','-')}")
             lines.append(f"機構備註：{inst_row.get('風險備註','-')}")
         lines.extend([
+            "",
+            "【結論】",
             f"理由：{trade_plan.get('reason','-')}",
             f"圖表：{self.current_chart_path or '-'}",
         ])
@@ -3212,6 +3289,7 @@ class AppUI:
                 "防守": self.last_defense_df,
                 "下單清單": self.last_order_list_df,
                 "機構交易計畫": getattr(self, "last_institutional_plan_df", pd.DataFrame()),
+                "操作SOP": getattr(self, "last_operation_sop_df", pd.DataFrame()),
                 "排行": self._filtered_ranking(),
                 "類股": pd.DataFrame([(self.sector_tree.item(i, "values")) for i in self.sector_tree.get_children()], columns=["產業", "檔數", "平均總分", "平均AI分", "代表股"]) if self.sector_tree.get_children() else pd.DataFrame(),
                 "題材": pd.DataFrame([(self.theme_tree.item(i, "values")) for i in self.theme_tree.get_children()], columns=["題材", "檔數", "平均總分", "平均AI分", "代表股"]) if self.theme_tree.get_children() else pd.DataFrame(),
@@ -3228,6 +3306,7 @@ class AppUI:
                     "預掛單": ["stock_id", "stock_name", "ui_state", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
                     "下單清單": ["優先級", "代號", "名稱", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "機構交易計畫": ["優先級", "代號", "名稱", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
+                    "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                 }
                 df = pd.DataFrame(columns=empty_columns.get(target, ["message"]))
                 if df.empty and target not in empty_columns:
@@ -3415,7 +3494,7 @@ class AppUI:
         def render_top5():
             self.refresh_top20_and_order_views()
             self.left_notebook.select(self.tab_top5)
-            lines = ["《v9.2 FINAL-RELEASE AI選股TOP5》", ""]
+            lines = ["《v9.2 FINAL-RELEASE V3.5｜AI選股TOP5》", "用途：這裡是核心觀察名單，不代表全部都要買；先看狀態與進場區，再決定是否列入下單清單。", ""]
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
                 lines.append(
                     f"{i}. {r['stock_id']} {r['stock_name']}｜{r.get('ui_state','-')}｜進場 {r.get('entry_zone','-')}｜RR {float(r.get('rr',0) or 0):.2f}｜勝率 {float(r.get('win_rate',0) or 0):.1f}%｜回測 {float(r.get('backtest_win_rate',0) or 0):.1f}%"
@@ -3584,6 +3663,47 @@ class AppUI:
 
         self._run_in_thread(worker, "init_market")
 
+    def populate_operation_sop(self, market: dict, trade_top20: pd.DataFrame, today_buy: pd.DataFrame, wait_pullback: pd.DataFrame, attack: pd.DataFrame, defense: pd.DataFrame):
+        for item in self.sop_tree.get_children():
+            self.sop_tree.delete(item)
+        sop_df = OperationGuideEngine.build_playbook(market, trade_top20, today_buy, wait_pullback, attack, defense)
+        self.last_operation_sop_df = sop_df.copy()
+        if sop_df.empty:
+            return
+        for _, r in sop_df.iterrows():
+            self.sop_tree.insert("", "end", values=(r["step"], r["module"], r["focus"], r["rule"], r["purpose"], r["output"]))
+
+    def show_operation_guide(self):
+        ranking = self._filtered_ranking()
+        trade_top20 = getattr(self, "last_top20_df", pd.DataFrame())
+        today_buy = getattr(self, "last_today_buy_df", pd.DataFrame())
+        wait_pullback = getattr(self, "last_wait_df", pd.DataFrame())
+        attack = getattr(self, "last_attack_df", pd.DataFrame())
+        defense = getattr(self, "last_defense_df", pd.DataFrame())
+        market = self.master_trading_engine.market_engine.get_market_regime()
+        self.populate_operation_sop(market, trade_top20, today_buy, wait_pullback, attack, defense)
+        lines = [
+            "《V3.5 操作版｜功能與用途》",
+            "",
+            f"市場狀態：{market['regime']}（{market['score']:.2f}）",
+            f"市場說明：{market['memo']}",
+            "",
+            "核心流程：先看市場 → 再看輪動 → 再看今日可買 / 預掛單 → 再看下單清單 → 最後用回測驗證。",
+            "",
+            "五種狀態怎麼用：",
+        ]
+        for state in ["可買", "準備買", "預掛單", "觀察", "不可買"]:
+            lines.append(f"- {state}：{OperationGuideEngine.explain_state(state)}")
+        if trade_top20 is not None and not trade_top20.empty:
+            lines.extend(["", "目前 TOP20 前3檔："])
+            for i, (_, r) in enumerate(trade_top20.head(3).iterrows(), start=1):
+                lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r.get('ui_state','-')}｜{r.get('entry_zone','-')}｜RR {float(r.get('rr',0) or 0):.2f}")
+        elif ranking is not None and not ranking.empty:
+            lines.extend(["", "尚未建立 TOP20，請先執行 AI選股TOP20。", f"目前排行第一：{ranking.iloc[0]['stock_id']} {ranking.iloc[0]['stock_name']}"])
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+        self.left_notebook.select(self.tab_sop)
+
     def refresh_filters(self):
         master = self.db.get_master()
         if master.empty:
@@ -3611,7 +3731,7 @@ class AppUI:
         return df.sort_values(["rank_all"]).reset_index(drop=True)
 
     def refresh_all_tables(self):
-        for tree in (self.dashboard_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
+        for tree in (self.dashboard_tree, self.sop_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
             for item in tree.get_children():
                 tree.delete(item)
 
@@ -3677,6 +3797,7 @@ class AppUI:
             ))
 
         trade = self.master_trading_engine.get_trade_pool(df)
+        self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
         attack_cnt = len(trade["attack"])
         defense_cnt = len(trade["defense"])
         self.set_status(
@@ -3807,17 +3928,19 @@ class AppUI:
                 self.last_order_list_df = self.build_order_list(today_buy, wait_pullback)
                 self.last_institutional_plan_df = self.portfolio_engine.build_institutional_plan(pd.concat([today_buy.copy(), wait_pullback.copy()], ignore_index=True))
 
+                self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
                 self.ui_call(self.refresh_top20_and_order_views)
                 self.ui_call(self.left_notebook.select, self.tab_top20)
                 self.ui_call(self.open_three_windows)
 
                 defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
                 lines = [
-                    "《v9.2 FINAL-RELEASE》",
+                    "《v9.2 FINAL-RELEASE V3.5 操作版》",
                     f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
                     f"市場說明：{market['memo']}",
                     f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可買：{len(today_buy)}｜預掛單：{len(wait_pullback)}｜防守：{defend_cnt}",
                     f"交易門檻：決策 BUY / WEAK BUY｜支撐 > 0｜壓力 > 支撐｜再依六模組總分排序",
+                    "操作用途：先看今日可買，再看預掛單，沒有進場區就不下單。",
                     "",
                     "【TOP20 觀察池 前5檔】",
                 ]
