@@ -2672,7 +2672,7 @@ class AppUI:
         self.last_job_summary = {}
 
         self.root.title(APP_NAME)
-        self.root.geometry("1580x920")
+        self._configure_startup_window()
         log_info(f"應用程式啟動｜DB={DB_PATH}｜LOG={LOG_PATH}")
 
         self.market_var = tk.StringVar(value="全部")
@@ -2699,7 +2699,56 @@ class AppUI:
         self.refresh_filters()
         self.show_welcome_message()
         self.refresh_all_tables()
+        self.root.after(180, self._apply_initial_layout)
+        self.root.after(600, self._apply_initial_layout)
         self.set_status(f"PACKED={PACKED_DATA_DIR} | EXTERNAL={EXTERNAL_DATA_DIR} | CSV={MASTER_CSV}")
+
+    def _configure_startup_window(self):
+        """啟動時自動貼齊可視區域，避免主視窗超出螢幕範圍。"""
+        try:
+            self.root.update_idletasks()
+            if sys.platform.startswith("win"):
+                try:
+                    self.root.state("zoomed")
+                    return
+                except Exception:
+                    pass
+
+            sw = int(self.root.winfo_screenwidth() or 1600)
+            sh = int(self.root.winfo_screenheight() or 900)
+            width = max(1280, int(sw * 0.96))
+            height = max(780, int(sh * 0.90))
+            width = min(width, sw - 20) if sw > 40 else width
+            height = min(height, sh - 80) if sh > 120 else height
+            x = max((sw - width) // 2, 0)
+            y = max((sh - height) // 2, 0)
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            self.root.geometry("1500x860")
+
+    def _apply_initial_layout(self):
+        """啟動後固定三區比例，減少人工手動調整。"""
+        try:
+            self.root.update_idletasks()
+            total_w = max(int(self.root.winfo_width() or 0), 1200)
+            total_h = max(int(self.root.winfo_height() or 0), 780)
+
+            if getattr(self, "main_paned", None) is not None:
+                left_w = max(760, int(total_w * 0.64))
+                try:
+                    self.main_paned.sashpos(0, left_w)
+                except Exception:
+                    pass
+
+            if getattr(self, "right_paned", None) is not None:
+                usable_h = max(total_h - 180, 520)
+                upper_h = max(260, int(usable_h * 0.56))
+                try:
+                    self.right_paned.sashpos(0, upper_h)
+                except Exception:
+                    pass
+        except Exception as exc:
+            log_warning(f"套用啟動版型失敗：{exc}")
 
     def show_welcome_message(self):
         last_date = self.db.get_last_price_date() or "尚未建立"
@@ -2813,13 +2862,13 @@ class AppUI:
         self.progress_text_label = ttk.Label(row2, textvariable=self.progress_text_var, width=44)
         self.progress_text_label.pack(side="left", padx=4)
 
-        main = ttk.Panedwindow(self.root, orient="horizontal")
-        main.pack(fill="both", expand=True, padx=8, pady=8)
+        self.main_paned = ttk.Panedwindow(self.root, orient="horizontal")
+        self.main_paned.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.left_notebook = ttk.Notebook(main)
-        right = ttk.Frame(main, padding=8)
-        main.add(self.left_notebook, weight=5)
-        main.add(right, weight=2)
+        self.left_notebook = ttk.Notebook(self.main_paned)
+        right = ttk.Frame(self.main_paned, padding=8)
+        self.main_paned.add(self.left_notebook, weight=5)
+        self.main_paned.add(right, weight=2)
 
         self.tab_dashboard = ttk.Frame(self.left_notebook)
         self.tab_sop = ttk.Frame(self.left_notebook)
@@ -2894,13 +2943,13 @@ class AppUI:
         })
         self.backtest_tree.bind("<<TreeviewSelect>>", self.on_select_backtest)
 
-        right_split = ttk.Panedwindow(right, orient="vertical")
-        right_split.pack(fill="both", expand=True)
+        self.right_paned = ttk.Panedwindow(right, orient="vertical")
+        self.right_paned.pack(fill="both", expand=True)
 
-        upper = ttk.LabelFrame(right_split, text="個股分析 / 交易計畫", padding=6)
-        right_lower = ttk.LabelFrame(right_split, text="圖表 / Log", padding=6)
-        right_split.add(upper, weight=3)
-        right_split.add(right_lower, weight=2)
+        upper = ttk.LabelFrame(self.right_paned, text="個股分析 / 交易計畫", padding=6)
+        right_lower = ttk.LabelFrame(self.right_paned, text="圖表 / Log", padding=6)
+        self.right_paned.add(upper, weight=3)
+        self.right_paned.add(right_lower, weight=2)
 
         upper_body = ttk.Frame(upper)
         upper_body.pack(fill="both", expand=True)
