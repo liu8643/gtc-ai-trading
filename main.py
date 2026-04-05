@@ -4321,6 +4321,36 @@ class AppUI:
         self.industry_cb["values"] = ["全部"] + sorted([x for x in master["industry"].dropna().unique().tolist() if str(x).strip() != ""])
         self.theme_cb["values"] = ["全部"] + sorted([x for x in master["theme"].dropna().unique().tolist() if str(x).strip() != ""])
 
+    def _parse_search_tokens(self, raw_query: str):
+        raw = str(raw_query or "").strip()
+        if not raw:
+            return []
+        normalized = raw.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
+        parts = [p.strip() for p in normalized.split(",")]
+        return [p for p in parts if p]
+
+    def _apply_search_filter(self, df: pd.DataFrame, raw_query: str) -> pd.DataFrame:
+        tokens = self._parse_search_tokens(raw_query)
+        if not tokens or df is None or df.empty:
+            return df
+
+        stock_id_series = df["stock_id"].astype(str)
+        stock_name_series = df["stock_name"].astype(str)
+        mask = pd.Series(False, index=df.index)
+
+        for token in tokens:
+            token_mask = pd.Series(False, index=df.index)
+            escaped = re.escape(token)
+            if token.isdigit():
+                token_mask = token_mask | stock_id_series.eq(token)
+                token_mask = token_mask | stock_id_series.str.contains(escaped, case=False, na=False, regex=True)
+            else:
+                token_mask = token_mask | stock_id_series.str.contains(escaped, case=False, na=False, regex=True)
+            token_mask = token_mask | stock_name_series.str.contains(escaped, case=False, na=False, regex=True)
+            mask = mask | token_mask
+
+        return df[mask]
+
     def _filtered_ranking(self):
         df = self.db.get_latest_ranking()
         if df.empty:
@@ -4333,7 +4363,7 @@ class AppUI:
             df = df[df["theme"] == self.theme_var.get()]
         q = self.search_var.get().strip()
         if q:
-            df = df[df["stock_id"].str.contains(q, case=False) | df["stock_name"].str.contains(q, case=False)]
+            df = self._apply_search_filter(df, q)
         return df.sort_values(["rank_all"]).reset_index(drop=True)
 
     def refresh_all_tables(self):
