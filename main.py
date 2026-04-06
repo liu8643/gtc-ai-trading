@@ -255,6 +255,7 @@ CLASSIFICATION_MAX_AGE_DAYS = 7
 CLASSIFICATION_DOWNLOAD_TIMEOUT = (10, 45)
 CLASSIFICATION_DOWNLOAD_RETRIES = 3
 CLASSIFICATION_MEMORY_CACHE = {"df": None, "path": None, "mtime": None, "meta": None}
+LAST_CLASSIFICATION_LOAD_INFO = {"loaded": False, "rows": 0, "path": "", "note": "尚未載入"}
 
 CLASSIFICATION_BOOK_CANDIDATES = [
     RUNTIME_DIR / "台股類股分類.xlsx",
@@ -335,24 +336,49 @@ def _classification_meta_is_stale(meta: dict, max_age_days: int = CLASSIFICATION
     except Exception:
         return True
 
+def _set_classification_load_info(loaded: bool, rows: int = 0, path: Path | None = None, note: str = ""):
+    global LAST_CLASSIFICATION_LOAD_INFO
+    LAST_CLASSIFICATION_LOAD_INFO = {
+        "loaded": bool(loaded),
+        "rows": int(rows or 0),
+        "path": str(path) if path else "",
+        "note": str(note or "")
+    }
+
+def get_classification_load_info() -> dict:
+    try:
+        return dict(LAST_CLASSIFICATION_LOAD_INFO)
+    except Exception:
+        return {"loaded": False, "rows": 0, "path": "", "note": "未知"}
+
 def get_classification_status() -> dict:
     path = resolve_classification_book()
     meta = _read_classification_meta()
     out = dict(meta) if isinstance(meta, dict) else {}
+    load_info = get_classification_load_info()
+    out["loaded"] = bool(load_info.get("loaded", False))
+    out["loaded_rows"] = int(load_info.get("rows", 0) or 0)
+    out["load_note"] = str(load_info.get("note", "") or "")
+    out["load_path"] = str(load_info.get("path", "") or "")
     if path and Path(path).exists():
         p = Path(path)
-        out.setdefault("file", p.name)
-        out.setdefault("path", str(p))
-        out.setdefault("hash", _safe_file_sha256(p))
-        out.setdefault("size", int(p.stat().st_size))
-        out.setdefault("mtime", float(p.stat().st_mtime))
-        out.setdefault("status", "ok")
-        out["is_stale"] = _classification_meta_is_stale(out)
+        out["file"] = p.name
+        out["path"] = str(p)
+        out["hash"] = _safe_file_sha256(p)
+        out["size"] = int(p.stat().st_size)
+        out["mtime"] = float(p.stat().st_mtime)
         out["exists"] = True
+        out["is_stale"] = _classification_meta_is_stale(out)
     else:
-        out["status"] = out.get("status", "missing")
         out["exists"] = False
         out["is_stale"] = True
+        out.setdefault("status", "missing")
+    if out.get("loaded") and out.get("loaded_rows", 0) > 0:
+        out["status"] = "ok"
+    elif out.get("exists"):
+        out["status"] = out.get("status", "fallback")
+    else:
+        out["status"] = out.get("status", "missing")
     return out
 
 def _normalize_stock_name_for_match(v) -> str:
@@ -3132,7 +3158,13 @@ class AppUI:
         price_rows = self.db.get_total_price_rows()
         cls_status = get_classification_status()
         cls_file = cls_status.get("file", "未載入")
-        cls_mark = "⚠ 過期" if cls_status.get("is_stale") else ("✔ 正常" if cls_status.get("exists") else "❌ 缺失")
+        cls_rows = int(cls_status.get("loaded_rows", 0) or 0)
+        if cls_status.get("loaded") and cls_rows > 0:
+            cls_mark = f"✔ 正常（已載入 {cls_rows} 筆）"
+        elif cls_status.get("exists"):
+            cls_mark = "⚠ 降級模式（檔案存在但未成功載入）"
+        else:
+            cls_mark = "❌ 缺失"
         lines = [
             "《GTC AI Trading System v9.2 FINAL-RELEASE》",
             "",
