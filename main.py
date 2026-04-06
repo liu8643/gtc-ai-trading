@@ -482,13 +482,10 @@ def safe_read_excel(path: Path):
                 return pd.read_excel(converted, engine="openpyxl")
             except Exception as exc:
                 last_error = exc
-        try:
-            return pd.read_excel(path)
-        except Exception as exc:
-            last_error = exc
+        raise RuntimeError(f"Excel讀取失敗：{path}｜無法將 xls 轉成 xlsx，且目前環境不可直接讀取 xls。原始錯誤：{last_error}")
 
     try:
-        return pd.read_excel(path)
+        return pd.read_excel(path, engine="openpyxl")
     except Exception as exc:
         last_error = exc
     raise RuntimeError(f"Excel讀取失敗：{path}｜{last_error}")
@@ -1170,40 +1167,49 @@ def build_full_market_universe() -> pd.DataFrame:
     if all_df.empty:
         csv_path = resolve_master_csv()
         if csv_path.exists():
-            x = pd.read_csv(csv_path, dtype={"stock_id": str}).fillna("")
+            x = pd.read_csv(csv_path, dtype=str).fillna("")
             return _normalize_master_df(x, "上市")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
 
     try:
         csv_path = resolve_master_csv()
         if csv_path.exists():
-            x = pd.read_csv(csv_path, dtype={"stock_id": str}).fillna("")
-            x["stock_id"] = x["stock_id"].astype(str).str.strip()
-            x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
-            keep_cols = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
-            for c in keep_cols:
-                if c not in x.columns:
-                    x[c] = ""
-            x = x[keep_cols].drop_duplicates(subset=["stock_id"]).set_index("stock_id")
-            all_df = all_df.drop_duplicates(subset=["stock_id"]).set_index("stock_id")
+            x = pd.read_csv(csv_path, dtype=str).fillna("")
+            x = _normalize_master_df(x, "上市")
+            if x is not None and not x.empty and "stock_id" in x.columns:
+                x["stock_id"] = x["stock_id"].astype(str).str.strip()
+                x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
+                keep_cols = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
+                for c in keep_cols:
+                    if c not in x.columns:
+                        x[c] = ""
+                x = x[keep_cols].drop_duplicates(subset=["stock_id"]).set_index("stock_id")
+                all_df = all_df.drop_duplicates(subset=["stock_id"]).set_index("stock_id")
 
-            invalid_text = {"", "未分類", "全市場", "系統掃描"}
-            for col in ["stock_name", "market", "industry", "theme", "sub_theme"]:
-                if col in x.columns and col in all_df.columns:
-                    valid_mask = ~x[col].astype(str).isin(invalid_text)
-                    all_df.loc[valid_mask, col] = x.loc[valid_mask, col]
+                invalid_text = {"", "未分類", "全市場", "系統掃描"}
+                for col in ["stock_name", "market", "industry", "theme", "sub_theme"]:
+                    if col in x.columns and col in all_df.columns:
+                        valid_mask = ~x[col].astype(str).isin(invalid_text)
+                        valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
+                        if len(valid_ids) > 0:
+                            all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
 
-            for col in ["is_etf", "is_active", "update_date"]:
-                if col in x.columns and col in all_df.columns:
-                    valid_mask = x[col].astype(str).str.strip().ne("")
-                    all_df.loc[valid_mask, col] = x.loc[valid_mask, col]
+                for col in ["is_etf", "is_active", "update_date"]:
+                    if col in x.columns and col in all_df.columns:
+                        valid_mask = x[col].astype(str).str.strip().ne("")
+                        valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
+                        if len(valid_ids) > 0:
+                            all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
 
-            all_df = all_df.reset_index()
-    except Exception:
-        pass
+                all_df = all_df.reset_index()
+    except Exception as exc:
+        log_warning(f"主檔覆蓋既有 CSV 時略過：{exc}")
 
-    all_df = apply_classification_layers(all_df)
+    if "stock_id" not in all_df.columns:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+
     return all_df.drop_duplicates(subset=["stock_id"]).sort_values(["market", "industry", "stock_id"]).reset_index(drop=True)
+
 
 
 class DBManager:
