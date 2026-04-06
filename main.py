@@ -396,7 +396,59 @@ def _try_convert_xls_to_xlsx(src: Path, dst: Path) -> Optional[Path]:
         finally:
             wb.Close(False)
             excel.Quit()
-        if dst.exists():
+        if dst.exists() and dst.stat().st_size > 0:
+            return dst
+    except Exception:
+        pass
+    return None
+
+
+def safe_read_excel(path: Path):
+    path = Path(path)
+    last_error = None
+    if path.suffix.lower() == ".xlsx":
+        try:
+            return pd.read_excel(path, engine="openpyxl")
+        except Exception as exc:
+            last_error = exc
+    if path.suffix.lower() == ".xls":
+        for engine in ("xlrd", None):
+            try:
+                if engine:
+                    return pd.read_excel(path, engine=engine)
+                return pd.read_excel(path)
+            except Exception as exc:
+                last_error = exc
+    try:
+        return pd.read_excel(path)
+    except Exception as exc:
+        last_error = exc
+    raise RuntimeError(f"Excel讀取失敗：{path}｜{last_error}")
+
+
+def convert_xls_to_xlsx_force(src: Path, dst: Path, log_cb=None) -> Optional[Path]:
+    src = Path(src)
+    dst = Path(dst)
+    converted = _try_convert_xls_to_xlsx(src, dst)
+    if converted is not None and converted.exists() and converted.stat().st_size > 0:
+        if log_cb:
+            log_cb(f"分類檔已轉成 xlsx（Excel COM）：{converted}")
+        return converted
+
+    try:
+        xl = pd.ExcelFile(src, engine="xlrd")
+        with pd.ExcelWriter(dst, engine="openpyxl") as writer:
+            wrote = False
+            for sheet in xl.sheet_names:
+                try:
+                    df = xl.parse(sheet)
+                    df.to_excel(writer, sheet_name=safe_sheet_name(sheet), index=False)
+                    wrote = True
+                except Exception:
+                    continue
+        if dst.exists() and dst.stat().st_size > 0:
+            if log_cb:
+                log_cb(f"分類檔已轉成 xlsx（pandas fallback）：{dst}")
             return dst
     except Exception:
         pass
@@ -425,12 +477,27 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
             CLASSIFICATION_CACHE_XLS.write_bytes(resp.content)
             if log_cb:
                 log_cb(f"分類檔已下載到快取：{CLASSIFICATION_CACHE_XLS}")
+
             target_path = CLASSIFICATION_CACHE_XLS
-            converted = _try_convert_xls_to_xlsx(CLASSIFICATION_CACHE_XLS, CLASSIFICATION_CACHE_XLSX)
+            converted = convert_xls_to_xlsx_force(CLASSIFICATION_CACHE_XLS, CLASSIFICATION_CACHE_XLSX, log_cb=log_cb)
             if converted is not None and converted.exists():
-                if log_cb:
-                    log_cb(f"分類檔已轉成 xlsx：{converted}")
                 target_path = converted
+            else:
+                if log_cb:
+                    log_cb("xlsx 轉檔失敗，改用原始 xls 直接讀取")
+
+            # 驗證至少能讀到一個工作表
+            try:
+                read_path = target_path
+                if target_path.suffix.lower() == ".xls":
+                    xl = pd.ExcelFile(read_path, engine="xlrd")
+                else:
+                    xl = pd.ExcelFile(read_path)
+                if not xl.sheet_names:
+                    raise RuntimeError("分類檔沒有可用工作表")
+            except Exception as exc:
+                raise RuntimeError(f"分類檔下載成功，但驗證失敗：{exc}") from exc
+
             meta = _build_classification_meta(target_path, source="TWSE", note=f"download attempt {attempt}")
             _write_classification_meta(meta)
             CLASSIFICATION_MEMORY_CACHE["df"] = None
@@ -467,12 +534,13 @@ def resolve_classification_book() -> Optional[Path]:
 
 def load_official_classification_book() -> pd.DataFrame:
     path = ensure_classification_book(force_refresh=False)
+    empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
     if path is None:
         CLASSIFICATION_MEMORY_CACHE["df"] = None
         CLASSIFICATION_MEMORY_CACHE["path"] = None
         CLASSIFICATION_MEMORY_CACHE["mtime"] = None
         _mark_classification_meta_status("missing", note="no classification book found")
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+        return empty_df
 
     path = Path(path)
     try:
@@ -505,15 +573,29 @@ def load_official_classification_book() -> pd.DataFrame:
             pass
 
     parts = []
+    final_read_path = path
     try:
         read_path = path
-        if str(path).lower().endswith(".xls"):
-            converted = _try_convert_xls_to_xlsx(path, CLASSIFICATION_CACHE_XLSX)
+        if path.suffix.lower() == ".xls":
+            converted = convert_xls_to_xlsx_force(path, CLASSIFICATION_CACHE_XLSX)
             if converted is not None and converted.exists():
                 read_path = converted
-        xl = pd.ExcelFile(read_path)
+        final_read_path = read_path
+
+        if read_path.suffix.lower() == ".xls":
+            xl = pd.ExcelFile(read_path, engine="xlrd")
+        else:
+            xl = pd.ExcelFile(read_path)
+
         for sheet in xl.sheet_names:
-            df = xl.parse(sheet).fillna("")
+            try:
+                df = safe_read_excel(read_path) if len(xl.sheet_names) == 1 else xl.parse(sheet)
+            except Exception:
+                try:
+                    df = xl.parse(sheet)
+                except Exception:
+                    continue
+            df = df.fillna("")
             market = "上市" if "上市" in sheet else ("上櫃" if "上櫃" in sheet else ("興櫃" if "興櫃" in sheet else ""))
             rename = {}
             for c in df.columns:
@@ -540,15 +622,15 @@ def load_official_classification_book() -> pd.DataFrame:
             df["market_official"] = market
             parts.append(df[["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]])
     except Exception as exc:
-        _mark_classification_meta_status("damaged", note=str(exc), path=path)
+        _mark_classification_meta_status("damaged", note=str(exc), path=final_read_path)
         CLASSIFICATION_MEMORY_CACHE["df"] = None
         CLASSIFICATION_MEMORY_CACHE["path"] = None
         CLASSIFICATION_MEMORY_CACHE["mtime"] = None
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+        return empty_df
 
     if not parts:
-        _mark_classification_meta_status("empty", note="no usable sheets", path=path)
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+        _mark_classification_meta_status("empty", note="no usable sheets", path=final_read_path)
+        return empty_df
 
     out = pd.concat(parts, ignore_index=True).fillna("")
     out = out.sort_values(["stock_id", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
@@ -556,10 +638,10 @@ def load_official_classification_book() -> pd.DataFrame:
         out.to_pickle(CLASSIFICATION_CACHE_PICKLE)
     except Exception:
         pass
-    meta = _build_classification_meta(path, source="TWSE", note=f"loaded rows={len(out)}")
+    meta = _build_classification_meta(final_read_path, source="TWSE", note=f"loaded rows={len(out)}")
     _write_classification_meta(meta)
     CLASSIFICATION_MEMORY_CACHE["df"] = out.copy()
-    CLASSIFICATION_MEMORY_CACHE["path"] = str(path)
+    CLASSIFICATION_MEMORY_CACHE["path"] = str(final_read_path)
     CLASSIFICATION_MEMORY_CACHE["mtime"] = current_mtime
     CLASSIFICATION_MEMORY_CACHE["meta"] = meta
     return out
