@@ -257,6 +257,32 @@ CLASSIFICATION_DOWNLOAD_RETRIES = 3
 CLASSIFICATION_MEMORY_CACHE = {"df": None, "path": None, "mtime": None, "meta": None}
 LAST_CLASSIFICATION_LOAD_INFO = {"loaded": False, "rows": 0, "path": "", "note": "尚未載入"}
 
+CLASSIFICATION_LOG_CALLBACK = None
+
+def set_classification_log_callback(cb):
+    global CLASSIFICATION_LOG_CALLBACK
+    CLASSIFICATION_LOG_CALLBACK = cb
+
+def classification_debug_log(message: str, level: str = "INFO"):
+    msg = f"[分類載入] {message}"
+    try:
+        level_upper = str(level or "INFO").upper()
+        if level_upper == "ERROR":
+            log_error(msg)
+        elif level_upper == "WARNING":
+            log_warning(msg)
+        else:
+            log_info(msg)
+    except Exception:
+        pass
+    try:
+        cb = CLASSIFICATION_LOG_CALLBACK
+        if cb is not None:
+            cb(msg, level)
+    except Exception:
+        pass
+
+
 CLASSIFICATION_BOOK_CANDIDATES = [
     RUNTIME_DIR / "台股類股分類.xlsx",
     RUNTIME_DIR / "台股類股分類.xls",
@@ -684,26 +710,35 @@ def load_official_classification_book() -> pd.DataFrame:
     - 優先讀取 xlsx
     - xls 僅在可成功轉檔後才使用
     - 允許工作表欄位名稱不一致，並處理重複欄名（尤其興櫃表）
+    - 分類載入失敗時，強制把失敗原因 / 實際檔名 / sheet / 欄位資訊打到右下 Log
     """
     path = ensure_classification_book(force_refresh=False)
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
     if path is None:
+        note = "找不到分類檔"
+        classification_debug_log(note, "ERROR")
         CLASSIFICATION_MEMORY_CACHE["df"] = None
         CLASSIFICATION_MEMORY_CACHE["path"] = None
         CLASSIFICATION_MEMORY_CACHE["mtime"] = None
         _mark_classification_meta_status("missing", note="no classification book found")
-        _set_classification_load_info(False, 0, None, "找不到分類檔")
+        _set_classification_load_info(False, 0, None, note)
         return empty_df
 
     path = Path(path)
+    classification_debug_log(f"實際讀到的分類檔：{path}")
     final_read_path = path
     if path.suffix.lower() == ".xls":
-        converted = convert_xls_to_xlsx_force(path, CLASSIFICATION_CACHE_XLSX)
+        classification_debug_log(f"偵測到 xls，嘗試轉成 xlsx：{path.name}")
+        converted = convert_xls_to_xlsx_force(path, CLASSIFICATION_CACHE_XLSX, log_cb=lambda m: classification_debug_log(m))
         if converted is not None and converted.exists():
             final_read_path = converted
+            classification_debug_log(f"轉檔完成，改讀：{final_read_path}")
+        else:
+            classification_debug_log(f"xls 轉 xlsx 失敗：{path}", "WARNING")
 
     if final_read_path.suffix.lower() != ".xlsx":
         note = "分類檔未能轉成 xlsx，無法作為補充分類來源"
+        classification_debug_log(note, "ERROR")
         _mark_classification_meta_status("fallback", note=note, path=path)
         _set_classification_load_info(False, 0, path, note)
         return empty_df
@@ -717,6 +752,7 @@ def load_official_classification_book() -> pd.DataFrame:
     cached_path = CLASSIFICATION_MEMORY_CACHE.get("path")
     cached_mtime = CLASSIFICATION_MEMORY_CACHE.get("mtime")
     if cached_df is not None and cached_path == str(final_read_path) and cached_mtime == current_mtime:
+        classification_debug_log(f"使用記憶體快取：{final_read_path.name}｜rows={len(cached_df)}")
         _set_classification_load_info(True, len(cached_df), final_read_path, "memory cache")
         return cached_df.copy()
 
@@ -734,33 +770,65 @@ def load_official_classification_book() -> pd.DataFrame:
                 CLASSIFICATION_MEMORY_CACHE["path"] = str(final_read_path)
                 CLASSIFICATION_MEMORY_CACHE["mtime"] = current_mtime
                 CLASSIFICATION_MEMORY_CACHE["meta"] = meta
+                classification_debug_log(f"使用 pickle 快取：{final_read_path.name}｜rows={len(pickled)}")
                 _set_classification_load_info(True, len(pickled), final_read_path, "pickle cache")
                 return pickled.copy()
-        except Exception:
-            pass
+        except Exception as exc:
+            classification_debug_log(f"pickle 快取讀取失敗：{exc}", "WARNING")
 
     parts = []
+    sheet_debug_rows = []
     try:
+        classification_debug_log(f"開始解析 Excel：{final_read_path}")
         xl = pd.ExcelFile(final_read_path, engine="openpyxl")
+        classification_debug_log(f"sheet 名稱：{', '.join([str(s) for s in xl.sheet_names]) if xl.sheet_names else '(無)'}")
         for sheet in xl.sheet_names:
             try:
                 df = xl.parse(sheet)
-            except Exception:
+            except Exception as exc:
+                classification_debug_log(f"sheet 讀取失敗：{sheet}｜{exc}", "WARNING")
+                sheet_debug_rows.append({"sheet": str(sheet), "rows": 0, "cols": 0, "columns": [], "matched": 0, "error": str(exc)})
                 continue
+
+            col_list = [str(c) for c in list(df.columns)]
             parsed = _extract_official_sheet_rows(df, sheet)
+            matched_rows = len(parsed) if parsed is not None else 0
+            sheet_debug_rows.append({
+                "sheet": str(sheet),
+                "rows": int(len(df)),
+                "cols": int(len(df.columns)),
+                "columns": col_list[:50],
+                "matched": int(matched_rows),
+                "error": ""
+            })
+            classification_debug_log(
+                f"sheet={sheet}｜原始 rows={len(df)} cols={len(df.columns)}｜欄位={col_list[:12]}｜匹配列數={matched_rows}"
+            )
             if parsed is not None and not parsed.empty:
                 parts.append(parsed)
     except Exception as exc:
-        _mark_classification_meta_status("damaged", note=str(exc), path=final_read_path)
+        note = str(exc)
+        classification_debug_log(f"分類檔解析失敗：{note}", "ERROR")
+        _mark_classification_meta_status("damaged", note=note, path=final_read_path)
         CLASSIFICATION_MEMORY_CACHE["df"] = None
         CLASSIFICATION_MEMORY_CACHE["path"] = None
         CLASSIFICATION_MEMORY_CACHE["mtime"] = None
-        _set_classification_load_info(False, 0, final_read_path, str(exc))
+        _set_classification_load_info(False, 0, final_read_path, note)
         return empty_df
 
     if not parts:
-        _mark_classification_meta_status("empty", note="no usable sheets", path=final_read_path)
-        _set_classification_load_info(False, 0, final_read_path, "無可用工作表或欄位")
+        details = []
+        for item in sheet_debug_rows:
+            details.append(
+                f"sheet={item['sheet']}｜rows={item['rows']} cols={item['cols']}｜matched={item['matched']}｜欄位={item['columns'][:12]}" + (f"｜error={item['error']}" if item.get('error') else "")
+            )
+        note = "無可用工作表或欄位"
+        classification_debug_log(f"分類載入失敗：{note}", "ERROR")
+        if details:
+            for line in details:
+                classification_debug_log(line, "ERROR")
+        _mark_classification_meta_status("empty", note=(note + " | " + " || ".join(details[:10]))[:4000], path=final_read_path)
+        _set_classification_load_info(False, 0, final_read_path, note)
         return empty_df
 
     out = pd.concat(parts, ignore_index=True).fillna("")
@@ -769,14 +837,21 @@ def load_official_classification_book() -> pd.DataFrame:
     out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
     out = out.sort_values(["stock_id", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
     if out.empty:
-        _mark_classification_meta_status("empty", note="no usable rows after normalize", path=final_read_path)
-        _set_classification_load_info(False, 0, final_read_path, "標準化後無有效資料")
+        note = "標準化後無有效資料"
+        classification_debug_log(f"分類載入失敗：{note}", "ERROR")
+        for item in sheet_debug_rows[:10]:
+            classification_debug_log(
+                f"sheet={item['sheet']}｜rows={item['rows']} cols={item['cols']}｜matched={item['matched']}｜欄位={item['columns'][:12]}",
+                "ERROR"
+            )
+        _mark_classification_meta_status("empty", note=note, path=final_read_path)
+        _set_classification_load_info(False, 0, final_read_path, note)
         return empty_df
 
     try:
         out.to_pickle(CLASSIFICATION_CACHE_PICKLE)
-    except Exception:
-        pass
+    except Exception as exc:
+        classification_debug_log(f"寫入分類 pickle 快取失敗：{exc}", "WARNING")
 
     meta = _build_classification_meta(final_read_path, source="TWSE-XLSX", note=f"supplement loaded rows={len(out)}")
     _write_classification_meta(meta)
@@ -784,6 +859,7 @@ def load_official_classification_book() -> pd.DataFrame:
     CLASSIFICATION_MEMORY_CACHE["path"] = str(final_read_path)
     CLASSIFICATION_MEMORY_CACHE["mtime"] = current_mtime
     CLASSIFICATION_MEMORY_CACHE["meta"] = meta
+    classification_debug_log(f"補充分類載入成功：{final_read_path.name}｜rows={len(out)}")
     _set_classification_load_info(True, len(out), final_read_path, "補充分類載入成功")
     return out
 
@@ -3234,6 +3310,7 @@ class AppUI:
         self.search_var = tk.StringVar(value="")
 
         self._build_ui()
+        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
         self.refresh_filters()
         self.show_welcome_message()
         self.refresh_all_tables()
@@ -3289,12 +3366,14 @@ class AppUI:
             log_warning(f"套用啟動版型失敗：{exc}")
 
     def show_welcome_message(self):
+        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
         last_date = self.db.get_last_price_date() or "尚未建立"
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
         cls_status = get_classification_status()
         cls_file = cls_status.get("file", "未載入")
         cls_rows = int(cls_status.get("loaded_rows", 0) or 0)
+        cls_note = str(cls_status.get("load_note", "") or cls_status.get("note", ""))
         if cls_status.get("loaded") and cls_rows > 0:
             cls_mark = f"✔ 正常（已載入 {cls_rows} 筆）"
         elif cls_status.get("exists"):
@@ -3308,6 +3387,7 @@ class AppUI:
             f"歷史資料：{price_rows} 筆｜最後交易日：{last_date}",
             f"最新排行筆數：{ranking_count}",
             f"分類檔狀態：{cls_mark}｜{cls_file}",
+            f"分類檔備註：{cls_note or '-'}",
             "",
             "建議操作順序：",
             "1. 初始化全市場（第一次或要重整主檔時）",
@@ -3632,6 +3712,7 @@ class AppUI:
             pass
 
     def update_classification_book(self):
+        set_classification_log_callback(lambda message, level="INFO": self.ui_call(self.append_log, message, level))
         def worker():
             self.ui_call(self.start_task, "更新分類檔", 4)
             self.ui_call(self.update_task, "更新分類檔", 1, 4, item="檢查本機快取")
