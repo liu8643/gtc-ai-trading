@@ -3,3 +3,4 @@ numpy>=1.24
 matplotlib>=3.7
 yfinance>=0.2
 pyinstaller>=6.0
+openpyxl>=3.1
