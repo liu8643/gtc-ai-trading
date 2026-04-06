@@ -606,7 +606,85 @@ def ensure_classification_book(force_refresh: bool = False, log_cb=None) -> Opti
 def resolve_classification_book() -> Optional[Path]:
     return ensure_classification_book(force_refresh=False)
 
+
+def _coerce_unique_columns(columns) -> list[str]:
+    seen = {}
+    out = []
+    for c in list(columns):
+        name = str(c).strip() if c is not None else ""
+        if not name:
+            name = "Unnamed"
+        count = seen.get(name, 0)
+        out_name = name if count == 0 else f"{name}__dup{count}"
+        seen[name] = count + 1
+        out.append(out_name)
+    return out
+
+def _extract_official_sheet_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    x = df.copy()
+    x.columns = _coerce_unique_columns(x.columns)
+    market = "上市" if "上市" in str(sheet_name) else ("上櫃" if "上櫃" in str(sheet_name) else ("興櫃" if "興櫃" in str(sheet_name) else ""))
+
+    industry_col = None
+    name_col = None
+    code_candidates = []
+
+    for c in x.columns:
+        s = str(c).strip()
+        base = s.split("__dup")[0]
+        if base in ("新產業類別", "新產業別"):
+            industry_col = c if industry_col is None else industry_col
+        elif base in ("公司名稱", "公司簡稱", "股票名稱", "證券名稱"):
+            name_col = c if name_col is None else name_col
+        elif base in ("股票代號", "證券代號", "公司代號"):
+            code_candidates.append(c)
+        elif base == "代號":
+            code_candidates.append(c)
+
+    if industry_col is None:
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    if not code_candidates:
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    preferred = []
+    for c in code_candidates:
+        base = str(c).split("__dup")[0]
+        if base in ("股票代號", "證券代號", "公司代號"):
+            preferred.append(c)
+    code_candidates = preferred + [c for c in code_candidates if c not in preferred]
+
+    stock_id_series = pd.Series([""] * len(x), index=x.index, dtype="object")
+    for c in code_candidates:
+        vals = x[c].map(normalize_stock_id)
+        fill_mask = stock_id_series.eq("") & vals.ne("")
+        if fill_mask.any():
+            stock_id_series.loc[fill_mask] = vals.loc[fill_mask]
+
+    out = pd.DataFrame({
+        "stock_id": stock_id_series.astype(str),
+        "stock_name_official": x[name_col].astype(str).str.strip() if name_col in x.columns else "",
+        "industry_official": x[industry_col].astype(str).str.strip(),
+    })
+    out["stock_name_norm_official"] = out["stock_name_official"].map(_normalize_stock_name_for_match)
+    out["market_official"] = market
+    out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
+    if out.empty:
+        return out
+    return out[["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]].drop_duplicates(subset=["stock_id"], keep="first")
+
+
+
 def load_official_classification_book() -> pd.DataFrame:
+    """
+    將官方分類檔視為「補充分類來源」，不是完整全市場主檔。
+    - 優先讀取 xlsx
+    - xls 僅在可成功轉檔後才使用
+    - 允許工作表欄位名稱不一致，並處理重複欄名（尤其興櫃表）
+    """
     path = ensure_classification_book(force_refresh=False)
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
     if path is None:
@@ -623,6 +701,12 @@ def load_official_classification_book() -> pd.DataFrame:
         converted = convert_xls_to_xlsx_force(path, CLASSIFICATION_CACHE_XLSX)
         if converted is not None and converted.exists():
             final_read_path = converted
+
+    if final_read_path.suffix.lower() != ".xlsx":
+        note = "分類檔未能轉成 xlsx，無法作為補充分類來源"
+        _mark_classification_meta_status("fallback", note=note, path=path)
+        _set_classification_load_info(False, 0, path, note)
+        return empty_df
 
     try:
         current_mtime = float(final_read_path.stat().st_mtime)
@@ -657,41 +741,15 @@ def load_official_classification_book() -> pd.DataFrame:
 
     parts = []
     try:
-        if final_read_path.suffix.lower() != ".xlsx":
-            raise RuntimeError("分類檔仍為 xls，且未能成功轉成 xlsx；請確認本機 Excel/LibreOffice 環境")
-
         xl = pd.ExcelFile(final_read_path, engine="openpyxl")
         for sheet in xl.sheet_names:
             try:
                 df = xl.parse(sheet)
             except Exception:
                 continue
-            df = df.fillna("")
-            market = "上市" if "上市" in sheet else ("上櫃" if "上櫃" in sheet else ("興櫃" if "興櫃" in sheet else ""))
-            rename = {}
-            for c in df.columns:
-                s = str(c).strip()
-                if s in ("代號", "股票代號", "證券代號"):
-                    rename[c] = "stock_id"
-                elif s in ("公司名稱", "公司簡稱", "股票名稱", "證券名稱"):
-                    rename[c] = "stock_name_official"
-                elif s in ("新產業類別", "新產業別"):
-                    rename[c] = "industry_official"
-                elif s in ("原產業類別", "原產業別"):
-                    rename[c] = "industry_origin_official"
-            df = df.rename(columns=rename)
-            if "stock_id" not in df.columns or "industry_official" not in df.columns:
-                continue
-            if "stock_name_official" not in df.columns:
-                df["stock_name_official"] = ""
-            df["stock_id"] = df["stock_id"].map(normalize_stock_id)
-            df["stock_name_norm_official"] = df["stock_name_official"].map(_normalize_stock_name_for_match)
-            df["industry_official"] = df["industry_official"].astype(str).str.strip()
-            df = df[(df["stock_id"] != "") & (df["industry_official"] != "")].copy()
-            if df.empty:
-                continue
-            df["market_official"] = market
-            parts.append(df[["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]])
+            parsed = _extract_official_sheet_rows(df, sheet)
+            if parsed is not None and not parsed.empty:
+                parts.append(parsed)
     except Exception as exc:
         _mark_classification_meta_status("damaged", note=str(exc), path=final_read_path)
         CLASSIFICATION_MEMORY_CACHE["df"] = None
@@ -706,20 +764,29 @@ def load_official_classification_book() -> pd.DataFrame:
         return empty_df
 
     out = pd.concat(parts, ignore_index=True).fillna("")
+    out["stock_id"] = out["stock_id"].astype(str).map(normalize_stock_id)
+    out["industry_official"] = out["industry_official"].astype(str).str.strip()
+    out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
     out = out.sort_values(["stock_id", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
+    if out.empty:
+        _mark_classification_meta_status("empty", note="no usable rows after normalize", path=final_read_path)
+        _set_classification_load_info(False, 0, final_read_path, "標準化後無有效資料")
+        return empty_df
+
     try:
         out.to_pickle(CLASSIFICATION_CACHE_PICKLE)
     except Exception:
         pass
 
-    meta = _build_classification_meta(final_read_path, source="TWSE", note=f"loaded rows={len(out)}")
+    meta = _build_classification_meta(final_read_path, source="TWSE-XLSX", note=f"supplement loaded rows={len(out)}")
     _write_classification_meta(meta)
     CLASSIFICATION_MEMORY_CACHE["df"] = out.copy()
     CLASSIFICATION_MEMORY_CACHE["path"] = str(final_read_path)
     CLASSIFICATION_MEMORY_CACHE["mtime"] = current_mtime
     CLASSIFICATION_MEMORY_CACHE["meta"] = meta
-    _set_classification_load_info(True, len(out), final_read_path, "正式載入成功")
+    _set_classification_load_info(True, len(out), final_read_path, "補充分類載入成功")
     return out
+
 
 
 def load_manual_theme_mapping() -> pd.DataFrame:
