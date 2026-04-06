@@ -1545,6 +1545,54 @@ class WaveEngine:
             return "修正浪"
         return "整理浪"
 
+    @staticmethod
+    def detect_wave_position(x: pd.DataFrame) -> str:
+        recent = x.tail(89).copy()
+        if recent.empty or len(recent) < 30:
+            return "區間整理"
+        close_ = float(recent.iloc[-1]["close"])
+        recent_high = float(recent["high"].max())
+        recent_low = float(recent["low"].min())
+        ma20 = float(recent.iloc[-1]["ma20"]) if pd.notna(recent.iloc[-1]["ma20"]) else close_
+        ma60 = float(recent.iloc[-1]["ma60"]) if pd.notna(recent.iloc[-1]["ma60"]) else close_
+        rsi = float(recent.iloc[-1]["rsi14"]) if pd.notna(recent.iloc[-1]["rsi14"]) else 50.0
+        macd_hist = float(recent.iloc[-1]["macd_hist"]) if pd.notna(recent.iloc[-1]["macd_hist"]) else 0.0
+        width = max(recent_high - recent_low, 1e-6)
+        pos = (close_ - recent_low) / width
+        recent_mid = recent_low + width * 0.5
+
+        if close_ >= recent_high * 0.995 and rsi > 72:
+            return "第5浪"
+        if close_ >= recent_high * 0.995 and macd_hist > 0:
+            return "第3浪"
+        if close_ > ma20 > ma60 and macd_hist > 0 and 0.45 <= pos <= 0.7:
+            return "第1浪"
+        if close_ > ma20 and macd_hist >= 0 and pos < 0.45:
+            return "第2浪"
+        if close_ > ma20 and macd_hist > 0 and 0.55 <= pos <= 0.85:
+            return "第3浪"
+        if close_ >= ma20 and abs(close_ - ma20) / max(ma20, 1e-6) <= 0.04 and 0.45 <= pos <= 0.75:
+            return "第4浪"
+        if close_ < ma20 and macd_hist < 0 and pos <= 0.35:
+            return "A浪"
+        if close_ < recent_mid and macd_hist >= 0 and 0.25 <= pos <= 0.55:
+            return "B浪"
+        if close_ < ma60 and macd_hist < 0 and pos < 0.25:
+            return "C浪"
+        return "區間整理"
+
+    @staticmethod
+    def detect_wave_structure(x: pd.DataFrame) -> tuple[str, str]:
+        label = WaveEngine.detect_wave_label(x)
+        position = WaveEngine.detect_wave_position(x)
+        if position in ("第1浪", "第3浪", "第5浪"):
+            structure = "推動浪"
+        elif position in ("A浪", "B浪", "C浪") or label == "修正浪":
+            structure = "修正浪"
+        else:
+            structure = "整理浪"
+        return structure, position
+
 
 class FibEngine:
     @staticmethod
@@ -1977,6 +2025,47 @@ class TradingPlanEngine:
 
         return round(self._clamp(base), 2)
 
+    def _trend_state(self, close_: float, fast: float, slow: float, slope_fast: float, slope_slow: float, macd_hist: float, rsi: float, kd_ok: bool) -> str:
+        score = 0
+        if close_ >= fast:
+            score += 1
+        if fast >= slow:
+            score += 1
+        if slope_fast > 0:
+            score += 1
+        if slope_slow > 0:
+            score += 1
+        if macd_hist > 0:
+            score += 1
+        if 45 <= rsi <= 72:
+            score += 1
+        if kd_ok:
+            score += 1
+        if score >= 5:
+            return "多"
+        if score <= 2:
+            return "空"
+        return "盤整"
+
+    def _ai_advice(self, ui_state: str, decision: str, rr: float, wave_position: str, trend_short: str, trend_mid: str, trend_long: str) -> str:
+        if ui_state == "不可買":
+            return "不可買"
+        if decision == "BUY" and trend_short == trend_mid == trend_long == "多" and wave_position in ("第3浪", "第1浪") and rr >= 1.5:
+            return "可買"
+        if decision == "BUY" and wave_position == "第3浪" and rr >= 2.0:
+            return "加碼"
+        if ui_state == "準備買":
+            return "準備買"
+        if ui_state == "預掛單":
+            return "預掛單"
+        if trend_short == "空" and trend_mid in ("空", "盤整"):
+            return "減碼"
+        if wave_position in ("第5浪", "C浪") or rr < 0.8:
+            return "出場"
+        if ui_state == "觀察":
+            return "觀察"
+        return ui_state or "觀察"
+
     # legacy helper removed in v9.2 FINAL-RELEASE: _decision is no longer used
 
     def build_plan(self, stock_id: str) -> dict:
@@ -1990,6 +2079,12 @@ class TradingPlanEngine:
                 "industry": stock["industry"] if stock is not None else "",
                 "trade_action": "AVOID",
                 "ui_state": "不可買",
+                "ai_advice": "不可買",
+                "trend_short": "盤整",
+                "trend_mid": "盤整",
+                "trend_long": "盤整",
+                "wave_structure": "整理浪",
+                "wave_position": "區間整理",
                 "entry_low": 0.0,
                 "entry_high": 0.0,
                 "entry_zone": "-",
@@ -2053,6 +2148,7 @@ class TradingPlanEngine:
         source_signal = str(score["signal"])
         signal = self._map_kline_signal(source_signal, close_, recent_high, ma5, ma10, ma20, ma60, macd_hist, rsi)
         wave_label = WaveEngine.detect_wave_label(x)
+        wave_structure, wave_position = WaveEngine.detect_wave_structure(x)
         sakata_label = SakataEngine.detect(signal, close_, ma5, ma10, ma20, recent_high)
         vol_ma20 = x["volume"].tail(20).mean()
         vol_ratio = float(last["volume"] / vol_ma20) if vol_ma20 and pd.notna(vol_ma20) else 1.0
@@ -2095,6 +2191,13 @@ class TradingPlanEngine:
         kd_ok = int(k >= d)
         volume_ok = int(vol_ratio >= 1.0)
 
+        slope_ma5 = float(x["ma5"].tail(3).diff().mean()) if x["ma5"].tail(3).notna().any() else 0.0
+        slope_ma20 = float(x["ma20"].tail(5).diff().mean()) if x["ma20"].tail(5).notna().any() else 0.0
+        slope_ma60 = float(x["ma60"].tail(5).diff().mean()) if x["ma60"].tail(5).notna().any() else 0.0
+        trend_short = self._trend_state(close_, ma5, ma10, slope_ma5, slope_ma20, macd_hist, rsi, kd_ok == 1)
+        trend_mid = self._trend_state(close_, ma20, ma60, slope_ma20, slope_ma60, macd_hist, rsi, kd_ok == 1)
+        trend_long = self._trend_state(close_, ma60, ma60, slope_ma60, slope_ma60, macd_hist, rsi, kd_ok == 1)
+
         win_grade, win_rate = WinRateEngine.estimate(hist)
         decision, auto_state = StrategyEngineV91.decide_signal(model_score, float(wave_trade["wave_trade_score"]), rr, rsi, wave_label)
 
@@ -2119,6 +2222,9 @@ class TradingPlanEngine:
         )
 
         ui_state = auto_state if auto_state in ("可買","預掛單","觀察","不可買") else self._ui_trade_state(decision, close_, entry_low, entry_high, rr, win_rate)
+        if ui_state == "可買" and not self._in_entry_zone(close_, entry_low, entry_high):
+            ui_state = "準備買"
+        ai_advice = self._ai_advice(ui_state, decision, rr, wave_position, trend_short, trend_mid, trend_long)
 
         return {
             "stock_id": stock_id,
@@ -2129,6 +2235,12 @@ class TradingPlanEngine:
             "is_etf": 1 if is_etf else 0,
             "trade_action": decision,
             "ui_state": ui_state,
+            "ai_advice": ai_advice,
+            "trend_short": trend_short,
+            "trend_mid": trend_mid,
+            "trend_long": trend_long,
+            "wave_structure": wave_structure,
+            "wave_position": wave_position,
             "entry_low": round(entry_low, 2),
             "entry_high": round(entry_high, 2),
             "entry_zone": f"{self._round_price(entry_low)} ~ {self._round_price(entry_high)}",
@@ -3543,10 +3655,10 @@ class AppUI:
         bt = self.get_cached_backtest(stock_id)
         if bt is None:
             bt = {"backtest_win_rate": 0.0, "avg_return": 0.0, "cagr": 0.0, "mdd": 0.0, "sharpe": 0.0, "samples": 0}
-        wave = str(trade_plan.get("wave", WaveEngine.detect_wave_label(hist)))
-        ranking = self._filtered_ranking()
+
         rank_text = "-"
         try:
+            ranking = self._filtered_ranking()
             if ranking is not None and not ranking.empty:
                 row = ranking[ranking["stock_id"].astype(str) == str(stock_id)]
                 if not row.empty:
@@ -3554,68 +3666,50 @@ class AppUI:
         except Exception:
             pass
 
-        top20_row = self._row_lookup(getattr(self, "last_top20_df", pd.DataFrame()), stock_id)
-        top5_row = self._row_lookup(getattr(self, "last_top5_df", pd.DataFrame()), stock_id)
-        inst_row = None
-        if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not self.last_institutional_plan_df.empty:
-            try:
-                tmp = self.last_institutional_plan_df[self.last_institutional_plan_df["代號"].astype(str) == str(stock_id)]
-                if not tmp.empty:
-                    inst_row = tmp.iloc[0]
-            except Exception:
-                inst_row = None
-
-        ui_state = str(trade_plan.get("ui_state", "-"))
-        state_help = OperationGuideEngine.explain_state(ui_state)
-        decision_flow = "市場→輪動→今日可買→下單清單→回測驗證"
+        analysis_mode = "快速模式" if quick_only or str(trade_plan.get("trade_type", "")) == "快速模式" else "完整模式"
+        ai_advice = str(trade_plan.get("ai_advice", trade_plan.get("ui_state", "觀察")))
+        trend_short = str(trade_plan.get("trend_short", "盤整"))
+        trend_mid = str(trade_plan.get("trend_mid", "盤整"))
+        trend_long = str(trade_plan.get("trend_long", "盤整"))
+        wave_structure = str(trade_plan.get("wave_structure", trade_plan.get("wave", "整理浪")))
+        wave_position = str(trade_plan.get("wave_position", trade_plan.get("wave", "區間整理")))
         lines = [
-            f"《{source or '專業交易終端版'}》",
+            f"《V3.6 AI分析版｜{analysis_mode}》",
             f"股票：{stock['stock_name']} ({stock_id})｜排行：{rank_text}",
             f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
+            f"資料來源：{source or '-'}｜最新收盤：{float(last['close']):.2f}",
             "",
-            "【功能定位】",
-            "這個畫面不是只看指標，而是把『可不可以買、為什麼買、買了怎麼控風險』一次講清楚。",
-            f"決策流程：{decision_flow}",
-            "背景狀態：快速顯示（先出基本判斷）" if quick_only else "背景狀態：完整分析已完成",
+            "【趨勢判斷模組】",
+            f"短線趨勢：{trend_short}｜依據 MA5/MA10、短斜率、MACD、RSI、KD",
+            f"中線趨勢：{trend_mid}｜依據 MA20/MA60、均線斜率與收盤位置",
+            f"長線趨勢：{trend_long}｜依據 MA60 結構、長斜率與中長期位置",
+            f"MA5 / MA10 / MA20 / MA60：{float(last['ma5']) if pd.notna(last['ma5']) else 0:.2f} / {float(last['ma10']) if pd.notna(last['ma10']) else 0:.2f} / {float(last['ma20']) if pd.notna(last['ma20']) else 0:.2f} / {float(last['ma60']) if pd.notna(last['ma60']) else 0:.2f}",
+            f"MACD Hist / RSI14 / KD：{float(last['macd_hist']) if pd.notna(last['macd_hist']) else 0:.4f} / {float(last['rsi14']) if pd.notna(last['rsi14']) else 0:.2f} / {float(last['k']) if pd.notna(last['k']) else 0:.2f}-{float(last['d']) if pd.notna(last['d']) else 0:.2f}",
             "",
-            "【目前判斷】",
-            f"最新收盤：{float(last['close']):.2f}",
-            "MA20 / MA60：{:.2f} / {:.2f}".format(last['ma20'], last['ma60']) if pd.notna(last['ma20']) and pd.notna(last['ma60']) else "MA20 / MA60：資料不足",
-            "RSI14：{:.2f}".format(last['rsi14']) if pd.notna(last['rsi14']) else "RSI14：資料不足",
-            "MACD Hist：{:.4f}".format(last['macd_hist']) if pd.notna(last['macd_hist']) else "MACD Hist：資料不足",
-            f"波浪：{wave}｜訊號：{trade_plan.get('signal','-')}｜交易型態：{trade_plan.get('trade_type','-')}",
-            f"狀態：{ui_state}｜決策：{trade_plan.get('trade_action','-')}｜分類：{trade_plan.get('bucket','-')}",
-            f"狀態用途：{state_help}",
+            "【波浪分析模組】",
+            f"波浪結構：{wave_structure}",
+            f"可能位置：{wave_position}",
+            f"交易訊號：{trade_plan.get('signal','-')}｜交易型態：{trade_plan.get('trade_type','-')}",
+            "用途：不是只看漲跌，而是判斷目前位在推動、修正或整理的哪一段。",
             "",
-            "【怎麼操作】",
-            f"支撐 / 壓力：{float(trade_plan.get('support',0) or 0):.2f} / {float(trade_plan.get('resistance',0) or 0):.2f}",
-            f"進場區：{trade_plan.get('entry_zone','-')}",
-            f"停損：{trade_plan.get('stop_loss','-')}",
-            f"1.382 / 1.618：{float(trade_plan.get('target_1382',0) or 0):.2f} / {float(trade_plan.get('target_1618',0) or 0):.2f}",
-            f"RR：{float(trade_plan.get('rr',0) or 0):.2f}｜模型勝率：{float(trade_plan.get('win_rate',0) or 0):.1f}%",
-            "操作原則：可買＝可執行；準備買＝小倉位等待；預掛單＝等價到位；觀察 / 不可買＝不下單。",
+            "【費波南西目標位模組】",
+            f"支撐位 / 壓力位：{float(trade_plan.get('support',0) or 0):.2f} / {float(trade_plan.get('resistance',0) or 0):.2f}",
+            f"Fib 1.0：{float(trade_plan.get('resistance',0) or 0):.2f}",
+            f"Fib 1.382：{float(trade_plan.get('target_1382',0) or 0):.2f}",
+            f"Fib 1.618：{float(trade_plan.get('target_1618',0) or 0):.2f}",
+            f"進場區 / 停損 / RR：{trade_plan.get('entry_zone','-')} / {trade_plan.get('stop_loss','-')} / {float(trade_plan.get('rr',0) or 0):.2f}",
+            "用途：判斷目標價、追價風險與停利停損區間。",
             "",
-            "【六模組評估】",
-            f"K線 {trade_plan.get('kline_score',0):.1f}｜波浪 {trade_plan.get('wave_score',0):.1f}｜費波 {trade_plan.get('fib_score',0):.1f}｜阪田 {trade_plan.get('sakata_score',0):.1f}｜量能 {trade_plan.get('volume_score',0):.1f}｜指標 {trade_plan.get('indicator_score',0):.1f}",
-            "六模組用途：避免只憑單一指標下單，必須同時確認結構、位置、量能與風險報酬。",
-            "",
-            "【回測驗證】",
-            f"回測：勝率 {float(bt.get('backtest_win_rate',0) or 0):.1f}%｜平均報酬 {float(bt.get('avg_return',0) or 0):.2f}%｜CAGR {float(bt.get('cagr',0) or 0):.2f}%｜MDD {float(bt.get('mdd',0) or 0):.2f}%｜Sharpe {float(bt.get('sharpe',0) or 0):.2f}",
-            "回測用途：用歷史結果過濾掉看起來很強、實際很差的 setup。",
+            "【AI建議模組】",
+            f"AI結論：{ai_advice}",
+            f"執行狀態：{trade_plan.get('ui_state','-')}｜決策：{trade_plan.get('trade_action','-')}｜分類：{trade_plan.get('bucket','-')}",
+            f"模型分數 / 交易分數：{float(trade_plan.get('model_score',0) or 0):.2f} / {float(trade_plan.get('wave_trade_score', trade_plan.get('trade_score',0)) or 0):.2f}",
+            f"勝率 / 回測勝率：{float(trade_plan.get('win_rate',0) or 0):.1f}% / {float(bt.get('backtest_win_rate',0) or 0):.1f}%",
+            f"平均報酬 / CAGR / MDD / Sharpe：{float(bt.get('avg_return',0) or 0):.2f}% / {float(bt.get('cagr',0) or 0):.2f}% / {float(bt.get('mdd',0) or 0):.2f}% / {float(bt.get('sharpe',0) or 0):.2f}",
+            f"一句話：{trade_plan.get('reason','-')}",
         ]
-        if top20_row is not None:
-            lines.append(f"TOP20：{top20_row.get('bucket','-')}｜{top20_row.get('ui_state','-')}｜用途＝今日優先追蹤池")
-        if top5_row is not None:
-            lines.append(f"TOP5：回測勝率 {float(top5_row.get('backtest_win_rate',0) or 0):.1f}%｜CAGR {float(top5_row.get('cagr',0) or 0):.2f}｜用途＝核心觀察名單")
-        if inst_row is not None:
-            lines.append(f"機構計畫：建議張數 {inst_row.get('建議張數',0)}｜建議金額 {inst_row.get('建議金額',0)}｜投資組合狀態 {inst_row.get('投資組合狀態','-')}")
-            lines.append(f"機構備註：{inst_row.get('風險備註','-')}")
-        lines.extend([
-            "",
-            "【結論】",
-            f"理由：{trade_plan.get('reason','-')}",
-            f"圖表：{self.current_chart_path or '-'}",
-        ])
+        if quick_only:
+            lines.extend(["", "備註：目前為快速模式，完整 AI 分析與回測背景完成後會自動更新。"])
         return lines
 
     def update_detail_panel(self, stock_id: str, source: str = ""):
