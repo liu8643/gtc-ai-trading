@@ -30,6 +30,8 @@ import os
 import subprocess
 import warnings
 import logging
+import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -242,10 +244,131 @@ def resolve_master_csv() -> Path:
     return ensure_external_master_csv()
 
 
+CLASSIFICATION_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
+CLASSIFICATION_CACHE_DIR = EXTERNAL_DATA_DIR / "classification"
+CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CLASSIFICATION_CACHE_XLS = CLASSIFICATION_CACHE_DIR / "台股類股分類.xls"
+CLASSIFICATION_CACHE_XLSX = CLASSIFICATION_CACHE_DIR / "台股類股分類.xlsx"
+CLASSIFICATION_META_PATH = CLASSIFICATION_CACHE_DIR / "classification_meta.json"
+CLASSIFICATION_CACHE_PICKLE = CLASSIFICATION_CACHE_DIR / "classification_cache.pkl"
+CLASSIFICATION_MAX_AGE_DAYS = 7
+CLASSIFICATION_DOWNLOAD_TIMEOUT = (10, 45)
+CLASSIFICATION_DOWNLOAD_RETRIES = 3
+CLASSIFICATION_MEMORY_CACHE = {"df": None, "path": None, "mtime": None, "meta": None}
+
 CLASSIFICATION_BOOK_CANDIDATES = [
+    RUNTIME_DIR / "台股類股分類.xlsx",
+    RUNTIME_DIR / "台股類股分類.xls",
     RUNTIME_DIR / "股票類別對照表.xlsx",
+    RUNTIME_DIR / "股票類別對照表.xls",
+    EXTERNAL_DATA_DIR / "台股類股分類.xlsx",
+    EXTERNAL_DATA_DIR / "台股類股分類.xls",
+    EXTERNAL_DATA_DIR / "股票類別對照表.xlsx",
+    EXTERNAL_DATA_DIR / "股票類別對照表.xls",
+    CLASSIFICATION_CACHE_XLSX,
+    CLASSIFICATION_CACHE_XLS,
+    BASE_DIR / "台股類股分類.xlsx",
+    BASE_DIR / "台股類股分類.xls",
     BASE_DIR / "股票類別對照表.xlsx",
+    BASE_DIR / "股票類別對照表.xls",
 ]
+
+
+def _safe_file_sha256(path: Path) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+def _read_classification_meta() -> dict:
+    try:
+        if CLASSIFICATION_META_PATH.exists():
+            return json.loads(CLASSIFICATION_META_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _write_classification_meta(meta: dict):
+    try:
+        CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        CLASSIFICATION_META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _build_classification_meta(path: Path, source: str = "TWSE", note: str = "") -> dict:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stat = path.stat() if path.exists() else None
+    return {
+        "last_update": now,
+        "source": source,
+        "file": path.name if path else "",
+        "path": str(path) if path else "",
+        "hash": _safe_file_sha256(path) if path and path.exists() else "",
+        "size": int(stat.st_size) if stat else 0,
+        "mtime": float(stat.st_mtime) if stat else 0.0,
+        "status": "ok" if path and path.exists() else "missing",
+        "note": note or "",
+    }
+
+def _mark_classification_meta_status(status: str, note: str = "", path: Path | None = None):
+    meta = _read_classification_meta()
+    if path and Path(path).exists():
+        meta.update(_build_classification_meta(Path(path), source=meta.get("source", "TWSE"), note=note))
+    meta["status"] = status
+    if note:
+        meta["note"] = note
+    if "last_update" not in meta:
+        meta["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _write_classification_meta(meta)
+
+def _classification_meta_is_stale(meta: dict, max_age_days: int = CLASSIFICATION_MAX_AGE_DAYS) -> bool:
+    try:
+        ts = float(meta.get("mtime", 0) or 0)
+        if ts <= 0:
+            return True
+        age_days = (time.time() - ts) / 86400.0
+        return age_days > max_age_days
+    except Exception:
+        return True
+
+def get_classification_status() -> dict:
+    path = resolve_classification_book()
+    meta = _read_classification_meta()
+    out = dict(meta) if isinstance(meta, dict) else {}
+    if path and Path(path).exists():
+        p = Path(path)
+        out.setdefault("file", p.name)
+        out.setdefault("path", str(p))
+        out.setdefault("hash", _safe_file_sha256(p))
+        out.setdefault("size", int(p.stat().st_size))
+        out.setdefault("mtime", float(p.stat().st_mtime))
+        out.setdefault("status", "ok")
+        out["is_stale"] = _classification_meta_is_stale(out)
+        out["exists"] = True
+    else:
+        out["status"] = out.get("status", "missing")
+        out["exists"] = False
+        out["is_stale"] = True
+    return out
+
+def _normalize_stock_name_for_match(v) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    replacements = {
+        "（": "(", "）": ")", "　": "", " ": "", "-": "", "_": "",
+        "股份有限公司": "", "有限公司": "", "公司": "", "控股": "", "控": "",
+        "DR": "", "dr": "", "ETF": "ETF",
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+    s = re.sub(r"[\.\,\/\\]+", "", s)
+    return s.upper().strip()
+
 
 
 def normalize_stock_id(v) -> str:
@@ -259,14 +382,190 @@ def normalize_stock_id(v) -> str:
     return code.zfill(4) if len(code) == 4 else code
 
 
-def resolve_classification_book() -> Optional[Path]:
-    for p in CLASSIFICATION_BOOK_CANDIDATES:
-        if p.exists():
-            return p
+def _try_convert_xls_to_xlsx(src: Path, dst: Path) -> Optional[Path]:
+    try:
+        if not src.exists():
+            return None
+        import win32com.client  # type: ignore
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        wb = excel.Workbooks.Open(str(src.resolve()))
+        try:
+            wb.SaveAs(str(dst.resolve()), FileFormat=51)
+        finally:
+            wb.Close(False)
+            excel.Quit()
+        if dst.exists():
+            return dst
+    except Exception:
+        pass
     return None
 
 
+def download_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
+    existing = None if force_refresh else next((p for p in CLASSIFICATION_BOOK_CANDIDATES if p.exists()), None)
+    if existing is not None and not force_refresh:
+        return existing
+
+    CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for attempt in range(1, CLASSIFICATION_DOWNLOAD_RETRIES + 1):
+        try:
+            if log_cb:
+                log_cb(f"分類檔下載開始（第 {attempt}/{CLASSIFICATION_DOWNLOAD_RETRIES} 次）：{CLASSIFICATION_DOWNLOAD_URL}")
+            resp = requests.get(
+                CLASSIFICATION_DOWNLOAD_URL,
+                timeout=CLASSIFICATION_DOWNLOAD_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
+            )
+            resp.raise_for_status()
+            if not resp.content or len(resp.content) < 4096:
+                raise ValueError("下載內容過小，疑似失敗或非有效檔案")
+            CLASSIFICATION_CACHE_XLS.write_bytes(resp.content)
+            if log_cb:
+                log_cb(f"分類檔已下載到快取：{CLASSIFICATION_CACHE_XLS}")
+            target_path = CLASSIFICATION_CACHE_XLS
+            converted = _try_convert_xls_to_xlsx(CLASSIFICATION_CACHE_XLS, CLASSIFICATION_CACHE_XLSX)
+            if converted is not None and converted.exists():
+                if log_cb:
+                    log_cb(f"分類檔已轉成 xlsx：{converted}")
+                target_path = converted
+            meta = _build_classification_meta(target_path, source="TWSE", note=f"download attempt {attempt}")
+            _write_classification_meta(meta)
+            CLASSIFICATION_MEMORY_CACHE["df"] = None
+            CLASSIFICATION_MEMORY_CACHE["path"] = None
+            CLASSIFICATION_MEMORY_CACHE["mtime"] = None
+            CLASSIFICATION_MEMORY_CACHE["meta"] = meta
+            return target_path
+        except Exception as exc:
+            last_error = exc
+            log_warning(f"分類檔下載失敗（第 {attempt} 次）：{exc}")
+            if log_cb:
+                log_cb(f"分類檔下載失敗（第 {attempt} 次）：{exc}")
+            if attempt < CLASSIFICATION_DOWNLOAD_RETRIES:
+                time.sleep(min(2 * attempt, 5))
+    fallback = next((p for p in CLASSIFICATION_BOOK_CANDIDATES if p.exists()), None)
+    if fallback is not None:
+        _mark_classification_meta_status("fallback", note=f"download failed: {last_error}", path=fallback)
+        return fallback
+    _mark_classification_meta_status("download_failed", note=str(last_error or "unknown"))
+    return None
+
+def ensure_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
+    if not force_refresh:
+        for p in CLASSIFICATION_BOOK_CANDIDATES:
+            if p.exists():
+                meta = _read_classification_meta()
+                if not meta or Path(meta.get("path", "")) != p:
+                    _write_classification_meta(_build_classification_meta(p, source="LOCAL", note="discovered existing file"))
+                return p
+    return download_classification_book(force_refresh=force_refresh, log_cb=log_cb)
+
+def resolve_classification_book() -> Optional[Path]:
+    return ensure_classification_book(force_refresh=False)
+
+def load_official_classification_book() -> pd.DataFrame:
+    path = ensure_classification_book(force_refresh=False)
+    if path is None:
+        CLASSIFICATION_MEMORY_CACHE["df"] = None
+        CLASSIFICATION_MEMORY_CACHE["path"] = None
+        CLASSIFICATION_MEMORY_CACHE["mtime"] = None
+        _mark_classification_meta_status("missing", note="no classification book found")
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    path = Path(path)
+    try:
+        current_mtime = float(path.stat().st_mtime)
+    except Exception:
+        current_mtime = None
+
+    cached_df = CLASSIFICATION_MEMORY_CACHE.get("df")
+    cached_path = CLASSIFICATION_MEMORY_CACHE.get("path")
+    cached_mtime = CLASSIFICATION_MEMORY_CACHE.get("mtime")
+    if cached_df is not None and cached_path == str(path) and cached_mtime == current_mtime:
+        return cached_df.copy()
+
+    if CLASSIFICATION_CACHE_PICKLE.exists():
+        try:
+            pickled = pd.read_pickle(CLASSIFICATION_CACHE_PICKLE)
+            meta = _read_classification_meta()
+            if (
+                isinstance(pickled, pd.DataFrame)
+                and not pickled.empty
+                and meta.get("path") == str(path)
+                and abs(float(meta.get("mtime", 0) or 0) - float(current_mtime or 0)) < 1e-6
+            ):
+                CLASSIFICATION_MEMORY_CACHE["df"] = pickled.copy()
+                CLASSIFICATION_MEMORY_CACHE["path"] = str(path)
+                CLASSIFICATION_MEMORY_CACHE["mtime"] = current_mtime
+                CLASSIFICATION_MEMORY_CACHE["meta"] = meta
+                return pickled.copy()
+        except Exception:
+            pass
+
+    parts = []
+    try:
+        read_path = path
+        if str(path).lower().endswith(".xls"):
+            converted = _try_convert_xls_to_xlsx(path, CLASSIFICATION_CACHE_XLSX)
+            if converted is not None and converted.exists():
+                read_path = converted
+        xl = pd.ExcelFile(read_path)
+        for sheet in xl.sheet_names:
+            df = xl.parse(sheet).fillna("")
+            market = "上市" if "上市" in sheet else ("上櫃" if "上櫃" in sheet else ("興櫃" if "興櫃" in sheet else ""))
+            rename = {}
+            for c in df.columns:
+                s = str(c).strip()
+                if s in ("代號", "股票代號", "證券代號"):
+                    rename[c] = "stock_id"
+                elif s in ("公司名稱", "公司簡稱", "股票名稱", "證券名稱"):
+                    rename[c] = "stock_name_official"
+                elif s in ("新產業類別", "新產業別"):
+                    rename[c] = "industry_official"
+                elif s in ("原產業類別", "原產業別"):
+                    rename[c] = "industry_origin_official"
+            df = df.rename(columns=rename)
+            if "stock_id" not in df.columns or "industry_official" not in df.columns:
+                continue
+            if "stock_name_official" not in df.columns:
+                df["stock_name_official"] = ""
+            df["stock_id"] = df["stock_id"].map(normalize_stock_id)
+            df["stock_name_norm_official"] = df["stock_name_official"].map(_normalize_stock_name_for_match)
+            df["industry_official"] = df["industry_official"].astype(str).str.strip()
+            df = df[(df["stock_id"] != "") & (df["industry_official"] != "")].copy()
+            if df.empty:
+                continue
+            df["market_official"] = market
+            parts.append(df[["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]])
+    except Exception as exc:
+        _mark_classification_meta_status("damaged", note=str(exc), path=path)
+        CLASSIFICATION_MEMORY_CACHE["df"] = None
+        CLASSIFICATION_MEMORY_CACHE["path"] = None
+        CLASSIFICATION_MEMORY_CACHE["mtime"] = None
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    if not parts:
+        _mark_classification_meta_status("empty", note="no usable sheets", path=path)
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    out = pd.concat(parts, ignore_index=True).fillna("")
+    out = out.sort_values(["stock_id", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
+    try:
+        out.to_pickle(CLASSIFICATION_CACHE_PICKLE)
+    except Exception:
+        pass
+    meta = _build_classification_meta(path, source="TWSE", note=f"loaded rows={len(out)}")
+    _write_classification_meta(meta)
+    CLASSIFICATION_MEMORY_CACHE["df"] = out.copy()
+    CLASSIFICATION_MEMORY_CACHE["path"] = str(path)
+    CLASSIFICATION_MEMORY_CACHE["mtime"] = current_mtime
+    CLASSIFICATION_MEMORY_CACHE["meta"] = meta
+    return out
+
 def load_manual_theme_mapping() -> pd.DataFrame:
+
     manual_parts = []
     try:
         seed = pd.read_csv(io.StringIO(DEFAULT_MASTER_CSV), dtype={"stock_id": str}).fillna("")
@@ -290,54 +589,17 @@ def load_manual_theme_mapping() -> pd.DataFrame:
     for c in ["stock_name", "market", "industry", "theme", "sub_theme", "is_etf"]:
         if c not in x.columns:
             x[c] = ""
+    x["stock_name_norm_manual"] = x["stock_name"].map(_normalize_stock_name_for_match)
     x = x.drop_duplicates(subset=["stock_id"], keep="first")
     return x.rename(columns={
         "stock_name": "stock_name_manual",
+        "stock_name_norm_manual": "stock_name_norm_manual",
         "market": "market_manual",
         "industry": "industry_manual",
         "theme": "theme_manual",
         "sub_theme": "sub_theme_manual",
         "is_etf": "is_etf_manual",
     })
-
-
-def load_official_classification_book() -> pd.DataFrame:
-    path = resolve_classification_book()
-    if path is None:
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "market_official", "industry_official"])
-    parts = []
-    try:
-        xl = pd.ExcelFile(path)
-        for sheet in xl.sheet_names:
-            df = xl.parse(sheet).fillna("")
-            market = "上市" if "上市" in sheet else ("上櫃" if "上櫃" in sheet else ("興櫃" if "興櫃" in sheet else ""))
-            rename = {}
-            for c in df.columns:
-                s = str(c).strip()
-                if s in ("代號", "股票代號"):
-                    rename[c] = "stock_id"
-                elif s in ("公司名稱", "公司簡稱"):
-                    rename[c] = "stock_name_official"
-                elif s in ("新產業類別", "新產業別"):
-                    rename[c] = "industry_official"
-            df = df.rename(columns=rename)
-            if "stock_id" not in df.columns or "industry_official" not in df.columns:
-                continue
-            if "stock_name_official" not in df.columns:
-                df["stock_name_official"] = ""
-            df["stock_id"] = df["stock_id"].map(normalize_stock_id)
-            df = df[df["stock_id"] != ""].copy()
-            if df.empty:
-                continue
-            df["market_official"] = market
-            parts.append(df[["stock_id", "stock_name_official", "market_official", "industry_official"]])
-    except Exception:
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "market_official", "industry_official"])
-    if not parts:
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "market_official", "industry_official"])
-    out = pd.concat(parts, ignore_index=True).fillna("")
-    out = out.drop_duplicates(subset=["stock_id"], keep="first")
-    return out
 
 
 THEME_RULES = [
@@ -404,6 +666,7 @@ def infer_theme_bundle(stock_name: str, industry: str, is_etf: int) -> Tuple[str
     return (industry or "未分類", "全市場", "系統掃描")
 
 
+
 def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy().fillna("")
     official = load_official_classification_book()
@@ -411,18 +674,45 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
 
     x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id)
     x = x[x["stock_id"] != ""].copy()
+    x["stock_name_norm"] = x.get("stock_name", "").map(_normalize_stock_name_for_match)
 
     if not official.empty:
         x = x.merge(official, on="stock_id", how="left")
+        missing_mask = x["industry_official"].fillna("").eq("")
+        if missing_mask.any() and "stock_name_norm_official" in official.columns:
+            official_name_map = official[official["stock_name_norm_official"].astype(str) != ""].drop_duplicates("stock_name_norm_official")
+            if not official_name_map.empty:
+                miss = x.loc[missing_mask, ["stock_name_norm"]].merge(
+                    official_name_map[["stock_name_norm_official", "stock_name_official", "market_official", "industry_official"]],
+                    left_on="stock_name_norm", right_on="stock_name_norm_official", how="left"
+                )
+                for col in ["stock_name_official", "market_official", "industry_official"]:
+                    vals = miss[col].fillna("").tolist()
+                    x.loc[missing_mask, col] = [v if v else orig for v, orig in zip(vals, x.loc[missing_mask, col].fillna("").tolist())]
     else:
         x["stock_name_official"] = ""
+        x["stock_name_norm_official"] = ""
         x["market_official"] = ""
         x["industry_official"] = ""
 
     if not manual.empty:
         x = x.merge(manual, on="stock_id", how="left")
+        missing_manual = x["industry_manual"].fillna("").eq("") if "industry_manual" in x.columns else pd.Series(False, index=x.index)
+        if missing_manual.any() and "stock_name_norm_manual" in manual.columns:
+            manual_name_map = manual[manual["stock_name_norm_manual"].astype(str) != ""].drop_duplicates("stock_name_norm_manual")
+            if not manual_name_map.empty:
+                miss = x.loc[missing_manual, ["stock_name_norm"]].merge(
+                    manual_name_map[["stock_name_norm_manual", "stock_name_manual", "market_manual", "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"]],
+                    left_on="stock_name_norm", right_on="stock_name_norm_manual", how="left"
+                )
+                for col in ["stock_name_manual", "market_manual", "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"]:
+                    if col not in x.columns:
+                        x[col] = ""
+                    vals = miss[col].fillna("").tolist()
+                    x.loc[missing_manual, col] = [v if str(v) != "" else orig for v, orig in zip(vals, x.loc[missing_manual, col].fillna("").tolist())]
     else:
         x["stock_name_manual"] = ""
+        x["stock_name_norm_manual"] = ""
         x["market_manual"] = ""
         x["industry_manual"] = ""
         x["theme_manual"] = ""
@@ -434,7 +724,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x["stock_name"] = x["stock_name"].fillna(x.get("stock_name_manual", "").replace("", pd.NA) if hasattr(x.get("stock_name_manual", ""), 'replace') else x.get("stock_name_manual", ""))
     x["stock_name"] = x["stock_name"].fillna(x["stock_id"]).astype(str)
 
-    etf_mask = x["stock_id"].astype(str).str.startswith("00") | x["stock_name"].astype(str).str.contains("ETF|台灣50|高股息|中型100|科技優息|精選高息", regex=True)
+    etf_mask = x["stock_id"].astype(str).str.startswith("00") | x["stock_name"].astype(str).str.contains("ETF|台灣50|高股息|中型100|科技優息|精選高息|DR", regex=True)
     if "is_etf_manual" in x.columns:
         etf_mask = etf_mask | pd.to_numeric(x["is_etf_manual"], errors="coerce").fillna(0).astype(int).eq(1)
     x["is_etf"] = etf_mask.astype(int)
@@ -477,6 +767,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
         if c not in x.columns:
             x[c] = ""
     return x[keep].drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+
 
 DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists() else PACKED_DATA_DIR
 CHART_DIR = RUNTIME_DIR / "charts"
@@ -2757,12 +3048,16 @@ class AppUI:
         last_date = self.db.get_last_price_date() or "尚未建立"
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
+        cls_status = get_classification_status()
+        cls_file = cls_status.get("file", "未載入")
+        cls_mark = "⚠ 過期" if cls_status.get("is_stale") else ("✔ 正常" if cls_status.get("exists") else "❌ 缺失")
         lines = [
             "《GTC AI Trading System v9.2 FINAL-RELEASE》",
             "",
             f"主檔狀態：{len(self.db.get_master())} 檔",
             f"歷史資料：{price_rows} 筆｜最後交易日：{last_date}",
             f"最新排行筆數：{ranking_count}",
+            f"分類檔狀態：{cls_mark}｜{cls_file}",
             "",
             "建議操作順序：",
             "1. 初始化全市場（第一次或要重整主檔時）",
@@ -2832,6 +3127,7 @@ class AppUI:
             "續跑建庫",
             "每日增量更新",
             "重建排行",
+            "更新分類檔",
             "中斷作業",
             "匯出分析Excel",
             "開啟圖表",
@@ -3085,6 +3381,29 @@ class AppUI:
         except Exception:
             pass
 
+    def update_classification_book(self):
+        def worker():
+            self.ui_call(self.start_task, "更新分類檔", 4)
+            self.ui_call(self.update_task, "更新分類檔", 1, 4, item="檢查本機快取")
+            current = ensure_classification_book(force_refresh=False, log_cb=lambda m: self.ui_call(self.append_log, m))
+            if current is not None:
+                self.ui_call(self.append_log, f"目前分類檔：{current}")
+            self.ui_call(self.update_task, "更新分類檔", 2, 4, item="下載最新分類檔")
+            refreshed = ensure_classification_book(force_refresh=True, log_cb=lambda m: self.ui_call(self.append_log, m))
+            if refreshed is None:
+                raise RuntimeError("分類檔下載失敗，且本機沒有可用快取。")
+            self.ui_call(self.update_task, "更新分類檔", 3, 4, item="驗證分類檔內容")
+            official = load_official_classification_book()
+            if official is None or official.empty:
+                raise RuntimeError(f"分類檔存在，但無法成功讀取：{refreshed}")
+            self.ui_call(self.update_task, "更新分類檔", 4, 4, success=1, item=Path(refreshed).name)
+            status = get_classification_status()
+            stale_text = "是" if status.get("is_stale") else "否"
+            self.ui_call(self.finish_task, "更新分類檔", f"分類檔更新完成：{Path(refreshed).name}｜共 {len(official)} 筆")
+            self.ui_call(self.append_log, f"分類檔更新完成：{refreshed}｜可辨識 {len(official)} 筆｜過期={stale_text}")
+            self.ui_call(messagebox.showinfo, "完成", f"分類檔更新完成：\n{refreshed}\n\n可辨識筆數：{len(official)}\n是否過期：{stale_text}\n\n下一步請執行『初始化全市場』以重建主檔分類。")
+        self._run_in_thread(worker, "update_classification_book")
+
     def cancel_current_job(self):
         if self.worker is None or not self.worker.is_alive():
             return messagebox.showinfo("提醒", "目前沒有執行中的背景作業。")
@@ -3116,6 +3435,7 @@ class AppUI:
             "續跑建庫": self.resume_full_history,
             "每日增量更新": self.update_data,
             "重建排行": self.rebuild_ranking,
+            "更新分類檔": self.update_classification_book,
             "AI選股TOP20": self.show_top20,
             "AI選股TOP5": self.show_top5,
             "V3.5操作說明": self.show_operation_guide,
