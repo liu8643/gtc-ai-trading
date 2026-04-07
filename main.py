@@ -446,6 +446,7 @@ def normalize_stock_id(v) -> str:
     return code.zfill(4) if len(code) == 4 else code
 
 
+
 def safe_read_csv_auto(path: Path) -> pd.DataFrame:
     path = Path(path)
     last_error = None
@@ -491,7 +492,6 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
     if out.empty:
         return out
     return out[["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]].drop_duplicates(subset=["stock_id"], keep="first")
-
 
 def _try_convert_xls_to_xlsx(src: Path, dst: Path) -> Optional[Path]:
     try:
@@ -672,7 +672,7 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
     return None
 
 
-def _iter_classification_candidates_prefer_xlsx():def _iter_classification_candidates_prefer_xlsx():
+def _iter_classification_candidates_prefer_xlsx():
     csv_first = []
     xlsx_second = []
     xls_after = []
@@ -951,7 +951,7 @@ def load_official_classification_book() -> pd.DataFrame:
     return out
 
 
-def load_manual_theme_mapping() -> pd.DataFrame:def load_manual_theme_mapping() -> pd.DataFrame:
+def load_manual_theme_mapping() -> pd.DataFrame:
 
     manual_parts = []
     try:
@@ -1012,6 +1012,12 @@ def _choose_text(*values, default: str = "") -> str:
             return s
     return str(default or "")
 
+def normalize_official_industry_name(v: str) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    return OFFICIAL_INDUSTRY_ALIAS_MAP.get(s, s)
+
 
 def _write_json_safe(path: Path, payload: dict):
     try:
@@ -1053,7 +1059,7 @@ def get_classification_v2_summary() -> dict:
 
 def infer_ai_classification(stock_name: str, industry_hint: str = "", market_hint: str = "", is_etf: int = 0) -> tuple[str, str, str, str, int, str]:
     name = str(stock_name or "").strip()
-    industry_hint = str(industry_hint or "").strip()
+    industry_hint = normalize_official_industry_name(str(industry_hint or "").strip())
     market_hint = str(market_hint or "").strip()
     if int(is_etf or 0) == 1 or re.search(r"ETF|台灣50|高股息|中型100|科技優息|精選高息", name, flags=re.I):
         return ("ETF", "ETF", "ETF", "ai_infer", 98, "ETF keyword")
@@ -1131,17 +1137,37 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
 
 
 THEME_RULES = [
-    (r"台積電|創意|世芯|晶心|聯發科|聯詠|矽力|祥碩", ("半導體", "AI/晶圓代工", "半導體")),
-    (r"智邦|智易|華星光|聯亞|光聖|波若威|上詮|聯鈞|眾達|環宇|前鼎|立碁|中磊|啟碁|正文|建漢|神準", ("網通/光通訊", "CPO/光模組", "高速光通訊")),
-    (r"台達電|光寶科|康舒|群電|全漢|偉訓|順達|AES|新盛力|加百裕|系統電", ("電源/電機", "電源/HVDC", "電源")),
-    (r"奇鋐|雙鴻|建準|超眾|力致|高力", ("散熱", "AI散熱", "液冷")),
-    (r"鴻海|廣達|緯創|緯穎|仁寶|英業達|和碩|技嘉|華碩|微星|神達", ("電子代工", "AI伺服器", "伺服器")),
+    (r"台積電|創意|世芯|世芯-KY|晶心|聯發科|聯詠|矽力|祥碩|M31|力旺|智原|信驊|創惟|威鋒電子", ("半導體", "AI/晶圓代工", "半導體")),
+    (r"華星光|聯亞|光聖|波若威|上詮|聯鈞|眾達|環宇|前鼎|立碁|光環|聯光通|聯合再生|聯亞光|IET-KY", ("光通訊", "CPO/光模組", "高速光通訊")),
+    (r"智邦|智易|中磊|啟碁|正文|建漢|神準|明泰|友訊|合勤控|振曜|康全電訊|仲琦", ("網通", "資料中心交換器", "高階網通")),
+    (r"台達電|光寶科|康舒|群電|全漢|偉訓|順達|AES|新盛力|加百裕|系統電|飛宏|茂達|群光電能", ("電源/電機", "電源/HVDC", "電源")),
+    (r"奇鋐|雙鴻|建準|超眾|力致|高力|健策|一詮|散熱", ("散熱", "AI散熱", "液冷")),
+    (r"鴻海|廣達|緯創|緯穎|仁寶|英業達|和碩|技嘉|華碩|微星|神達|宏碁|研華", ("電子代工", "AI伺服器", "伺服器")),
+    (r"南亞科|華邦電|旺宏|群聯|威剛|十銓|宇瞻|創見", ("半導體", "記憶體", "DRAM/NAND")),
+    (r"日月光|京元電子|矽格|精材|頎邦|力成", ("半導體", "先進封裝", "封測")),
+    (r"長榮|萬海|陽明|裕民|慧洋|中航|四維航", ("航運業", "運輸", "航運")),
+    (r"富邦金|國泰金|中信金|兆豐金|玉山金|元大金|第一金|華南金|永豐金|台新金", ("金融保險", "金融", "金融")),
 ]
+
+OFFICIAL_INDUSTRY_ALIAS_MAP = {
+    "半導體業": "半導體",
+    "半導體": "半導體",
+    "電腦及週邊設備業": "電子代工",
+    "電子工業": "電子工業",
+    "電子零組件業": "電子零組件",
+    "通信網路業": "網通",
+    "光電業": "光電",
+    "資訊服務業": "資訊服務",
+    "其他電子業": "其他電子",
+    "電機機械": "電源/電機",
+    "電器電纜": "電源/電機",
+}
 
 INDUSTRY_THEME_MAP = {
     "食品工業": ("食品工業", "民生消費", "食品"),
     "塑膠工業": ("塑膠工業", "基礎原物料", "塑膠"),
     "紡織纖維": ("紡織纖維", "傳產", "紡織"),
+    "電源/電機": ("電源/電機", "電源/HVDC", "電源"),
     "電機機械": ("電源/電機", "電源/HVDC", "電機"),
     "電器電纜": ("電源/電機", "電力基建", "電纜"),
     "化學工業": ("化學工業", "基礎原物料", "化工"),
@@ -1153,13 +1179,22 @@ INDUSTRY_THEME_MAP = {
     "汽車工業": ("汽車工業", "電動車", "車用"),
     "電子工業": ("電子工業", "電子", "電子"),
     "半導體業": ("半導體", "半導體", "半導體"),
+    "半導體": ("半導體", "AI/晶圓代工", "半導體"),
+    "記憶體": ("半導體", "記憶體", "DRAM/NAND"),
+    "先進封裝": ("半導體", "先進封裝", "封測"),
     "電腦及週邊設備業": ("電子代工", "AI伺服器", "伺服器"),
+    "電子代工": ("電子代工", "AI伺服器", "伺服器"),
     "光電業": ("光電", "光電", "面板/光學"),
-    "通信網路業": ("網通/光通訊", "網通/光通訊", "網通"),
+    "光通訊": ("光通訊", "CPO/光模組", "高速光通訊"),
+    "通信網路業": ("網通", "網通/光通訊", "網通"),
+    "網通": ("網通", "資料中心交換器", "高階網通"),
     "電子零組件業": ("電子零組件", "電子零組件", "零組件"),
+    "電子零組件": ("電子零組件", "電子零組件", "零組件"),
     "電子通路業": ("電子通路", "電子通路", "通路"),
     "資訊服務業": ("資訊服務", "軟體/資訊服務", "資訊服務"),
+    "資訊服務": ("資訊服務", "軟體/雲端", "雲端"),
     "其他電子業": ("其他電子", "電子", "其他電子"),
+    "散熱": ("散熱", "AI散熱", "液冷"),
     "建材營造": ("建材營造", "傳產", "營造"),
     "航運業": ("航運業", "運輸", "航運"),
     "觀光餐旅": ("觀光餐旅", "內需消費", "觀光"),
@@ -1172,12 +1207,13 @@ INDUSTRY_THEME_MAP = {
     "運動休閒": ("運動休閒", "內需消費", "運動"),
     "文化創意業": ("文化創意", "內需消費", "文創"),
     "農業科技業": ("農業科技", "農業科技", "農業"),
+    "ETF": ("ETF", "ETF", "ETF"),
 }
 
 
 def infer_theme_bundle(stock_name: str, industry: str, is_etf: int) -> Tuple[str, str, str]:
     name = str(stock_name or "")
-    industry = str(industry or "").strip()
+    industry = normalize_official_industry_name(str(industry or "").strip())
     if int(is_etf or 0) == 1 or re.search(r"ETF|台灣50|高股息|中型100|科技優息|精選高息", name):
         return "ETF", "ETF", "ETF"
     for pattern, bundle in THEME_RULES:
@@ -1185,12 +1221,16 @@ def infer_theme_bundle(stock_name: str, industry: str, is_etf: int) -> Tuple[str
             return bundle
     if industry in INDUSTRY_THEME_MAP:
         return INDUSTRY_THEME_MAP[industry]
-    if re.search(r"光|通|網|訊", name):
-        return (industry or "網通/光通訊", "網通/光通訊", "網通")
-    if re.search(r"電|控|達|機", name):
+    if re.search(r"光|通|網|訊|CPO|矽光", name):
+        return (industry or "光通訊", "CPO/光模組", "高速光通訊")
+    if re.search(r"交換器|路由|寬頻|通訊|5G", name):
+        return (industry or "網通", "資料中心交換器", "高階網通")
+    if re.search(r"電|控|達|機|電源|電池|能源", name):
         return (industry or "電源/電機", "電源/HVDC", "電源")
-    if re.search(r"積電|半導體|晶|芯", name):
+    if re.search(r"積電|半導體|晶|芯|封裝|測試|DRAM|記憶體", name):
         return (industry or "半導體", "半導體", "半導體")
+    if re.search(r"伺服器|AI|雲端|運算|主機板", name):
+        return (industry or "電子代工", "AI伺服器", "伺服器")
     return (industry or "未分類", "全市場", "系統掃描")
 
 
@@ -1265,7 +1305,11 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x["market"] = x["market"].fillna("上市")
     x.loc[x["is_etf"].eq(1), "market"] = "ETF"
 
-    x["industry_seed"] = x["industry"].replace("", pd.NA)
+    if "industry_official" in x.columns:
+        x["industry_official"] = x["industry_official"].map(normalize_official_industry_name)
+    if "industry_manual" in x.columns:
+        x["industry_manual"] = x["industry_manual"].map(normalize_official_industry_name)
+    x["industry_seed"] = x["industry"].map(normalize_official_industry_name).replace("", pd.NA)
     if "industry_official" in x.columns:
         x["industry_seed"] = x["industry_seed"].fillna(x["industry_official"].replace("", pd.NA))
     if "industry_manual" in x.columns:
@@ -1307,7 +1351,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     ai_rows.columns = ["industry_ai", "theme_ai", "sub_theme_ai", "source_ai", "confidence_ai", "note_ai"]
     x = pd.concat([x, ai_rows], axis=1)
 
-    x["industry_final"] = x["industry_seed"].astype(str)
+    x["industry_final"] = x["industry_seed"].astype(str).map(normalize_official_industry_name)
     x["theme_final"] = x["theme_seed"].astype(str)
     x["sub_theme_final"] = x["sub_theme_seed"].astype(str)
 
@@ -1315,9 +1359,17 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     missing_theme = x["theme_final"].map(_is_missing_classification_value)
     missing_sub = x["sub_theme_final"].map(_is_missing_classification_value)
 
-    x.loc[missing_industry, "industry_final"] = x.loc[missing_industry, "industry_ai"]
+    x.loc[missing_industry, "industry_final"] = x.loc[missing_industry, "industry_ai"].map(normalize_official_industry_name)
     x.loc[missing_theme, "theme_final"] = x.loc[missing_theme, "theme_ai"]
     x.loc[missing_sub, "sub_theme_final"] = x.loc[missing_sub, "sub_theme_ai"]
+
+    industry_map_rows = x["industry_final"].map(lambda s: INDUSTRY_THEME_MAP.get(normalize_official_industry_name(s), ("", "", "")))
+    industry_map_df = pd.DataFrame(industry_map_rows.tolist(), columns=["industry_from_map", "theme_from_map", "sub_from_map"], index=x.index)
+    x = pd.concat([x, industry_map_df], axis=1)
+    missing_theme = x["theme_final"].map(_is_missing_classification_value)
+    missing_sub = x["sub_theme_final"].map(_is_missing_classification_value)
+    x.loc[missing_theme, "theme_final"] = x.loc[missing_theme, "theme_from_map"]
+    x.loc[missing_sub, "sub_theme_final"] = x.loc[missing_sub, "sub_from_map"]
 
     rule_used_mask = x["classification_source"].eq("") & x["source_ai"].isin(["rule_engine", "ai_infer"])
     x.loc[rule_used_mask, "classification_source"] = x.loc[rule_used_mask, "source_ai"]
@@ -4009,7 +4061,7 @@ class AppUI:
             self.ui_call(self.update_task, "更新分類檔", 1, 4, item="檢查本機快取")
             current = ensure_classification_book(force_refresh=False, log_cb=lambda m: self.ui_call(self.append_log, m))
             if current is not None:
-                self.ui_call(self.append_log, f"目前分類來源：{current}")
+                self.ui_call(self.append_log, f"目前官方分類來源：{current}")
             self.ui_call(self.update_task, "更新分類檔", 2, 4, item="下載最新官方分類來源")
             refreshed = ensure_classification_book(force_refresh=True, log_cb=lambda m: self.ui_call(self.append_log, m))
             if refreshed is None:
@@ -4023,7 +4075,7 @@ class AppUI:
             stale_text = "是" if status.get("is_stale") else "否"
             self.ui_call(self.finish_task, "更新分類檔", f"分類來源更新完成：{Path(refreshed).name}｜共 {len(official)} 筆")
             self.ui_call(self.append_log, f"分類來源更新完成：{refreshed}｜可辨識 {len(official)} 筆｜過期={stale_text}")
-            self.ui_call(messagebox.showinfo, "完成", f"分類來源更新完成：\n{refreshed}\n\n可辨識筆數：{len(official)}\n是否過期：{stale_text}\n\n下一步請執行『初始化全市場』以重建主檔分類。\n\n現在官方產業優先採用 MOPS CSV。")
+            self.ui_call(messagebox.showinfo, "完成", f"分類來源更新完成：\n{refreshed}\n\n可辨識筆數：{len(official)}\n是否過期：{stale_text}\n\n下一步請執行「初始化全市場」以重建主檔分類。\n\n現在官方產業優先採用 MOPS CSV，題材/子題材則由手動映射 + 規則引擎 + AI 補值。")
         self._run_in_thread(worker, "update_classification_book")
 
     def cancel_current_job(self):
