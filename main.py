@@ -244,9 +244,11 @@ def resolve_master_csv() -> Path:
     return ensure_external_master_csv()
 
 
-CLASSIFICATION_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
+CLASSIFICATION_DOWNLOAD_URL = "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv"
+CLASSIFICATION_LEGACY_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
 CLASSIFICATION_CACHE_DIR = EXTERNAL_DATA_DIR / "classification"
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CLASSIFICATION_CACHE_CSV = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上市.csv"
 CLASSIFICATION_CACHE_XLS = CLASSIFICATION_CACHE_DIR / "台股類股分類.xls"
 CLASSIFICATION_CACHE_XLSX = CLASSIFICATION_CACHE_DIR / "台股類股分類.xlsx"
 CLASSIFICATION_META_PATH = CLASSIFICATION_CACHE_DIR / "classification_meta.json"
@@ -287,6 +289,13 @@ def classification_debug_log(message: str, level: str = "INFO"):
 
 
 CLASSIFICATION_BOOK_CANDIDATES = [
+    RUNTIME_DIR / "台股官方產業分類_上市.csv",
+    EXTERNAL_DATA_DIR / "台股官方產業分類_上市.csv",
+    CLASSIFICATION_CACHE_CSV,
+    BASE_DIR / "台股官方產業分類_上市.csv",
+    RUNTIME_DIR / "台股類股分類.csv",
+    EXTERNAL_DATA_DIR / "台股類股分類.csv",
+    BASE_DIR / "台股類股分類.csv",
     RUNTIME_DIR / "台股類股分類.xlsx",
     RUNTIME_DIR / "台股類股分類.xls",
     RUNTIME_DIR / "股票類別對照表.xlsx",
@@ -437,6 +446,53 @@ def normalize_stock_id(v) -> str:
     return code.zfill(4) if len(code) == 4 else code
 
 
+def safe_read_csv_auto(path: Path) -> pd.DataFrame:
+    path = Path(path)
+    last_error = None
+    for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+        try:
+            return pd.read_csv(path, encoding=enc, dtype=str).fillna("")
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"CSV讀取失敗：{path}｜{last_error}")
+
+
+def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    x = df.copy().fillna("")
+    x.columns = _coerce_unique_columns(x.columns)
+
+    code_col = None
+    name_col = None
+    industry_col = None
+
+    for c in x.columns:
+        base = str(c).split("__dup")[0].strip()
+        if base in ("公司代號", "股票代號", "證券代號", "公司代碼"):
+            code_col = c if code_col is None else code_col
+        elif base in ("公司名稱", "公司簡稱", "證券名稱", "股票名稱"):
+            name_col = c if name_col is None else name_col
+        elif base in ("產業別", "產業類別", "新產業類別", "新產業別"):
+            industry_col = c if industry_col is None else industry_col
+
+    if code_col is None or industry_col is None:
+        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    out = pd.DataFrame({
+        "stock_id": x[code_col].map(normalize_stock_id),
+        "stock_name_official": x[name_col].astype(str).str.strip() if name_col in x.columns else "",
+        "industry_official": x[industry_col].astype(str).str.strip(),
+    })
+    out["stock_name_norm_official"] = out["stock_name_official"].map(_normalize_stock_name_for_match)
+    out["market_official"] = market
+    out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
+    if out.empty:
+        return out
+    return out[["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]].drop_duplicates(subset=["stock_id"], keep="first")
+
+
 def _try_convert_xls_to_xlsx(src: Path, dst: Path) -> Optional[Path]:
     try:
         if not src.exists():
@@ -567,48 +623,42 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
     for attempt in range(1, CLASSIFICATION_DOWNLOAD_RETRIES + 1):
         try:
             if log_cb:
-                log_cb(f"分類檔下載開始（第 {attempt}/{CLASSIFICATION_DOWNLOAD_RETRIES} 次）：{CLASSIFICATION_DOWNLOAD_URL}")
+                log_cb(f"分類來源下載開始（第 {attempt}/{CLASSIFICATION_DOWNLOAD_RETRIES} 次）：{CLASSIFICATION_DOWNLOAD_URL}")
             resp = requests.get(
                 CLASSIFICATION_DOWNLOAD_URL,
                 timeout=CLASSIFICATION_DOWNLOAD_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mopsfin.twse.com.tw/"}
             )
             resp.raise_for_status()
-            if not resp.content or len(resp.content) < 4096:
+            content = resp.content or b""
+            if len(content) < 256:
                 raise ValueError("下載內容過小，疑似失敗或非有效檔案")
 
-            CLASSIFICATION_CACHE_XLS.write_bytes(resp.content)
+            CLASSIFICATION_CACHE_CSV.write_bytes(content)
             if log_cb:
-                log_cb(f"分類檔已下載到快取：{CLASSIFICATION_CACHE_XLS}")
-
-            target_path = CLASSIFICATION_CACHE_XLS
-            converted = convert_xls_to_xlsx_force(CLASSIFICATION_CACHE_XLS, CLASSIFICATION_CACHE_XLSX, log_cb=log_cb)
-            if converted is not None and converted.exists():
-                target_path = converted
-            else:
-                if log_cb:
-                    log_cb("xlsx 轉檔失敗，保留原始 xls；正式載入時會再嘗試轉檔")
+                log_cb(f"官方分類CSV已下載到快取：{CLASSIFICATION_CACHE_CSV}")
 
             try:
-                probe = safe_read_excel(target_path)
-                if probe is None or probe.empty:
-                    raise RuntimeError("分類檔可開啟，但無可用資料")
+                probe = safe_read_csv_auto(CLASSIFICATION_CACHE_CSV)
+                parsed = _extract_official_csv_rows(probe, market="上市")
+                if parsed is None or parsed.empty:
+                    raise RuntimeError("CSV可讀取，但無可用官方產業資料")
             except Exception as exc:
-                raise RuntimeError(f"分類檔下載成功，但驗證失敗：{exc}") from exc
+                raise RuntimeError(f"分類來源下載成功，但驗證失敗：{exc}") from exc
 
-            meta = _build_classification_meta(target_path, source="TWSE", note=f"download attempt {attempt}")
+            meta = _build_classification_meta(CLASSIFICATION_CACHE_CSV, source="MOPS-CSV", note=f"download attempt {attempt}")
             _write_classification_meta(meta)
             CLASSIFICATION_MEMORY_CACHE["df"] = None
             CLASSIFICATION_MEMORY_CACHE["path"] = None
             CLASSIFICATION_MEMORY_CACHE["mtime"] = None
             CLASSIFICATION_MEMORY_CACHE["meta"] = meta
-            _set_classification_load_info(False, 0, target_path, "已下載，待正式載入")
-            return target_path
+            _set_classification_load_info(False, 0, CLASSIFICATION_CACHE_CSV, "已下載官方CSV，待正式載入")
+            return CLASSIFICATION_CACHE_CSV
         except Exception as exc:
             last_error = exc
-            log_warning(f"分類檔下載失敗（第 {attempt} 次）：{exc}")
+            log_warning(f"分類來源下載失敗（第 {attempt} 次）：{exc}")
             if log_cb:
-                log_cb(f"分類檔下載失敗（第 {attempt} 次）：{exc}")
+                log_cb(f"分類來源下載失敗（第 {attempt} 次）：{exc}")
             if attempt < CLASSIFICATION_DOWNLOAD_RETRIES:
                 time.sleep(min(2 * attempt, 5))
 
@@ -622,21 +672,27 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
     return None
 
 
-def _iter_classification_candidates_prefer_xlsx():
-    xlsx_first = []
+def _iter_classification_candidates_prefer_xlsx():def _iter_classification_candidates_prefer_xlsx():
+    csv_first = []
+    xlsx_second = []
     xls_after = []
+    others = []
     for p in CLASSIFICATION_BOOK_CANDIDATES:
         pp = Path(p)
         if not pp.exists():
             continue
-        if pp.suffix.lower() == ".xlsx":
-            xlsx_first.append(pp)
-        else:
+        suffix = pp.suffix.lower()
+        if suffix == ".csv":
+            csv_first.append(pp)
+        elif suffix == ".xlsx":
+            xlsx_second.append(pp)
+        elif suffix == ".xls":
             xls_after.append(pp)
-    # 去重並保留順序
+        else:
+            others.append(pp)
     seen = set()
     ordered = []
-    for pp in xlsx_first + xls_after:
+    for pp in csv_first + xlsx_second + xls_after + others:
         key = str(pp.resolve()) if pp.exists() else str(pp)
         if key in seen:
             continue
@@ -731,27 +787,28 @@ def _extract_official_sheet_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFr
 
 def load_official_classification_book() -> pd.DataFrame:
     """
-    將官方分類檔視為「補充分類來源」，不是完整全市場主檔。
-    - 優先讀取 xlsx
-    - xls 僅在可成功轉檔後才使用
-    - 允許工作表欄位名稱不一致，並處理重複欄名（尤其興櫃表）
-    - 分類載入失敗時，強制把失敗原因 / 實際檔名 / sheet / 欄位資訊打到右下 Log
+    將官方分類來源視為「補充分類來源」，不是完整全市場主檔。
+    優先順序：
+    1. MOPS 官方 CSV
+    2. 本機 xlsx
+    3. xls 僅在可成功轉檔後才使用
     """
     path = ensure_classification_book(force_refresh=False)
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
     if path is None:
-        note = "找不到分類檔"
+        note = "找不到官方分類來源"
         classification_debug_log(note, "ERROR")
         CLASSIFICATION_MEMORY_CACHE["df"] = None
         CLASSIFICATION_MEMORY_CACHE["path"] = None
         CLASSIFICATION_MEMORY_CACHE["mtime"] = None
-        _mark_classification_meta_status("missing", note="no classification book found")
+        _mark_classification_meta_status("missing", note="no classification source found")
         _set_classification_load_info(False, 0, None, note)
         return empty_df
 
     path = Path(path)
-    classification_debug_log(f"實際讀到的分類檔：{path}")
+    classification_debug_log(f"實際讀到的分類來源：{path}")
     final_read_path = path
+
     if path.suffix.lower() == ".xls":
         sibling_xlsx = path.with_suffix(".xlsx")
         if sibling_xlsx.exists() and sibling_xlsx.stat().st_size > 0:
@@ -765,13 +822,10 @@ def load_official_classification_book() -> pd.DataFrame:
                 classification_debug_log(f"轉檔完成，改讀：{final_read_path}")
             else:
                 classification_debug_log(f"xls 轉 xlsx 失敗：{path}", "WARNING")
-
-    if final_read_path.suffix.lower() != ".xlsx":
-        note = "分類檔未能轉成 xlsx，無法作為補充分類來源"
-        classification_debug_log(note, "ERROR")
-        _mark_classification_meta_status("fallback", note=note, path=path)
-        _set_classification_load_info(False, 0, path, note)
-        return empty_df
+                note = "分類檔未能轉成 xlsx，無法作為補充分類來源"
+                _mark_classification_meta_status("fallback", note=note, path=path)
+                _set_classification_load_info(False, 0, path, note)
+                return empty_df
 
     try:
         current_mtime = float(final_read_path.stat().st_mtime)
@@ -806,75 +860,77 @@ def load_official_classification_book() -> pd.DataFrame:
         except Exception as exc:
             classification_debug_log(f"pickle 快取讀取失敗：{exc}", "WARNING")
 
-    parts = []
-    sheet_debug_rows = []
     try:
-        classification_debug_log(f"開始解析 Excel：{final_read_path}")
-        xl = pd.ExcelFile(final_read_path, engine="openpyxl")
-        classification_debug_log(f"sheet 名稱：{', '.join([str(s) for s in xl.sheet_names]) if xl.sheet_names else '(無)'}")
-        for sheet in xl.sheet_names:
-            try:
-                df = xl.parse(sheet)
-            except Exception as exc:
-                classification_debug_log(f"sheet 讀取失敗：{sheet}｜{exc}", "WARNING")
-                sheet_debug_rows.append({"sheet": str(sheet), "rows": 0, "cols": 0, "columns": [], "matched": 0, "error": str(exc)})
-                continue
+        if final_read_path.suffix.lower() == ".csv":
+            classification_debug_log(f"開始解析官方CSV：{final_read_path}")
+            raw = safe_read_csv_auto(final_read_path)
+            out = _extract_official_csv_rows(raw, market="上市")
+            if out is None or out.empty:
+                raise RuntimeError("官方CSV可讀取，但沒有可用的公司代號/產業別資料")
+        else:
+            parts = []
+            sheet_debug_rows = []
+            classification_debug_log(f"開始解析 Excel：{final_read_path}")
+            xl = pd.ExcelFile(final_read_path, engine="openpyxl")
+            classification_debug_log(f"sheet 名稱：{', '.join([str(s) for s in xl.sheet_names]) if xl.sheet_names else '(無)'}")
+            for sheet in xl.sheet_names:
+                try:
+                    df = xl.parse(sheet)
+                except Exception as exc:
+                    classification_debug_log(f"sheet 讀取失敗：{sheet}｜{exc}", "WARNING")
+                    sheet_debug_rows.append({"sheet": str(sheet), "rows": 0, "cols": 0, "columns": [], "matched": 0, "error": str(exc)})
+                    continue
 
-            col_list = [str(c) for c in list(df.columns)]
-            parsed = _extract_official_sheet_rows(df, sheet)
-            matched_rows = len(parsed) if parsed is not None else 0
-            sheet_debug_rows.append({
-                "sheet": str(sheet),
-                "rows": int(len(df)),
-                "cols": int(len(df.columns)),
-                "columns": col_list[:50],
-                "matched": int(matched_rows),
-                "error": ""
-            })
-            classification_debug_log(
-                f"sheet={sheet}｜原始 rows={len(df)} cols={len(df.columns)}｜欄位={col_list[:12]}｜匹配列數={matched_rows}"
-            )
-            if parsed is not None and not parsed.empty:
-                parts.append(parsed)
+                col_list = [str(c) for c in list(df.columns)]
+                parsed = _extract_official_sheet_rows(df, sheet)
+                matched_rows = len(parsed) if parsed is not None else 0
+                sheet_debug_rows.append({
+                    "sheet": str(sheet),
+                    "rows": int(len(df)),
+                    "cols": int(len(df.columns)),
+                    "columns": col_list[:50],
+                    "matched": int(matched_rows),
+                    "error": ""
+                })
+                classification_debug_log(
+                    f"sheet={sheet}｜原始 rows={len(df)} cols={len(df.columns)}｜欄位={col_list[:12]}｜匹配列數={matched_rows}"
+                )
+                if parsed is not None and not parsed.empty:
+                    parts.append(parsed)
+
+            if not parts:
+                details = []
+                for item in sheet_debug_rows:
+                    details.append(
+                        f"sheet={item['sheet']}｜rows={item['rows']} cols={item['cols']}｜matched={item['matched']}｜欄位={item['columns'][:12]}" + (f"｜error={item['error']}" if item.get('error') else "")
+                    )
+                note = "無可用工作表或欄位"
+                classification_debug_log(f"分類載入失敗：{note}", "ERROR")
+                if details:
+                    for line in details:
+                        classification_debug_log(line, "ERROR")
+                _mark_classification_meta_status("empty", note=(note + " | " + " || ".join(details[:10]))[:4000], path=final_read_path)
+                _set_classification_load_info(False, 0, final_read_path, note)
+                return empty_df
+
+            out = pd.concat(parts, ignore_index=True).fillna("")
+            out["stock_id"] = out["stock_id"].astype(str).map(normalize_stock_id)
+            out["industry_official"] = out["industry_official"].astype(str).str.strip()
+            out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
+            out = out.sort_values(["stock_id", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
+            if out.empty:
+                note = "標準化後無有效資料"
+                classification_debug_log(f"分類載入失敗：{note}", "ERROR")
+                _mark_classification_meta_status("empty", note=note, path=final_read_path)
+                _set_classification_load_info(False, 0, final_read_path, note)
+                return empty_df
     except Exception as exc:
         note = str(exc)
-        classification_debug_log(f"分類檔解析失敗：{note}", "ERROR")
+        classification_debug_log(f"分類來源解析失敗：{note}", "ERROR")
         _mark_classification_meta_status("damaged", note=note, path=final_read_path)
         CLASSIFICATION_MEMORY_CACHE["df"] = None
         CLASSIFICATION_MEMORY_CACHE["path"] = None
         CLASSIFICATION_MEMORY_CACHE["mtime"] = None
-        _set_classification_load_info(False, 0, final_read_path, note)
-        return empty_df
-
-    if not parts:
-        details = []
-        for item in sheet_debug_rows:
-            details.append(
-                f"sheet={item['sheet']}｜rows={item['rows']} cols={item['cols']}｜matched={item['matched']}｜欄位={item['columns'][:12]}" + (f"｜error={item['error']}" if item.get('error') else "")
-            )
-        note = "無可用工作表或欄位"
-        classification_debug_log(f"分類載入失敗：{note}", "ERROR")
-        if details:
-            for line in details:
-                classification_debug_log(line, "ERROR")
-        _mark_classification_meta_status("empty", note=(note + " | " + " || ".join(details[:10]))[:4000], path=final_read_path)
-        _set_classification_load_info(False, 0, final_read_path, note)
-        return empty_df
-
-    out = pd.concat(parts, ignore_index=True).fillna("")
-    out["stock_id"] = out["stock_id"].astype(str).map(normalize_stock_id)
-    out["industry_official"] = out["industry_official"].astype(str).str.strip()
-    out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
-    out = out.sort_values(["stock_id", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
-    if out.empty:
-        note = "標準化後無有效資料"
-        classification_debug_log(f"分類載入失敗：{note}", "ERROR")
-        for item in sheet_debug_rows[:10]:
-            classification_debug_log(
-                f"sheet={item['sheet']}｜rows={item['rows']} cols={item['cols']}｜matched={item['matched']}｜欄位={item['columns'][:12]}",
-                "ERROR"
-            )
-        _mark_classification_meta_status("empty", note=note, path=final_read_path)
         _set_classification_load_info(False, 0, final_read_path, note)
         return empty_df
 
@@ -883,7 +939,8 @@ def load_official_classification_book() -> pd.DataFrame:
     except Exception as exc:
         classification_debug_log(f"寫入分類 pickle 快取失敗：{exc}", "WARNING")
 
-    meta = _build_classification_meta(final_read_path, source="TWSE-XLSX", note=f"supplement loaded rows={len(out)}")
+    source_name = "MOPS-CSV" if final_read_path.suffix.lower() == ".csv" else "TWSE-XLSX"
+    meta = _build_classification_meta(final_read_path, source=source_name, note=f"supplement loaded rows={len(out)}")
     _write_classification_meta(meta)
     CLASSIFICATION_MEMORY_CACHE["df"] = out.copy()
     CLASSIFICATION_MEMORY_CACHE["path"] = str(final_read_path)
@@ -894,8 +951,7 @@ def load_official_classification_book() -> pd.DataFrame:
     return out
 
 
-
-def load_manual_theme_mapping() -> pd.DataFrame:
+def load_manual_theme_mapping() -> pd.DataFrame:def load_manual_theme_mapping() -> pd.DataFrame:
 
     manual_parts = []
     try:
@@ -3953,21 +4009,21 @@ class AppUI:
             self.ui_call(self.update_task, "更新分類檔", 1, 4, item="檢查本機快取")
             current = ensure_classification_book(force_refresh=False, log_cb=lambda m: self.ui_call(self.append_log, m))
             if current is not None:
-                self.ui_call(self.append_log, f"目前分類檔：{current}")
-            self.ui_call(self.update_task, "更新分類檔", 2, 4, item="下載最新分類檔")
+                self.ui_call(self.append_log, f"目前分類來源：{current}")
+            self.ui_call(self.update_task, "更新分類檔", 2, 4, item="下載最新官方分類來源")
             refreshed = ensure_classification_book(force_refresh=True, log_cb=lambda m: self.ui_call(self.append_log, m))
             if refreshed is None:
-                raise RuntimeError("分類檔下載失敗，且本機沒有可用快取。")
-            self.ui_call(self.update_task, "更新分類檔", 3, 4, item="驗證分類檔內容")
+                raise RuntimeError("官方分類來源下載失敗，且本機沒有可用快取。")
+            self.ui_call(self.update_task, "更新分類檔", 3, 4, item="驗證官方分類來源")
             official = load_official_classification_book()
             if official is None or official.empty:
-                raise RuntimeError(f"分類檔存在，但無法成功讀取：{refreshed}")
+                raise RuntimeError(f"分類來源存在，但無法成功讀取：{refreshed}")
             self.ui_call(self.update_task, "更新分類檔", 4, 4, success=1, item=Path(refreshed).name)
             status = get_classification_status()
             stale_text = "是" if status.get("is_stale") else "否"
-            self.ui_call(self.finish_task, "更新分類檔", f"分類檔更新完成：{Path(refreshed).name}｜共 {len(official)} 筆")
-            self.ui_call(self.append_log, f"分類檔更新完成：{refreshed}｜可辨識 {len(official)} 筆｜過期={stale_text}")
-            self.ui_call(messagebox.showinfo, "完成", f"分類檔更新完成：\n{refreshed}\n\n可辨識筆數：{len(official)}\n是否過期：{stale_text}\n\n下一步請執行『初始化全市場』以重建主檔分類。")
+            self.ui_call(self.finish_task, "更新分類檔", f"分類來源更新完成：{Path(refreshed).name}｜共 {len(official)} 筆")
+            self.ui_call(self.append_log, f"分類來源更新完成：{refreshed}｜可辨識 {len(official)} 筆｜過期={stale_text}")
+            self.ui_call(messagebox.showinfo, "完成", f"分類來源更新完成：\n{refreshed}\n\n可辨識筆數：{len(official)}\n是否過期：{stale_text}\n\n下一步請執行『初始化全市場』以重建主檔分類。\n\n現在官方產業優先採用 MOPS CSV。")
         self._run_in_thread(worker, "update_classification_book")
 
     def cancel_current_job(self):
