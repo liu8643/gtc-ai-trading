@@ -558,7 +558,7 @@ def convert_xls_to_xlsx_force(src: Path, dst: Path, log_cb=None) -> Optional[Pat
 
 
 def download_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
-    existing = None if force_refresh else next((p for p in CLASSIFICATION_BOOK_CANDIDATES if p.exists()), None)
+    existing = None if force_refresh else next(iter(_iter_classification_candidates_prefer_xlsx()), None)
     if existing is not None and not force_refresh:
         return existing
 
@@ -612,7 +612,7 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
             if attempt < CLASSIFICATION_DOWNLOAD_RETRIES:
                 time.sleep(min(2 * attempt, 5))
 
-    fallback = next((p for p in CLASSIFICATION_BOOK_CANDIDATES if p.exists()), None)
+    fallback = next(iter(_iter_classification_candidates_prefer_xlsx()), None)
     if fallback is not None:
         _mark_classification_meta_status("fallback", note=f"download failed: {last_error}", path=fallback)
         _set_classification_load_info(False, 0, fallback, f"下載失敗，使用既有檔：{last_error}")
@@ -622,14 +622,36 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
     return None
 
 
+def _iter_classification_candidates_prefer_xlsx():
+    xlsx_first = []
+    xls_after = []
+    for p in CLASSIFICATION_BOOK_CANDIDATES:
+        pp = Path(p)
+        if not pp.exists():
+            continue
+        if pp.suffix.lower() == ".xlsx":
+            xlsx_first.append(pp)
+        else:
+            xls_after.append(pp)
+    # 去重並保留順序
+    seen = set()
+    ordered = []
+    for pp in xlsx_first + xls_after:
+        key = str(pp.resolve()) if pp.exists() else str(pp)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(pp)
+    return ordered
+
+
 def ensure_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
     if not force_refresh:
-        for p in CLASSIFICATION_BOOK_CANDIDATES:
-            if p.exists():
-                meta = _read_classification_meta()
-                if not meta or Path(meta.get("path", "")) != p:
-                    _write_classification_meta(_build_classification_meta(p, source="LOCAL", note="discovered existing file"))
-                return p
+        for p in _iter_classification_candidates_prefer_xlsx():
+            meta = _read_classification_meta()
+            if not meta or Path(meta.get("path", "")) != p:
+                _write_classification_meta(_build_classification_meta(p, source="LOCAL", note="discovered existing file"))
+            return p
     return download_classification_book(force_refresh=force_refresh, log_cb=log_cb)
 
 def resolve_classification_book() -> Optional[Path]:
@@ -731,13 +753,18 @@ def load_official_classification_book() -> pd.DataFrame:
     classification_debug_log(f"實際讀到的分類檔：{path}")
     final_read_path = path
     if path.suffix.lower() == ".xls":
-        classification_debug_log(f"偵測到 xls，嘗試轉成 xlsx：{path.name}")
-        converted = convert_xls_to_xlsx_force(path, CLASSIFICATION_CACHE_XLSX, log_cb=lambda m: classification_debug_log(m))
-        if converted is not None and converted.exists():
-            final_read_path = converted
-            classification_debug_log(f"轉檔完成，改讀：{final_read_path}")
+        sibling_xlsx = path.with_suffix(".xlsx")
+        if sibling_xlsx.exists() and sibling_xlsx.stat().st_size > 0:
+            final_read_path = sibling_xlsx
+            classification_debug_log(f"偵測到同名 xlsx，優先改讀：{final_read_path}")
         else:
-            classification_debug_log(f"xls 轉 xlsx 失敗：{path}", "WARNING")
+            classification_debug_log(f"偵測到 xls，嘗試轉成 xlsx：{path.name}")
+            converted = convert_xls_to_xlsx_force(path, CLASSIFICATION_CACHE_XLSX, log_cb=lambda m: classification_debug_log(m))
+            if converted is not None and converted.exists():
+                final_read_path = converted
+                classification_debug_log(f"轉檔完成，改讀：{final_read_path}")
+            else:
+                classification_debug_log(f"xls 轉 xlsx 失敗：{path}", "WARNING")
 
     if final_read_path.suffix.lower() != ".xlsx":
         note = "分類檔未能轉成 xlsx，無法作為補充分類來源"
@@ -914,7 +941,12 @@ def _safe_int(v, default: int = 0) -> int:
 
 
 def _is_placeholder_text(v) -> bool:
-    return str(v or "").strip() in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None")
+    return str(v or "").strip() in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
+
+
+def _is_missing_classification_value(v) -> bool:
+    s = str(v or "").strip()
+    return s in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
 
 
 def _choose_text(*values, default: str = "") -> str:
@@ -1015,7 +1047,7 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
         if col not in x.columns:
             x[col] = ""
 
-    unclassified_mask = (x["industry_final"].astype(str).isin(["", "未分類"]) | x["theme_final"].astype(str).isin(["", "全市場"]) | x["sub_theme_final"].astype(str).isin(["", "系統掃描"]))
+    unclassified_mask = (x["industry_final"].map(_is_missing_classification_value) | x["theme_final"].map(_is_missing_classification_value) | x["sub_theme_final"].map(_is_missing_classification_value))
     unclassified = x.loc[unclassified_mask, ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]].copy().sort_values(["classification_source", "stock_id"])
 
     source_counts = x["classification_source"].astype(str).value_counts().to_dict()
@@ -1186,10 +1218,21 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
 
     x["theme_seed"] = x["theme"] if "theme" in x.columns else ""
     x["sub_theme_seed"] = x["sub_theme"] if "sub_theme" in x.columns else ""
+
+    def _clean_classification_seed(series: pd.Series) -> pd.Series:
+        s = series.astype(str).str.strip()
+        s = s.replace({"<NA>": "", "nan": "", "None": "", "N/A": "", "NaN": "", "null": "", "NULL": ""})
+        return s
+
+    x["theme_seed"] = _clean_classification_seed(x["theme_seed"])
+    x["sub_theme_seed"] = _clean_classification_seed(x["sub_theme_seed"])
+
     if "theme_manual" in x.columns:
-        x["theme_seed"] = x["theme_seed"].replace("", pd.NA).fillna(x["theme_manual"].replace("", pd.NA))
+        manual_theme = _clean_classification_seed(x["theme_manual"])
+        x["theme_seed"] = x["theme_seed"].replace("", pd.NA).fillna(manual_theme.replace("", pd.NA))
     if "sub_theme_manual" in x.columns:
-        x["sub_theme_seed"] = x["sub_theme_seed"].replace("", pd.NA).fillna(x["sub_theme_manual"].replace("", pd.NA))
+        manual_sub_theme = _clean_classification_seed(x["sub_theme_manual"])
+        x["sub_theme_seed"] = x["sub_theme_seed"].replace("", pd.NA).fillna(manual_sub_theme.replace("", pd.NA))
 
     x["classification_source"] = ""
     x.loc[x.get("industry_official", "").astype(str).str.strip() != "", "classification_source"] = "official"
@@ -1212,9 +1255,9 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x["theme_final"] = x["theme_seed"].astype(str)
     x["sub_theme_final"] = x["sub_theme_seed"].astype(str)
 
-    missing_industry = x["industry_final"].astype(str).isin(["", "未分類"])
-    missing_theme = x["theme_final"].astype(str).isin(["", "全市場"])
-    missing_sub = x["sub_theme_final"].astype(str).isin(["", "系統掃描"])
+    missing_industry = x["industry_final"].map(_is_missing_classification_value)
+    missing_theme = x["theme_final"].map(_is_missing_classification_value)
+    missing_sub = x["sub_theme_final"].map(_is_missing_classification_value)
 
     x.loc[missing_industry, "industry_final"] = x.loc[missing_industry, "industry_ai"]
     x.loc[missing_theme, "theme_final"] = x.loc[missing_theme, "theme_ai"]
@@ -1225,14 +1268,14 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x.loc[rule_used_mask, "classification_confidence"] = x.loc[rule_used_mask, "confidence_ai"].astype(int)
     x.loc[rule_used_mask, "classification_note"] = x.loc[rule_used_mask, "note_ai"].astype(str)
 
-    supplement_mask = ~x["classification_source"].eq("") & (x["theme_final"].astype(str).isin(["", "全市場"]) | x["sub_theme_final"].astype(str).isin(["", "系統掃描"]))
+    supplement_mask = ~x["classification_source"].eq("") & (x["theme_final"].map(_is_missing_classification_value) | x["sub_theme_final"].map(_is_missing_classification_value))
     x.loc[supplement_mask, "theme_final"] = x.loc[supplement_mask, "theme_ai"]
     x.loc[supplement_mask, "sub_theme_final"] = x.loc[supplement_mask, "sub_theme_ai"]
     x.loc[supplement_mask & x["classification_note"].eq(""), "classification_note"] = x.loc[supplement_mask, "note_ai"].astype(str)
 
-    x["industry_final"] = x["industry_final"].replace("", "未分類")
-    x["theme_final"] = x["theme_final"].replace("", "全市場")
-    x["sub_theme_final"] = x["sub_theme_final"].replace("", "系統掃描")
+    x["industry_final"] = x["industry_final"].astype(str).str.strip().replace({"": "未分類", "<NA>": "未分類", "nan": "未分類", "None": "未分類"})
+    x["theme_final"] = x["theme_final"].astype(str).str.strip().replace({"": "全市場", "<NA>": "全市場", "nan": "全市場", "None": "全市場"})
+    x["sub_theme_final"] = x["sub_theme_final"].astype(str).str.strip().replace({"": "系統掃描", "<NA>": "系統掃描", "nan": "系統掃描", "None": "系統掃描"})
     x.loc[x["is_etf"].eq(1), ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]] = ["ETF", "ETF", "ETF", "manual", 98, "ETF normalized"]
 
     x["industry"] = x["industry_final"]
