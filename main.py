@@ -256,6 +256,9 @@ CLASSIFICATION_DOWNLOAD_TIMEOUT = (10, 45)
 CLASSIFICATION_DOWNLOAD_RETRIES = 3
 CLASSIFICATION_MEMORY_CACHE = {"df": None, "path": None, "mtime": None, "meta": None}
 LAST_CLASSIFICATION_LOAD_INFO = {"loaded": False, "rows": 0, "path": "", "note": "尚未載入"}
+CLASSIFICATION_V2_SUMMARY_PATH = CLASSIFICATION_CACHE_DIR / "classification_v2_summary.json"
+CLASSIFICATION_V2_UNCLASSIFIED_PATH = CLASSIFICATION_CACHE_DIR / "unclassified_report.xlsx"
+CLASSIFICATION_V2_LAST_SUMMARY = {}
 
 CLASSIFICATION_LOG_CALLBACK = None
 
@@ -903,6 +906,142 @@ def load_manual_theme_mapping() -> pd.DataFrame:
     })
 
 
+def _safe_int(v, default: int = 0) -> int:
+    try:
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _is_placeholder_text(v) -> bool:
+    return str(v or "").strip() in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None")
+
+
+def _choose_text(*values, default: str = "") -> str:
+    for v in values:
+        s = str(v or "").strip()
+        if s and not _is_placeholder_text(s):
+            return s
+    return str(default or "")
+
+
+def _write_json_safe(path: Path, payload: dict):
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _write_unclassified_report(df: pd.DataFrame):
+    try:
+        if df is None:
+            return
+        CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        engine = available_excel_engine()
+        if engine:
+            with pd.ExcelWriter(CLASSIFICATION_V2_UNCLASSIFIED_PATH, engine=engine) as writer:
+                df.to_excel(writer, sheet_name="Unclassified", index=False)
+        else:
+            df.to_csv(CLASSIFICATION_V2_UNCLASSIFIED_PATH.with_suffix('.csv'), index=False, encoding='utf-8-sig')
+    except Exception:
+        pass
+
+
+def get_classification_v2_summary() -> dict:
+    global CLASSIFICATION_V2_LAST_SUMMARY
+    if isinstance(CLASSIFICATION_V2_LAST_SUMMARY, dict) and CLASSIFICATION_V2_LAST_SUMMARY:
+        return dict(CLASSIFICATION_V2_LAST_SUMMARY)
+    try:
+        if CLASSIFICATION_V2_SUMMARY_PATH.exists():
+            data = json.loads(CLASSIFICATION_V2_SUMMARY_PATH.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                CLASSIFICATION_V2_LAST_SUMMARY = dict(data)
+                return dict(data)
+    except Exception:
+        pass
+    return {}
+
+
+def infer_ai_classification(stock_name: str, industry_hint: str = "", market_hint: str = "", is_etf: int = 0) -> tuple[str, str, str, str, int, str]:
+    name = str(stock_name or "").strip()
+    industry_hint = str(industry_hint or "").strip()
+    market_hint = str(market_hint or "").strip()
+    if int(is_etf or 0) == 1 or re.search(r"ETF|台灣50|高股息|中型100|科技優息|精選高息", name, flags=re.I):
+        return ("ETF", "ETF", "ETF", "ai_infer", 98, "ETF keyword")
+
+    ai_rules = [
+        (r"華星光|上詮|聯鈞|波若威|光聖|聯亞|眾達|前鼎|立碁|環宇|光環|聯光通|眾達-KY", ("光通訊", "CPO/光模組", "高速光通訊", 94, "光通訊/CPO keyword")),
+        (r"智邦|智易|中磊|啟碁|正文|建漢|神準|明泰|友訊|合勤控|振曜", ("網通", "資料中心交換器", "高階網通", 90, "網通 keyword")),
+        (r"台積電|創意|世芯|世芯-KY|晶心科|聯發科|聯詠|祥碩|M31|力旺|智原|信驊", ("半導體", "AI/晶圓代工", "半導體", 92, "半導體 keyword")),
+        (r"奇鋐|雙鴻|建準|高力|力致|超眾|健策", ("散熱", "AI散熱", "液冷", 90, "散熱 keyword")),
+        (r"鴻海|廣達|緯創|緯穎|仁寶|英業達|和碩|神達|技嘉|華碩|微星|宏碁", ("電子代工", "AI伺服器", "伺服器", 88, "伺服器/代工 keyword")),
+        (r"台達電|光寶科|康舒|群電|全漢|偉訓|順達|AES|新盛力|加百裕|系統電|飛宏|茂達", ("電源/電機", "電源/HVDC", "電源", 88, "電源 keyword")),
+        (r"長榮|萬海|陽明|裕民|慧洋|中航|四維航", ("航運業", "運輸", "航運", 85, "航運 keyword")),
+        (r"富邦金|國泰金|中信金|兆豐金|玉山金|元大金|第一金|華南金|永豐金|台新金", ("金融保險", "金融", "金融", 86, "金融 keyword")),
+        (r"統一|大成|卜蜂|味全|愛之味|黑松|佳格", ("食品工業", "民生消費", "食品", 84, "食品 keyword")),
+    ]
+    for pattern, bundle in ai_rules:
+        if re.search(pattern, name):
+            industry, theme, sub_theme, conf, note = bundle
+            return industry, theme, sub_theme, "ai_infer", conf, note
+
+    if industry_hint in INDUSTRY_THEME_MAP:
+        industry, theme, sub_theme = INDUSTRY_THEME_MAP[industry_hint]
+        return industry, theme, sub_theme, "rule_engine", 76, f"industry map: {industry_hint}"
+
+    fallback_industry, fallback_theme, fallback_sub = infer_theme_bundle(name, industry_hint, int(is_etf or 0))
+    if _is_placeholder_text(fallback_theme) and _is_placeholder_text(fallback_sub):
+        if market_hint == "ETF":
+            return ("ETF", "ETF", "ETF", "ai_infer", 90, "market hint ETF")
+        return (_choose_text(industry_hint, fallback_industry, default="未分類"), _choose_text(fallback_theme, default="全市場"), _choose_text(fallback_sub, default="系統掃描"), "ai_infer", 55, "weak fallback")
+    return (_choose_text(industry_hint, fallback_industry, default="未分類"), _choose_text(fallback_theme, default="全市場"), _choose_text(fallback_sub, default="系統掃描"), "rule_engine", 68, "generic keyword fallback")
+
+
+def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    global CLASSIFICATION_V2_LAST_SUMMARY
+    if df is None or df.empty:
+        summary = {
+            "total": 0, "official": 0, "manual": 0, "rule_engine": 0, "ai_infer": 0,
+            "unclassified": 0, "coverage_pct": 0.0, "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        CLASSIFICATION_V2_LAST_SUMMARY = summary
+        _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
+        _write_unclassified_report(pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]))
+        return pd.DataFrame(), summary
+
+    x = df.copy().fillna("")
+    for col in ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]:
+        if col not in x.columns:
+            x[col] = ""
+
+    unclassified_mask = (x["industry_final"].astype(str).isin(["", "未分類"]) | x["theme_final"].astype(str).isin(["", "全市場"]) | x["sub_theme_final"].astype(str).isin(["", "系統掃描"]))
+    unclassified = x.loc[unclassified_mask, ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]].copy().sort_values(["classification_source", "stock_id"])
+
+    source_counts = x["classification_source"].astype(str).value_counts().to_dict()
+    total = int(len(x))
+    unclassified_count = int(unclassified_mask.sum())
+    covered = max(total - unclassified_count, 0)
+    summary = {
+        "total": total,
+        "official": int(source_counts.get("official", 0)),
+        "manual": int(source_counts.get("manual", 0)),
+        "rule_engine": int(source_counts.get("rule_engine", 0)),
+        "ai_infer": int(source_counts.get("ai_infer", 0)),
+        "unclassified": unclassified_count,
+        "covered": covered,
+        "coverage_pct": round((covered / total * 100.0), 2) if total else 0.0,
+        "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "unclassified_report": str(CLASSIFICATION_V2_UNCLASSIFIED_PATH),
+    }
+    CLASSIFICATION_V2_LAST_SUMMARY = summary
+    _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
+    _write_unclassified_report(unclassified)
+    return unclassified, summary
+
+
+
+
 THEME_RULES = [
     (r"台積電|創意|世芯|晶心|聯發科|聯詠|矽力|祥碩", ("半導體", "AI/晶圓代工", "半導體")),
     (r"智邦|智易|華星光|聯亞|光聖|波若威|上詮|聯鈞|眾達|環宇|前鼎|立碁|中磊|啟碁|正文|建漢|神準", ("網通/光通訊", "CPO/光模組", "高速光通訊")),
@@ -1038,31 +1177,76 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x["market"] = x["market"].fillna("上市")
     x.loc[x["is_etf"].eq(1), "market"] = "ETF"
 
-    x["industry"] = x["industry"].replace("", pd.NA)
+    x["industry_seed"] = x["industry"].replace("", pd.NA)
     if "industry_official" in x.columns:
-        x["industry"] = x["industry"].fillna(x["industry_official"].replace("", pd.NA))
+        x["industry_seed"] = x["industry_seed"].fillna(x["industry_official"].replace("", pd.NA))
     if "industry_manual" in x.columns:
-        x["industry"] = x["industry"].fillna(x["industry_manual"].replace("", pd.NA))
-    x["industry"] = x["industry"].fillna("未分類")
+        x["industry_seed"] = x["industry_seed"].fillna(x["industry_manual"].replace("", pd.NA))
+    x["industry_seed"] = x["industry_seed"].fillna("未分類")
 
-    x["theme"] = x["theme"] if "theme" in x.columns else ""
-    x["sub_theme"] = x["sub_theme"] if "sub_theme" in x.columns else ""
+    x["theme_seed"] = x["theme"] if "theme" in x.columns else ""
+    x["sub_theme_seed"] = x["sub_theme"] if "sub_theme" in x.columns else ""
     if "theme_manual" in x.columns:
-        x["theme"] = x["theme"].replace("", pd.NA).fillna(x["theme_manual"].replace("", pd.NA))
+        x["theme_seed"] = x["theme_seed"].replace("", pd.NA).fillna(x["theme_manual"].replace("", pd.NA))
     if "sub_theme_manual" in x.columns:
-        x["sub_theme"] = x["sub_theme"].replace("", pd.NA).fillna(x["sub_theme_manual"].replace("", pd.NA))
+        x["sub_theme_seed"] = x["sub_theme_seed"].replace("", pd.NA).fillna(x["sub_theme_manual"].replace("", pd.NA))
 
-    bundles = x.apply(lambda r: infer_theme_bundle(r.get("stock_name", ""), r.get("industry", ""), r.get("is_etf", 0)), axis=1, result_type="expand")
-    bundles.columns = ["industry_inferred", "theme_inferred", "sub_theme_inferred"]
-    x = pd.concat([x, bundles], axis=1)
+    x["classification_source"] = ""
+    x.loc[x.get("industry_official", "").astype(str).str.strip() != "", "classification_source"] = "official"
+    manual_mask = x["classification_source"].eq("") & (x.get("industry_manual", "").astype(str).str.strip() != "")
+    x.loc[manual_mask, "classification_source"] = "manual"
 
-    x["industry"] = x["industry"].replace("未分類", pd.NA).fillna(x["industry_inferred"]).fillna("未分類")
-    x["theme"] = x["theme"].replace("", pd.NA).fillna(x["theme_inferred"]).fillna("全市場")
-    x["sub_theme"] = x["sub_theme"].replace("", pd.NA).fillna(x["sub_theme_inferred"]).fillna("系統掃描")
-    x.loc[x["is_etf"].eq(1), ["industry", "theme", "sub_theme"]] = ["ETF", "ETF", "ETF"]
+    x["classification_confidence"] = 0
+    x.loc[x["classification_source"].eq("official"), "classification_confidence"] = 100
+    x.loc[x["classification_source"].eq("manual"), "classification_confidence"] = 92
 
+    x["classification_note"] = ""
+    x.loc[x["classification_source"].eq("official"), "classification_note"] = "official workbook matched"
+    x.loc[x["classification_source"].eq("manual"), "classification_note"] = "manual mapping matched"
+
+    ai_rows = x.apply(lambda r: infer_ai_classification(r.get("stock_name", ""), r.get("industry_seed", ""), r.get("market", ""), _safe_int(r.get("is_etf", 0))), axis=1, result_type="expand")
+    ai_rows.columns = ["industry_ai", "theme_ai", "sub_theme_ai", "source_ai", "confidence_ai", "note_ai"]
+    x = pd.concat([x, ai_rows], axis=1)
+
+    x["industry_final"] = x["industry_seed"].astype(str)
+    x["theme_final"] = x["theme_seed"].astype(str)
+    x["sub_theme_final"] = x["sub_theme_seed"].astype(str)
+
+    missing_industry = x["industry_final"].astype(str).isin(["", "未分類"])
+    missing_theme = x["theme_final"].astype(str).isin(["", "全市場"])
+    missing_sub = x["sub_theme_final"].astype(str).isin(["", "系統掃描"])
+
+    x.loc[missing_industry, "industry_final"] = x.loc[missing_industry, "industry_ai"]
+    x.loc[missing_theme, "theme_final"] = x.loc[missing_theme, "theme_ai"]
+    x.loc[missing_sub, "sub_theme_final"] = x.loc[missing_sub, "sub_theme_ai"]
+
+    rule_used_mask = x["classification_source"].eq("") & x["source_ai"].isin(["rule_engine", "ai_infer"])
+    x.loc[rule_used_mask, "classification_source"] = x.loc[rule_used_mask, "source_ai"]
+    x.loc[rule_used_mask, "classification_confidence"] = x.loc[rule_used_mask, "confidence_ai"].astype(int)
+    x.loc[rule_used_mask, "classification_note"] = x.loc[rule_used_mask, "note_ai"].astype(str)
+
+    supplement_mask = ~x["classification_source"].eq("") & (x["theme_final"].astype(str).isin(["", "全市場"]) | x["sub_theme_final"].astype(str).isin(["", "系統掃描"]))
+    x.loc[supplement_mask, "theme_final"] = x.loc[supplement_mask, "theme_ai"]
+    x.loc[supplement_mask, "sub_theme_final"] = x.loc[supplement_mask, "sub_theme_ai"]
+    x.loc[supplement_mask & x["classification_note"].eq(""), "classification_note"] = x.loc[supplement_mask, "note_ai"].astype(str)
+
+    x["industry_final"] = x["industry_final"].replace("", "未分類")
+    x["theme_final"] = x["theme_final"].replace("", "全市場")
+    x["sub_theme_final"] = x["sub_theme_final"].replace("", "系統掃描")
+    x.loc[x["is_etf"].eq(1), ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]] = ["ETF", "ETF", "ETF", "manual", 98, "ETF normalized"]
+
+    x["industry"] = x["industry_final"]
+    x["theme"] = x["theme_final"]
+    x["sub_theme"] = x["sub_theme_final"]
     x["is_active"] = 1
     x["update_date"] = datetime.now().strftime("%Y-%m-%d")
+
+    _, summary = build_classification_quality_report(x)
+    try:
+        classification_debug_log(f"V2 覆蓋率 {summary.get('coverage_pct', 0):.2f}%｜官方 {summary.get('official', 0)}｜手動 {summary.get('manual', 0)}｜規則 {summary.get('rule_engine', 0)}｜AI {summary.get('ai_infer', 0)}｜未分類 {summary.get('unclassified', 0)}")
+    except Exception:
+        pass
+
     keep = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
     for c in keep:
         if c not in x.columns:
@@ -3380,6 +3564,12 @@ class AppUI:
             cls_mark = "⚠ 降級模式（檔案存在但未成功載入）"
         else:
             cls_mark = "❌ 缺失"
+        cls_v2 = get_classification_v2_summary()
+        coverage_text = "-"
+        coverage_detail = ""
+        if cls_v2:
+            coverage_text = f"{float(cls_v2.get('coverage_pct', 0) or 0):.2f}%"
+            coverage_detail = f"官方 {int(cls_v2.get('official', 0) or 0)}｜手動 {int(cls_v2.get('manual', 0) or 0)}｜規則 {int(cls_v2.get('rule_engine', 0) or 0)}｜AI {int(cls_v2.get('ai_infer', 0) or 0)}｜未分類 {int(cls_v2.get('unclassified', 0) or 0)}"
         lines = [
             "《GTC AI Trading System v9.2 FINAL-RELEASE》",
             "",
@@ -3388,6 +3578,8 @@ class AppUI:
             f"最新排行筆數：{ranking_count}",
             f"分類檔狀態：{cls_mark}｜{cls_file}",
             f"分類檔備註：{cls_note or '-'}",
+            f"分類覆蓋率：{coverage_text}",
+            f"分類V2統計：{coverage_detail or '-'}",
             "",
             "建議操作順序：",
             "1. 初始化全市場（第一次或要重整主檔時）",
@@ -3469,7 +3661,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "下單清單", "機構交易計畫", "操作SOP", "排行", "類股", "題材"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "下單清單", "機構交易計畫", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -4630,6 +4822,8 @@ class AppUI:
                 "排行": self._filtered_ranking(),
                 "類股": pd.DataFrame([(self.sector_tree.item(i, "values")) for i in self.sector_tree.get_children()], columns=["產業", "檔數", "平均總分", "平均AI分", "代表股"]) if self.sector_tree.get_children() else pd.DataFrame(),
                 "題材": pd.DataFrame([(self.theme_tree.item(i, "values")) for i in self.theme_tree.get_children()], columns=["題材", "檔數", "平均總分", "平均AI分", "代表股"]) if self.theme_tree.get_children() else pd.DataFrame(),
+                "未分類清單": pd.read_excel(CLASSIFICATION_V2_UNCLASSIFIED_PATH) if CLASSIFICATION_V2_UNCLASSIFIED_PATH.exists() else pd.DataFrame(),
+                "分類V2摘要": pd.DataFrame([get_classification_v2_summary()]) if get_classification_v2_summary() else pd.DataFrame(),
             }
             df = mapping.get(target, pd.DataFrame())
             if df is None:
@@ -4644,6 +4838,8 @@ class AppUI:
                     "下單清單": ["優先級", "代號", "名稱", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "機構交易計畫": ["優先級", "代號", "名稱", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
+                    "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
+                    "分類V2摘要": ["total", "official", "manual", "rule_engine", "ai_infer", "unclassified", "covered", "coverage_pct", "report_time", "unclassified_report"],
                 }
                 df = pd.DataFrame(columns=empty_columns.get(target, ["message"]))
                 if df.empty and target not in empty_columns:
@@ -4702,6 +4898,14 @@ class AppUI:
                     tables["Order_List"] = self.last_order_list_df
                 if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not getattr(self, "last_institutional_plan_df", pd.DataFrame()).empty:
                     tables["Institutional_Plan"] = self.last_institutional_plan_df
+                cls_v2 = get_classification_v2_summary()
+                if cls_v2:
+                    tables["Classification_V2_Summary"] = pd.DataFrame([cls_v2])
+                try:
+                    if CLASSIFICATION_V2_UNCLASSIFIED_PATH.exists():
+                        tables["Unclassified_Report"] = pd.read_excel(CLASSIFICATION_V2_UNCLASSIFIED_PATH)
+                except Exception:
+                    pass
                 tables["Detail"] = pd.DataFrame({"detail": [detail_text]})
                 self.ui_call(self.update_task, "匯出分析", 3, 5, item="寫入檔案")
                 base = RUNTIME_DIR / f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
