@@ -996,6 +996,58 @@ def load_manual_theme_mapping() -> pd.DataFrame:
     })
 
 
+
+def _ensure_object_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    x = df.copy()
+    for col in columns:
+        if col not in x.columns:
+            x[col] = ""
+        try:
+            x[col] = x[col].astype("object")
+        except Exception:
+            x[col] = pd.Series(list(x[col]), index=x.index, dtype="object")
+    return x
+
+def _safe_text_series(series: pd.Series, default: str = "") -> pd.Series:
+    if series is None:
+        return pd.Series(dtype="object")
+    s = pd.Series(series, copy=True)
+    try:
+        s = s.astype("object")
+    except Exception:
+        s = pd.Series(list(s), index=s.index, dtype="object")
+    s = s.where(pd.notna(s), default)
+    def _clean(v):
+        if v is None:
+            return default
+        sv = str(v).strip()
+        if sv in ("<NA>", "nan", "None", "NaN", "NULL", "null"):
+            return default
+        return sv
+    s = s.map(_clean)
+    try:
+        s = s.fillna(default)
+    except Exception:
+        pass
+    return s.astype("object")
+
+def _safe_numeric_flag_series(series: pd.Series, default: int = 0) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").fillna(default)
+    return s.astype(int)
+
+def _assign_object_values(df: pd.DataFrame, mask: pd.Series, col: str, values) -> pd.DataFrame:
+    x = df
+    if col not in x.columns:
+        x[col] = ""
+    try:
+        x[col] = x[col].astype("object")
+    except Exception:
+        x[col] = pd.Series(list(x[col]), index=x.index, dtype="object")
+    vals = _safe_text_series(pd.Series(list(values), index=x.index[mask]), "")
+    x.loc[mask, col] = vals.astype("object").values
+    return x
+
+
 def _safe_int(v, default: int = 0) -> int:
     try:
         return int(float(v))
@@ -1056,17 +1108,25 @@ def _write_unclassified_report(df: pd.DataFrame):
 
 def get_classification_v2_summary() -> dict:
     global CLASSIFICATION_V2_LAST_SUMMARY
-    if isinstance(CLASSIFICATION_V2_LAST_SUMMARY, dict) and CLASSIFICATION_V2_LAST_SUMMARY:
-        return dict(CLASSIFICATION_V2_LAST_SUMMARY)
+    file_data = {}
     try:
         if CLASSIFICATION_V2_SUMMARY_PATH.exists():
-            data = json.loads(CLASSIFICATION_V2_SUMMARY_PATH.read_text(encoding='utf-8'))
-            if isinstance(data, dict):
-                CLASSIFICATION_V2_LAST_SUMMARY = dict(data)
-                return dict(data)
+            raw = json.loads(CLASSIFICATION_V2_SUMMARY_PATH.read_text(encoding='utf-8'))
+            if isinstance(raw, dict):
+                file_data = dict(raw)
     except Exception:
-        pass
+        file_data = {}
+    if file_data:
+        mem = CLASSIFICATION_V2_LAST_SUMMARY if isinstance(CLASSIFICATION_V2_LAST_SUMMARY, dict) else {}
+        mem_time = str(mem.get("report_time", "") or "")
+        file_time = str(file_data.get("report_time", "") or "")
+        if not mem or (file_time and file_time >= mem_time):
+            CLASSIFICATION_V2_LAST_SUMMARY = dict(file_data)
+            return dict(file_data)
+    if isinstance(CLASSIFICATION_V2_LAST_SUMMARY, dict) and CLASSIFICATION_V2_LAST_SUMMARY:
+        return dict(CLASSIFICATION_V2_LAST_SUMMARY)
     return {}
+
 
 
 def infer_ai_classification(stock_name: str, industry_hint: str = "", market_hint: str = "", is_etf: int = 0) -> tuple[str, str, str, str, int, str]:
@@ -1109,19 +1169,27 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
     if df is None or df.empty:
         summary = {
             "total": 0, "official": 0, "manual": 0, "rule_engine": 0, "ai_infer": 0,
-            "unclassified": 0, "coverage_pct": 0.0, "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "unclassified": 0, "covered": 0, "coverage_pct": 0.0,
+            "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        CLASSIFICATION_V2_LAST_SUMMARY = summary
+        CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
         _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
         _write_unclassified_report(pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]))
         return pd.DataFrame(), summary
 
-    x = df.copy().fillna("")
-    for col in ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]:
+    x = df.copy()
+    for col in ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]:
         if col not in x.columns:
             x[col] = ""
+    for col in ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_note"]:
+        x[col] = _safe_text_series(x[col], "")
+    x["classification_confidence"] = pd.to_numeric(x["classification_confidence"], errors="coerce").fillna(0)
 
-    unclassified_mask = (x["industry_final"].map(_is_missing_classification_value) | x["theme_final"].map(_is_missing_classification_value) | x["sub_theme_final"].map(_is_missing_classification_value))
+    unclassified_mask = (
+        x["industry_final"].map(_is_missing_classification_value) |
+        x["theme_final"].map(_is_missing_classification_value) |
+        x["sub_theme_final"].map(_is_missing_classification_value)
+    )
     unclassified = x.loc[unclassified_mask, ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]].copy().sort_values(["classification_source", "stock_id"])
 
     source_counts = x["classification_source"].astype(str).value_counts().to_dict()
@@ -1140,10 +1208,11 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
         "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "unclassified_report": str(CLASSIFICATION_V2_UNCLASSIFIED_PATH),
     }
-    CLASSIFICATION_V2_LAST_SUMMARY = summary
+    CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
     _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
     _write_unclassified_report(unclassified)
     return unclassified, summary
+
 
 
 
@@ -1297,16 +1366,42 @@ def infer_theme_bundle(stock_name: str, industry: str, is_etf: int) -> Tuple[str
 
 def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy().fillna("")
+    x = _ensure_object_columns(x, [
+        "stock_id", "stock_name", "market", "industry", "theme", "sub_theme",
+        "classification_source", "classification_note"
+    ])
+
     official = load_official_classification_book()
     manual = load_manual_theme_mapping()
 
-    x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id)
-    x = x[x["stock_id"] != ""].copy()
+    x["stock_id"] = _safe_text_series(x["stock_id"], "").map(normalize_stock_id)
+    x = x[x["stock_id"] != ""].copy().reset_index(drop=True)
+    if x.empty:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+
+    x["stock_name"] = _safe_text_series(x["stock_name"], "")
+    x["market"] = _safe_text_series(x["market"], "")
+    x["industry"] = _safe_text_series(x["industry"], "")
+    x["theme"] = _safe_text_series(x["theme"], "")
+    x["sub_theme"] = _safe_text_series(x["sub_theme"], "")
+    x["classification_source"] = _safe_text_series(x["classification_source"], "")
+    x["classification_note"] = _safe_text_series(x["classification_note"], "")
     x["stock_name_norm"] = x.get("stock_name", "").map(_normalize_stock_name_for_match)
 
     if not official.empty:
+        official = official.copy()
+        official = _ensure_object_columns(official, [
+            "stock_id", "stock_name_official", "stock_name_norm_official",
+            "market_official", "industry_official"
+        ])
+        for col in ["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]:
+            official[col] = _safe_text_series(official[col], "")
+        official["industry_official"] = official["industry_official"].map(normalize_official_industry_name)
         x = x.merge(official, on="stock_id", how="left")
-        missing_mask = x["industry_official"].fillna("").eq("")
+        x = _ensure_object_columns(x, ["stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+        for col in ["stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]:
+            x[col] = _safe_text_series(x[col], "")
+        missing_mask = x["industry_official"].eq("")
         if missing_mask.any() and "stock_name_norm_official" in official.columns:
             official_name_map = official[official["stock_name_norm_official"].astype(str) != ""].drop_duplicates("stock_name_norm_official")
             if not official_name_map.empty:
@@ -1315,17 +1410,28 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
                     left_on="stock_name_norm", right_on="stock_name_norm_official", how="left"
                 )
                 for col in ["stock_name_official", "market_official", "industry_official"]:
-                    vals = miss[col].fillna("").tolist()
-                    x.loc[missing_mask, col] = [v if v else orig for v, orig in zip(vals, x.loc[missing_mask, col].fillna("").tolist())]
+                    vals = _safe_text_series(miss[col], "")
+                    orig = _safe_text_series(x.loc[missing_mask, col], "")
+                    merged_vals = [v if v else o for v, o in zip(vals.tolist(), orig.tolist())]
+                    x = _assign_object_values(x, missing_mask, col, merged_vals)
     else:
-        x["stock_name_official"] = ""
-        x["stock_name_norm_official"] = ""
-        x["market_official"] = ""
-        x["industry_official"] = ""
+        for col in ["stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]:
+            x[col] = ""
 
     if not manual.empty:
+        manual = manual.copy()
+        manual = _ensure_object_columns(manual, [
+            "stock_id", "stock_name_manual", "stock_name_norm_manual", "market_manual",
+            "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"
+        ])
+        for col in ["stock_id", "stock_name_manual", "stock_name_norm_manual", "market_manual", "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"]:
+            manual[col] = _safe_text_series(manual[col], "")
+        manual["industry_manual"] = manual["industry_manual"].map(normalize_official_industry_name)
         x = x.merge(manual, on="stock_id", how="left")
-        missing_manual = x["industry_manual"].fillna("").eq("") if "industry_manual" in x.columns else pd.Series(False, index=x.index)
+        x = _ensure_object_columns(x, ["stock_name_manual", "stock_name_norm_manual", "market_manual", "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"])
+        for col in ["stock_name_manual", "stock_name_norm_manual", "market_manual", "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"]:
+            x[col] = _safe_text_series(x[col], "")
+        missing_manual = x["industry_manual"].eq("")
         if missing_manual.any() and "stock_name_norm_manual" in manual.columns:
             manual_name_map = manual[manual["stock_name_norm_manual"].astype(str) != ""].drop_duplicates("stock_name_norm_manual")
             if not manual_name_map.empty:
@@ -1334,122 +1440,134 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
                     left_on="stock_name_norm", right_on="stock_name_norm_manual", how="left"
                 )
                 for col in ["stock_name_manual", "market_manual", "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"]:
-                    if col not in x.columns:
-                        x[col] = ""
-                    vals = miss[col].fillna("").tolist()
-                    x.loc[missing_manual, col] = [v if str(v) != "" else orig for v, orig in zip(vals, x.loc[missing_manual, col].fillna("").tolist())]
+                    vals = _safe_text_series(miss[col], "")
+                    orig = _safe_text_series(x.loc[missing_manual, col], "")
+                    merged_vals = [v if v else o for v, o in zip(vals.tolist(), orig.tolist())]
+                    x = _assign_object_values(x, missing_manual, col, merged_vals)
     else:
-        x["stock_name_manual"] = ""
-        x["stock_name_norm_manual"] = ""
-        x["market_manual"] = ""
-        x["industry_manual"] = ""
-        x["theme_manual"] = ""
-        x["sub_theme_manual"] = ""
-        x["is_etf_manual"] = ""
+        for col in ["stock_name_manual", "stock_name_norm_manual", "market_manual", "industry_manual", "theme_manual", "sub_theme_manual", "is_etf_manual"]:
+            x[col] = ""
 
-    x["stock_name"] = x["stock_name"].replace("", pd.NA)
-    x["stock_name"] = x["stock_name"].fillna(x.get("stock_name_official", "").replace("", pd.NA) if hasattr(x.get("stock_name_official", ""), 'replace') else x.get("stock_name_official", ""))
-    x["stock_name"] = x["stock_name"].fillna(x.get("stock_name_manual", "").replace("", pd.NA) if hasattr(x.get("stock_name_manual", ""), 'replace') else x.get("stock_name_manual", ""))
-    x["stock_name"] = x["stock_name"].fillna(x["stock_id"]).astype(str)
+    x["stock_name"] = _safe_text_series(x["stock_name"], "")
+    x["stock_name_official"] = _safe_text_series(x.get("stock_name_official", ""), "")
+    x["stock_name_manual"] = _safe_text_series(x.get("stock_name_manual", ""), "")
+    x["stock_name"] = _safe_text_series(
+        x["stock_name"].replace("", pd.NA).fillna(x["stock_name_official"].replace("", pd.NA)).fillna(x["stock_name_manual"].replace("", pd.NA)).fillna(x["stock_id"]),
+        ""
+    )
 
     etf_mask = x["stock_id"].astype(str).str.startswith("00") | x["stock_name"].astype(str).str.contains("ETF|台灣50|高股息|中型100|科技優息|精選高息|DR", regex=True)
     if "is_etf_manual" in x.columns:
-        etf_mask = etf_mask | pd.to_numeric(x["is_etf_manual"], errors="coerce").fillna(0).astype(int).eq(1)
+        etf_mask = etf_mask | _safe_numeric_flag_series(x["is_etf_manual"], 0).eq(1)
     x["is_etf"] = etf_mask.astype(int)
 
-    x["market"] = x["market"].replace("", pd.NA)
+    x["market"] = _safe_text_series(x["market"], "")
     if "market_official" in x.columns:
-        x["market"] = x["market"].fillna(x["market_official"].replace("", pd.NA))
+        x["market"] = _safe_text_series(x["market"].replace("", pd.NA).fillna(_safe_text_series(x["market_official"], "").replace("", pd.NA)), "")
     if "market_manual" in x.columns:
-        x["market"] = x["market"].fillna(x["market_manual"].replace("", pd.NA))
-    x["market"] = x["market"].fillna("上市")
+        x["market"] = _safe_text_series(x["market"].replace("", pd.NA).fillna(_safe_text_series(x["market_manual"], "").replace("", pd.NA)), "")
+    x["market"] = _safe_text_series(x["market"].replace("", pd.NA).fillna("上市"), "上市")
     x.loc[x["is_etf"].eq(1), "market"] = "ETF"
 
     if "industry_official" in x.columns:
-        x["industry_official"] = x["industry_official"].map(normalize_official_industry_name)
+        x["industry_official"] = _safe_text_series(x["industry_official"], "").map(normalize_official_industry_name)
     if "industry_manual" in x.columns:
-        x["industry_manual"] = x["industry_manual"].map(normalize_official_industry_name)
-    x["industry_seed"] = x["industry"].map(normalize_official_industry_name).replace("", pd.NA)
-    if "industry_official" in x.columns:
-        x["industry_seed"] = x["industry_seed"].fillna(x["industry_official"].replace("", pd.NA))
-    if "industry_manual" in x.columns:
-        x["industry_seed"] = x["industry_seed"].fillna(x["industry_manual"].replace("", pd.NA))
-    x["industry_seed"] = x["industry_seed"].fillna("未分類")
+        x["industry_manual"] = _safe_text_series(x["industry_manual"], "").map(normalize_official_industry_name)
 
-    x["theme_seed"] = x["theme"] if "theme" in x.columns else ""
-    x["sub_theme_seed"] = x["sub_theme"] if "sub_theme" in x.columns else ""
+    x["industry_seed"] = _safe_text_series(x["industry"], "").map(normalize_official_industry_name).replace("", pd.NA)
+    if "industry_official" in x.columns:
+        x["industry_seed"] = x["industry_seed"].fillna(_safe_text_series(x["industry_official"], "").replace("", pd.NA))
+    if "industry_manual" in x.columns:
+        x["industry_seed"] = x["industry_seed"].fillna(_safe_text_series(x["industry_manual"], "").replace("", pd.NA))
+    x["industry_seed"] = _safe_text_series(x["industry_seed"].fillna("未分類"), "未分類")
+
+    x["theme_seed"] = _safe_text_series(x["theme"] if "theme" in x.columns else "", "")
+    x["sub_theme_seed"] = _safe_text_series(x["sub_theme"] if "sub_theme" in x.columns else "", "")
 
     def _clean_classification_seed(series: pd.Series) -> pd.Series:
-        s = series.astype(str).str.strip()
-        s = s.replace({"<NA>": "", "nan": "", "None": "", "N/A": "", "NaN": "", "null": "", "NULL": ""})
-        return s
-
-    x["theme_seed"] = _clean_classification_seed(x["theme_seed"])
-    x["sub_theme_seed"] = _clean_classification_seed(x["sub_theme_seed"])
+        return _safe_text_series(series, "")
 
     if "theme_manual" in x.columns:
         manual_theme = _clean_classification_seed(x["theme_manual"])
-        x["theme_seed"] = x["theme_seed"].replace("", pd.NA).fillna(manual_theme.replace("", pd.NA))
+        x["theme_seed"] = _safe_text_series(x["theme_seed"].replace("", pd.NA).fillna(manual_theme.replace("", pd.NA)), "")
     if "sub_theme_manual" in x.columns:
         manual_sub_theme = _clean_classification_seed(x["sub_theme_manual"])
-        x["sub_theme_seed"] = x["sub_theme_seed"].replace("", pd.NA).fillna(manual_sub_theme.replace("", pd.NA))
+        x["sub_theme_seed"] = _safe_text_series(x["sub_theme_seed"].replace("", pd.NA).fillna(manual_sub_theme.replace("", pd.NA)), "")
 
-    x["classification_source"] = ""
-    x.loc[x.get("industry_official", "").astype(str).str.strip() != "", "classification_source"] = "official"
-    manual_mask = x["classification_source"].eq("") & (x.get("industry_manual", "").astype(str).str.strip() != "")
+    x["classification_source"] = _safe_text_series(x.get("classification_source", ""), "")
+    official_mask = _safe_text_series(x.get("industry_official", ""), "").ne("")
+    x.loc[official_mask, "classification_source"] = "official"
+    manual_mask = x["classification_source"].eq("") & _safe_text_series(x.get("industry_manual", ""), "").ne("")
     x.loc[manual_mask, "classification_source"] = "manual"
 
     x["classification_confidence"] = 0
     x.loc[x["classification_source"].eq("official"), "classification_confidence"] = 100
     x.loc[x["classification_source"].eq("manual"), "classification_confidence"] = 92
 
-    x["classification_note"] = ""
+    x["classification_note"] = _safe_text_series(x.get("classification_note", ""), "")
     x.loc[x["classification_source"].eq("official"), "classification_note"] = "official workbook matched"
     x.loc[x["classification_source"].eq("manual"), "classification_note"] = "manual mapping matched"
 
     ai_rows = x.apply(lambda r: infer_ai_classification(r.get("stock_name", ""), r.get("industry_seed", ""), r.get("market", ""), _safe_int(r.get("is_etf", 0))), axis=1, result_type="expand")
     ai_rows.columns = ["industry_ai", "theme_ai", "sub_theme_ai", "source_ai", "confidence_ai", "note_ai"]
     x = pd.concat([x, ai_rows], axis=1)
+    x = _ensure_object_columns(x, ["industry_ai", "theme_ai", "sub_theme_ai", "source_ai", "note_ai"])
+    for col in ["industry_ai", "theme_ai", "sub_theme_ai", "source_ai", "note_ai"]:
+        x[col] = _safe_text_series(x[col], "")
+    x["confidence_ai"] = pd.to_numeric(x["confidence_ai"], errors="coerce").fillna(0).astype(int)
 
-    x["industry_final"] = x["industry_seed"].astype(str).map(normalize_official_industry_name)
-    x["theme_final"] = x["theme_seed"].astype(str)
-    x["sub_theme_final"] = x["sub_theme_seed"].astype(str)
+    x["industry_final"] = _safe_text_series(x["industry_seed"], "未分類").map(normalize_official_industry_name)
+    x["theme_final"] = _safe_text_series(x["theme_seed"], "")
+    x["sub_theme_final"] = _safe_text_series(x["sub_theme_seed"], "")
 
     missing_industry = x["industry_final"].map(_is_missing_classification_value)
     missing_theme = x["theme_final"].map(_is_missing_classification_value)
     missing_sub = x["sub_theme_final"].map(_is_missing_classification_value)
 
-    x.loc[missing_industry, "industry_final"] = x.loc[missing_industry, "industry_ai"].map(normalize_official_industry_name)
-    x.loc[missing_theme, "theme_final"] = x.loc[missing_theme, "theme_ai"]
-    x.loc[missing_sub, "sub_theme_final"] = x.loc[missing_sub, "sub_theme_ai"]
+    x.loc[missing_industry, "industry_final"] = _safe_text_series(x.loc[missing_industry, "industry_ai"], "").map(normalize_official_industry_name).values
+    x.loc[missing_theme, "theme_final"] = _safe_text_series(x.loc[missing_theme, "theme_ai"], "").values
+    x.loc[missing_sub, "sub_theme_final"] = _safe_text_series(x.loc[missing_sub, "sub_theme_ai"], "").values
 
     industry_map_rows = x["industry_final"].map(lambda s: INDUSTRY_THEME_MAP.get(normalize_official_industry_name(s), ("", "", "")))
     industry_map_df = pd.DataFrame(industry_map_rows.tolist(), columns=["industry_from_map", "theme_from_map", "sub_from_map"], index=x.index)
     x = pd.concat([x, industry_map_df], axis=1)
+    x = _ensure_object_columns(x, ["industry_from_map", "theme_from_map", "sub_from_map"])
+    for col in ["industry_from_map", "theme_from_map", "sub_from_map"]:
+        x[col] = _safe_text_series(x[col], "")
     missing_theme = x["theme_final"].map(_is_missing_classification_value)
     missing_sub = x["sub_theme_final"].map(_is_missing_classification_value)
-    x.loc[missing_theme, "theme_final"] = x.loc[missing_theme, "theme_from_map"]
-    x.loc[missing_sub, "sub_theme_final"] = x.loc[missing_sub, "sub_from_map"]
+    x.loc[missing_theme, "theme_final"] = _safe_text_series(x.loc[missing_theme, "theme_from_map"], "").values
+    x.loc[missing_sub, "sub_theme_final"] = _safe_text_series(x.loc[missing_sub, "sub_from_map"], "").values
 
     rule_used_mask = x["classification_source"].eq("") & x["source_ai"].isin(["rule_engine", "ai_infer"])
-    x.loc[rule_used_mask, "classification_source"] = x.loc[rule_used_mask, "source_ai"]
-    x.loc[rule_used_mask, "classification_confidence"] = x.loc[rule_used_mask, "confidence_ai"].astype(int)
-    x.loc[rule_used_mask, "classification_note"] = x.loc[rule_used_mask, "note_ai"].astype(str)
+    x.loc[rule_used_mask, "classification_source"] = _safe_text_series(x.loc[rule_used_mask, "source_ai"], "").values
+    x.loc[rule_used_mask, "classification_confidence"] = pd.to_numeric(x.loc[rule_used_mask, "confidence_ai"], errors="coerce").fillna(0).astype(int).values
+    x.loc[rule_used_mask, "classification_note"] = _safe_text_series(x.loc[rule_used_mask, "note_ai"], "").values
 
     supplement_mask = ~x["classification_source"].eq("") & (x["theme_final"].map(_is_missing_classification_value) | x["sub_theme_final"].map(_is_missing_classification_value))
-    x.loc[supplement_mask, "theme_final"] = x.loc[supplement_mask, "theme_ai"]
-    x.loc[supplement_mask, "sub_theme_final"] = x.loc[supplement_mask, "sub_theme_ai"]
-    x.loc[supplement_mask & x["classification_note"].eq(""), "classification_note"] = x.loc[supplement_mask, "note_ai"].astype(str)
+    x.loc[supplement_mask, "theme_final"] = _safe_text_series(x.loc[supplement_mask, "theme_ai"], "").values
+    x.loc[supplement_mask, "sub_theme_final"] = _safe_text_series(x.loc[supplement_mask, "sub_theme_ai"], "").values
+    note_mask = supplement_mask & x["classification_note"].eq("")
+    x.loc[note_mask, "classification_note"] = _safe_text_series(x.loc[note_mask, "note_ai"], "").values
 
-    x["industry_final"] = x["industry_final"].astype(str).str.strip().replace({"": "未分類", "<NA>": "未分類", "nan": "未分類", "None": "未分類"})
-    x["theme_final"] = x["theme_final"].astype(str).str.strip().replace({"": "全市場", "<NA>": "全市場", "nan": "全市場", "None": "全市場"})
-    x["sub_theme_final"] = x["sub_theme_final"].astype(str).str.strip().replace({"": "系統掃描", "<NA>": "系統掃描", "nan": "系統掃描", "None": "系統掃描"})
+    for col in [
+        "industry", "theme", "sub_theme",
+        "industry_final", "theme_final", "sub_theme_final",
+        "classification_source", "classification_note"
+    ]:
+        if col not in x.columns:
+            x[col] = ""
+        x[col] = _safe_text_series(x[col], "")
+
+    x["industry_final"] = _safe_text_series(x["industry_final"], "未分類").map(normalize_official_industry_name)
+    x["industry_final"] = _safe_text_series(x["industry_final"], "未分類").replace("", "未分類")
+    x["theme_final"] = _safe_text_series(x["theme_final"], "全市場").replace("", "全市場")
+    x["sub_theme_final"] = _safe_text_series(x["sub_theme_final"], "系統掃描").replace("", "系統掃描")
     x.loc[x["is_etf"].eq(1), ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]] = ["ETF", "ETF", "ETF", "manual", 98, "ETF normalized"]
 
-    x["industry_final"] = x["industry_final"].map(normalize_official_industry_name)
-    x["industry"] = x["industry_final"]
-    x["theme"] = x["theme_final"]
-    x["sub_theme"] = x["sub_theme_final"]
+    x["industry"] = _safe_text_series(x["industry_final"], "未分類")
+    x["theme"] = _safe_text_series(x["theme_final"], "全市場")
+    x["sub_theme"] = _safe_text_series(x["sub_theme_final"], "系統掃描")
     x["is_active"] = 1
     x["update_date"] = datetime.now().strftime("%Y-%m-%d")
 
@@ -1463,7 +1581,12 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     for c in keep:
         if c not in x.columns:
             x[c] = ""
+    for c in ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "update_date"]:
+        x[c] = _safe_text_series(x[c], "")
+    x["is_etf"] = _safe_numeric_flag_series(x["is_etf"], 0)
+    x["is_active"] = _safe_numeric_flag_series(x["is_active"], 1)
     return x[keep].drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+
 
 
 DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists() else PACKED_DATA_DIR
@@ -3806,6 +3929,22 @@ class AppUI:
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
 
+    def refresh_classification_summary_ui(self):
+        try:
+            _ = get_classification_status()
+            _ = get_classification_v2_summary()
+        except Exception:
+            pass
+        try:
+            self.show_welcome_message()
+        except Exception:
+            pass
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+
     def ensure_ranking_ready(self, auto_rebuild: bool = False) -> bool:
         ranking = self.db.get_latest_ranking()
         if ranking is not None and not ranking.empty:
@@ -4132,6 +4271,7 @@ class AppUI:
             if official is None or official.empty:
                 raise RuntimeError(f"分類來源存在，但無法成功讀取：{refreshed}")
             self.ui_call(self.update_task, "更新分類檔", 4, 4, success=1, item=Path(refreshed).name)
+            self.ui_call(self.refresh_classification_summary_ui)
             status = get_classification_status()
             stale_text = "是" if status.get("is_stale") else "否"
             self.ui_call(self.finish_task, "更新分類檔", f"分類來源更新完成：{Path(refreshed).name}｜共 {len(official)} 筆")
@@ -5406,6 +5546,7 @@ class AppUI:
                     master2 = self.db.get_master()
                     self.ui_call(self.refresh_filters)
                     self.ui_call(self.refresh_all_tables)
+                    self.ui_call(self.refresh_classification_summary_ui)
                     self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
                     self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master2)} 檔。")
                     self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master2)} 檔\n\n使用主檔：{csv_path}")
@@ -5414,7 +5555,7 @@ class AppUI:
                 master2 = self.db.get_master()
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
-                self.ui_call(self.show_welcome_message)
+                self.ui_call(self.refresh_classification_summary_ui)
                 self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
                 self.ui_call(self.set_status, f"全市場初始化完成，共 {len(master2)} 檔。")
                 self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔")
@@ -5655,7 +5796,7 @@ class AppUI:
                 count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
                 self.ui_call(self.refresh_filters)
                 self.ui_call(self.refresh_all_tables)
-                self.ui_call(self.show_welcome_message)
+                self.ui_call(self.refresh_classification_summary_ui)
                 self.ui_call(self.finish_task, "重建排行", f"排行已完成，共 {count} 檔")
                 if count <= 0:
                     self.ui_call(messagebox.showwarning, "提醒", "排行重建完成，但目前可計算檔數為 0。\n請先建立至少 70 根以上歷史K線資料。")
