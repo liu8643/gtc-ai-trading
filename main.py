@@ -467,7 +467,8 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
 
     code_col = None
     name_col = None
-    industry_col = None
+    industry_name_col = None
+    industry_code_col = None
 
     for c in x.columns:
         base = str(c).split("__dup")[0].strip()
@@ -475,9 +476,12 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
             code_col = c if code_col is None else code_col
         elif base in ("公司名稱", "公司簡稱", "證券名稱", "股票名稱"):
             name_col = c if name_col is None else name_col
-        elif base in ("產業別", "產業類別", "新產業類別", "新產業別"):
-            industry_col = c if industry_col is None else industry_col
+        elif base in ("新產業類別", "新產業別", "產業名稱", "industry_name"):
+            industry_name_col = c if industry_name_col is None else industry_name_col
+        elif base in ("產業別", "產業類別", "產業代碼", "產業類別代號", "industry_code"):
+            industry_code_col = c if industry_code_col is None else industry_code_col
 
+    industry_col = industry_name_col or industry_code_col
     if code_col is None or industry_col is None:
         return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
 
@@ -486,6 +490,7 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
         "stock_name_official": x[name_col].astype(str).str.strip() if name_col in x.columns else "",
         "industry_official": x[industry_col].astype(str).str.strip(),
     })
+    out["industry_official"] = out["industry_official"].map(normalize_official_industry_name)
     out["stock_name_norm_official"] = out["stock_name_official"].map(_normalize_stock_name_for_match)
     out["market_official"] = market
     out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
@@ -731,30 +736,31 @@ def _extract_official_sheet_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFr
     if df is None or df.empty:
         return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
 
-    x = df.copy()
+    x = df.copy().fillna("")
     x.columns = _coerce_unique_columns(x.columns)
     market = "上市" if "上市" in str(sheet_name) else ("上櫃" if "上櫃" in str(sheet_name) else ("興櫃" if "興櫃" in str(sheet_name) else ""))
 
-    industry_col = None
-    name_col = None
     code_candidates = []
+    name_col = None
+    industry_name_col = None
+    industry_code_col = None
 
     for c in x.columns:
         s = str(c).strip()
-        base = s.split("__dup")[0]
-        if base in ("新產業類別", "新產業別"):
-            industry_col = c if industry_col is None else industry_col
-        elif base in ("公司名稱", "公司簡稱", "股票名稱", "證券名稱"):
+        base = s.split("__dup")[0].strip()
+        if base in ("公司名稱", "公司簡稱", "股票名稱", "證券名稱"):
             name_col = c if name_col is None else name_col
+        elif base in ("新產業類別", "新產業別", "產業名稱", "industry_name"):
+            industry_name_col = c if industry_name_col is None else industry_name_col
+        elif base in ("產業別", "產業類別", "產業代碼", "產業類別代號", "industry_code"):
+            industry_code_col = c if industry_code_col is None else industry_code_col
         elif base in ("股票代號", "證券代號", "公司代號"):
             code_candidates.append(c)
         elif base == "代號":
             code_candidates.append(c)
 
-    if industry_col is None:
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
-
-    if not code_candidates:
+    industry_col = industry_name_col or industry_code_col
+    if industry_col is None or not code_candidates:
         return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
 
     preferred = []
@@ -776,6 +782,7 @@ def _extract_official_sheet_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFr
         "stock_name_official": x[name_col].astype(str).str.strip() if name_col in x.columns else "",
         "industry_official": x[industry_col].astype(str).str.strip(),
     })
+    out["industry_official"] = out["industry_official"].map(normalize_official_industry_name)
     out["stock_name_norm_official"] = out["stock_name_official"].map(_normalize_stock_name_for_match)
     out["market_official"] = market
     out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
@@ -1016,6 +1023,11 @@ def normalize_official_industry_name(v: str) -> str:
     s = str(v or "").strip()
     if not s:
         return ""
+    s = s.replace(".0", "") if re.fullmatch(r"\d+\.0", s) else s
+    if re.fullmatch(r"\d{1,2}", s):
+        s = s.zfill(2)
+    if s in INDUSTRY_CODE_MAP:
+        s = INDUSTRY_CODE_MAP.get(s, s)
     return OFFICIAL_INDUSTRY_ALIAS_MAP.get(s, s)
 
 
@@ -1149,6 +1161,44 @@ THEME_RULES = [
     (r"富邦金|國泰金|中信金|兆豐金|玉山金|元大金|第一金|華南金|永豐金|台新金", ("金融保險", "金融", "金融")),
 ]
 
+INDUSTRY_CODE_MAP = {
+    "01": "水泥工業",
+    "02": "食品工業",
+    "03": "塑膠工業",
+    "04": "紡織纖維",
+    "05": "電機機械",
+    "06": "電器電纜",
+    "08": "玻璃陶瓷",
+    "09": "造紙工業",
+    "10": "鋼鐵工業",
+    "11": "橡膠工業",
+    "12": "汽車工業",
+    "14": "建材營造",
+    "15": "航運業",
+    "16": "觀光餐旅",
+    "17": "金融保險",
+    "18": "貿易百貨",
+    "20": "其他",
+    "21": "化學工業",
+    "22": "生技醫療",
+    "23": "油電燃氣",
+    "24": "半導體業",
+    "25": "電腦及週邊設備業",
+    "26": "光電業",
+    "27": "通信網路業",
+    "28": "電子零組件業",
+    "29": "電子通路業",
+    "30": "資訊服務業",
+    "31": "其他電子業",
+    "32": "文化創意業",
+    "33": "農業科技業",
+    "34": "電子商務",
+    "35": "綠能環保",
+    "36": "數位雲端",
+    "37": "運動休閒",
+    "38": "居家生活",
+}
+
 OFFICIAL_INDUSTRY_ALIAS_MAP = {
     "半導體業": "半導體",
     "半導體": "半導體",
@@ -1156,11 +1206,21 @@ OFFICIAL_INDUSTRY_ALIAS_MAP = {
     "電子工業": "電子工業",
     "電子零組件業": "電子零組件",
     "通信網路業": "網通",
-    "光電業": "光電",
+    "光電業": "光通訊",
     "資訊服務業": "資訊服務",
     "其他電子業": "其他電子",
     "電機機械": "電源/電機",
     "電器電纜": "電源/電機",
+    "生技醫療": "生技醫療",
+    "油電燃氣": "油電燃氣",
+    "其他": "其他",
+    "文化創意業": "文化創意",
+    "農業科技業": "農業科技",
+    "電子商務": "電子商務",
+    "綠能環保": "綠能環保",
+    "數位雲端": "資訊服務",
+    "運動休閒": "運動休閒",
+    "居家生活": "居家生活",
 }
 
 INDUSTRY_THEME_MAP = {
@@ -1386,6 +1446,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x["sub_theme_final"] = x["sub_theme_final"].astype(str).str.strip().replace({"": "系統掃描", "<NA>": "系統掃描", "nan": "系統掃描", "None": "系統掃描"})
     x.loc[x["is_etf"].eq(1), ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]] = ["ETF", "ETF", "ETF", "manual", 98, "ETF normalized"]
 
+    x["industry_final"] = x["industry_final"].map(normalize_official_industry_name)
     x["industry"] = x["industry_final"]
     x["theme"] = x["theme_final"]
     x["sub_theme"] = x["sub_theme_final"]
