@@ -3824,6 +3824,7 @@ class AppUI:
         self.pending_chart_image = None
         self.chart_image_job = None
         self.selection_chart_pending_token = 0
+        self.backtest_selection_token = 0
         self.industry_var = tk.StringVar(value="全部")
         self.theme_var = tk.StringVar(value="全部")
         self.search_var = tk.StringVar(value="")
@@ -4906,6 +4907,92 @@ class AppUI:
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
 
+    def start_backtest_selection_job(self, stock_id: str):
+        stock_id = str(stock_id or "").strip()
+        if not stock_id:
+            return
+        self.backtest_selection_token += 1
+        token = self.backtest_selection_token
+        self.window_current_stock_id = stock_id
+        self.sync_multi_windows_selectors(stock_id)
+
+        lines = self.build_unified_detail_lines(stock_id, source="回測視覺化", quick_only=True)
+        lines.extend([
+            "",
+            "回測圖表狀態：背景計算 Equity Curve 中，完成後自動更新右下圖表。",
+        ])
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+        try:
+            self.show_chart_loading(stock_id)
+        except Exception:
+            pass
+        self.append_log(f"回測視覺化背景任務啟動：{stock_id}")
+        t = threading.Thread(
+            target=self._backtest_selection_worker,
+            args=(stock_id, token),
+            daemon=True,
+            name=f"bt_select_{stock_id}"
+        )
+        t.start()
+
+    def _backtest_selection_worker(self, stock_id: str, token: int):
+        try:
+            log_info(f"回測視覺化背景開始：{stock_id}｜token={token}")
+            if token != self.backtest_selection_token:
+                return
+
+            stock = self.db.get_stock_row(stock_id)
+            hist = self.db.get_price_history(stock_id)
+            if stock is None or hist is None or hist.empty:
+                self.ui_call(self.append_log, f"回測視覺化無資料：{stock_id}", "WARNING")
+                return
+
+            try:
+                bt = self.backtest_engine.estimate_trade_quality(stock_id)
+                self.backtest_cache[str(stock_id)] = bt
+                log_info(f"回測視覺化回測完成：{stock_id}｜samples={bt.get('samples', 0)}")
+            except Exception as e:
+                log_exception(f"回測視覺化回測失敗：{stock_id}", e)
+                self.ui_call(self.append_log, f"回測視覺化回測失敗：{stock_id}｜{e}", "ERROR")
+
+            if token != self.backtest_selection_token:
+                return
+
+            eq_path = None
+            try:
+                log_info(f"回測視覺化圖表輸出開始：{stock_id}")
+                eq_path = self.export_equity_curve_chart(stock_id, hist)
+                log_info(f"回測視覺化圖表輸出完成：{stock_id}｜{eq_path}")
+            except Exception as e:
+                log_exception(f"回測視覺化圖表輸出失敗：{stock_id}", e)
+                self.ui_call(self.append_log, f"回測視覺化圖表輸出失敗：{stock_id}｜{e}", "ERROR")
+
+            def apply_result():
+                if token != self.backtest_selection_token:
+                    return
+                try:
+                    self.update_detail_panel(stock_id, source="回測視覺化")
+                except Exception as e:
+                    self.append_log(f"回測視覺化明細更新失敗：{stock_id}｜{e}", "WARNING")
+                try:
+                    if eq_path:
+                        self.current_chart_path = eq_path
+                        self._schedule_chart_file_update(stock_id, eq_path)
+                    else:
+                        self.show_chart_message("回測圖表產生失敗，請重新點選。")
+                    try:
+                        self.right_lower_notebook.select(self.chart_tab)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.append_log(f"回測視覺化圖表更新失敗：{stock_id}｜{e}", "WARNING")
+
+            self.ui_call(apply_result)
+        except Exception as e:
+            log_exception(f"回測視覺化背景失敗：{stock_id}", e)
+            self.ui_call(self.append_log, f"回測視覺化背景失敗：{stock_id}｜{e}", "ERROR")
+
     def update_chart_panel(self, stock_id: str):
         self.window_current_stock_id = stock_id
         if self.current_chart_path and Path(self.current_chart_path).exists():
@@ -5971,14 +6058,12 @@ class AppUI:
         if not sel:
             return
         vals = self.backtest_tree.item(sel[0], "values")
-        stock_id = str(vals[1])
-        hist = self.db.get_price_history(stock_id)
-        if hist is None or hist.empty:
+        stock_id = str(vals[1]).strip()
+        if not stock_id:
             return
-        eq_path = self.export_equity_curve_chart(stock_id, hist)
-        if eq_path:
-            self.current_chart_path = eq_path
-        self.sync_all_views(stock_id, source="回測視覺化")
+        if self._should_ignore_select_event(stock_id, "回測視覺化"):
+            return
+        self.start_backtest_selection_job(stock_id)
 
     def on_select_stock(self, event=None):
         sel = self.rank_tree.selection()
