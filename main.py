@@ -3627,7 +3627,8 @@ class MasterTradingEngine:
             market = self.market_engine.get_market_regime()
             return {
                 "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
-                "today_buy": empty, "wait_pullback": empty, "theme_summary": empty, "eliminated": empty
+                "today_buy": empty, "wait_pullback": empty, "execution_pool": empty,
+                "theme_summary": empty, "eliminated": empty
             }
 
         base = filtered_df.copy()
@@ -3651,7 +3652,8 @@ class MasterTradingEngine:
             empty = pd.DataFrame()
             return {
                 "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
-                "today_buy": empty, "wait_pullback": empty, "theme_summary": ThemeStrengthEngine.summarize(base), "eliminated": empty
+                "today_buy": empty, "wait_pullback": empty, "execution_pool": empty,
+                "theme_summary": ThemeStrengthEngine.summarize(base), "eliminated": empty
             }
 
         preferred_mask = plans_df["theme"].isin(hot_themes) if hot_themes else pd.Series([True] * len(plans_df), index=plans_df.index)
@@ -3669,7 +3671,10 @@ class MasterTradingEngine:
             tradable["preferred_rank"] = preferred_mask.reindex(tradable.index).fillna(False).astype(int)
             tradable = tradable.sort_values(["liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
 
-        trade_top20 = tradable.head(20).copy()  # 依你的要求，TOP20 保留
+        trade_top20 = tradable.head(20).copy()
+        if not trade_top20.empty:
+            trade_top20 = trade_top20.copy()
+            trade_top20["pool_role"] = "交易候選池"
 
         attack = trade_top20[(trade_top20["decision"] == "BUY") & (trade_top20["liquidity_status"] == "PASS")].copy()
         watch = trade_top20[(trade_top20["liquidity_status"] == "WATCH") | (trade_top20["decision"].isin(["WEAK BUY", "HOLD"]))].copy()
@@ -3681,21 +3686,37 @@ class MasterTradingEngine:
         ].copy()
         if not defense.empty:
             defense = defense.sort_values(["model_score", "trade_score", "rr", "win_rate"], ascending=False).head(10)
+            defense["pool_role"] = "防守池"
 
-        today_buy = tradable[
-            (tradable["decision"] == "BUY") &
-            (tradable["liquidity_status"] == "PASS") &
-            (tradable["rr"] >= 1.2) &
-            (tradable["win_rate"] >= max(55.0, market["min_win_rate"] - 10))
-        ].sort_values(["liquidity_score", "model_score"], ascending=False)
+        # 依規格書：Today_Buy / Wait_Pullback 必須只從 Trade_TOP20 派生，不可從 tradable 另選
+        today_buy = trade_top20[
+            (trade_top20["decision"] == "BUY") &
+            (trade_top20["liquidity_status"] == "PASS") &
+            (trade_top20["rr"] >= 1.2) &
+            (trade_top20["win_rate"] >= max(55.0, market["min_win_rate"] - 10))
+        ].sort_values(["liquidity_score", "model_score"], ascending=False).copy()
+        if not today_buy.empty:
+            today_buy["pool_role"] = "今日可買"
 
-        wait_pullback = tradable[
-            (tradable["decision"].isin(["WEAK BUY", "HOLD"])) &
-            (tradable["liquidity_status"].isin(["PASS", "WATCH"])) &
-            (tradable["rr"] >= 1.0)
-        ].sort_values(["liquidity_score", "model_score"], ascending=False)
+        wait_pullback = trade_top20[
+            (trade_top20["decision"].isin(["WEAK BUY", "HOLD"])) &
+            (trade_top20["liquidity_status"].isin(["PASS", "WATCH"])) &
+            (trade_top20["rr"] >= 1.0)
+        ].sort_values(["liquidity_score", "model_score"], ascending=False).copy()
+        if not wait_pullback.empty:
+            wait_pullback["pool_role"] = "等待拉回"
+
+        execution_parts = []
+        if not today_buy.empty:
+            execution_parts.append(today_buy.copy())
+        if not wait_pullback.empty:
+            execution_parts.append(wait_pullback.copy())
+        execution_pool = pd.concat(execution_parts, ignore_index=True) if execution_parts else pd.DataFrame(columns=trade_top20.columns.tolist() + ["pool_role"])
+        if not execution_pool.empty and "stock_id" in execution_pool.columns:
+            execution_pool = execution_pool.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
 
         dynamic_n = max(1, min(10, market["max_positions"] + 2))
+        execution_pool = execution_pool.head(dynamic_n * 2).copy() if not execution_pool.empty else execution_pool
 
         return {
             "market": market,
@@ -3705,6 +3726,7 @@ class MasterTradingEngine:
             "defense": defense.head(10),
             "today_buy": today_buy.head(dynamic_n),
             "wait_pullback": wait_pullback.head(dynamic_n),
+            "execution_pool": execution_pool,
             "theme_summary": ThemeStrengthEngine.summarize(base),
             "eliminated": eliminated.head(20),
         }
@@ -4108,6 +4130,7 @@ class AppUI:
         self.last_defense_df = pd.DataFrame()
         self.last_order_list_df = pd.DataFrame()
         self.last_institutional_plan_df = pd.DataFrame()
+        self.last_execution_pool_df = pd.DataFrame()
         self.last_today_buy_df = pd.DataFrame()
         self.last_wait_df = pd.DataFrame()
         self.last_operation_sop_df = pd.DataFrame()
@@ -5657,6 +5680,8 @@ class AppUI:
                     tables["Watch"] = self.last_watch_df
                 if self.last_defense_df is not None and not self.last_defense_df.empty:
                     tables["Defense"] = self.last_defense_df
+                if getattr(self, "last_execution_pool_df", pd.DataFrame()) is not None and not getattr(self, "last_execution_pool_df", pd.DataFrame()).empty:
+                    tables["Execution_Pool"] = self.last_execution_pool_df
                 if self.last_order_list_df is not None and not self.last_order_list_df.empty:
                     tables["Order_List"] = self.last_order_list_df
                 if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not getattr(self, "last_institutional_plan_df", pd.DataFrame()).empty:
@@ -5682,12 +5707,12 @@ class AppUI:
 
         self._run_in_thread(worker, "export_analysis")
 
-    def build_order_list(self, today_buy_df: pd.DataFrame, wait_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        x1 = today_buy_df.copy() if today_buy_df is not None else pd.DataFrame()
-        x2 = wait_df.copy() if wait_df is not None else pd.DataFrame()
-        pool = pd.concat([x1, x2], ignore_index=True) if (not x1.empty or not x2.empty) else pd.DataFrame()
-        plan = self.portfolio_engine.build_institutional_plan(pool)
+    def build_order_list(self, execution_pool_df: pd.DataFrame | None = None, plan_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        execution_pool = execution_pool_df.copy() if execution_pool_df is not None else pd.DataFrame()
+        self.last_execution_pool_df = execution_pool.copy()
+        plan = plan_df.copy() if plan_df is not None else self.portfolio_engine.build_institutional_plan(execution_pool)
         if plan.empty:
+            self.last_institutional_plan_df = pd.DataFrame()
             return pd.DataFrame(columns=["優先級","代號","名稱","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
         order_df = pd.DataFrame({
             "優先級": plan["優先級"],
@@ -6258,6 +6283,7 @@ class AppUI:
                 wait_pullback = trade["wait_pullback"]
                 theme_summary = trade["theme_summary"]
                 eliminated = trade.get("eliminated", pd.DataFrame())
+                execution_pool = trade.get("execution_pool", pd.DataFrame())
 
                 self.last_top20_df = trade_top20.copy()
                 self.cache_trade_dataframe(self.last_top20_df)
@@ -6283,8 +6309,10 @@ class AppUI:
                 self.cache_trade_dataframe(self.last_today_buy_df)
                 self.last_wait_df = wait_pullback.copy()
                 self.cache_trade_dataframe(self.last_wait_df)
-                self.last_order_list_df = self.build_order_list(today_buy, wait_pullback)
-                self.last_institutional_plan_df = self.portfolio_engine.build_institutional_plan(pd.concat([today_buy.copy(), wait_pullback.copy()], ignore_index=True))
+                self.last_execution_pool_df = execution_pool.copy()
+                institutional_plan = self.portfolio_engine.build_institutional_plan(execution_pool)
+                self.last_institutional_plan_df = institutional_plan.copy()
+                self.last_order_list_df = self.build_order_list(execution_pool, institutional_plan)
 
                 self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
                 self.ui_call(self.refresh_top20_and_order_views)
