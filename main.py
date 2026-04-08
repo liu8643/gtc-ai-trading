@@ -2987,10 +2987,274 @@ class StrategyEngineV91:
             "position_tier_v91": tier,
         }
 
+
+
+class IntradayLiquidityEngine:
+    """
+    v9.2 升級：盤中資金活性淘汰規則（以日K/近端價量做代理版）
+    - Phase A：分時趨勢分 / 攻擊量分 / 區間股淘汰
+    - Phase B：VWAP缺資料時用近端均價代理 + 相對市場 / 相對產業強弱
+    - Phase C：主動買盤 / 大單掃盤暫以量價攻擊代理分數占位
+    """
+    def __init__(self, db: DBManager):
+        self.db = db
+
+    @staticmethod
+    def _safe_float(v, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _clamp(v: float, low: float = 0.0, high: float = 100.0) -> float:
+        return max(low, min(high, float(v)))
+
+    def _benchmark_strength(self) -> float:
+        for sid in ("0050", "2330"):
+            hist = self.db.get_price_history(sid)
+            if hist is not None and not hist.empty and len(hist) >= 25:
+                x = IndicatorEngine.attach(hist.copy())
+                last = x.iloc[-1]
+                close_ = self._safe_float(last.get("close", 0), 0)
+                close_5 = self._safe_float(x.iloc[-6]["close"], close_) if len(x) >= 6 else close_
+                close_20 = self._safe_float(x.iloc[-21]["close"], close_) if len(x) >= 21 else close_
+                ret5 = (close_ / max(close_5, 1e-6) - 1.0) * 100
+                ret20 = (close_ / max(close_20, 1e-6) - 1.0) * 100
+                return ret5 * 0.55 + ret20 * 0.45
+        return 0.0
+
+    def _industry_relative_score(self, stock_row: pd.Series, own_ret20: float) -> tuple[float, float]:
+        try:
+            industry = str(stock_row.get("industry", "") or "").strip()
+        except Exception:
+            industry = ""
+        if not industry:
+            return 50.0, 0.0
+        master = self.db.get_master()
+        if master is None or master.empty or "industry" not in master.columns:
+            return 50.0, 0.0
+        peers = master[master["industry"].astype(str) == industry]["stock_id"].astype(str).tolist()[:60]
+        peer_scores = []
+        for sid in peers:
+            hist = self.db.get_price_history(sid)
+            if hist is None or hist.empty or len(hist) < 25:
+                continue
+            try:
+                c = float(hist.iloc[-1]["close"])
+                c20 = float(hist.iloc[-21]["close"]) if len(hist) >= 21 else c
+                peer_scores.append((c / max(c20, 1e-6) - 1.0) * 100)
+            except Exception:
+                continue
+        if not peer_scores:
+            return 50.0, 0.0
+        arr = pd.Series(peer_scores, dtype=float)
+        pct = float((arr <= own_ret20).mean() * 100.0)
+        return self._clamp(pct), float(arr.mean())
+
+    def evaluate(self, stock_row: pd.Series, hist: pd.DataFrame, theme_hot: bool = False) -> dict:
+        out = {
+            "intraday_trend_score": 0.0,
+            "attack_volume_score": 0.0,
+            "range_breakout_score": 0.0,
+            "vwap_distance_pct": 0.0,
+            "relative_strength_market": 0.0,
+            "relative_strength_industry": 0.0,
+            "leader_follow_score": 0.0,
+            "active_buy_score": 0.0,
+            "orderflow_aggression_score": 0.0,
+            "large_order_scan_score": 0.0,
+            "institutional_participation_score": 0.0,
+            "liquidity_status": "WATCH",
+            "elimination_reason": "",
+            "is_mainstream_funding": 0,
+            "liquidity_score": 0.0,
+        }
+        if hist is None or hist.empty or len(hist) < 30:
+            out["liquidity_status"] = "ELIMINATE"
+            out["elimination_reason"] = "歷史資料不足"
+            return out
+
+        x = IndicatorEngine.attach(hist.copy())
+        last = x.iloc[-1]
+        close_ = self._safe_float(last.get("close", 0), 0)
+        open_ = self._safe_float(last.get("open", close_), close_)
+        high_ = self._safe_float(last.get("high", close_), close_)
+        low_ = self._safe_float(last.get("low", close_), close_)
+        ma5 = self._safe_float(last.get("ma5", close_), close_)
+        ma10 = self._safe_float(last.get("ma10", close_), close_)
+        ma20 = self._safe_float(last.get("ma20", close_), close_)
+        ma60 = self._safe_float(last.get("ma60", close_), close_)
+
+        recent20 = x.tail(20)
+        recent60 = x.tail(60)
+        recent10 = x.tail(10)
+
+        close5 = self._safe_float(x.iloc[-6]["close"], close_) if len(x) >= 6 else close_
+        close20 = self._safe_float(x.iloc[-21]["close"], close_) if len(x) >= 21 else close_
+        ret5 = (close_ / max(close5, 1e-6) - 1.0) * 100
+        ret20 = (close_ / max(close20, 1e-6) - 1.0) * 100
+
+        range20_high = self._safe_float(recent20["high"].max(), close_)
+        range20_low = self._safe_float(recent20["low"].min(), close_)
+        range60_high = self._safe_float(recent60["high"].max(), close_)
+        range60_low = self._safe_float(recent60["low"].min(), close_)
+        width20 = max(range20_high - range20_low, 1e-6)
+        width60 = max(range60_high - range60_low, 1e-6)
+        close_loc = (close_ - low_) / max(high_ - low_, 1e-6)
+        range_pos20 = (close_ - range20_low) / width20
+        range_pos60 = (close_ - range60_low) / width60
+
+        # 用近端均價代理 VWAP / 均價線
+        proxy_vwap = self._safe_float((recent10["turnover"].sum() / max(recent10["volume"].sum(), 1e-6)) if "turnover" in recent10.columns else recent10["close"].mean(), recent10["close"].mean())
+        vwap_distance_pct = ((close_ / max(proxy_vwap, 1e-6)) - 1.0) * 100
+
+        trend_score = 0.0
+        if close_ > proxy_vwap:
+            trend_score += 24
+        if close_ > ma5 > ma10:
+            trend_score += 18
+        if ma10 >= ma20:
+            trend_score += 12
+        if recent10["close"].tail(3).is_monotonic_increasing:
+            trend_score += 12
+        if ret5 > 0:
+            trend_score += 12
+        if range_pos20 >= 0.62:
+            trend_score += 12
+        if close_loc >= 0.62:
+            trend_score += 10
+        out["intraday_trend_score"] = round(self._clamp(trend_score), 2)
+        out["vwap_distance_pct"] = round(vwap_distance_pct, 2)
+
+        vol_today = self._safe_float(last.get("volume", 0), 0)
+        vol5 = self._safe_float(recent20["volume"].tail(5).mean(), vol_today)
+        vol10 = self._safe_float(recent20["volume"].tail(10).mean(), vol_today)
+        vol20 = self._safe_float(recent20["volume"].mean(), vol_today)
+        vr5 = vol_today / max(vol5, 1e-6)
+        vr10 = vol_today / max(vol10, 1e-6)
+        vr20 = vol_today / max(vol20, 1e-6)
+        attack_volume_score = 0.0
+        if vr5 >= 1.35:
+            attack_volume_score += 30
+        elif vr5 >= 1.10:
+            attack_volume_score += 20
+        elif vr5 >= 0.90:
+            attack_volume_score += 10
+        if vr10 >= 1.20:
+            attack_volume_score += 20
+        elif vr10 >= 1.00:
+            attack_volume_score += 12
+        if ret5 > 0 and vr20 >= 1.00:
+            attack_volume_score += 20
+        if close_ > open_ and close_loc >= 0.60:
+            attack_volume_score += 15
+        if close_ >= range20_high * 0.995:
+            attack_volume_score += 15
+        out["attack_volume_score"] = round(self._clamp(attack_volume_score), 2)
+
+        range_breakout_score = 0.0
+        is_range_stock = (width60 / max(close_, 1e-6)) < 0.12 and abs(ret20) < 8
+        if close_ >= range20_high * 0.995:
+            range_breakout_score += 45
+        elif range_pos20 >= 0.75:
+            range_breakout_score += 25
+        if close_ > ma20 > ma60:
+            range_breakout_score += 20
+        if not is_range_stock:
+            range_breakout_score += 20
+        out["range_breakout_score"] = round(self._clamp(range_breakout_score), 2)
+
+        benchmark = self._benchmark_strength()
+        rel_market = ret20 - benchmark
+        out["relative_strength_market"] = round(rel_market, 2)
+
+        ind_pct, ind_mean = self._industry_relative_score(stock_row, ret20)
+        out["relative_strength_industry"] = round(ind_pct, 2)
+
+        leader_follow_score = 0.0
+        if rel_market > 3:
+            leader_follow_score += 35
+        elif rel_market > 0:
+            leader_follow_score += 22
+        if ind_pct >= 70:
+            leader_follow_score += 30
+        elif ind_pct >= 55:
+            leader_follow_score += 18
+        if theme_hot:
+            leader_follow_score += 20
+        if close_ > proxy_vwap and vr5 >= 1.0:
+            leader_follow_score += 15
+        out["leader_follow_score"] = round(self._clamp(leader_follow_score), 2)
+        out["is_mainstream_funding"] = int(theme_hot and rel_market > 0 and ind_pct >= 50)
+
+        # 無五檔/主動買盤資料時，使用量價攻擊代理分數占位
+        candle_body = max(close_ - open_, 0.0)
+        candle_range = max(high_ - low_, 1e-6)
+        body_ratio = candle_body / candle_range
+        active_buy_score = 0.0
+        if close_ > open_:
+            active_buy_score += 25
+        if body_ratio >= 0.55:
+            active_buy_score += 20
+        if close_loc >= 0.70:
+            active_buy_score += 20
+        if vr5 >= 1.10 and ret5 > 0:
+            active_buy_score += 20
+        if rel_market > 0:
+            active_buy_score += 15
+        out["active_buy_score"] = round(self._clamp(active_buy_score), 2)
+        out["orderflow_aggression_score"] = round(self._clamp(active_buy_score * 0.9 + attack_volume_score * 0.1), 2)
+        out["large_order_scan_score"] = round(self._clamp((body_ratio * 45) + (max(vr5 - 1, 0) * 55)), 2)
+        out["institutional_participation_score"] = round(self._clamp((leader_follow_score * 0.55) + (active_buy_score * 0.45)), 2)
+
+        fail_reasons = []
+        hard_fail = False
+        if out["intraday_trend_score"] < 42:
+            fail_reasons.append("無方向")
+        if out["attack_volume_score"] < 35:
+            fail_reasons.append("無攻擊量")
+        if is_range_stock and out["range_breakout_score"] < 40:
+            fail_reasons.append("區間股")
+        if out["leader_follow_score"] < 35:
+            fail_reasons.append("非主流/相對弱")
+        if out["orderflow_aggression_score"] < 35:
+            fail_reasons.append("主動買盤弱")
+
+        if out["intraday_trend_score"] < 35 and out["attack_volume_score"] < 30:
+            hard_fail = True
+        if is_range_stock and out["orderflow_aggression_score"] < 38:
+            hard_fail = True
+
+        liquidity_score = (
+            out["intraday_trend_score"] * 0.28 +
+            out["attack_volume_score"] * 0.24 +
+            out["range_breakout_score"] * 0.14 +
+            self._clamp(out["relative_strength_market"] * 6 + 50) * 0.10 +
+            out["relative_strength_industry"] * 0.10 +
+            out["leader_follow_score"] * 0.08 +
+            out["orderflow_aggression_score"] * 0.06
+        )
+        out["liquidity_score"] = round(self._clamp(liquidity_score), 2)
+
+        if hard_fail:
+            out["liquidity_status"] = "ELIMINATE"
+        elif out["liquidity_score"] >= 68 and out["intraday_trend_score"] >= 55 and out["attack_volume_score"] >= 50:
+            out["liquidity_status"] = "PASS"
+        else:
+            out["liquidity_status"] = "WATCH"
+
+        if out["liquidity_status"] == "ELIMINATE" and not fail_reasons:
+            fail_reasons = ["量縮盤整"]
+        out["elimination_reason"] = " / ".join(fail_reasons[:4]) if fail_reasons else "盤中結構可接受"
+        return out
+
+
 class TradingPlanEngine:
     def __init__(self, db: DBManager):
         self.db = db
         self.market_engine = MarketRegimeEngine(db)
+        self.intraday_engine = IntradayLiquidityEngine(db)
 
     @staticmethod
     def _is_etf(stock: pd.Series) -> bool:
@@ -3014,14 +3278,17 @@ class TradingPlanEngine:
             return False
 
     @staticmethod
-    def _ui_trade_state(decision: str, close_: float, entry_low: float, entry_high: float, rr: float, win_rate: float) -> str:
+    def _ui_trade_state(decision: str, close_: float, entry_low: float, entry_high: float, rr: float, win_rate: float, liquidity_status: str = "WATCH") -> str:
         decision = str(decision or "").strip().upper()
+        liquidity_status = str(liquidity_status or "WATCH").strip().upper()
         in_entry_zone = TradingPlanEngine._in_entry_zone(close_, entry_low, entry_high)
 
+        if liquidity_status == "ELIMINATE":
+            return "淘汰"
         if decision == "BUY":
             return "可買" if in_entry_zone else "準備買"
         if decision == "WEAK BUY":
-            return "預掛單"
+            return "預掛單" if liquidity_status == "PASS" else "觀察"
         if decision == "HOLD":
             return "觀察"
         if decision == "AVOID":
@@ -3157,6 +3424,22 @@ class TradingPlanEngine:
                 "trade_type": "觀望",
                 "sakata_label": "觀望",
                 "volume_label": "多空均衡",
+                "intraday_trend_score": 0.0,
+                "attack_volume_score": 0.0,
+                "range_breakout_score": 0.0,
+                "vwap_distance_pct": 0.0,
+                "relative_strength_market": 0.0,
+                "relative_strength_industry": 0.0,
+                "leader_follow_score": 0.0,
+                "active_buy_score": 0.0,
+                "orderflow_aggression_score": 0.0,
+                "large_order_scan_score": 0.0,
+                "institutional_participation_score": 0.0,
+                "liquidity_status": "ELIMINATE",
+                "elimination_reason": "資料不足",
+                "liquidity_score": 0.0,
+                "is_mainstream_funding": 0,
+                "final_trade_decision": "AVOID",
             }
 
         x = IndicatorEngine.attach(hist.copy())
@@ -3231,27 +3514,41 @@ class TradingPlanEngine:
         win_grade, win_rate = WinRateEngine.estimate(hist)
         decision, auto_state = StrategyEngineV91.decide_signal(model_score, float(wave_trade["wave_trade_score"]), rr, rsi, wave_label)
 
+        preferred_theme = any(key.lower() in str(stock.get("theme", "")).lower() for key in ThemeStrengthEngine.PREFERRED_KEYWORDS)
+        liquidity = self.intraday_engine.evaluate(stock, hist, theme_hot=preferred_theme)
+        liquidity_status = str(liquidity.get("liquidity_status", "WATCH") or "WATCH")
+        elimination_reason = str(liquidity.get("elimination_reason", "") or "")
+
+        if liquidity_status == "ELIMINATE":
+            decision = "AVOID"
+            auto_state = "淘汰"
+        elif liquidity_status == "WATCH" and decision == "BUY":
+            decision = "HOLD"
+            auto_state = "觀察"
+        elif liquidity_status == "WATCH" and decision == "WEAK BUY":
+            auto_state = "觀察"
+
         if is_etf:
             bucket = "防守"
-        elif decision == "BUY":
+        elif liquidity_status == "ELIMINATE":
+            bucket = "淘汰"
+        elif decision == "BUY" and liquidity_status == "PASS":
             bucket = "主攻"
-        elif decision == "WEAK BUY":
-            bucket = "次強"
-        elif decision == "HOLD":
+        elif decision in ("WEAK BUY", "HOLD") or liquidity_status == "WATCH":
             bucket = "觀察"
         else:
             bucket = "排除"
 
-        preferred_theme = any(key.lower() in str(stock.get("theme", "")).lower() for key in ThemeStrengthEngine.PREFERRED_KEYWORDS)
-        selection_score = round(model_score * 0.55 + float(wave_trade["wave_trade_score"]) * 0.20 + win_rate * 0.15 + min(rr, 3.0) * 5 + (8 if decision == "BUY" else 4 if decision == "WEAK BUY" else 0), 2)
-        trade_score = round(model_score * 0.35 + float(wave_trade["wave_trade_score"]) * 0.25 + score["ai_score"] * 0.10 + win_rate * 0.2 + min(rr, 3.0) * 6 + (8 if preferred_theme else 0), 2)
+        selection_score = round(model_score * 0.45 + float(wave_trade["wave_trade_score"]) * 0.16 + win_rate * 0.12 + min(rr, 3.0) * 5 + float(liquidity.get("liquidity_score", 0)) * 0.22 + (6 if decision == "BUY" else 2 if decision == "WEAK BUY" else 0), 2)
+        trade_score = round(model_score * 0.25 + float(wave_trade["wave_trade_score"]) * 0.18 + score["ai_score"] * 0.08 + win_rate * 0.14 + min(rr, 3.0) * 5 + float(liquidity.get("intraday_trend_score", 0)) * 0.14 + float(liquidity.get("attack_volume_score", 0)) * 0.11 + float(liquidity.get("leader_follow_score", 0)) * 0.10 + (6 if preferred_theme else 0), 2)
 
         reason = (
             f"{signal}｜{wave_label}｜{trade_type}｜{volume_label}｜"
+            f"活性 {float(liquidity.get('liquidity_score',0) or 0):.1f}｜{liquidity_status}｜{elimination_reason or '盤中結構可接受'}｜"
             f"六模組 {model_score:.1f}｜RR {rr:.2f}｜RSI {rsi:.1f}"
         )
 
-        ui_state = self._ui_trade_state(decision, close_, entry_low, entry_high, rr, win_rate)
+        ui_state = self._ui_trade_state(decision, close_, entry_low, entry_high, rr, win_rate, liquidity_status)
 
         return {
             "stock_id": stock_id,
@@ -3299,6 +3596,22 @@ class TradingPlanEngine:
             "atr_pct": atr_pct,
             "sakata_label": sakata_label,
             "volume_label": volume_label,
+            "intraday_trend_score": round(float(liquidity.get("intraday_trend_score", 0) or 0), 2),
+            "attack_volume_score": round(float(liquidity.get("attack_volume_score", 0) or 0), 2),
+            "range_breakout_score": round(float(liquidity.get("range_breakout_score", 0) or 0), 2),
+            "vwap_distance_pct": round(float(liquidity.get("vwap_distance_pct", 0) or 0), 2),
+            "relative_strength_market": round(float(liquidity.get("relative_strength_market", 0) or 0), 2),
+            "relative_strength_industry": round(float(liquidity.get("relative_strength_industry", 0) or 0), 2),
+            "leader_follow_score": round(float(liquidity.get("leader_follow_score", 0) or 0), 2),
+            "active_buy_score": round(float(liquidity.get("active_buy_score", 0) or 0), 2),
+            "orderflow_aggression_score": round(float(liquidity.get("orderflow_aggression_score", 0) or 0), 2),
+            "large_order_scan_score": round(float(liquidity.get("large_order_scan_score", 0) or 0), 2),
+            "institutional_participation_score": round(float(liquidity.get("institutional_participation_score", 0) or 0), 2),
+            "liquidity_status": liquidity_status,
+            "liquidity_score": round(float(liquidity.get("liquidity_score", 0) or 0), 2),
+            "elimination_reason": elimination_reason,
+            "is_mainstream_funding": int(liquidity.get("is_mainstream_funding", 0) or 0),
+            "final_trade_decision": decision if liquidity_status == "PASS" else ("WATCH" if liquidity_status == "WATCH" else "ELIMINATE"),
         }
 
 
@@ -3314,7 +3627,7 @@ class MasterTradingEngine:
             market = self.market_engine.get_market_regime()
             return {
                 "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
-                "today_buy": empty, "wait_pullback": empty, "theme_summary": empty
+                "today_buy": empty, "wait_pullback": empty, "theme_summary": empty, "eliminated": empty
             }
 
         base = filtered_df.copy()
@@ -3338,27 +3651,28 @@ class MasterTradingEngine:
             empty = pd.DataFrame()
             return {
                 "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
-                "today_buy": empty, "wait_pullback": empty, "theme_summary": ThemeStrengthEngine.summarize(base)
+                "today_buy": empty, "wait_pullback": empty, "theme_summary": ThemeStrengthEngine.summarize(base), "eliminated": empty
             }
 
         preferred_mask = plans_df["theme"].isin(hot_themes) if hot_themes else pd.Series([True] * len(plans_df), index=plans_df.index)
 
         # 依 SOP 順序：先篩決策，再支撐>0，再壓力>支撐，最後按六模組總分排序
-        tradable = plans_df[
-            (plans_df["decision"].isin(["BUY", "WEAK BUY"])) &
+        eligible = plans_df[
             (plans_df["support"] > 0) &
             (plans_df["resistance"] > plans_df["support"])
         ].copy()
+        eliminated = eligible[eligible["liquidity_status"].eq("ELIMINATE")].copy()
+        tradable = eligible[~eligible["liquidity_status"].eq("ELIMINATE")].copy()
 
         if not tradable.empty:
-            tradable["decision_rank"] = tradable["decision"].map({"BUY": 2, "WEAK BUY": 1}).fillna(0)
+            tradable["decision_rank"] = tradable["decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1}).fillna(0)
             tradable["preferred_rank"] = preferred_mask.reindex(tradable.index).fillna(False).astype(int)
-            tradable = tradable.sort_values("model_score", ascending=False)
+            tradable = tradable.sort_values(["liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
 
         trade_top20 = tradable.head(20).copy()  # 依你的要求，TOP20 保留
 
-        attack = trade_top20[trade_top20["decision"] == "BUY"].copy()
-        watch = trade_top20[trade_top20["decision"] == "WEAK BUY"].copy()
+        attack = trade_top20[(trade_top20["decision"] == "BUY") & (trade_top20["liquidity_status"] == "PASS")].copy()
+        watch = trade_top20[(trade_top20["liquidity_status"] == "WATCH") | (trade_top20["decision"].isin(["WEAK BUY", "HOLD"]))].copy()
 
         defense = plans_df[
             (plans_df["is_etf"] == 1) &
@@ -3370,14 +3684,16 @@ class MasterTradingEngine:
 
         today_buy = tradable[
             (tradable["decision"] == "BUY") &
+            (tradable["liquidity_status"] == "PASS") &
             (tradable["rr"] >= 1.2) &
             (tradable["win_rate"] >= max(55.0, market["min_win_rate"] - 10))
-        ].sort_values("model_score", ascending=False)
+        ].sort_values(["liquidity_score", "model_score"], ascending=False)
 
         wait_pullback = tradable[
-            (tradable["decision"] == "WEAK BUY") &
+            (tradable["decision"].isin(["WEAK BUY", "HOLD"])) &
+            (tradable["liquidity_status"].isin(["PASS", "WATCH"])) &
             (tradable["rr"] >= 1.0)
-        ].sort_values("model_score", ascending=False)
+        ].sort_values(["liquidity_score", "model_score"], ascending=False)
 
         dynamic_n = max(1, min(10, market["max_positions"] + 2))
 
@@ -3390,6 +3706,7 @@ class MasterTradingEngine:
             "today_buy": today_buy.head(dynamic_n),
             "wait_pullback": wait_pullback.head(dynamic_n),
             "theme_summary": ThemeStrengthEngine.summarize(base),
+            "eliminated": eliminated.head(20),
         }
 
 
@@ -3607,7 +3924,7 @@ class PortfolioEngine:
 
     def build_institutional_plan(self, candidates: pd.DataFrame) -> pd.DataFrame:
         cols = [
-            "優先級","代號","名稱","市場","產業","題材","分類","狀態","進場區","停損",
+            "優先級","代號","名稱","市場","產業","題材","分類","狀態","盤中狀態","活性分","淘汰原因","進場區","停損",
             "1.382","1.618","RR","勝率","模型分數","交易分數","ATR%","Kelly%","建議張數","建議金額","單檔曝險%",
             "題材曝險%","產業曝險%","投資組合狀態","風險備註"
         ]
@@ -3677,6 +3994,8 @@ class PortfolioEngine:
             industry_pct = round(industry_alloc.get(industry, 0.0) / total_capital * 100, 2) if total_capital else 0.0
 
             note_parts = [f"市場={market['regime']}"]
+            if str(r.get("liquidity_status","")) == "ELIMINATE":
+                note_parts.append(f"淘汰={r.get('elimination_reason','')}")
             if desired_amt > remain_theme:
                 note_parts.append("受題材曝險上限限制")
             if desired_amt > remain_industry:
@@ -3699,6 +4018,9 @@ class PortfolioEngine:
                 "題材": theme,
                 "分類": r.get("bucket",""),
                 "狀態": r.get("ui_state",""),
+                "盤中狀態": r.get("liquidity_status",""),
+                "活性分": round(float(r.get("liquidity_score",0) or 0),2),
+                "淘汰原因": r.get("elimination_reason",""),
                 "進場區": r.get("entry_zone","-"),
                 "停損": r.get("stop_loss","-"),
                 "1.382": f"{float(r.get('target_1382',0) or 0):.2f}",
@@ -3764,6 +4086,7 @@ class OperationGuideEngine:
             "預掛單": "只列入名單，不追價，等價格回到進場區再動作。",
             "觀察": "可以追蹤，但目前不應出手。",
             "不可買": "不符合 SOP，應直接排除。",
+            "淘汰": "已被盤中資金活性規則淘汰，不進觀察清單。",
         }
         return mapping.get(str(ui_state or ""), "依 SOP 判斷，不做主觀硬拗。")
 
@@ -4091,23 +4414,23 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "bucket", "ui_action", "entry", "stop", "target1382", "target1618", "rr", "win_rate"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "狀態", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
-        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "state", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "state": "狀態", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
+        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "state": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
         })
         self.top5_tree.bind("<<TreeviewSelect>>", self.on_select_top5)
 
-        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "bucket", "action", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "bucket": "分類", "action": "狀態", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
+        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
         })
         self.order_tree.bind("<<TreeviewSelect>>", self.on_select_order)
 
-        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "market", "industry", "theme", "bucket", "action", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
+        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
         })
         self.inst_tree.bind("<<TreeviewSelect>>", self.on_select_institutional)
 
@@ -4894,6 +5217,7 @@ class AppUI:
             "【AI建議模組】",
             f"AI結論：{display_ai}",
             f"執行狀態：{display_ai}｜決策：{decision or '-'}｜分類：{trade_plan.get('bucket','-')}",
+            f"盤中狀態：{trade_plan.get('liquidity_status','-')}｜活性分：{float(trade_plan.get('liquidity_score',0) or 0):.1f}｜淘汰原因：{trade_plan.get('elimination_reason','-')}",
             f"模型分數 / 交易分數：{float(trade_plan.get('model_score',0) or 0):.2f} / {float(trade_plan.get('wave_trade_score', trade_plan.get('trade_score',0)) or 0):.2f}",
             f"勝率 / 回測勝率：{model_win_rate:.1f}% / {backtest_win_rate:.1f}%",
             f"平均報酬 / CAGR / MDD / Sharpe：{float(bt.get('avg_return',0) or 0):.2f}% / {float(bt.get('cagr',0) or 0):.2f}% / {float(bt.get('mdd',0) or 0):.2f}% / {float(bt.get('sharpe',0) or 0):.2f}",
@@ -5112,7 +5436,7 @@ class AppUI:
             f"股票：{stock['stock_name']} ({stock_id})",
             f"市場 / 產業 / 題材：{stock['market']} / {stock['industry']} / {stock['theme']}",
             f"最新收盤：{float(last['close']):.2f}",
-            f"狀態：{trade_plan.get('ui_state','-')}｜決策：{trade_plan.get('trade_action','-')}",
+            f"狀態：{trade_plan.get('ui_state','-')}｜決策：{trade_plan.get('trade_action','-')}｜盤中：{trade_plan.get('liquidity_status','-')} {float(trade_plan.get('liquidity_score',0) or 0):.1f}",
             f"波浪：{wave}｜訊號：{trade_plan.get('signal','-')}｜交易型態：{trade_plan.get('trade_type','-')}",
             f"進場區：{trade_plan.get('entry_zone','-')}",
             f"停損：{trade_plan.get('stop_loss','-')}",
@@ -5269,11 +5593,11 @@ class AppUI:
                 df = pd.DataFrame()
             if df.empty:
                 empty_columns = {
-                    "TOP20": ["stock_id", "stock_name", "bucket", "ui_state", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "TOP5": ["stock_id", "stock_name", "ui_state", "entry_zone", "stop_loss", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
-                    "今日可買": ["stock_id", "stock_name", "ui_state", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "等待拉回": ["stock_id", "stock_name", "ui_state", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "預掛單": ["stock_id", "stock_name", "ui_state", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "TOP20": ["stock_id", "stock_name", "bucket", "ui_state", "liquidity_status", "liquidity_score", "elimination_reason", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "TOP5": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
+                    "今日可買": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "等待拉回": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "預掛單": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
                     "下單清單": ["優先級", "代號", "名稱", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "機構交易計畫": ["優先級", "代號", "名稱", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
@@ -5364,13 +5688,15 @@ class AppUI:
         pool = pd.concat([x1, x2], ignore_index=True) if (not x1.empty or not x2.empty) else pd.DataFrame()
         plan = self.portfolio_engine.build_institutional_plan(pool)
         if plan.empty:
-            return pd.DataFrame(columns=["優先級","代號","名稱","分類","狀態","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
+            return pd.DataFrame(columns=["優先級","代號","名稱","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
         order_df = pd.DataFrame({
             "優先級": plan["優先級"],
             "代號": plan["代號"],
             "名稱": plan["名稱"],
             "分類": plan["分類"],
             "狀態": plan["狀態"],
+            "盤中狀態": plan["盤中狀態"] if "盤中狀態" in plan.columns else "",
+            "活性分": plan["活性分"] if "活性分" in plan.columns else 0,
             "進場區": plan["進場區"],
             "停損": plan["停損"],
             "1.382": plan["1.382"],
@@ -5399,15 +5725,18 @@ class AppUI:
                 ui_action = str(r.get("ui_state", "不可買"))
                 self.top20_tree.insert("", "end", values=(
                     i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("bucket", ""), ui_action,
+                    r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
-                    f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}"
+                    f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}",
+                    r.get("elimination_reason", "")
                 ))
 
         if self.last_top5_df is not None and not self.last_top5_df.empty:
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
                 self.top5_tree.insert("", "end", values=(
                     i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("ui_state", "-"),
+                    r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}",
@@ -5423,6 +5752,7 @@ class AppUI:
                 self.inst_tree.insert("", "end", values=(
                     int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("市場", ""),
                     r.get("產業", ""), r.get("題材", ""), r.get("分類", ""), r.get("狀態", ""),
+                    r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
                     r.get("進場區", "-"), r.get("停損", "-"),
                     f"{float(r.get('RR', 0) or 0):.2f}", f"{float(r.get('勝率', 0) or 0):.1f}",
                     f"{float(r.get('模型分數', 0) or 0):.2f}",
@@ -5927,6 +6257,7 @@ class AppUI:
                 today_buy = trade["today_buy"]
                 wait_pullback = trade["wait_pullback"]
                 theme_summary = trade["theme_summary"]
+                eliminated = trade.get("eliminated", pd.DataFrame())
 
                 self.last_top20_df = trade_top20.copy()
                 self.cache_trade_dataframe(self.last_top20_df)
@@ -5961,11 +6292,12 @@ class AppUI:
                 self.ui_call(self.open_three_windows)
 
                 defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
+                eliminated_cnt = len(eliminated) if eliminated is not None else 0
                 lines = [
                     "《v9.2 FINAL-RELEASE V3.5 操作版》",
                     f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
                     f"市場說明：{market['memo']}",
-                    f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可買：{len(today_buy)}｜預掛單：{len(wait_pullback)}｜防守：{defend_cnt}",
+                    f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可買：{len(today_buy)}｜預掛單：{len(wait_pullback)}｜防守：{defend_cnt}｜淘汰：{eliminated_cnt}",
                     f"交易門檻：決策 BUY / WEAK BUY｜支撐 > 0｜壓力 > 支撐｜再依六模組總分排序",
                     "操作用途：先看今日可買，再看預掛單，沒有進場區就不下單。",
                     "",
@@ -5975,7 +6307,7 @@ class AppUI:
                     lines.append("目前無符合條件標的")
                 else:
                     for i, (_, r) in enumerate(trade_top20.head(5).iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
 
                 lines.extend(["", "【今日可買】"])
                 if today_buy.empty:
