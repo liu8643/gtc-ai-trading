@@ -2190,6 +2190,24 @@ class DataEngine:
                 continue
         return latest
 
+    def get_realtime_quote(self, stock_id: str, market: str, hist: pd.DataFrame | None = None) -> dict:
+        fallback = {}
+        try:
+            x = hist if hist is not None and not hist.empty else self.db.get_price_history(stock_id)
+            if x is not None and not x.empty:
+                x = x.copy()
+                last = x.iloc[-1]
+                fallback = {
+                    'close': float(last.get('close', 0) or 0),
+                    'prev_close': float(x.iloc[-2].get('close', last.get('close', 0)) or 0) if len(x) >= 2 else float(last.get('close', 0) or 0),
+                    'open': float(last.get('open', last.get('close', 0)) or 0),
+                    'high': float(last.get('high', last.get('close', 0)) or 0),
+                    'low': float(last.get('low', last.get('close', 0)) or 0),
+                }
+        except Exception:
+            fallback = {}
+        return RealtimeQuoteEngine.build_realtime_snapshot(stock_id, market, fallback=fallback)
+
 
     def build_full_history(self, min_days: int = 240, batch_size: int = 25, sleep_sec: float = 0.6, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
         master = self.db.get_master()
@@ -2330,6 +2348,460 @@ class DataEngine:
         x["k"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
         x["d"] = x["k"].ewm(alpha=1 / 3, adjust=False).mean()
         return x
+
+
+class RealtimeQuoteEngine:
+    """Phase 1 tactical layer: unify TWSE MIS and Yahoo near-live quote."""
+
+    @staticmethod
+    def _safe_float(v, default=None):
+        try:
+            if v in (None, "", "-", "--"):
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_int(v, default=None):
+        try:
+            if v in (None, "", "-", "--"):
+                return default
+            return int(float(v))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _round_price(v):
+        try:
+            return round(float(v), 2)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _split_prices(text):
+        vals = []
+        for x in str(text or '').split('_'):
+            v = RealtimeQuoteEngine._safe_float(x)
+            if v is not None and v > 0:
+                vals.append(RealtimeQuoteEngine._round_price(v))
+        return vals
+
+    @staticmethod
+    def _split_ints(text):
+        vals = []
+        for x in str(text or '').split('_'):
+            v = RealtimeQuoteEngine._safe_int(x)
+            if v is not None and v >= 0:
+                vals.append(v)
+        return vals
+
+    @staticmethod
+    def compute_orderbook_bias(bid_vols, ask_vols):
+        buy_qty = int(sum((bid_vols or [])[:5])) if bid_vols else 0
+        sell_qty = int(sum((ask_vols or [])[:5])) if ask_vols else 0
+        if buy_qty == 0 and sell_qty == 0:
+            return {"buy_qty": 0, "sell_qty": 0, "ratio": "-", "bias": "無有效五檔"}
+        if sell_qty == 0:
+            return {"buy_qty": buy_qty, "sell_qty": sell_qty, "ratio": "∞", "bias": "買盤明顯偏強"}
+        ratio = buy_qty / max(sell_qty, 1)
+        if ratio >= 1.5:
+            bias = "買盤偏強"
+        elif ratio <= 0.67:
+            bias = "賣盤偏強"
+        else:
+            bias = "多空均衡"
+        return {"buy_qty": buy_qty, "sell_qty": sell_qty, "ratio": f"{ratio:.2f}", "bias": bias}
+
+    @staticmethod
+    def fetch_twse_mis_quote(stock_id: str, market: str) -> dict | None:
+        market = str(market or '')
+        if market not in ('上市', '上櫃', 'ETF'):
+            return None
+        ex_prefix = 'otc' if market == '上櫃' else 'tse'
+        ex_ch = f"{ex_prefix}_{stock_id}.tw"
+        url = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp'
+        params = {"ex_ch": ex_ch, "json": "1", "delay": "0", "_": str(int(time.time() * 1000))}
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"}
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=8)
+            r.raise_for_status()
+            data = r.json()
+            msg_array = data.get('msgArray', [])
+            if not msg_array:
+                return None
+            item = msg_array[0]
+            last_trade = RealtimeQuoteEngine._safe_float(item.get('z'))
+            open_price = RealtimeQuoteEngine._safe_float(item.get('o'))
+            high_price = RealtimeQuoteEngine._safe_float(item.get('h'))
+            low_price = RealtimeQuoteEngine._safe_float(item.get('l'))
+            prev_close = RealtimeQuoteEngine._safe_float(item.get('y'))
+            ask_prices = RealtimeQuoteEngine._split_prices(item.get('a'))
+            bid_prices = RealtimeQuoteEngine._split_prices(item.get('b'))
+            ask_vols = RealtimeQuoteEngine._split_ints(item.get('f'))
+            bid_vols = RealtimeQuoteEngine._split_ints(item.get('g'))
+            indicative_price = None
+            if bid_prices and ask_prices:
+                indicative_price = RealtimeQuoteEngine._round_price((bid_prices[0] + ask_prices[0]) / 2)
+            elif bid_prices:
+                indicative_price = bid_prices[0]
+            elif ask_prices:
+                indicative_price = ask_prices[0]
+            display_price = last_trade if last_trade is not None else indicative_price
+            if display_price is None and prev_close is not None:
+                display_price = prev_close
+            if display_price is None:
+                return None
+            ob = RealtimeQuoteEngine.compute_orderbook_bias(bid_vols, ask_vols)
+            return {
+                'close': RealtimeQuoteEngine._round_price(display_price),
+                'prev_close': RealtimeQuoteEngine._round_price(prev_close if prev_close is not None else display_price),
+                'open': RealtimeQuoteEngine._round_price(open_price if open_price is not None else display_price),
+                'high': RealtimeQuoteEngine._round_price(high_price if high_price is not None else display_price),
+                'low': RealtimeQuoteEngine._round_price(low_price if low_price is not None else display_price),
+                'last_trade': RealtimeQuoteEngine._round_price(last_trade) if last_trade is not None else None,
+                'indicative_price': RealtimeQuoteEngine._round_price(indicative_price) if indicative_price is not None else None,
+                'bid_prices': bid_prices,
+                'ask_prices': ask_prices,
+                'bid_vols': bid_vols,
+                'ask_vols': ask_vols,
+                'buy_qty': ob['buy_qty'],
+                'sell_qty': ob['sell_qty'],
+                'orderbook_ratio': ob['ratio'],
+                'orderbook_bias': ob['bias'],
+                'quote_time': item.get('t') or item.get('tt') or '',
+                'source': 'TWSE MIS 即時',
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def fetch_yahoo_live_quote(stock_id: str, market: str, fallback: dict | None = None) -> dict:
+        fallback = dict(fallback or {})
+        live_price = float(fallback.get('close', 0) or 0)
+        prev_close = float(fallback.get('prev_close', live_price) or live_price)
+        open_price = float(fallback.get('open', live_price) or live_price)
+        high_price = float(fallback.get('high', live_price) or live_price)
+        low_price = float(fallback.get('low', live_price) or live_price)
+        symbol = DataEngine.yahoo_symbol(stock_id, market)
+        if yf is not None:
+            try:
+                ticker = yf.Ticker(symbol)
+                try:
+                    fi = ticker.fast_info
+                    if fi:
+                        live_price = float(fi.get('lastPrice') or live_price)
+                        prev_close = float(fi.get('previousClose') or prev_close)
+                        open_price = float(fi.get('open') or open_price)
+                        high_price = float(fi.get('dayHigh') or high_price)
+                        low_price = float(fi.get('dayLow') or low_price)
+                except Exception:
+                    pass
+                try:
+                    info = ticker.info or {}
+                    live_price = float(info.get('regularMarketPrice') or live_price)
+                    prev_close = float(info.get('regularMarketPreviousClose') or prev_close)
+                    open_price = float(info.get('regularMarketOpen') or open_price)
+                    high_price = float(info.get('regularMarketDayHigh') or high_price)
+                    low_price = float(info.get('regularMarketDayLow') or low_price)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return {
+            'close': RealtimeQuoteEngine._round_price(live_price),
+            'prev_close': RealtimeQuoteEngine._round_price(prev_close),
+            'open': RealtimeQuoteEngine._round_price(open_price),
+            'high': RealtimeQuoteEngine._round_price(high_price),
+            'low': RealtimeQuoteEngine._round_price(low_price),
+            'last_trade': RealtimeQuoteEngine._round_price(live_price),
+            'indicative_price': RealtimeQuoteEngine._round_price(live_price),
+            'bid_prices': [], 'ask_prices': [], 'bid_vols': [], 'ask_vols': [],
+            'buy_qty': 0, 'sell_qty': 0, 'orderbook_ratio': '-', 'orderbook_bias': '不適用',
+            'quote_time': '', 'source': 'Yahoo Finance',
+        }
+
+    @staticmethod
+    def build_realtime_snapshot(stock_id: str, market: str, fallback: dict | None = None) -> dict:
+        fallback = dict(fallback or {})
+        quote = None
+        if market in ('上市', '上櫃', 'ETF'):
+            quote = RealtimeQuoteEngine.fetch_twse_mis_quote(stock_id, market)
+        if quote is None:
+            quote = RealtimeQuoteEngine.fetch_yahoo_live_quote(stock_id, market, fallback=fallback)
+        if not quote:
+            quote = {
+                'close': float(fallback.get('close', 0) or 0),
+                'prev_close': float(fallback.get('prev_close', fallback.get('close', 0)) or 0),
+                'open': float(fallback.get('open', fallback.get('close', 0)) or 0),
+                'high': float(fallback.get('high', fallback.get('close', 0)) or 0),
+                'low': float(fallback.get('low', fallback.get('close', 0)) or 0),
+                'bid_prices': [], 'ask_prices': [], 'bid_vols': [], 'ask_vols': [],
+                'buy_qty': 0, 'sell_qty': 0, 'orderbook_ratio': '-', 'orderbook_bias': '無有效五檔',
+                'quote_time': '', 'source': 'fallback', 'last_trade': None, 'indicative_price': None,
+            }
+        quote['stock_id'] = str(stock_id)
+        quote['market'] = str(market)
+        return quote
+
+
+class TacticalScoreEngine:
+    @staticmethod
+    def calc_intraday_tactical_score(close, prev_close, open_price, high_price, low_price, support, resistance, orderbook_bias, change_pct):
+        score = 50
+        if change_pct >= 3:
+            score += 20
+        elif change_pct >= 1:
+            score += 10
+        elif change_pct <= -9:
+            score -= 35
+        elif change_pct <= -5:
+            score -= 20
+        elif change_pct < 0:
+            score -= 8
+        if close >= open_price:
+            score += 8
+        else:
+            score -= 8
+        if close >= prev_close:
+            score += 8
+        else:
+            score -= 8
+        day_range = max(high_price - low_price, 0.01)
+        pos = (close - low_price) / day_range
+        if pos >= 0.8:
+            score += 12
+        elif pos <= 0.2:
+            score -= 12
+        if resistance and close > resistance:
+            score += 18
+        elif resistance and close >= resistance * 0.995:
+            score += 6
+        elif support and close < support:
+            score -= 18
+        if change_pct >= 1.5 and close >= open_price and close >= prev_close:
+            score += 10
+        if orderbook_bias == '買盤明顯偏強':
+            score += 12
+        elif orderbook_bias == '買盤偏強':
+            score += 7
+        elif orderbook_bias == '賣盤偏強':
+            score -= 8
+        return max(0, min(100, int(score)))
+
+    @staticmethod
+    def evaluate_intraday_trade_state(close, prev_close, open_price, support, resistance, change_pct, trend_score, intraday_score, score, orderbook_bias, ma20=0, ma60=0, rsi=50):
+        near_resistance = close >= resistance * 0.988 if resistance else False
+        at_breakout = close >= resistance * 0.998 if resistance else False
+        above_open = close >= open_price
+        above_prev = close >= prev_close
+        bullish_orderbook = orderbook_bias in ('買盤偏強', '買盤明顯偏強')
+        structure_bullish = (close >= ma20 and close >= ma60 and ma20 >= ma60) if ma20 and ma60 else False
+        if change_pct <= -9.0 or intraday_score <= 15:
+            return '急跌風險', '觀望為主', 'weak'
+        if support and (close < support * 0.997 or (close < support and intraday_score < 42)):
+            return '跌破支撐', '減碼/防守', 'weak'
+        if score >= 95 and trend_score >= 90 and intraday_score >= 85:
+            if at_breakout and bullish_orderbook:
+                return '突破強勢', '突破可追', 'strong'
+            return '強勢追蹤', '拉回加碼', 'strong'
+        if resistance and close > resistance and trend_score >= 82 and intraday_score >= 78 and score >= 86 and change_pct >= 1.8 and above_open and above_prev and bullish_orderbook:
+            return '突破強勢', '突破可追', 'strong'
+        if trend_score >= 82 and intraday_score >= 70 and score >= 82 and change_pct >= 0.8 and above_open and above_prev and bullish_orderbook:
+            return '強勢追蹤', '拉回加碼', 'strong'
+        if trend_score >= 80 and intraday_score >= 70 and score >= 75 and structure_bullish:
+            return '整理偏多', '低接布局', 'bullish'
+        if trend_score >= 72 and intraday_score >= 58 and score >= 70 and change_pct >= 0.3 and (above_open or structure_bullish):
+            return '偏多觀察', '低接布局', 'bullish'
+        if support and resistance and score >= 45 and support <= close <= resistance:
+            return '區間整理', '區間操作', 'range'
+        if score >= 30:
+            return '轉弱警戒', '減碼/防守', 'weak'
+        return '轉弱警戒', '減碼/防守', 'weak'
+
+    @staticmethod
+    def classify_leader_candidate(score, trend_score, intraday_score, close, ma20, ma60, resistance, rsi, signal, orderbook_bias):
+        if (score >= 90 and trend_score >= 85 and intraday_score >= 80 and 50 <= rsi <= 70 and
+            close > ma20 > ma60 and signal in ('強勢追蹤', '突破強勢', '偏多觀察') and
+            orderbook_bias in ('買盤偏強', '買盤明顯偏強', '多空均衡') and
+            (not resistance or close <= resistance * 1.01)):
+            return '是'
+        if (score >= 85 and trend_score >= 80 and intraday_score >= 70 and close > ma20 >= ma60 and
+            48 <= rsi <= 72 and signal in ('強勢追蹤', '突破強勢', '偏多觀察') and orderbook_bias != '賣盤偏強' and
+            (not resistance or close <= resistance * 1.003)):
+            return '觀察'
+        return '-'
+
+
+class SingleStockNarrativeEngine:
+    @staticmethod
+    def build_tactical_risk_note(close, support, resistance, rsi, score, change_pct=None):
+        notes = []
+        if change_pct is not None and change_pct <= -7:
+            notes.append('當日跌幅偏大，短線波動風險升高')
+        if change_pct is not None and change_pct <= -9:
+            notes.append('接近跌停級別，避免把急跌誤判為強勢買點')
+        if support and close <= support * 1.01:
+            notes.append('接近支撐，觀察是否守穩')
+        if support and close < support:
+            notes.append('已跌破支撐，需提高風險控管')
+        if resistance and close >= resistance * 0.99:
+            notes.append('逼近壓力，留意獲利了結賣壓')
+        if resistance and close > resistance:
+            notes.append('已突破壓力，觀察是否假突破')
+        if rsi >= 70:
+            notes.append('RSI 偏高，短線過熱風險上升')
+        if rsi <= 30:
+            notes.append('RSI 偏低，可能進入超跌區')
+        if score < 30:
+            notes.append('綜合評分偏弱，不宜積極追價')
+        return '；'.join(notes) if notes else '目前技術面無明顯異常，但仍須控管部位'
+
+    @staticmethod
+    def build_ai_summary_text(ctx: dict) -> str:
+        close = float(ctx.get('close', 0) or 0)
+        ma20 = float(ctx.get('ma20', close) or close)
+        ma60 = float(ctx.get('ma60', close) or close)
+        rsi = float(ctx.get('rsi', 50) or 50)
+        score = float(ctx.get('score', 0) or 0)
+        trend_score = float(ctx.get('trend_score', score) or score)
+        intraday_score = float(ctx.get('intraday_score', score) or score)
+        support = float(ctx.get('support', 0) or 0)
+        resistance = float(ctx.get('resistance', 0) or 0)
+        signal = str(ctx.get('signal', '-'))
+        advice = str(ctx.get('advice', '-'))
+        orderbook_bias = str(ctx.get('orderbook_bias', '無'))
+        orderbook_ratio = str(ctx.get('orderbook_ratio', '-'))
+        change_pct = float(ctx.get('change_pct', 0) or 0)
+        if close >= ma20 and close >= ma60:
+            trend_text = '目前股價位於20日線與60日線之上，中期趨勢偏強。'
+        elif close >= ma20 and close < ma60:
+            trend_text = '目前股價站上20日線，但仍在60日線下方，屬短強中性結構。'
+        elif close < ma20 and close >= ma60:
+            trend_text = '目前股價跌破20日線但仍守住60日線，短線轉弱、中期待觀察。'
+        else:
+            trend_text = '目前股價位於20日線與60日線下方，技術面偏弱。'
+        pos_text = f'目前股價位於支撐 {support:.2f} 與壓力 {resistance:.2f} 之間，仍屬區間內。' if support and resistance and support <= close <= resistance else (f'目前股價 {close:.2f} 已跌破支撐 {support:.2f}。' if support and close < support else f'目前股價 {close:.2f} 已突破壓力 {resistance:.2f}。' if resistance and close > resistance else f'目前股價 {close:.2f} 尚待確認位置。')
+        rsi_text = f'RSI為 {rsi:.1f}。'
+        ob_text = f'五檔力道為「{orderbook_bias}」，委買/委賣比 {orderbook_ratio}。'
+        score_text = f'波段分={trend_score:.1f} / 盤中分={intraday_score:.1f} / 綜合分={score:.1f}'
+        final_text = f'AI綜合判斷：訊號「{signal}」，建議「{advice}」。'
+        if change_pct <= -9:
+            final_text += ' 今日屬急跌型態，避免誤判強勢。'
+        return '\n'.join([
+            '【AI個股分析】',
+            f'1. 趨勢判讀：{trend_text}',
+            f'2. 位置判讀：{pos_text}',
+            f'3. 動能狀態：{rsi_text}',
+            f'4. 五檔力道：{ob_text}',
+            f'5. 分數解讀：{score_text}',
+            f'6. AI結論：{final_text}',
+        ])
+
+    @staticmethod
+    def build_wave_summary_text(ctx: dict) -> str:
+        return '\n'.join([
+            '【波浪理論分析】',
+            f"1. 波浪結構：{ctx.get('wave_structure', '-')}",
+            f"2. 可能位置：{ctx.get('wave_position', '-')}",
+            f"3. 交易訊號：{ctx.get('signal', '-')}｜交易型態：{ctx.get('trade_type', '-')}",
+        ])
+
+    @staticmethod
+    def build_fibo_summary_text(ctx: dict) -> str:
+        return '\n'.join([
+            '【費波南西目標位】',
+            f"1. 支撐位 / 壓力位：{float(ctx.get('support',0) or 0):.2f} / {float(ctx.get('resistance',0) or 0):.2f}",
+            f"2. Fib 1.382：{float(ctx.get('target_1382',0) or 0):.2f}",
+            f"3. Fib 1.618：{float(ctx.get('target_1618',0) or 0):.2f}",
+            f"4. 進場區 / 停損 / RR：{ctx.get('entry_zone','-')} / {ctx.get('stop_loss','-')} / {float(ctx.get('rr',0) or 0):.2f}",
+        ])
+
+    @staticmethod
+    def build_bull_bear_path_text(ctx: dict) -> str:
+        support = float(ctx.get('support',0) or 0)
+        resistance = float(ctx.get('resistance',0) or 0)
+        target = float(ctx.get('target_1382', resistance) or resistance)
+        return '\n'.join([
+            '【多空路徑圖示】',
+            f'◎ 多方：守住 {support:.2f} → 挑戰 {resistance:.2f} → 續強看 {target:.2f}',
+            f'◎ 空方：跌破 {support:.2f} → 結構轉弱 → 反彈無法站回 {resistance:.2f} 則弱勢延續',
+        ])
+
+    @staticmethod
+    def build_trade_scripts_text(ctx: dict) -> dict:
+        support = float(ctx.get('support',0) or 0)
+        resistance = float(ctx.get('resistance',0) or 0)
+        target = float(ctx.get('target_1382', resistance) or resistance)
+        bucket = str(ctx.get('state_bucket', 'range'))
+        if bucket == 'strong':
+            return {
+                'script_a': f'劇本A（強勢突破）: 站穩 {resistance:.2f} 之上且量能續強，可順勢追蹤，下一目標看 {target:.2f}',
+                'script_b': f'劇本B（拉回承接）: 回測 {support:.2f} 附近不破，可分批承接；失守則降級。',
+                'script_c': f'劇本C（壓力震盪）: 接近 {resistance:.2f} 但量能不足，先等整理後再攻。',
+            }
+        if bucket == 'bullish':
+            return {
+                'script_a': f'劇本A（偏多延續）: 守住 {support:.2f} 可維持偏多，等待再挑戰 {resistance:.2f}',
+                'script_b': f'劇本B（回測確認）: 回測 {support:.2f} 但止穩，可偏向低接；跌破則觀望。',
+                'script_c': f'劇本C（轉強升級）: 有效突破 {resistance:.2f} 並量價配合，可升級為強勢追蹤。',
+            }
+        if bucket == 'weak':
+            return {
+                'script_a': f'劇本A（弱勢反彈）: 反彈至 {resistance:.2f} 下方仍無法突破，先視為弱勢反彈。',
+                'script_b': f'劇本B（跌破續弱）: 若失守 {support:.2f}，優先控管部位。',
+                'script_c': f'劇本C（止穩觀察）: 只有重新站回 {support:.2f} 並伴隨量價轉強，才考慮恢復偏多。',
+            }
+        return {
+            'script_a': f'劇本A（區間低接）: 靠近 {support:.2f} 觀察承接力道。',
+            'script_b': f'劇本B（跌破下緣）: 跌破 {support:.2f} 先轉為保守觀察。',
+            'script_c': f'劇本C（突破上緣）: 有效突破 {resistance:.2f} 並量能配合，可由整理升級為偏多追蹤。',
+        }
+
+    @staticmethod
+    def build_summary_block(ctx: dict) -> str:
+        return f"{ctx.get('light','⚪')} {ctx.get('orderbook_bias','無')}｜盤中分 {float(ctx.get('intraday_score',0) or 0):.1f}｜{ctx.get('state_bucket','-')}｜主升候選 {ctx.get('leader_candidate','-')}"
+
+
+class UITacticalPresenter:
+    @staticmethod
+    def derive_signal_light(signal, score=0, change_pct=0, intraday_score=0):
+        if signal == '急跌風險' or change_pct <= -9.0:
+            return '🔴'
+        if signal in ('跌破支撐', '轉弱警戒'):
+            return '🟠'
+        if signal == '突破強勢':
+            return '🔵'
+        if signal in ('偏多觀察', '強勢追蹤', '整理偏多'):
+            return '🟢'
+        if signal == '區間整理':
+            return '🟡'
+        if score >= 45 or intraday_score >= 45:
+            return '🟡'
+        return '⚪'
+
+
+class TacticalPlanAdapter:
+    @staticmethod
+    def calc_intraday_trade_plan(ctx: dict) -> dict:
+        support = float(ctx.get('support', 0) or 0)
+        resistance = float(ctx.get('resistance', 0) or 0)
+        state = str(ctx.get('state_bucket', 'range'))
+        target_1382 = float(ctx.get('target_1382', resistance) or resistance)
+        if support <= 0:
+            return {'entry_zone': '-', 'stop_loss': '-', 'intraday_target': '-', 'intraday_rr': None}
+        if state == 'strong':
+            entry_low = support * 1.002; entry_high = min(support * 1.012, resistance * 0.995) if resistance > 0 else support * 1.012; stop = support * 0.982
+        elif state == 'bullish':
+            entry_low = support * 1.000; entry_high = min(support * 1.010, resistance * 0.992) if resistance > 0 else support * 1.010; stop = support * 0.978
+        elif state == 'range':
+            entry_low = support * 0.998; entry_high = min(support * 1.006, resistance * 0.988) if resistance > 0 else support * 1.006; stop = support * 0.972
+        else:
+            return {'entry_zone': '-', 'stop_loss': f"{support * 0.968:.2f}", 'intraday_target': '-', 'intraday_rr': None}
+        risk = entry_high - stop
+        reward = max(target_1382, resistance) - entry_high
+        rr = round(reward / risk, 2) if risk > 0 and reward > 0 else None
+        return {'entry_zone': f"{entry_low:.2f} ~ {entry_high:.2f}", 'stop_loss': f"{stop:.2f}", 'intraday_target': f"{max(target_1382, resistance):.2f}", 'intraday_rr': rr}
 
 
 class IndicatorEngine:
@@ -4122,6 +4594,10 @@ class AppUI:
         self.master_trading_engine = MasterTradingEngine(db)
         self.backtest_engine = BacktestEngine(db)
         self.portfolio_engine = PortfolioEngine(db)
+        self.realtime_quote_engine = RealtimeQuoteEngine()
+        self.tactical_score_engine = TacticalScoreEngine()
+        self.single_stock_narrative_engine = SingleStockNarrativeEngine()
+        self.ui_tactical_presenter = UITacticalPresenter()
         self.last_top20_df = pd.DataFrame()
         self.last_top5_df = pd.DataFrame()
         self.last_theme_summary_df = pd.DataFrame()
@@ -4437,13 +4913,13 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "light", "id", "name", "bucket", "ui_action", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
+            "rank": "排序", "light": "燈號", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
-        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "state": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
+        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "light", "id", "name", "state", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
+            "rank": "排序", "light": "燈號", "id": "代號", "name": "名稱", "state": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
         })
         self.top5_tree.bind("<<TreeviewSelect>>", self.on_select_top5)
 
@@ -5246,9 +5722,158 @@ class AppUI:
             f"平均報酬 / CAGR / MDD / Sharpe：{float(bt.get('avg_return',0) or 0):.2f}% / {float(bt.get('cagr',0) or 0):.2f}% / {float(bt.get('mdd',0) or 0):.2f}% / {float(bt.get('sharpe',0) or 0):.2f}",
             f"一句話：{reason_text}",
         ]
+        try:
+            lines.extend(self.build_tactical_section_lines(stock_id, hist, stock, trade_plan))
+        except Exception as e:
+            lines.extend(["", f"【Phase 1 Tactical Layer】載入失敗：{e}"])
         if quick_only:
             lines.extend(["", "備註：目前為快速模式，完整 AI 分析與回測背景完成後會自動更新。"])
         return lines
+    def _find_trade_row_snapshot(self, stock_id: str) -> dict:
+        stock_id = str(stock_id or '').strip()
+        frames = [
+            getattr(self, 'last_top20_df', pd.DataFrame()),
+            getattr(self, 'last_top5_df', pd.DataFrame()),
+            getattr(self, 'last_today_buy_df', pd.DataFrame()),
+            getattr(self, 'last_wait_df', pd.DataFrame()),
+            getattr(self, 'last_execution_pool_df', pd.DataFrame()),
+        ]
+        for df in frames:
+            try:
+                if df is not None and not df.empty and 'stock_id' in df.columns:
+                    row = df[df['stock_id'].astype(str) == stock_id]
+                    if not row.empty:
+                        return dict(row.iloc[0])
+            except Exception:
+                continue
+        return {}
+
+    def enrich_trade_dataframe_with_tactical(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame() if df is None else df.copy()
+        x = df.copy()
+        for idx, r in x.iterrows():
+            try:
+                stock_id = str(r.get('stock_id', '') or '')
+                stock = self.db.get_stock_row(stock_id)
+                hist = self.db.get_price_history(stock_id)
+                if stock is None or hist is None or hist.empty:
+                    continue
+                hist = DataEngine.attach(hist.copy())
+                last = hist.iloc[-1]
+                realtime = self.data_engine.get_realtime_quote(stock_id, str(stock.get('market', '上市')), hist=hist)
+                close = float(realtime.get('close', last.get('close', 0)) or 0)
+                prev_close = float(realtime.get('prev_close', hist.iloc[-2]['close']) if len(hist) >= 2 else realtime.get('prev_close', close) or close)
+                open_price = float(realtime.get('open', close) or close)
+                high_price = float(realtime.get('high', close) or close)
+                low_price = float(realtime.get('low', close) or close)
+                change_pct = round(((close - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
+                ma20 = float(last.get('ma20', close) or close)
+                ma60 = float(last.get('ma60', close) or close)
+                rsi = float(last.get('rsi14', 50) or 50)
+                trend_score = float(r.get('total_score', r.get('model_score', 0)) or 0)
+                support = float(r.get('support', 0) or 0)
+                resistance = float(r.get('resistance', 0) or 0)
+                if support <= 0 or resistance <= 0 or resistance <= support:
+                    recent = hist.tail(40)
+                    support = float(recent['low'].min()) if not recent.empty else close
+                    resistance = float(recent['high'].max()) if not recent.empty else close
+                intraday_score = self.tactical_score_engine.calc_intraday_tactical_score(close, prev_close, open_price, high_price, low_price, support, resistance, realtime.get('orderbook_bias', '無有效五檔'), change_pct)
+                signal, advice, state_bucket = self.tactical_score_engine.evaluate_intraday_trade_state(close, prev_close, open_price, support, resistance, change_pct, trend_score, intraday_score, trend_score, realtime.get('orderbook_bias', '無有效五檔'), ma20=ma20, ma60=ma60, rsi=rsi)
+                leader = self.tactical_score_engine.classify_leader_candidate(trend_score, trend_score, intraday_score, close, ma20, ma60, resistance, rsi, signal, realtime.get('orderbook_bias', '無有效五檔'))
+                light = self.ui_tactical_presenter.derive_signal_light(signal, trend_score, change_pct, intraday_score)
+                ctx = {
+                    'close': close, 'ma20': ma20, 'ma60': ma60, 'rsi': rsi, 'score': trend_score, 'trend_score': trend_score, 'intraday_score': intraday_score,
+                    'support': support, 'resistance': resistance, 'signal': signal, 'advice': advice, 'orderbook_bias': realtime.get('orderbook_bias', '無有效五檔'),
+                    'orderbook_ratio': realtime.get('orderbook_ratio', '-'), 'change_pct': change_pct, 'wave_structure': r.get('wave_structure', '-'), 'wave_position': r.get('wave_position', '-'),
+                    'trade_type': r.get('trade_type', '-'), 'entry_zone': r.get('entry_zone', '-'), 'stop_loss': r.get('stop_loss', '-'), 'rr': r.get('rr', 0), 'target_1382': r.get('target_1382', 0), 'target_1618': r.get('target_1618', 0),
+                    'state_bucket': state_bucket, 'light': light, 'leader_candidate': leader
+                }
+                scripts = self.single_stock_narrative_engine.build_trade_scripts_text(ctx)
+                x.at[idx, 'tactical_light'] = light
+                x.at[idx, 'orderbook_bias'] = realtime.get('orderbook_bias', '無有效五檔')
+                x.at[idx, 'orderbook_ratio'] = realtime.get('orderbook_ratio', '-')
+                x.at[idx, 'intraday_score'] = intraday_score
+                x.at[idx, 'state_bucket'] = state_bucket
+                x.at[idx, 'leader_candidate'] = leader
+                x.at[idx, 'summary_block'] = self.single_stock_narrative_engine.build_summary_block(ctx)
+                x.at[idx, 'ai_analysis_text'] = self.single_stock_narrative_engine.build_ai_summary_text(ctx)
+                x.at[idx, 'wave_analysis_text'] = self.single_stock_narrative_engine.build_wave_summary_text(ctx)
+                x.at[idx, 'fibo_analysis_text'] = self.single_stock_narrative_engine.build_fibo_summary_text(ctx)
+                x.at[idx, 'path_analysis_text'] = self.single_stock_narrative_engine.build_bull_bear_path_text(ctx)
+                x.at[idx, 'risk_note_tactical'] = self.single_stock_narrative_engine.build_tactical_risk_note(close, support, resistance, rsi, trend_score, change_pct)
+                x.at[idx, 'script_a'] = scripts.get('script_a', '')
+                x.at[idx, 'script_b'] = scripts.get('script_b', '')
+                x.at[idx, 'script_c'] = scripts.get('script_c', '')
+            except Exception as e:
+                try:
+                    self.append_log(f'戰術欄位補強失敗：{r.get("stock_id", "")}｜{e}', 'WARNING')
+                except Exception:
+                    pass
+        return x
+
+    def build_tactical_section_lines(self, stock_id: str, hist: pd.DataFrame, stock: pd.Series, trade_plan: dict) -> list[str]:
+        cached = self._find_trade_row_snapshot(stock_id)
+        hist = DataEngine.attach(hist.copy())
+        last = hist.iloc[-1]
+        realtime = self.data_engine.get_realtime_quote(stock_id, str(stock.get('market', '上市')), hist=hist)
+        close = float(realtime.get('close', last.get('close', 0)) or 0)
+        prev_close = float(realtime.get('prev_close', hist.iloc[-2]['close']) if len(hist) >= 2 else realtime.get('prev_close', close) or close)
+        open_price = float(realtime.get('open', close) or close)
+        high_price = float(realtime.get('high', close) or close)
+        low_price = float(realtime.get('low', close) or close)
+        ma20 = float(last.get('ma20', close) or close)
+        ma60 = float(last.get('ma60', close) or close)
+        rsi = float(last.get('rsi14', 50) or 50)
+        support = float(trade_plan.get('support', cached.get('support', 0)) or 0)
+        resistance = float(trade_plan.get('resistance', cached.get('resistance', 0)) or 0)
+        if support <= 0 or resistance <= 0 or resistance <= support:
+            recent = hist.tail(40)
+            support = float(recent['low'].min()) if not recent.empty else close
+            resistance = float(recent['high'].max()) if not recent.empty else close
+        base_score = float(trade_plan.get('model_score', trade_plan.get('total_score', trade_plan.get('wave_trade_score', 0))) or 0)
+        change_pct = round(((close - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
+        intraday_score = float(cached.get('intraday_score', 0) or 0)
+        signal = str(cached.get('signal', trade_plan.get('signal', '-')) or '-')
+        advice = str(cached.get('trade_action', trade_plan.get('trade_action', '-')) or '-')
+        state_bucket = str(cached.get('state_bucket', 'range') or 'range')
+        leader = str(cached.get('leader_candidate', '-') or '-')
+        light = str(cached.get('tactical_light', '') or '')
+        if intraday_score <= 0 or not light:
+            intraday_score = self.tactical_score_engine.calc_intraday_tactical_score(close, prev_close, open_price, high_price, low_price, support, resistance, realtime.get('orderbook_bias', '無有效五檔'), change_pct)
+            signal, advice, state_bucket = self.tactical_score_engine.evaluate_intraday_trade_state(close, prev_close, open_price, support, resistance, change_pct, base_score, intraday_score, base_score, realtime.get('orderbook_bias', '無有效五檔'), ma20=ma20, ma60=ma60, rsi=rsi)
+            leader = self.tactical_score_engine.classify_leader_candidate(base_score, base_score, intraday_score, close, ma20, ma60, resistance, rsi, signal, realtime.get('orderbook_bias', '無有效五檔'))
+            light = self.ui_tactical_presenter.derive_signal_light(signal, base_score, change_pct, intraday_score)
+        ctx = {
+            'close': close, 'ma20': ma20, 'ma60': ma60, 'rsi': rsi, 'score': base_score, 'trend_score': base_score, 'intraday_score': intraday_score,
+            'support': support, 'resistance': resistance, 'signal': signal, 'advice': advice, 'orderbook_bias': realtime.get('orderbook_bias', '無有效五檔'),
+            'orderbook_ratio': realtime.get('orderbook_ratio', '-'), 'change_pct': change_pct, 'wave_structure': trade_plan.get('wave_structure', '-'), 'wave_position': trade_plan.get('wave_position', '-'),
+            'trade_type': trade_plan.get('trade_type', '-'), 'entry_zone': trade_plan.get('entry_zone', '-'), 'stop_loss': trade_plan.get('stop_loss', '-'), 'rr': trade_plan.get('rr', 0), 'target_1382': trade_plan.get('target_1382', 0), 'target_1618': trade_plan.get('target_1618', 0),
+            'state_bucket': state_bucket, 'light': light, 'leader_candidate': leader
+        }
+        scripts = self.single_stock_narrative_engine.build_trade_scripts_text(ctx)
+        return [
+            '',
+            '【Phase 1 Tactical Layer】',
+            f"燈號 / 五檔 / 比率：{light} / {realtime.get('orderbook_bias','無有效五檔')} / {realtime.get('orderbook_ratio','-')}",
+            f"盤中分 / 狀態 / 主升候選：{intraday_score:.1f} / {state_bucket} / {leader}",
+            f"即時價 / 昨收 / 開高低：{close:.2f} / {prev_close:.2f} / {open_price:.2f}-{high_price:.2f}-{low_price:.2f}",
+            f"風險提示：{self.single_stock_narrative_engine.build_tactical_risk_note(close, support, resistance, rsi, base_score, change_pct)}",
+            '',
+            self.single_stock_narrative_engine.build_ai_summary_text(ctx),
+            '',
+            self.single_stock_narrative_engine.build_wave_summary_text(ctx),
+            '',
+            self.single_stock_narrative_engine.build_fibo_summary_text(ctx),
+            '',
+            self.single_stock_narrative_engine.build_bull_bear_path_text(ctx),
+            '',
+            '【交易劇本】',
+            scripts.get('script_a', ''),
+            scripts.get('script_b', ''),
+            scripts.get('script_c', ''),
+        ]
+
     def update_detail_panel(self, stock_id: str, source: str = ""):
         lines = self.build_unified_detail_lines(stock_id, source=source or "多來源同步模式")
         self.detail.delete("1.0", tk.END)
@@ -5749,8 +6374,8 @@ class AppUI:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
                 self.top20_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("bucket", ""), ui_action,
-                    r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
+                    i, r.get('tactical_light', '⚪'), r.get("stock_id", ""), r.get("stock_name", ""), r.get("bucket", ""), ui_action,
+                    r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}",
@@ -5760,8 +6385,8 @@ class AppUI:
         if self.last_top5_df is not None and not self.last_top5_df.empty:
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
                 self.top5_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("ui_state", "-"),
-                    r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
+                    i, r.get('tactical_light', '⚪'), r.get("stock_id", ""), r.get("stock_name", ""), r.get("ui_state", "-"),
+                    r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}",
@@ -6275,15 +6900,15 @@ class AppUI:
                     cancel_cb=lambda: self.cancel_event.is_set(),
                 )
                 market = trade["market"]
-                trade_top20 = trade["trade_top20"]
-                attack = trade["attack"]
-                watch = trade["watch"]
-                defense = trade["defense"]
-                today_buy = trade["today_buy"]
-                wait_pullback = trade["wait_pullback"]
+                trade_top20 = self.enrich_trade_dataframe_with_tactical(trade["trade_top20"])
+                attack = self.enrich_trade_dataframe_with_tactical(trade["attack"])
+                watch = self.enrich_trade_dataframe_with_tactical(trade["watch"])
+                defense = self.enrich_trade_dataframe_with_tactical(trade["defense"])
+                today_buy = self.enrich_trade_dataframe_with_tactical(trade["today_buy"])
+                wait_pullback = self.enrich_trade_dataframe_with_tactical(trade["wait_pullback"])
                 theme_summary = trade["theme_summary"]
                 eliminated = trade.get("eliminated", pd.DataFrame())
-                execution_pool = trade.get("execution_pool", pd.DataFrame())
+                execution_pool = self.enrich_trade_dataframe_with_tactical(trade.get("execution_pool", pd.DataFrame()))
 
                 self.last_top20_df = trade_top20.copy()
                 self.cache_trade_dataframe(self.last_top20_df)
@@ -6335,21 +6960,21 @@ class AppUI:
                     lines.append("目前無符合條件標的")
                 else:
                     for i, (_, r) in enumerate(trade_top20.head(5).iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r.get('tactical_light','⚪')} {r.get('orderbook_bias','-')}｜盤中分 {float(r.get('intraday_score',0) or 0):.1f}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
 
                 lines.extend(["", "【今日可買】"])
                 if today_buy.empty:
                     lines.append("今日無符合 SOP 的可買名單（允許空白，不為湊數放寬）。")
                 else:
                     for i, (_, r) in enumerate(today_buy.iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r.get('tactical_light','⚪')} {r.get('orderbook_bias','-')}｜盤中分 {float(r.get('intraday_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
 
                 lines.extend(["", "【預掛單】"])
                 if wait_pullback.empty:
                     lines.append("無預掛單")
                 else:
                     for i, (_, r) in enumerate(wait_pullback.iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜預掛單｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r.get('tactical_light','⚪')} {r.get('orderbook_bias','-')}｜盤中分 {float(r.get('intraday_score',0) or 0):.1f}｜預掛單｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
 
                 self.ui_call(self.detail.delete, "1.0", tk.END)
                 self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
