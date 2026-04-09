@@ -3881,6 +3881,7 @@ class TradingPlanEngine:
                 "macd_ok": 0,
                 "volume_ok": 0,
                 "decision": "AVOID",
+                "price": 0.0,
                 "support": 0.0,
                 "resistance": 0.0,
                 "model_score": 0.0,
@@ -4028,6 +4029,7 @@ class TradingPlanEngine:
             "industry": stock["industry"],
             "theme": stock["theme"],
             "market": stock["market"],
+            "price": round(close_, 2),
             "is_etf": 1 if is_etf else 0,
             "trade_action": decision,
             "ui_state": ui_state,
@@ -4418,7 +4420,7 @@ class PortfolioEngine:
 
     def build_institutional_plan(self, candidates: pd.DataFrame) -> pd.DataFrame:
         cols = [
-            "優先級","代號","名稱","市場","產業","題材","分類","狀態","盤中狀態","活性分","淘汰原因","進場區","停損",
+            "優先級","代號","名稱","現價","市場","產業","題材","分類","狀態","盤中狀態","活性分","淘汰原因","進場區","停損",
             "1.382","1.618","RR","勝率","模型分數","交易分數","ATR%","Kelly%","建議張數","建議金額","單檔曝險%",
             "題材曝險%","產業曝險%","投資組合狀態","風險備註"
         ]
@@ -4507,6 +4509,7 @@ class PortfolioEngine:
                 "優先級": i,
                 "代號": r.get("stock_id",""),
                 "名稱": r.get("stock_name",""),
+                "現價": f"{float(r.get('price', 0) or 0):.2f}",
                 "市場": r.get("market",""),
                 "產業": industry,
                 "題材": theme,
@@ -4653,12 +4656,12 @@ class AppUI:
 
         self._build_ui()
         set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
-        self.refresh_filters()
-        self.show_welcome_message()
-        self.refresh_all_tables()
+        self.root.after(80, self.refresh_filters)
+        self.root.after(120, self.show_welcome_message)
         self.root.after(180, self._apply_initial_layout)
+        self.root.after(260, self.bootstrap_after_startup)
         self.root.after(600, self._apply_initial_layout)
-        self.set_status(f"PACKED={PACKED_DATA_DIR} | EXTERNAL={EXTERNAL_DATA_DIR} | CSV={MASTER_CSV}")
+        self.set_status(f"啟動畫面已建立｜PACKED={PACKED_DATA_DIR.name} | EXTERNAL={EXTERNAL_DATA_DIR.name}")
 
     def _configure_startup_window(self):
         """啟動時自動貼齊可視區域，避免主視窗超出螢幕範圍。"""
@@ -4682,6 +4685,52 @@ class AppUI:
             self.root.geometry(f"{width}x{height}+{x}+{y}")
         except Exception:
             self.root.geometry("1500x860")
+
+    def bootstrap_after_startup(self):
+        if getattr(self, "_bootstrap_started", False):
+            return
+        self._bootstrap_started = True
+
+        def worker():
+            try:
+                self.ui_call(self.set_status, "啟動中：載入主檔 / 排行...")
+                master = self.db.get_master()
+                init_message = f"股票主檔已載入，共 {len(master)} 檔" if master is not None and not master.empty else "股票主檔尚未建立"
+                if master is None or master.empty:
+                    universe = build_full_market_universe()
+                    if universe is not None and not universe.empty:
+                        self.db.import_master_df(universe)
+                        master = self.db.get_master()
+                        init_message = f"已於背景建立全市場股票主檔，共 {len(master)} 檔"
+                    else:
+                        csv_path = resolve_master_csv()
+                        self.db.import_master_csv(csv_path)
+                        master = self.db.get_master()
+                        init_message = f"已於背景改用本地主檔，共 {len(master)} 檔 | {csv_path}"
+
+                rank_count = self.db.get_ranking_rows_count()
+                if rank_count == 0 and self.db.get_total_price_rows() > 0:
+                    self.ui_call(self.set_status, "啟動中：背景重建排行...")
+                    rank_count = self.rank_engine.rebuild(
+                        log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                        cancel_cb=lambda: self.cancel_event.is_set(),
+                    )
+                    if rank_count > 0:
+                        init_message += f"｜已於背景重建排行 {rank_count} 檔"
+                    else:
+                        init_message += "｜已有歷史資料，但目前不足以形成排行"
+
+                self.ui_call(self.refresh_filters)
+                self.ui_call(self.refresh_all_tables)
+                self.ui_call(self.refresh_classification_summary_ui)
+                self.ui_call(self.show_welcome_message)
+                self.ui_call(self.set_status, init_message)
+            except Exception as e:
+                log_exception("background bootstrap failed", e)
+                self.ui_call(self.append_log, f"背景初始化失敗：{e}", "ERROR")
+                self.ui_call(self.set_status, f"背景初始化失敗：{e}")
+
+        self._run_in_thread(worker, "startup_bootstrap")
 
     def _apply_initial_layout(self):
         """啟動後固定三區比例，減少人工手動調整。"""
@@ -4900,8 +4949,8 @@ class AppUI:
             "industry": "產業", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "trend_count": "強勢數", "hot_score": "輪動分", "rotation": "輪動狀態"
         })
 
-        self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "industry", "theme", "total", "ai", "signal", "action"), {
-            "rank": "排名", "id": "代號", "name": "名稱", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
+        self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "price", "industry", "theme", "total", "ai", "signal", "action"), {
+            "rank": "排名", "id": "代號", "name": "名稱", "price": "股價", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
         })
         self.rank_tree.bind("<<TreeviewSelect>>", self.on_select_stock)
 
@@ -4913,28 +4962,28 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "light", "id", "name", "bucket", "ui_action", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
-            "rank": "排序", "light": "燈號", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "light", "name", "price", "bucket", "ui_action", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
+            "rank": "排序", "id": "代號", "light": "燈號", "name": "名稱", "price": "股價", "bucket": "分類", "ui_action": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
-        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "light", "id", "name", "state", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
-            "rank": "排序", "light": "燈號", "id": "代號", "name": "名稱", "state": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
+        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "light", "name", "price", "state", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
+            "rank": "排序", "id": "代號", "light": "燈號", "name": "名稱", "price": "股價", "state": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
         })
         self.top5_tree.bind("<<TreeviewSelect>>", self.on_select_top5)
 
-        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
+        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "price": "股價", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
         })
         self.order_tree.bind("<<TreeviewSelect>>", self.on_select_order)
 
-        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
+        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "price", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "price": "股價", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
         })
         self.inst_tree.bind("<<TreeviewSelect>>", self.on_select_institutional)
 
-        self.backtest_tree = self._make_tree(self.tab_backtest, ("rank", "id", "name", "win", "avg_ret", "cagr", "mdd", "sharpe", "samples"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "win": "勝率%", "avg_ret": "平均報酬%", "cagr": "CAGR%", "mdd": "MDD%", "sharpe": "Sharpe", "samples": "樣本數"
+        self.backtest_tree = self._make_tree(self.tab_backtest, ("rank", "id", "name", "price", "win", "avg_ret", "cagr", "mdd", "sharpe", "samples"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "price": "股價", "win": "勝率%", "avg_ret": "平均報酬%", "cagr": "CAGR%", "mdd": "MDD%", "sharpe": "Sharpe", "samples": "樣本數"
         })
         self.backtest_tree.bind("<<TreeviewSelect>>", self.on_select_backtest)
 
@@ -4991,9 +5040,19 @@ class AppUI:
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=28)
+        narrow_cols = {"rank", "count", "avg_total", "avg_ai", "id", "total", "ai", "price", "intra", "liq_score", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "single_pct", "theme_pct", "industry_pct", "backtest", "cagr", "mdd", "win", "avg_ret", "samples"}
+        medium_cols = {"light", "state", "action", "signal", "liquidity", "market", "bucket", "ui_action", "priority"}
+        wide_cols = {"name", "industry", "theme", "entry", "stop", "target1382", "target1618", "portfolio_state", "risk_note", "elim_reason"}
         for c in cols:
             tree.heading(c, text=headers[c])
-            tree.column(c, width=140 if c not in ("rank", "count", "avg_total", "avg_ai", "id", "total", "ai") else 90, anchor="center")
+            width = 140
+            if c in narrow_cols:
+                width = 90
+            elif c in medium_cols:
+                width = 110
+            elif c in wide_cols:
+                width = 130
+            tree.column(c, width=width, anchor="center")
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -5035,6 +5094,30 @@ class AppUI:
 
     def finish_task(self, stage: str, summary: str = ""):
         self.set_status(summary or f"{stage} 完成")
+
+    def _fmt_price(self, value) -> str:
+        try:
+            return f"{float(value):.2f}"
+        except Exception:
+            return "-"
+
+    def _get_stock_display_price(self, stock_id: str, row: dict | pd.Series | None = None) -> str:
+        try:
+            if row is not None:
+                for key in ("price", "close", "last_price", "現價"):
+                    if hasattr(row, "get"):
+                        v = row.get(key, None)
+                        if v not in (None, "", "-", "--"):
+                            return self._fmt_price(v)
+        except Exception:
+            pass
+        try:
+            hist = self.db.get_price_history(str(stock_id))
+            if hist is not None and not hist.empty:
+                return self._fmt_price(hist.iloc[-1].get("close", 0))
+        except Exception:
+            pass
+        return "-"
 
     def append_log(self, text, level: str = "INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -5385,6 +5468,7 @@ class AppUI:
                 "market": stock.get("market", "") if stock is not None else "",
                 "industry": stock.get("industry", "") if stock is not None else "",
                 "theme": stock.get("theme", "") if stock is not None else "",
+                "price": round(close_, 2),
                 "ui_state": "觀察", "trade_action": "HOLD", "entry_zone": "-", "stop_loss": "-",
                 "target_1382": 0.0, "target_1618": 0.0, "support": 0.0, "resistance": 0.0, "rr": 0.0,
                 "win_rate": 0.0, "wave": "資料不足", "signal": "載入中", "trade_type": "快速模式", "bucket": "觀察",
@@ -5790,6 +5874,7 @@ class AppUI:
                     'state_bucket': state_bucket, 'light': light, 'leader_candidate': leader
                 }
                 scripts = self.single_stock_narrative_engine.build_trade_scripts_text(ctx)
+                x.at[idx, 'price'] = close
                 x.at[idx, 'tactical_light'] = light
                 x.at[idx, 'orderbook_bias'] = realtime.get('orderbook_bias', '無有效五檔')
                 x.at[idx, 'orderbook_ratio'] = realtime.get('orderbook_ratio', '-')
@@ -6241,13 +6326,13 @@ class AppUI:
                 df = pd.DataFrame()
             if df.empty:
                 empty_columns = {
-                    "TOP20": ["stock_id", "stock_name", "bucket", "ui_state", "liquidity_status", "liquidity_score", "elimination_reason", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "TOP5": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
-                    "今日可買": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "等待拉回": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "預掛單": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "下單清單": ["優先級", "代號", "名稱", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
-                    "機構交易計畫": ["優先級", "代號", "名稱", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
+                    "TOP20": ["stock_id", "stock_name", "price", "bucket", "ui_state", "liquidity_status", "liquidity_score", "elimination_reason", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "TOP5": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
+                    "今日可買": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "等待拉回": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "預掛單": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "下單清單": ["優先級", "代號", "名稱", "現價", "分類", "狀態", "盤中狀態", "活性分", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
+                    "機構交易計畫": ["優先級", "代號", "名稱", "現價", "市場", "產業", "題材", "分類", "狀態", "盤中狀態", "活性分", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                     "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
                     "分類V2摘要": ["total", "official", "manual", "rule_engine", "ai_infer", "unclassified", "covered", "coverage_pct", "report_time", "unclassified_report"],
@@ -6338,11 +6423,12 @@ class AppUI:
         plan = plan_df.copy() if plan_df is not None else self.portfolio_engine.build_institutional_plan(execution_pool)
         if plan.empty:
             self.last_institutional_plan_df = pd.DataFrame()
-            return pd.DataFrame(columns=["優先級","代號","名稱","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
+            return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
         order_df = pd.DataFrame({
             "優先級": plan["優先級"],
             "代號": plan["代號"],
             "名稱": plan["名稱"],
+            "現價": plan["現價"] if "現價" in plan.columns else "",
             "分類": plan["分類"],
             "狀態": plan["狀態"],
             "盤中狀態": plan["盤中狀態"] if "盤中狀態" in plan.columns else "",
@@ -6374,7 +6460,7 @@ class AppUI:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
                 self.top20_tree.insert("", "end", values=(
-                    i, r.get('tactical_light', '⚪'), r.get("stock_id", ""), r.get("stock_name", ""), r.get("bucket", ""), ui_action,
+                    i, r.get("stock_id", ""), r.get('tactical_light', '⚪'), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), ui_action,
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
@@ -6385,7 +6471,7 @@ class AppUI:
         if self.last_top5_df is not None and not self.last_top5_df.empty:
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
                 self.top5_tree.insert("", "end", values=(
-                    i, r.get('tactical_light', '⚪'), r.get("stock_id", ""), r.get("stock_name", ""), r.get("ui_state", "-"),
+                    i, r.get("stock_id", ""), r.get('tactical_light', '⚪'), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("ui_state", "-"),
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}",
@@ -6400,7 +6486,7 @@ class AppUI:
         if self.last_institutional_plan_df is not None and not self.last_institutional_plan_df.empty:
             for _, r in self.last_institutional_plan_df.iterrows():
                 self.inst_tree.insert("", "end", values=(
-                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("市場", ""),
+                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), self._fmt_price(r.get("現價", "")), r.get("市場", ""),
                     r.get("產業", ""), r.get("題材", ""), r.get("分類", ""), r.get("狀態", ""),
                     r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
                     r.get("進場區", "-"), r.get("停損", "-"),
@@ -6420,8 +6506,9 @@ class AppUI:
         if self.last_order_list_df is not None and not self.last_order_list_df.empty:
             for _, r in self.last_order_list_df.iterrows():
                 self.order_tree.insert("", "end", values=(
-                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("分類", ""),
-                    r.get("狀態", ""), r.get("進場區", "-"), r.get("停損", "-"),
+                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), self._fmt_price(r.get("現價", "")), r.get("分類", ""),
+                    r.get("狀態", ""), r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
+                    r.get("進場區", "-"), r.get("停損", "-"),
                     r.get("1.382", "-"), r.get("1.618", "-"),
                     f"{float(r.get('RR', 0) or 0):.2f}", f"{float(r.get('勝率', 0) or 0):.1f}",
                     f"{float(r.get('ATR%', 0) or 0):.2f}", f"{float(r.get('Kelly%', 0) or 0):.2f}",
@@ -6545,13 +6632,33 @@ class AppUI:
                 self.ui_call(self.start_task, "建立完整歷史", total)
                 self.ui_call(self.update_task, "建立完整歷史", 0, total, 0, 0, 0, "準備中")
                 counters = {"ok": 0, "fail": 0}
+                progress_every = 25
+                status_every = 25
+                log_every = 25
+
+                def throttled_log(msg: str):
+                    text_msg = str(msg or "")
+                    emit = False
+                    if "分批節點" in text_msg or "完成" in text_msg or "錯誤" in text_msg or "失敗" in text_msg:
+                        emit = True
+                    else:
+                        m = re.search(r"\[(\d+)/(\d+)\]", text_msg)
+                        if m:
+                            idx_num = int(m.group(1))
+                            total_num = int(m.group(2))
+                            emit = (idx_num == 1) or (idx_num == total_num) or (idx_num % log_every == 0)
+                    if emit:
+                        self.ui_call(self.append_log, text_msg)
 
                 def progress(idx, total_count, sid, existing_count, flag):
                     if flag in ("fail", "error"):
                         counters["fail"] += 1
                     elif flag == "ok":
                         counters["ok"] += 1
-                    self.ui_call(self.update_task, "建立完整歷史", idx, total_count, counters["ok"], counters["fail"], 0, sid)
+
+                    if idx == 1 or idx == total_count or idx % progress_every == 0 or flag in ("fail", "error"):
+                        self.ui_call(self.update_task, "建立完整歷史", idx, total_count, counters["ok"], counters["fail"], 0, sid)
+
                     self.save_history_state({
                         "mode": "build_history",
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -6563,14 +6670,14 @@ class AppUI:
                         "failed": counters["fail"],
                         "existing_count": int(existing_count),
                     })
-                    if idx % 10 == 0 or idx == total_count:
+                    if idx == 1 or idx == total_count or idx % status_every == 0 or flag in ("fail", "error"):
                         self.ui_call(self.set_status, f"建立歷史中 {idx}/{total_count}｜{sid}｜成功 {counters['ok']}｜失敗 {counters['fail']}")
 
                 success, failed, rows = self.data_engine.build_full_history(
                     batch_size=self.history_batch_size,
                     sleep_sec=self.history_sleep_sec,
                     progress_cb=progress,
-                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                    log_cb=throttled_log,
                     cancel_cb=lambda: self.cancel_event.is_set(),
                 )
                 self.clear_history_state()
@@ -6750,7 +6857,7 @@ class AppUI:
 
         for i, row in df.iterrows():
             self.rank_tree.insert("", "end", values=(
-                i + 1, row["stock_id"], row["stock_name"], row["industry"], row["theme"],
+                i + 1, row["stock_id"], row["stock_name"], self._get_stock_display_price(row["stock_id"], row), row["industry"], row["theme"],
                 f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
             ))
 
@@ -7178,14 +7285,18 @@ def bootstrap():
 
 def main():
     log_info("main start")
-    db, init_message = bootstrap()
+    db = DBManager(DB_PATH)
+    db.init_db()
     root = tk.Tk()
     app = AppUI(root, db)
-    app.set_status(init_message)
+    app.set_status("UI 已啟動，背景初始化中...")
 
     def _close():
         log_info("application closing")
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _close)
