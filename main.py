@@ -6470,7 +6470,7 @@ class AppUI:
                 display_name = Path(out_path).name if isinstance(out_path, Path) else str(out_path)
                 self.ui_call(self.update_task, "匯出分析", 5, 5, success=1, item=display_name)
                 self.ui_call(self.finish_task, "匯出分析", f"分析報告已輸出：{display_name}")
-                PLACEHOLDER
+                self.ui_call(messagebox.showinfo, "完成", f"分析報告已輸出（{out_type}）：\n{out_path}")
             except Exception as e:
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
 
