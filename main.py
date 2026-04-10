@@ -4115,7 +4115,7 @@ class MasterTradingEngine:
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷 AI選股TOP20")
             plans.append(self.plan_engine.build_plan(sid))
-            if progress_cb:
+            if progress_cb and (idx2 % 25 == 0 or idx2 == total):
                 progress_cb(idx2, total, sid)
             if log_cb and (idx2 % 100 == 0 or idx2 == total):
                 log_cb(f"AI選股分析進度 {idx2}/{total}｜{sid}")
@@ -4628,6 +4628,8 @@ class AppUI:
         self.history_batch_size = 25
         self.history_sleep_sec = 0.6
         self.last_job_summary = {}
+        self.quote_cache = {}
+        self.last_filter_signature = None
 
         self.root.title(APP_NAME)
         self._configure_startup_window()
@@ -5119,6 +5121,28 @@ class AppUI:
             pass
         return "-"
 
+    def build_enriched_ranking_dataframe(self, df: pd.DataFrame, scope: str = "ui", max_rows: int | None = None) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame() if df is None else df.copy()
+        x = df.copy()
+        if max_rows is not None and max_rows > 0:
+            head = x.head(max_rows).copy()
+            tail = x.iloc[max_rows:].copy() if len(x) > max_rows else pd.DataFrame(columns=x.columns)
+        else:
+            head = x
+            tail = pd.DataFrame(columns=x.columns)
+        prices = []
+        for _, row in head.iterrows():
+            sid = str(row.get("stock_id", "") or "")
+            prices.append(self._get_stock_display_price(sid, row))
+        head["display_price"] = prices
+        if not tail.empty:
+            tail["display_price"] = tail.apply(lambda r: self._get_stock_display_price(str(r.get("stock_id", "") or ""), r), axis=1)
+        out = pd.concat([head, tail], ignore_index=True) if not tail.empty else head
+        if "現價" not in out.columns:
+            out["現價"] = out["display_price"]
+        return out
+
     def append_log(self, text, level: str = "INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
         level_upper = str(level or "INFO").upper()
@@ -5351,7 +5375,7 @@ class AppUI:
             return self.window_current_stock_id
         if self.last_top20_df is not None and not self.last_top20_df.empty:
             return str(self.last_top20_df.iloc[0]["stock_id"])
-        ranking = self._filtered_ranking()
+        ranking = self.build_enriched_ranking_dataframe(self._filtered_ranking(), scope="export")
         if ranking is not None and not ranking.empty:
             return str(ranking.iloc[0]["stock_id"])
         return None
@@ -6780,16 +6804,24 @@ class AppUI:
         self.detail.insert("1.0", "\n".join(lines))
         self.left_notebook.select(self.tab_sop)
 
-    def refresh_filters(self):
+    def refresh_filters(self, force: bool = False):
         master = self.db.get_master()
         if master.empty:
             self.market_cb["values"] = ["全部"]
             self.industry_cb["values"] = ["全部"]
             self.theme_cb["values"] = ["全部"]
+            self.last_filter_signature = ((), (), ())
             return
-        self.market_cb["values"] = ["全部"] + sorted([x for x in master["market"].dropna().unique().tolist() if str(x).strip() != ""])
-        self.industry_cb["values"] = ["全部"] + sorted([x for x in master["industry"].dropna().unique().tolist() if str(x).strip() != ""])
-        self.theme_cb["values"] = ["全部"] + sorted([x for x in master["theme"].dropna().unique().tolist() if str(x).strip() != ""])
+        markets = tuple(sorted([x for x in master["market"].dropna().unique().tolist() if str(x).strip() != ""]))
+        industries = tuple(sorted([x for x in master["industry"].dropna().unique().tolist() if str(x).strip() != ""]))
+        themes = tuple(sorted([x for x in master["theme"].dropna().unique().tolist() if str(x).strip() != ""]))
+        signature = (markets, industries, themes)
+        if (not force) and signature == self.last_filter_signature:
+            return
+        self.market_cb["values"] = ["全部"] + list(markets)
+        self.industry_cb["values"] = ["全部"] + list(industries)
+        self.theme_cb["values"] = ["全部"] + list(themes)
+        self.last_filter_signature = signature
 
     def _parse_search_tokens(self, raw_query: str):
         raw = str(raw_query or "").strip()
@@ -6836,57 +6868,47 @@ class AppUI:
             df = self._apply_search_filter(df, q)
         return df.sort_values(["rank_all"]).reset_index(drop=True)
 
-    def refresh_all_tables(self):
-        for tree in (self.dashboard_tree, self.sop_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
+    def refresh_ranking_table_only(self):
+        for tree in (self.rank_tree, self.sector_tree, self.theme_tree):
             for item in tree.get_children():
                 tree.delete(item)
-
-        if not self.ensure_ranking_ready(auto_rebuild=True):
-            price_rows = self.db.get_total_price_rows()
-            if price_rows > 0:
-                self.set_status("已有歷史資料，但尚未形成有效排行；請先補足歷史或重建排行。")
-            else:
-                self.set_status("目前尚無排行資料，請先初始化、建立歷史，再重建排行。")
-            self.show_welcome_message()
-            return
-
         df = self._filtered_ranking()
-        if df.empty:
-            self.set_status("目前篩選條件下沒有資料。")
-            return
-
-        for i, row in df.iterrows():
+        if df is None or df.empty:
+            return pd.DataFrame()
+        enriched = self.build_enriched_ranking_dataframe(df, scope="ui")
+        for i, row in enriched.iterrows():
             self.rank_tree.insert("", "end", values=(
-                i + 1, row["stock_id"], row["stock_name"], self._get_stock_display_price(row["stock_id"], row), row["industry"], row["theme"],
+                i + 1, row["stock_id"], row["stock_name"], row.get("display_price", self._get_stock_display_price(row["stock_id"], row)), row["industry"], row["theme"],
                 f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
             ))
-
         sector = (
-            df.groupby("industry", as_index=False)
+            enriched.groupby("industry", as_index=False)
             .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
             .sort_values(["avg_total", "avg_ai"], ascending=False)
         )
         for _, r in sector.iterrows():
-            top_name = df[df["industry"] == r["industry"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
-            self.sector_tree.insert("", "end", values=(
-                r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name
-            ))
-
+            top_name = enriched[enriched["industry"] == r["industry"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
+            self.sector_tree.insert("", "end", values=(r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name))
         theme = (
-            df.groupby("theme", as_index=False)
+            enriched.groupby("theme", as_index=False)
             .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
             .sort_values(["avg_total", "avg_ai"], ascending=False)
         )
         for _, r in theme.iterrows():
-            top_name = df[df["theme"] == r["theme"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
-            self.theme_tree.insert("", "end", values=(
-                r["theme"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name
-            ))
+            top_name = enriched[enriched["theme"] == r["theme"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
+            self.theme_tree.insert("", "end", values=(r["theme"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name))
+        return enriched
 
+    def refresh_trade_summary_only(self):
+        for tree in (self.dashboard_tree, self.rotation_tree):
+            for item in tree.get_children():
+                tree.delete(item)
+        df = self._filtered_ranking()
+        if df is None or df.empty:
+            return
         market_engine = self.master_trading_engine.market_engine
         regime = market_engine.get_market_regime()
         rotation = IndustryRotationEngine.summarize(df)
-
         dash_rows = [
             ("市場狀態", regime["regime"], f"Regime score {regime['score']:.2f}"),
             ("市場廣度", f"{regime['breadth']:.1f}", "強勢訊號占比"),
@@ -6897,18 +6919,58 @@ class AppUI:
         for m, v, d in dash_rows:
             self.dashboard_tree.insert("", "end", values=(m, v, d))
         for _, r in rotation.iterrows():
-            self.rotation_tree.insert("", "end", values=(
-                r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", int(r["trend_count"]),
-                f"{r['hot_score']:.2f}", r["rotation"]
-            ))
+            self.rotation_tree.insert("", "end", values=(r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", int(r["trend_count"]), f"{r['hot_score']:.2f}", r["rotation"]))
 
-        trade = self.master_trading_engine.get_trade_pool(df)
-        self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
-        attack_cnt = len(trade["attack"])
-        defense_cnt = len(trade["defense"])
-        self.set_status(
-            f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}"
-        )
+    def refresh_optional_views_lazy(self):
+        try:
+            if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
+                self.refresh_top20_and_order_views()
+        except Exception:
+            pass
+        try:
+            self.refresh_classification_summary_ui()
+        except Exception:
+            pass
+
+    def _finish_rebuild_rank_fast(self, count: int, stage_name: str = "重建排行"):
+        try:
+            self.refresh_ranking_table_only()
+        except Exception:
+            pass
+        try:
+            self.refresh_trade_summary_only()
+        except Exception:
+            pass
+        self.finish_task(stage_name, f"排行已完成，共 {count} 檔")
+        self.append_log(f"{stage_name}已完成，共 {count} 檔；其餘頁面將延後刷新。")
+        self.root.after(200, self._post_refresh_after_rank)
+
+    def _post_refresh_after_rank(self):
+        self.refresh_trade_summary_only()
+        self.root.after(200, self.refresh_optional_views_lazy)
+
+    def refresh_all_tables(self):
+        if not self.ensure_ranking_ready(auto_rebuild=True):
+            price_rows = self.db.get_total_price_rows()
+            if price_rows > 0:
+                self.set_status("已有歷史資料，但尚未形成有效排行；請先補足歷史或重建排行。")
+            else:
+                self.set_status("目前尚無排行資料，請先初始化、建立歷史，再重建排行。")
+            self.show_welcome_message()
+            return
+        df = self.refresh_ranking_table_only()
+        if df is None or df.empty:
+            self.set_status("目前篩選條件下沒有資料。")
+            return
+        self.refresh_trade_summary_only()
+        try:
+            trade = self.master_trading_engine.get_trade_pool(df.head(200))
+            self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
+            attack_cnt = len(trade["attack"])
+            defense_cnt = len(trade["defense"])
+            self.set_status(f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}")
+        except Exception:
+            self.set_status(f"已載入資料，共 {len(df)} 檔")
         if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
             self.refresh_top20_and_order_views()
 
@@ -6944,11 +7006,10 @@ class AppUI:
                     rank_skip["skip"] = skip_count
                     self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
                 rank_count = self.rank_engine.rebuild(progress_cb=rank_progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
-                self.ui_call(self.refresh_filters)
-                self.ui_call(self.refresh_all_tables)
+                self.ui_call(self.refresh_filters, False)
+                self.ui_call(self._finish_rebuild_rank_fast, rank_count, "每日增量更新")
                 self.ui_call(self.show_welcome_message)
-                self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。")
-                self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n排行 {rank_count} 檔\n（TWSE/TPEX 官方優先，只更新今日）")
+                self.ui_call(self.append_log, f"每日增量更新完成｜成功 {success} 檔｜寫入 {rows} 筆｜排行 {rank_count} 檔")
             except OperationCancelled:
                 self.ui_call(self.append_log, "每日更新/重排行已中斷")
                 self.ui_call(self.finish_task, "每日增量更新", "作業已中斷")
@@ -6968,14 +7029,10 @@ class AppUI:
                 def progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
                     self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
                 count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
-                self.ui_call(self.refresh_filters)
-                self.ui_call(self.refresh_all_tables)
-                self.ui_call(self.refresh_classification_summary_ui)
-                self.ui_call(self.finish_task, "重建排行", f"排行已完成，共 {count} 檔")
+                self.ui_call(self.refresh_filters, False)
+                self.ui_call(self._finish_rebuild_rank_fast, count, "重建排行")
                 if count <= 0:
                     self.ui_call(messagebox.showwarning, "提醒", "排行重建完成，但目前可計算檔數為 0。\n請先建立至少 70 根以上歷史K線資料。")
-                else:
-                    self.ui_call(messagebox.showinfo, "完成", f"排行已完成，共 {count} 檔")
             except OperationCancelled:
                 self.ui_call(self.finish_task, "重建排行", "重建排行已中斷")
             except Exception as e:
@@ -6993,7 +7050,8 @@ class AppUI:
 
         def worker():
             try:
-                total = len(df)
+                candidate_df = df.head(300).copy()
+                total = len(candidate_df)
                 self.ui_call(self.clear_log)
                 self.ui_call(self.start_task, "AI選股TOP20", total)
 
@@ -7001,7 +7059,7 @@ class AppUI:
                     self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
 
                 trade = self.master_trading_engine.get_trade_pool(
-                    df,
+                    candidate_df,
                     progress_cb=progress,
                     log_cb=lambda msg: self.ui_call(self.append_log, msg),
                     cancel_cb=lambda: self.cancel_event.is_set(),
@@ -7009,13 +7067,13 @@ class AppUI:
                 market = trade["market"]
                 trade_top20 = self.enrich_trade_dataframe_with_tactical(trade["trade_top20"])
                 attack = self.enrich_trade_dataframe_with_tactical(trade["attack"])
-                watch = self.enrich_trade_dataframe_with_tactical(trade["watch"])
-                defense = self.enrich_trade_dataframe_with_tactical(trade["defense"])
                 today_buy = self.enrich_trade_dataframe_with_tactical(trade["today_buy"])
                 wait_pullback = self.enrich_trade_dataframe_with_tactical(trade["wait_pullback"])
+                execution_pool = self.enrich_trade_dataframe_with_tactical(trade.get("execution_pool", pd.DataFrame()))
+                watch = trade["watch"].copy()
+                defense = trade["defense"].copy()
                 theme_summary = trade["theme_summary"]
                 eliminated = trade.get("eliminated", pd.DataFrame())
-                execution_pool = self.enrich_trade_dataframe_with_tactical(trade.get("execution_pool", pd.DataFrame()))
 
                 self.last_top20_df = trade_top20.copy()
                 self.cache_trade_dataframe(self.last_top20_df)
@@ -7085,7 +7143,7 @@ class AppUI:
 
                 self.ui_call(self.detail.delete, "1.0", tk.END)
                 self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
-                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：TOP20 {len(trade_top20)}｜今日可買 {len(today_buy)}｜等待 {len(wait_pullback)}")
+                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：候選 {len(candidate_df)}｜TOP20 {len(trade_top20)}｜今日可買 {len(today_buy)}｜等待 {len(wait_pullback)}")
             except OperationCancelled:
                 self.ui_call(self.finish_task, "AI選股TOP20", "AI選股TOP20 已中斷")
             except Exception as e:
