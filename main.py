@@ -6380,9 +6380,10 @@ class AppUI:
         self._run_in_thread(worker, f"export_{target}")
 
 
+
     def export_analysis_excel(self):
-        ranking = self._filtered_ranking()
-        if ranking is None or ranking.empty:
+        ranking_raw = self._filtered_ranking()
+        if ranking_raw is None or ranking_raw.empty:
             return messagebox.showwarning("提醒", "目前沒有可匯出的分析資料。")
 
         def worker():
@@ -6391,9 +6392,43 @@ class AppUI:
                 theme = pd.DataFrame()
                 self.ui_call(self.start_task, "匯出分析", 5)
                 self.ui_call(self.update_task, "匯出分析", 1, 5, item="整理排行")
+
+                ranking = self.build_enriched_ranking_dataframe(ranking_raw, scope="export")
+                if ranking is None or ranking.empty:
+                    raise RuntimeError("排行資料整理失敗，無法匯出。")
+
+                if "display_price" in ranking.columns:
+                    ranking["price"] = ranking["display_price"]
+                elif "現價" in ranking.columns and "price" not in ranking.columns:
+                    ranking["price"] = ranking["現價"]
+                elif "price" not in ranking.columns:
+                    ranking["price"] = ranking.apply(
+                        lambda r: self._get_stock_display_price(str(r.get("stock_id", "") or ""), r), axis=1
+                    )
+
+                preferred_cols = [
+                    "rank_all", "stock_id", "stock_name", "price",
+                    "market", "industry", "theme",
+                    "momentum_score", "trend_score", "reversal_score",
+                    "volume_score", "risk_score", "ai_score", "total_score",
+                    "signal", "action", "rank_industry", "display_price", "現價"
+                ]
+                existing_cols = [c for c in preferred_cols if c in ranking.columns]
+                other_cols = [c for c in ranking.columns if c not in existing_cols]
+                ranking = ranking[existing_cols + other_cols].copy()
+
                 if not ranking.empty:
-                    sector = ranking.groupby("industry", as_index=False).agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean")).sort_values(["avg_total", "avg_ai"], ascending=False)
-                    theme = ranking.groupby("theme", as_index=False).agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean")).sort_values(["avg_total", "avg_ai"], ascending=False)
+                    sector = ranking.groupby("industry", as_index=False).agg(
+                        count=("stock_id", "count"),
+                        avg_total=("total_score", "mean"),
+                        avg_ai=("ai_score", "mean")
+                    ).sort_values(["avg_total", "avg_ai"], ascending=False)
+                    theme = ranking.groupby("theme", as_index=False).agg(
+                        count=("stock_id", "count"),
+                        avg_total=("total_score", "mean"),
+                        avg_ai=("ai_score", "mean")
+                    ).sort_values(["avg_total", "avg_ai"], ascending=False)
+
                 detail_text = self.detail.get("1.0", tk.END).strip()
                 tables = {"Ranking": ranking}
                 if not sector.empty:
@@ -6435,7 +6470,7 @@ class AppUI:
                 display_name = Path(out_path).name if isinstance(out_path, Path) else str(out_path)
                 self.ui_call(self.update_task, "匯出分析", 5, 5, success=1, item=display_name)
                 self.ui_call(self.finish_task, "匯出分析", f"分析報告已輸出：{display_name}")
-                self.ui_call(messagebox.showinfo, "完成", f"分析報告已輸出（{out_type}）：\n{out_path}")
+                PLACEHOLDER
             except Exception as e:
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
 
@@ -7156,12 +7191,16 @@ class AppUI:
     def show_strategy_backtest(self):
         if self.last_top20_df is None or self.last_top20_df.empty:
             return messagebox.showwarning("提醒", "請先執行 AI選股TOP20。")
+
         rows = []
         for _, r in self.last_top20_df.head(10).iterrows():
-            bt = self.backtest_engine.estimate_trade_quality(str(r["stock_id"]))
+            stock_id = str(r["stock_id"])
+            bt = self.backtest_engine.estimate_trade_quality(stock_id)
+            price = self._get_stock_display_price(stock_id, r)
             rows.append({
-                "stock_id": r["stock_id"],
+                "stock_id": stock_id,
                 "stock_name": r["stock_name"],
+                "price": price,
                 "backtest_win_rate": bt.get("backtest_win_rate", 0),
                 "avg_return": bt.get("avg_return", 0),
                 "cagr": bt.get("cagr", 0),
@@ -7169,17 +7208,34 @@ class AppUI:
                 "sharpe": bt.get("sharpe", 0),
                 "samples": bt.get("samples", 0),
             })
+
         out = pd.DataFrame(rows).sort_values(["backtest_win_rate", "cagr", "sharpe"], ascending=False).reset_index(drop=True)
+
         for item in self.backtest_tree.get_children():
             self.backtest_tree.delete(item)
+
+        expected_cols = 10
         for i, (_, r) in enumerate(out.iterrows(), start=1):
-            self.backtest_tree.insert("", "end", values=(
-                i, r["stock_id"], r["stock_name"], f"{r['backtest_win_rate']:.1f}", f"{r['avg_return']:.2f}",
-                f"{r['cagr']:.2f}", f"{r['mdd']:.2f}", f"{r['sharpe']:.2f}", int(r["samples"])
-            ))
+            values = (
+                i,
+                r["stock_id"],
+                r["stock_name"],
+                r["price"],
+                f"{float(r['backtest_win_rate']):.1f}",
+                f"{float(r['avg_return']):.2f}",
+                f"{float(r['cagr']):.2f}",
+                f"{float(r['mdd']):.2f}",
+                f"{float(r['sharpe']):.2f}",
+                int(r["samples"]),
+            )
+            assert len(values) == expected_cols, "backtest_tree 欄位數與寫入值數量不一致"
+            self.backtest_tree.insert("", "end", values=values)
+
         lines = ["《v9.2 FINAL-RELEASE 策略回測摘要》", ""]
         for i, (_, r) in enumerate(out.iterrows(), start=1):
-            lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜勝率 {r['backtest_win_rate']:.1f}%｜CAGR {r['cagr']:.2f}%｜MDD {r['mdd']:.2f}%｜Sharpe {r['sharpe']:.2f}｜樣本 {int(r['samples'])}")
+            lines.append(
+                f"{i}. {r['stock_id']} {r['stock_name']}｜現價 {r['price']}｜勝率 {float(r['backtest_win_rate']):.1f}%｜CAGR {float(r['cagr']):.2f}%｜MDD {float(r['mdd']):.2f}%｜Sharpe {float(r['sharpe']):.2f}｜樣本 {int(r['samples'])}"
+            )
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
         self.left_notebook.select(self.tab_backtest)
