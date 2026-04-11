@@ -4796,7 +4796,7 @@ class FinalDecisionEngine:
                 part["source_role"] = role
                 frames.append(part)
         if not frames:
-            return pd.DataFrame(columns=["stock_id", "stock_name", "decision_bucket", "decision_reason", "execution_ready"])
+            return pd.DataFrame(columns=["stock_id", "stock_name", "decision_bucket", "decision_reason", "risk_reason", "execution_ready", "empty_reason", "strategy_layer_source"])
 
         merged = pd.concat(frames, ignore_index=True, sort=False)
         if "stock_id" in merged.columns:
@@ -4807,11 +4807,9 @@ class FinalDecisionEngine:
         if theme_summary is not None and not theme_summary.empty and all(c in theme_summary.columns for c in ["theme", "hot_score"]):
             ts = theme_summary[["theme", "hot_score"]].copy()
             ts["hot_score"] = pd.to_numeric(ts["hot_score"], errors="coerce").fillna(0)
+            ts["top_name"] = ""
             max_hot = float(ts["hot_score"].max()) if not ts.empty else 0.0
-            if max_hot > 0:
-                ts["theme_weight"] = (ts["hot_score"] / max_hot * 100).round(2)
-            else:
-                ts["theme_weight"] = 0.0
+            ts["theme_weight"] = (ts["hot_score"] / max_hot * 100).round(2) if max_hot > 0 else 0.0
             theme_weight_map = dict(zip(ts["theme"].astype(str), ts["theme_weight"]))
         merged["theme_weight"] = merged.get("theme", pd.Series(dtype=object)).astype(str).map(theme_weight_map).fillna(0.0)
 
@@ -4841,36 +4839,66 @@ class FinalDecisionEngine:
             position_bucket = FinalDecisionEngine._position_bucket(price, support, resistance)
             distribution_flag = FinalDecisionEngine._distribution_flag(row)
             final_trade_decision = str(row.get("final_trade_decision", trade_action) or trade_action).upper()
-
             modules_pass_count = FinalDecisionEngine._safe_int(row.get("modules_pass_count", 0), 0)
             operation_grade = str(row.get("operation_grade", "") or "")
+            risk_reasons = []
             reasons = []
+            empty_reason = ""
+            strategy_layer_source = str(row.get("source_role", "交易候選") or "交易候選")
+
             if is_etf or sid in defense_ids or str(row.get("bucket", "")) == "防守":
                 decision_bucket = "防守"
                 reasons.append("ETF/防守池")
+                strategy_layer_source = "Defense"
             elif trade_action == "AVOID" or final_trade_decision in ("AVOID", "ELIMINATE") or liquidity_status == "ELIMINATE":
                 decision_bucket = "排除"
                 reasons.append("AVOID/淘汰")
+                strategy_layer_source = "Eliminated"
             elif sid in wait_ids or distance > 3.5 or trade_action == "HOLD" or ui_state in ("預掛單", "觀察"):
                 decision_bucket = "等待拉回"
                 reasons.append("方向正確但未到執行條件")
-            elif trade_action in ("BUY", "WEAK BUY") and modules_pass_count >= 4 and position_bucket != "高位":
+                strategy_layer_source = "Wait_Pullback"
+            elif (sid in today_buy_ids) or (trade_action in ("BUY", "WEAK BUY") and modules_pass_count >= 4 and position_bucket != "高位"):
                 decision_bucket = "主攻"
                 reasons.append("策略層主攻成立")
+                strategy_layer_source = "Final主攻"
             elif modules_pass_count == 3 or trade_action in ("WEAK BUY", "HOLD") or ui_state in ("準備買",):
                 decision_bucket = "等待拉回"
                 reasons.append("模組成立數不足，保留觀察")
+                strategy_layer_source = "Wait_Pullback"
             else:
                 decision_bucket = "排除"
                 reasons.append("不符合唯一決策規則")
+                strategy_layer_source = "Eliminated"
 
-            if distribution_flag == "是" and decision_bucket == "主攻":
-                decision_bucket = "等待拉回"
-                reasons.append("高位/出貨警示降級")
+            if distribution_flag == "是":
+                risk_reasons.append("高位/出貨警示")
+                if decision_bucket == "主攻":
+                    decision_bucket = "等待拉回"
+                    reasons.append("高位/出貨警示降級")
+                    strategy_layer_source = "Wait_Pullback"
+            if position_bucket == "高位":
+                risk_reasons.append("位置偏高")
+            rsi_val = FinalDecisionEngine._safe_float(row.get("rsi", row.get("rsi14", 50)), 50)
+            if rsi_val >= 72:
+                risk_reasons.append("RSI偏高")
+            if liquidity_status == "WATCH":
+                risk_reasons.append("盤中狀態WATCH")
+            if liquidity_status == "ELIMINATE":
+                risk_reasons.append("盤中結構淘汰")
 
             execution_ready = int(decision_bucket == "主攻" and inst_status == "PASS" and suggested_qty > 0 and trade_action in ("BUY", "WEAK BUY"))
-            if decision_bucket == "主攻" and inst_status and inst_status != "PASS":
-                reasons.append(f"盤中狀態={inst_status}，先保留策略主攻、暫不下單")
+            if decision_bucket == "主攻" and not execution_ready:
+                fail_reasons = []
+                if inst_status != "PASS":
+                    fail_reasons.append(f"盤中狀態={inst_status or '未評級'}")
+                if suggested_qty <= 0:
+                    fail_reasons.append("建議張數=0")
+                if trade_action not in ("BUY", "WEAK BUY"):
+                    fail_reasons.append(f"交易動作={trade_action or '-'}")
+                empty_reason = " / ".join(fail_reasons)
+                if empty_reason:
+                    reasons.append(f"暫不可執行：{empty_reason}")
 
             reason_tail = []
             if str(row.get("signal", "")):
@@ -4895,6 +4923,9 @@ class FinalDecisionEngine:
                 "execution_ready": execution_ready,
                 "decision_bucket": decision_bucket,
                 "decision_reason": "｜".join(reasons + reason_tail),
+                "risk_reason": "｜".join(dict.fromkeys([r for r in risk_reasons if r])) if risk_reasons else "",
+                "empty_reason": empty_reason,
+                "strategy_layer_source": strategy_layer_source,
                 "theme_weight": round(FinalDecisionEngine._safe_float(out.get("theme_weight", 0)), 2),
                 "inst_status": inst_status,
                 "suggested_qty": suggested_qty,
@@ -5258,7 +5289,7 @@ class AppUI:
         self.left_notebook.add(self.tab_rank, text="排行榜")
         self.left_notebook.add(self.tab_sector, text="類股熱度")
         self.left_notebook.add(self.tab_theme, text="題材輪動")
-        self.left_notebook.add(self.tab_top20, text="AI交易TOP20")
+        self.left_notebook.add(self.tab_top20, text="雙引擎TOP20")
         self.left_notebook.add(self.tab_top5, text="AI選股TOP5")
         self.left_notebook.add(self.tab_order, text="下單清單")
         self.left_notebook.add(self.tab_inst, text="機構交易計畫")
@@ -5289,8 +5320,8 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "light", "name", "price", "bucket", "ui_action", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
-            "rank": "排序", "id": "代號", "light": "燈號", "name": "名稱", "price": "股價", "bucket": "分類", "ui_action": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "engine", "id", "light", "name", "price", "bucket", "grade", "ui_action", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
+            "rank": "排序", "engine": "來源", "id": "代號", "light": "燈號", "name": "名稱", "price": "股價", "bucket": "分類", "grade": "操作權", "ui_action": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
@@ -5299,8 +5330,8 @@ class AppUI:
         })
         self.top5_tree.bind("<<TreeviewSelect>>", self.on_select_top5)
 
-        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "price": "股價", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
+        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note", "reason"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "price": "股價", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註", "reason": "決策/空表說明"
         })
         self.order_tree.bind("<<TreeviewSelect>>", self.on_select_order)
 
@@ -5313,6 +5344,7 @@ class AppUI:
             "rank": "排序", "id": "代號", "name": "名稱", "price": "股價", "win": "勝率%", "avg_ret": "平均報酬%", "cagr": "CAGR%", "mdd": "MDD%", "sharpe": "Sharpe", "samples": "樣本數"
         })
         self.backtest_tree.bind("<<TreeviewSelect>>", self.on_select_backtest)
+        self.left_notebook.bind("<<NotebookTabChanged>>", self.on_left_tab_changed)
 
         self.right_paned = ttk.Panedwindow(right, orient="vertical")
         self.right_paned.pack(fill="both", expand=True)
@@ -5636,6 +5668,25 @@ class AppUI:
 
     def open_three_windows(self):
         self.left_notebook.select(self.tab_top20)
+        # 題材頁改用最新題材摘要，避免後端有資料但 UI 空白
+        if self.theme_tree is not None:
+            for item in self.theme_tree.get_children():
+                self.theme_tree.delete(item)
+            theme_df = getattr(self, "last_theme_summary_df", pd.DataFrame())
+            if theme_df is not None and not theme_df.empty:
+                tdf = theme_df.copy()
+                if "top_name" not in tdf.columns:
+                    top_map = {}
+                    source_df = self.last_top20_df if self.last_top20_df is not None and not self.last_top20_df.empty else pd.DataFrame()
+                    if source_df is not None and not source_df.empty and "theme" in source_df.columns:
+                        for theme_name, grp in source_df.groupby("theme"):
+                            try:
+                                top_map[str(theme_name)] = str(grp.sort_values(["model_score", "trade_score", "win_rate"], ascending=False).iloc[0].get("stock_name", ""))
+                            except Exception:
+                                top_map[str(theme_name)] = ""
+                    tdf["top_name"] = tdf["theme"].astype(str).map(top_map).fillna("")
+                for _, r in tdf.iterrows():
+                    self.theme_tree.insert("", "end", values=(r.get("theme", ""), int(r.get("count", 0) or 0), f"{float(r.get('avg_total', 0) or 0):.2f}", f"{float(r.get('avg_ai', 0) or 0):.2f}", r.get("top_name", "")))
         self.sync_multi_windows()
         stock_id = self.window_current_stock_id
         if not stock_id:
@@ -6750,11 +6801,19 @@ class AppUI:
                         avg_total=("total_score", "mean"),
                         avg_ai=("ai_score", "mean")
                     ).sort_values(["avg_total", "avg_ai"], ascending=False)
+                    if not sector.empty:
+                        sector["top_name"] = sector["industry"].astype(str).map(
+                            ranking.sort_values(["industry", "total_score", "ai_score"], ascending=[True, False, False]).drop_duplicates("industry").set_index("industry")["stock_name"].to_dict()
+                        ).fillna("")
                     theme = ranking.groupby("theme", as_index=False).agg(
                         count=("stock_id", "count"),
                         avg_total=("total_score", "mean"),
                         avg_ai=("ai_score", "mean")
                     ).sort_values(["avg_total", "avg_ai"], ascending=False)
+                    if not theme.empty:
+                        theme["top_name"] = theme["theme"].astype(str).map(
+                            ranking.sort_values(["theme", "total_score", "ai_score"], ascending=[True, False, False]).drop_duplicates("theme").set_index("theme")["stock_name"].to_dict()
+                        ).fillna("")
 
                 detail_text = self.detail.get("1.0", tk.END).strip()
                 tables = {"Ranking": ranking}
@@ -6784,10 +6843,8 @@ class AppUI:
                     tables["Execution_Pool"] = self.last_execution_pool_df
                 if getattr(self, "last_final_decision_df", pd.DataFrame()) is not None and not getattr(self, "last_final_decision_df", pd.DataFrame()).empty:
                     tables["Final_Decision"] = self.last_final_decision_df
-                if self.last_order_list_df is not None and not self.last_order_list_df.empty:
-                    tables["Order_List"] = self.last_order_list_df
-                if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not getattr(self, "last_institutional_plan_df", pd.DataFrame()).empty:
-                    tables["Institutional_Plan"] = self.last_institutional_plan_df
+                tables["Order_List"] = self.last_order_list_df.copy() if self.last_order_list_df is not None and not self.last_order_list_df.empty else pd.DataFrame([{"message":"今日無可執行標的","reason":"請檢查 Final_Decision / execution_ready / suggested_qty"}])
+                tables["Institutional_Plan"] = self.last_institutional_plan_df.copy() if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not getattr(self, "last_institutional_plan_df", pd.DataFrame()).empty else pd.DataFrame([{"message":"今日無機構交易計畫","reason":"execution_pool 為空或過濾後無資料"}])
                 cls_v2 = get_classification_v2_summary()
                 if cls_v2:
                     tables["Classification_V2_Summary"] = pd.DataFrame([cls_v2])
@@ -6813,28 +6870,36 @@ class AppUI:
         execution_pool = execution_pool_df.copy() if execution_pool_df is not None else pd.DataFrame()
         self.last_execution_pool_df = execution_pool.copy()
         plan = plan_df.copy() if plan_df is not None else self.portfolio_engine.build_institutional_plan(execution_pool)
+        empty_columns = ["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行","空表說明"]
         if plan.empty:
             self.last_institutional_plan_df = pd.DataFrame()
-            return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行"])
+            return pd.DataFrame([{"優先級":0,"代號":"-","名稱":"今日無可執行標的","現價":"","分類":"-","狀態":"說明","盤中狀態":"-","活性分":"0","進場區":"-","停損":"-","1.382":"-","1.618":"-","RR":"0","勝率":"0","ATR%":"0","Kelly%":"0","建議張數":"0","建議金額":"0","單檔曝險%":"0","投資組合狀態":"空表","風險備註":"請先執行AI選股TOP20 / 機構交易計畫","唯一決策":"-","決策原因":"-","可執行":0,"空表說明":"機構交易計畫為空，因此下單清單沒有資料"}], columns=empty_columns)
 
         final_df = getattr(self, "last_final_decision_df", pd.DataFrame()).copy()
         if final_df is not None and not final_df.empty and "stock_id" in final_df.columns and "代號" in plan.columns:
-            fd = final_df[[c for c in ["stock_id", "decision_bucket", "decision_reason", "execution_ready"] if c in final_df.columns]].copy()
+            fd_cols = [c for c in ["stock_id", "decision_bucket", "decision_reason", "execution_ready", "risk_reason", "empty_reason", "strategy_layer_source"] if c in final_df.columns]
+            fd = final_df[fd_cols].copy()
             fd["stock_id"] = fd["stock_id"].astype(str)
             plan = plan.copy()
             plan["代號"] = plan["代號"].astype(str)
             plan = plan.merge(fd, left_on="代號", right_on="stock_id", how="left")
             plan["decision_bucket"] = plan.get("decision_bucket", "排除").fillna("排除")
             plan["execution_ready"] = pd.to_numeric(plan.get("execution_ready", 0), errors="coerce").fillna(0).astype(int)
-            plan = plan[plan["execution_ready"] == 1].copy()
-            if plan.empty:
-                self.last_institutional_plan_df = pd.DataFrame()
-                return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行"])
+            filtered = plan[plan["execution_ready"] == 1].copy()
+            if filtered.empty:
+                self.last_institutional_plan_df = plan.copy()
+                empty_reason = "所有股票未同時滿足 主攻 + execution_ready=1"
+                if "empty_reason" in plan.columns:
+                    candidates = [str(x).strip() for x in plan["empty_reason"].fillna("").tolist() if str(x).strip()]
+                    if candidates:
+                        empty_reason = "；".join(candidates[:5])
+                return pd.DataFrame([{"優先級":0,"代號":"-","名稱":"今日無可執行標的","現價":"","分類":"-","狀態":"說明","盤中狀態":"-","活性分":"0","進場區":"-","停損":"-","1.382":"-","1.618":"-","RR":"0","勝率":"0","ATR%":"0","Kelly%":"0","建議張數":"0","建議金額":"0","單檔曝險%":"0","投資組合狀態":"空表","風險備註":empty_reason,"唯一決策":"-","決策原因":"請檢查 Final_Decision / Institutional_Plan","可執行":0,"空表說明":empty_reason}], columns=empty_columns)
+            plan = filtered
         elif "盤中狀態" in plan.columns:
             plan = plan[plan["盤中狀態"].astype(str).eq("PASS")].copy()
         if plan.empty:
             self.last_institutional_plan_df = pd.DataFrame()
-            return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行"])
+            return pd.DataFrame([{"優先級":0,"代號":"-","名稱":"今日無可執行標的","現價":"","分類":"-","狀態":"說明","盤中狀態":"-","活性分":"0","進場區":"-","停損":"-","1.382":"-","1.618":"-","RR":"0","勝率":"0","ATR%":"0","Kelly%":"0","建議張數":"0","建議金額":"0","單檔曝險%":"0","投資組合狀態":"空表","風險備註":"過濾後無 PASS 資料","唯一決策":"-","決策原因":"-","可執行":0,"空表說明":"請檢查盤中狀態 / suggested_qty"}], columns=empty_columns)
         order_df = pd.DataFrame({
             "優先級": plan["優先級"],
             "代號": plan["代號"],
@@ -6860,6 +6925,7 @@ class AppUI:
             "唯一決策": plan["decision_bucket"] if "decision_bucket" in plan.columns else "主攻",
             "決策原因": plan["decision_reason"] if "decision_reason" in plan.columns else "",
             "可執行": plan["execution_ready"] if "execution_ready" in plan.columns else 1,
+            "空表說明": "",
         })
         self.last_institutional_plan_df = plan.copy()
         return order_df
@@ -6874,7 +6940,7 @@ class AppUI:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
                 self.top20_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get('tactical_light', '⚪'), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), ui_action,
+                    i, r.get("candidate_engine", "混合"), r.get("stock_id", ""), r.get('tactical_light', '⚪'), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), r.get("operation_grade", "-"), ui_action,
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
@@ -6928,7 +6994,7 @@ class AppUI:
                     f"{float(r.get('ATR%', 0) or 0):.2f}", f"{float(r.get('Kelly%', 0) or 0):.2f}",
                     (f"{float(r.get('建議張數', 0) or 0):.1f}".rstrip('0').rstrip('.') if pd.notna(r.get('建議張數', 0)) else "0"),
                     f"{float(r.get('建議金額', 0) or 0):.0f}", f"{float(r.get('單檔曝險%', 0) or 0):.2f}",
-                    r.get("投資組合狀態", ""), r.get("風險備註", "")
+                    r.get("投資組合狀態", ""), r.get("風險備註", ""), r.get("空表說明", r.get("決策原因", ""))
                 ))
 
         self.sync_multi_windows()
@@ -6954,6 +7020,48 @@ class AppUI:
             return
         self.sync_all_views(stock_id, source="下單清單")
 
+
+    def _show_theme_detail_summary(self):
+        theme_df = getattr(self, "last_theme_summary_df", pd.DataFrame())
+        lines = ["《題材輪動摘要》", ""]
+        if theme_df is None or theme_df.empty:
+            lines.append("目前沒有題材摘要資料。請先執行 AI選股TOP20 或重建排行。")
+        else:
+            lines.append("用途：先看題材，再看個股，不要只看單一股票分數。")
+            lines.append("")
+            for i, (_, r) in enumerate(theme_df.head(10).iterrows(), start=1):
+                lines.append(f"{i}. {r.get('theme','-')}｜檔數 {int(r.get('count',0) or 0)}｜熱度 {float(r.get('hot_score',0) or 0):.2f}｜平均總分 {float(r.get('avg_total',0) or 0):.2f}")
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+
+    def _show_order_detail_summary(self):
+        order_df = getattr(self, "last_order_list_df", pd.DataFrame())
+        lines = ["《下單清單摘要》", ""]
+        if order_df is None or order_df.empty:
+            lines.append("今日無下單清單資料。")
+        else:
+            first_name = str(order_df.iloc[0].get("名稱", "") or "")
+            if first_name == "今日無可執行標的":
+                lines.append("今日無 execution_ready=1 的標的。")
+                lines.append(f"原因：{order_df.iloc[0].get('空表說明','-')}")
+            else:
+                lines.append("用途：這裡只保留 execution_ready=1 的最終可下單名單。")
+                lines.append("")
+                for i, (_, r) in enumerate(order_df.head(10).iterrows(), start=1):
+                    lines.append(f"{i}. {r.get('代號','-')} {r.get('名稱','-')}｜狀態 {r.get('狀態','-')}｜進場 {r.get('進場區','-')}｜RR {float(r.get('RR',0) or 0):.2f}")
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+
+    def on_left_tab_changed(self, event=None):
+        try:
+            current = self.left_notebook.select()
+            current_text = self.left_notebook.tab(current, "text")
+        except Exception:
+            return
+        if current_text in ("題材輪動",):
+            self._show_theme_detail_summary()
+        elif current_text in ("下單清單",):
+            self._show_order_detail_summary()
 
     def show_top5(self):
         def render_top5():
@@ -7491,11 +7599,12 @@ class AppUI:
 
                 top5_source = final_decision[(final_decision["decision_bucket"] == "主攻") & (final_decision["trade_action"].astype(str).str.upper().isin(["BUY", "WEAK BUY"]))].copy() if final_decision is not None and not final_decision.empty else pd.DataFrame()
                 if not top5_source.empty:
-                    top5_source["top5_source"] = "主攻"
-                if top5_source.empty:
-                    top5_source = final_decision[final_decision["decision_bucket"].isin(["主攻", "等待拉回"])].copy() if final_decision is not None and not final_decision.empty else pd.DataFrame()
-                    if not top5_source.empty:
-                        top5_source["top5_source"] = top5_source["decision_bucket"].map(lambda x: "主攻" if x == "主攻" else "等待拉回補足")
+                    top5_source["top5_source"] = "Final主攻"
+                if len(top5_source) < 5 and final_decision is not None and not final_decision.empty:
+                    supplement = final_decision[final_decision["decision_bucket"] == "等待拉回"].copy()
+                    if not supplement.empty:
+                        supplement["top5_source"] = "Wait fallback"
+                        top5_source = pd.concat([top5_source, supplement], ignore_index=True)
                 top5_source = top5_source.head(5).copy() if not top5_source.empty else top5_source
                 if not top5_source.empty:
                     bt_rows = []
