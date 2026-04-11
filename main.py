@@ -5353,13 +5353,47 @@ class AppUI:
         frame.columnconfigure(0, weight=1)
         return tree
 
-    def _display_light_symbol(self, light):
-        light = str(light or "⚪").strip()
-        return "●" if light in ("🔴", "🟠", "🟡", "🟢", "🔵") else "○"
-
-    def _resolve_light_tag(self, light="", ui_state="", bucket="", liquidity_status=""):
-        """燈號顏色唯一來源：tactical_light。ui_state / bucket 只顯示文字，不再干預燈號。"""
+    def _normalize_light_value(self, light):
         light = str(light or "").strip()
+        alias = {
+            "red": "🔴", "orange": "🟠", "yellow": "🟡", "green": "🟢", "blue": "🔵", "neutral": "⚪",
+            "light_red": "🔴", "light_orange": "🟠", "light_yellow": "🟡", "light_green": "🟢", "light_blue": "🔵", "light_neutral": "⚪",
+            "R": "🔴", "O": "🟠", "Y": "🟡", "G": "🟢", "B": "🔵", "N": "⚪",
+            "紅": "🔴", "橘": "🟠", "黃": "🟡", "綠": "🟢", "藍": "🔵", "白": "⚪",
+            "○": "⚪",
+        }
+        return alias.get(light, light if light in ("🔴", "🟠", "🟡", "🟢", "🔵", "⚪") else "⚪")
+
+    def _get_display_light(self, row):
+        row = dict(row or {})
+        light = self._normalize_light_value(row.get("tactical_light", ""))
+        if light and light != "⚪":
+            return light
+        signal = str(row.get("signal", "") or "").strip()
+        if signal:
+            return self._normalize_light_value(UITacticalPresenter.derive_signal_light(
+                signal,
+                score=float(row.get("score", row.get("selection_score", 0)) or 0),
+                change_pct=float(row.get("change_pct", 0) or 0),
+                intraday_score=float(row.get("intraday_score", 0) or 0),
+            ))
+        return "⚪"
+
+    def _display_light_symbol(self, light):
+        light = self._normalize_light_value(light)
+        mapping = {
+            "🔴": "紅",
+            "🟠": "橘",
+            "🟡": "黃",
+            "🟢": "綠",
+            "🔵": "藍",
+            "⚪": "白",
+        }
+        return mapping.get(light, "白")
+
+    def _resolve_light_tag(self, light=""):
+        """燈號顏色唯一來源：只接受 tactical_light / signal fallback 的最終燈號。"""
+        light = self._normalize_light_value(light)
         mapping = {
             "🔴": "light_red",
             "🟠": "light_orange",
@@ -5370,8 +5404,8 @@ class AppUI:
         }
         return mapping.get(light, "light_neutral")
 
-    def _insert_colored_row(self, tree, values, light="", ui_state="", bucket="", liquidity_status=""):
-        tag = self._resolve_light_tag(light=light, ui_state=ui_state, bucket=bucket, liquidity_status=liquidity_status)
+    def _insert_colored_row(self, tree, values, light=""):
+        tag = self._resolve_light_tag(light=light)
         return tree.insert("", "end", values=values, tags=(tag,))
 
     def set_status(self, text):
@@ -6915,14 +6949,7 @@ class AppUI:
         if self.last_top20_df is not None and not self.last_top20_df.empty:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
-                light = str(r.get('tactical_light', '') or '').strip()
-                if light in ('', '-', '--'):
-                    light = UITacticalPresenter.derive_signal_light(
-                        r.get('signal', ''),
-                        score=float(r.get('score', r.get('selection_score', 0)) or 0),
-                        change_pct=float(r.get('change_pct', 0) or 0),
-                        intraday_score=float(r.get('intraday_score', 0) or 0),
-                    )
+                light = self._get_display_light(r.to_dict())
                 self._insert_colored_row(self.top20_tree, values=(
                     i, r.get("stock_id", ""), r.get("stock_name", ""), self._display_light_symbol(light), r.get("candidate_engine", "混合"), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), r.get("operation_grade", "-"), ui_action,
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
@@ -6930,18 +6957,11 @@ class AppUI:
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}",
                     r.get("elimination_reason", "")
-                ), light=light, ui_state=ui_action, bucket=r.get("bucket", ""), liquidity_status=r.get("liquidity_status", ""))
+                ), light=light)
 
         if self.last_top5_df is not None and not self.last_top5_df.empty:
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
-                _light = str(r.get('tactical_light', '') or '').strip()
-                if _light in ('', '-', '--'):
-                    _light = UITacticalPresenter.derive_signal_light(
-                        r.get('signal', ''),
-                        score=float(r.get('score', r.get('selection_score', 0)) or 0),
-                        change_pct=float(r.get('change_pct', 0) or 0),
-                        intraday_score=float(r.get('intraday_score', 0) or 0),
-                    )
+                _light = self._get_display_light(r.to_dict())
                 self._insert_colored_row(self.top5_tree, values=(
                     i, r.get("stock_id", ""), self._display_light_symbol(_light), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("ui_state", "-"),
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
@@ -6952,7 +6972,7 @@ class AppUI:
                     f"{float(r.get('backtest_win_rate', 0) or 0):.1f}",
                     f"{float(r.get('cagr', 0) or 0):.2f}",
                     f"{float(r.get('mdd', 0) or 0):.2f}"
-                ), light=_light, ui_state=r.get("ui_state", "-"), bucket=r.get("bucket", ""), liquidity_status=r.get("liquidity_status", ""))
+                ), light=_light)
 
 
         if self.last_institutional_plan_df is not None and not self.last_institutional_plan_df.empty:
@@ -6974,7 +6994,7 @@ class AppUI:
                     f"{float(r.get('題材曝險%', 0) or 0):.2f}",
                     f"{float(r.get('產業曝險%', 0) or 0):.2f}",
                     r.get("投資組合狀態", "")
-                ), light=_inst_light, ui_state=r.get("狀態", ""), bucket=r.get("分類", ""), liquidity_status=r.get("盤中狀態", ""))
+                ), light=_inst_light)
 
         if self.last_order_list_df is not None and not self.last_order_list_df.empty:
             for _, r in self.last_order_list_df.iterrows():
@@ -6989,7 +7009,7 @@ class AppUI:
                     (f"{float(r.get('建議張數', 0) or 0):.1f}".rstrip('0').rstrip('.') if pd.notna(r.get('建議張數', 0)) else "0"),
                     f"{float(r.get('建議金額', 0) or 0):.0f}", f"{float(r.get('單檔曝險%', 0) or 0):.2f}",
                     r.get("投資組合狀態", ""), r.get("風險備註", ""), r.get("空表說明", r.get("決策原因", ""))
-                ), light=_order_light, ui_state=r.get("狀態", ""), bucket=r.get("分類", ""), liquidity_status=r.get("盤中狀態", ""))
+                ), light=_order_light)
 
         self.sync_multi_windows()
         if self.window_current_stock_id and self.current_chart_path and Path(self.current_chart_path).exists():
@@ -7384,7 +7404,7 @@ class AppUI:
             self._insert_colored_row(self.rank_tree, values=(
                 i + 1, row["stock_id"], row["stock_name"], row.get("display_price", self._get_stock_display_price(row["stock_id"], row)), row["industry"], row["theme"],
                 f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
-            ), light=_rank_light, ui_state=row.get("action", ""), bucket=row.get("bucket", ""), liquidity_status=row.get("liquidity_status", ""))
+            ), light=_rank_light)
         sector = (
             enriched.groupby("industry", as_index=False)
             .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
