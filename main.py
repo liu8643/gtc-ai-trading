@@ -3849,6 +3849,93 @@ class TradingPlanEngine:
 
         return round(self._clamp(base), 2)
 
+    def _calc_position_score(self, close_: float, recent_high: float, recent_low: float, wave_label: str, vol_ratio: float, range_pos60: float) -> tuple[float, str]:
+        recent_high = float(recent_high or close_)
+        recent_low = float(recent_low or close_)
+        width = max(recent_high - recent_low, 1e-6)
+        dist_to_high_pct = (recent_high - close_) / max(recent_high, 1e-6) * 100.0
+        if close_ >= recent_high * 0.995 and vol_ratio >= 1.2 and wave_label in ("第3浪", "推動浪"):
+            return 100.0, "突破"
+        if 0.45 <= range_pos60 <= 0.78 and vol_ratio >= 0.9 and wave_label in ("整理浪", "第3浪", "推動浪"):
+            return 80.0, "平台整理"
+        if wave_label == "修正浪" and range_pos60 <= 0.45:
+            return 30.0, "反彈"
+        if wave_label == "第5浪" or dist_to_high_pct <= 1.2 or range_pos60 >= 0.88:
+            return -50.0, "高檔"
+        return 55.0, "中位"
+
+    def _theme_bonus_score(self, theme: str) -> tuple[float, str]:
+        t = str(theme or "")
+        if any(k in t for k in ["AI", "CPO", "網通"]):
+            return 15.0, "主流題材"
+        if any(k in t for k in ["伺服器", "半導體", "光通訊", "散熱", "電源"]):
+            return 8.0, "次主流題材"
+        return 0.0, "一般題材"
+
+    def _module_pass_flags(self, signal: str, wave_label: str, fib_score: float, sakata_label: str, volume_label: str, rsi: float, macd_hist: float, k: float, d: float) -> dict:
+        kline_pass = int(str(signal) in ("突破強勢", "強勢追蹤", "整理偏多", "偏多觀察"))
+        wave_pass = int(str(wave_label) in ("第3浪", "推動浪", "修正浪"))
+        fib_pass = int(float(fib_score or 0) >= 65)
+        sakata_pass = int(str(sakata_label) in ("拉回承接", "偏多低接", "整理偏多", "區間低接"))
+        volume_pass = int(str(volume_label) in ("買盤明顯偏強", "買盤偏強"))
+        indicator_pass = int((45 <= float(rsi or 0) <= 72) and float(macd_hist or 0) >= 0 and float(k or 0) >= float(d or 0))
+        modules_pass_count = int(kline_pass + wave_pass + fib_pass + sakata_pass + volume_pass + indicator_pass)
+        strong_signal_flag = int(modules_pass_count >= 5)
+        tradable_flag = int(modules_pass_count >= 4)
+        return {
+            "kline_pass": kline_pass,
+            "wave_pass": wave_pass,
+            "fib_pass": fib_pass,
+            "sakata_pass": sakata_pass,
+            "volume_pass": volume_pass,
+            "indicator_pass": indicator_pass,
+            "modules_pass_count": modules_pass_count,
+            "strong_signal_flag": strong_signal_flag,
+            "tradable_flag": tradable_flag,
+        }
+
+    def _path_probabilities(self, wave_label: str, modules_pass_count: int, position_tag: str, rsi: float, distribution_flag: str = "否") -> tuple[float, float, float]:
+        bull = 33.0
+        rng = 34.0
+        bear = 33.0
+        if wave_label == "第3浪":
+            bull += 18; bear -= 8
+        elif wave_label == "推動浪":
+            bull += 10; rng -= 2
+        elif wave_label == "整理浪":
+            rng += 12
+        elif wave_label == "第5浪":
+            bear += 15; bull -= 10
+        elif wave_label == "修正浪":
+            bear += 8; bull -= 6
+        if modules_pass_count >= 5:
+            bull += 10; bear -= 5
+        elif modules_pass_count <= 2:
+            bear += 12; bull -= 8
+        if position_tag == "高檔":
+            bear += 12; bull -= 10
+        elif position_tag == "突破":
+            bull += 8
+        if distribution_flag == "是" or float(rsi or 0) >= 75:
+            bear += 10; bull -= 8
+        vals = [max(5.0, bull), max(5.0, rng), max(5.0, bear)]
+        s = sum(vals)
+        vals = [round(v / s * 100.0, 1) for v in vals]
+        diff = round(100.0 - sum(vals), 1)
+        vals[0] = round(vals[0] + diff, 1)
+        return tuple(vals)
+
+    def _operation_grade(self, wave_label: str, modules_pass_count: int, bucket: str, execution_ready: int = 0, distribution_flag: str = "否") -> str:
+        if distribution_flag == "是" or wave_label == "第5浪" or bucket == "排除":
+            return "C"
+        if wave_label == "第3浪" and modules_pass_count >= 5 and execution_ready == 1:
+            return "S"
+        if modules_pass_count >= 4 and bucket == "主攻":
+            return "A"
+        if modules_pass_count >= 3 or bucket in ("等待拉回", "觀察"):
+            return "B"
+        return "C"
+
     # legacy helper removed in v9.2 FINAL-RELEASE: _decision is no longer used
 
     def build_plan(self, stock_id: str) -> dict:
@@ -3946,6 +4033,10 @@ class TradingPlanEngine:
         vol_ma20 = x["volume"].tail(20).mean()
         vol_ratio = float(last["volume"] / vol_ma20) if vol_ma20 and pd.notna(vol_ma20) else 1.0
         volume_label = self._volume_label(vol_ratio, close_, ma20)
+        recent_low60 = float(recent["low"].min()) if not recent.empty else close_
+        range_pos60 = (close_ - recent_low60) / max(recent_high - recent_low60, 1e-6)
+        position_score, position_tag = self._calc_position_score(close_, recent_high, recent_low60, wave_label, vol_ratio, range_pos60)
+        theme_bonus, theme_bonus_tag = self._theme_bonus_score(stock.get("theme", ""))
 
         kline_score = float(V80_KLINE_SCORE.get(signal, 55))
         wave_score = float(V80_WAVE_SCORE.get(wave_label, 60))
@@ -3953,6 +4044,7 @@ class TradingPlanEngine:
         sakata_score = float(V80_SAKATA_SCORE.get(sakata_label, 20))
         volume_score = float(V80_VOLUME_SCORE.get(volume_label, 60))
         indicator_score = float(self._indicator_score(rsi, macd_hist, k, d))
+        module_flags = self._module_pass_flags(signal, wave_label, fib_score, sakata_label, volume_label, rsi, macd_hist, k, d)
 
         model_score = round(
             kline_score * V80_WEIGHTS["kline"] +
@@ -3986,6 +4078,9 @@ class TradingPlanEngine:
 
         win_grade, win_rate = WinRateEngine.estimate(hist)
         decision, auto_state = StrategyEngineV91.decide_signal(model_score, float(wave_trade["wave_trade_score"]), rr, rsi, wave_label)
+        if module_flags["modules_pass_count"] < 4:
+            decision = "HOLD" if module_flags["modules_pass_count"] == 3 and decision != "AVOID" else "AVOID"
+            auto_state = "觀察" if decision == "HOLD" else "不可買"
 
         preferred_theme = any(key.lower() in str(stock.get("theme", "")).lower() for key in ThemeStrengthEngine.PREFERRED_KEYWORDS)
         liquidity = self.intraday_engine.evaluate(stock, hist, theme_hot=preferred_theme)
@@ -4005,20 +4100,26 @@ class TradingPlanEngine:
             bucket = "防守"
         elif liquidity_status == "ELIMINATE":
             bucket = "淘汰"
-        elif decision == "BUY" and liquidity_status == "PASS":
+        elif decision == "BUY" and module_flags["modules_pass_count"] >= 4:
             bucket = "主攻"
-        elif decision in ("WEAK BUY", "HOLD") or liquidity_status == "WATCH":
+        elif decision in ("WEAK BUY", "HOLD") or liquidity_status == "WATCH" or module_flags["modules_pass_count"] == 3:
             bucket = "觀察"
         else:
             bucket = "排除"
 
-        selection_score = round(model_score * 0.45 + float(wave_trade["wave_trade_score"]) * 0.16 + win_rate * 0.12 + min(rr, 3.0) * 5 + float(liquidity.get("liquidity_score", 0)) * 0.22 + (6 if decision == "BUY" else 2 if decision == "WEAK BUY" else 0), 2)
-        trade_score = round(model_score * 0.25 + float(wave_trade["wave_trade_score"]) * 0.18 + score["ai_score"] * 0.08 + win_rate * 0.14 + min(rr, 3.0) * 5 + float(liquidity.get("intraday_trend_score", 0)) * 0.14 + float(liquidity.get("attack_volume_score", 0)) * 0.11 + float(liquidity.get("leader_follow_score", 0)) * 0.10 + (6 if preferred_theme else 0), 2)
+        mainstream_score = round(score["momentum_score"] * 0.35 + score["volume_score"] * 0.25 + score["trend_score"] * 0.20 + score["ai_score"] * 0.20 - score["risk_score"] * 0.25 + theme_bonus, 2)
+        breakout_score = round(score["momentum_score"] * 0.30 + score["volume_score"] * 0.25 + score["trend_score"] * 0.20 + score["ai_score"] * 0.15 + position_score * 0.10 - score["risk_score"] * 0.30 + theme_bonus, 2)
+
+        selection_score = round(model_score * 0.38 + float(wave_trade["wave_trade_score"]) * 0.12 + win_rate * 0.10 + min(rr, 3.0) * 5 + float(liquidity.get("liquidity_score", 0)) * 0.18 + module_flags["modules_pass_count"] * 3.8 + max(position_score, 0) * 0.05 + theme_bonus * 0.8 + (6 if decision == "BUY" else 2 if decision == "WEAK BUY" else 0), 2)
+        trade_score = round(model_score * 0.22 + float(wave_trade["wave_trade_score"]) * 0.18 + score["ai_score"] * 0.06 + win_rate * 0.10 + min(rr, 3.0) * 5 + float(liquidity.get("intraday_trend_score", 0)) * 0.12 + float(liquidity.get("attack_volume_score", 0)) * 0.10 + float(liquidity.get("leader_follow_score", 0)) * 0.08 + module_flags["modules_pass_count"] * 4.0 + max(position_score, 0) * 0.06 + theme_bonus * 0.9 + (6 if preferred_theme else 0), 2)
+
+        bull_prob, range_prob, bear_prob = self._path_probabilities(wave_label, module_flags["modules_pass_count"], position_tag, rsi)
+        operation_grade = self._operation_grade(wave_label, module_flags["modules_pass_count"], bucket, 0, "否")
 
         reason = (
-            f"{signal}｜{wave_label}｜{trade_type}｜{volume_label}｜"
+            f"{signal}｜{wave_label}｜{trade_type}｜{volume_label}｜{position_tag}｜{theme_bonus_tag}｜"
             f"活性 {float(liquidity.get('liquidity_score',0) or 0):.1f}｜{liquidity_status}｜{elimination_reason or '盤中結構可接受'}｜"
-            f"六模組 {model_score:.1f}｜RR {rr:.2f}｜RSI {rsi:.1f}"
+            f"六模組 {model_score:.1f}｜成立數 {module_flags['modules_pass_count']}｜RR {rr:.2f}｜RSI {rsi:.1f}"
         )
 
         ui_state = self._ui_trade_state(decision, close_, entry_low, entry_high, rr, win_rate, liquidity_status)
@@ -4064,6 +4165,24 @@ class TradingPlanEngine:
             "sakata_score": round(sakata_score, 2),
             "volume_score": round(volume_score, 2),
             "indicator_score": round(indicator_score, 2),
+            "position_score": round(position_score, 2),
+            "position_tag": position_tag,
+            "theme_bonus": round(theme_bonus, 2),
+            "mainstream_score": mainstream_score,
+            "breakout_score": breakout_score,
+            "kline_pass": module_flags["kline_pass"],
+            "wave_pass": module_flags["wave_pass"],
+            "fib_pass": module_flags["fib_pass"],
+            "sakata_pass": module_flags["sakata_pass"],
+            "volume_pass_flag": module_flags["volume_pass"],
+            "indicator_pass": module_flags["indicator_pass"],
+            "modules_pass_count": module_flags["modules_pass_count"],
+            "strong_signal_flag": module_flags["strong_signal_flag"],
+            "tradable_flag": module_flags["tradable_flag"],
+            "operation_grade": operation_grade,
+            "bull_prob": bull_prob,
+            "range_prob": range_prob,
+            "bear_prob": bear_prob,
             "model_score": model_score,
             "wave_trade_score": round(float(wave_trade["wave_trade_score"]), 2),
             "atr14": round(atr14, 4),
@@ -4131,6 +4250,14 @@ class MasterTradingEngine:
             }
 
         preferred_mask = plans_df["theme"].isin(hot_themes) if hot_themes else pd.Series([True] * len(plans_df), index=plans_df.index)
+        top_themes = ThemeStrengthEngine.summarize(base).head(3)["theme"].astype(str).tolist() if not base.empty else []
+        plans_df["theme_bonus_dynamic"] = plans_df["theme"].astype(str).apply(lambda t: 15.0 if t in top_themes else (8.0 if t in hot_themes else 0.0))
+        if "mainstream_score" not in plans_df.columns:
+            plans_df["mainstream_score"] = plans_df.get("selection_score", 0)
+        plans_df["mainstream_score"] = pd.to_numeric(plans_df["mainstream_score"], errors="coerce").fillna(0) + plans_df["theme_bonus_dynamic"]
+        if "breakout_score" not in plans_df.columns:
+            plans_df["breakout_score"] = plans_df.get("selection_score", 0)
+        plans_df["breakout_score"] = pd.to_numeric(plans_df["breakout_score"], errors="coerce").fillna(0) + plans_df["theme_bonus_dynamic"]
 
         # 依 SOP 順序：先篩決策，再支撐>0，再壓力>支撐，最後按六模組總分排序
         eligible = plans_df[
@@ -4143,11 +4270,20 @@ class MasterTradingEngine:
         if not tradable.empty:
             tradable["decision_rank"] = tradable["decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1}).fillna(0)
             tradable["preferred_rank"] = preferred_mask.reindex(tradable.index).fillna(False).astype(int)
-            tradable = tradable.sort_values(["liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
+            tradable = tradable.sort_values(["modules_pass_count", "liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
 
-        trade_top20 = tradable.head(20).copy()
+        mainstream_top20 = tradable.sort_values(["mainstream_score", "modules_pass_count", "liquidity_score", "model_score"], ascending=False).head(20).copy() if not tradable.empty else pd.DataFrame()
+        breakout_top20 = tradable.sort_values(["breakout_score", "modules_pass_count", "position_score", "trade_score"], ascending=False).head(20).copy() if not tradable.empty else pd.DataFrame()
+        combined_parts = []
+        if not mainstream_top20.empty:
+            tmp = mainstream_top20.copy(); tmp["candidate_engine"] = "主流TOP20"; combined_parts.append(tmp)
+        if not breakout_top20.empty:
+            tmp = breakout_top20.copy(); tmp["candidate_engine"] = "起爆TOP20"; combined_parts.append(tmp)
+        trade_top20 = pd.concat(combined_parts, ignore_index=True) if combined_parts else tradable.head(20).copy()
         if not trade_top20.empty:
-            trade_top20 = trade_top20.copy()
+            trade_top20["stock_id"] = trade_top20["stock_id"].astype(str)
+            trade_top20 = trade_top20.sort_values(["modules_pass_count", "liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
+            trade_top20 = trade_top20.drop_duplicates(subset=["stock_id"], keep="first").head(20).copy()
             trade_top20["pool_role"] = "交易候選池"
 
         attack = trade_top20[(trade_top20["decision"] == "BUY") & (trade_top20["liquidity_status"] == "PASS")].copy()
@@ -4164,19 +4300,20 @@ class MasterTradingEngine:
 
         # 依規格書：Today_Buy / Wait_Pullback 必須只從 Trade_TOP20 派生，不可從 tradable 另選
         today_buy = trade_top20[
-            (trade_top20["decision"] == "BUY") &
-            (trade_top20["liquidity_status"] == "PASS") &
-            (trade_top20["rr"] >= 1.2) &
-            (trade_top20["win_rate"] >= max(55.0, market["min_win_rate"] - 10))
-        ].sort_values(["liquidity_score", "model_score"], ascending=False).copy()
+            (trade_top20["decision"].isin(["BUY", "WEAK BUY"])) &
+            (trade_top20["modules_pass_count"] >= 4) &
+            (trade_top20["liquidity_status"].isin(["PASS", "WATCH"])) &
+            (trade_top20["rr"] >= 1.15) &
+            (trade_top20["win_rate"] >= max(55.0, market["min_win_rate"] - 12))
+        ].sort_values(["modules_pass_count", "liquidity_score", "model_score"], ascending=False).copy()
         if not today_buy.empty:
             today_buy["pool_role"] = "今日可買"
 
         wait_pullback = trade_top20[
-            (trade_top20["decision"].isin(["WEAK BUY", "HOLD"])) &
+            ((trade_top20["decision"].isin(["WEAK BUY", "HOLD"])) | (trade_top20["modules_pass_count"] == 3)) &
             (trade_top20["liquidity_status"].isin(["PASS", "WATCH"])) &
             (trade_top20["rr"] >= 1.0)
-        ].sort_values(["liquidity_score", "model_score"], ascending=False).copy()
+        ].sort_values(["modules_pass_count", "liquidity_score", "model_score"], ascending=False).copy()
         if not wait_pullback.empty:
             wait_pullback["pool_role"] = "等待拉回"
 
@@ -4202,6 +4339,8 @@ class MasterTradingEngine:
             "wait_pullback": wait_pullback.head(dynamic_n),
             "execution_pool": execution_pool,
             "theme_summary": ThemeStrengthEngine.summarize(base),
+            "mainstream_top20": mainstream_top20.head(20) if not mainstream_top20.empty else pd.DataFrame(),
+            "breakout_top20": breakout_top20.head(20) if not breakout_top20.empty else pd.DataFrame(),
             "eliminated": eliminated.head(20),
         }
 
@@ -4635,6 +4774,20 @@ class FinalDecisionEngine:
         return round((price - entry_high) / entry_high * 100.0, 2)
 
     @staticmethod
+    def _operation_grade_from_row(row: pd.Series, decision_bucket: str, execution_ready: int, distribution_flag: str) -> str:
+        wave = str(row.get("wave", "") or "")
+        count = FinalDecisionEngine._safe_int(row.get("modules_pass_count", 0), 0)
+        if distribution_flag == "是" or decision_bucket == "排除" or wave == "第5浪":
+            return "C"
+        if wave == "第3浪" and count >= 5 and execution_ready == 1:
+            return "S"
+        if count >= 4 and decision_bucket == "主攻":
+            return "A"
+        if count >= 3 or decision_bucket == "等待拉回":
+            return "B"
+        return "C"
+
+    @staticmethod
     def finalize(trade_top20: pd.DataFrame, today_buy: pd.DataFrame, wait_pullback: pd.DataFrame, defense: pd.DataFrame, institutional_plan: pd.DataFrame, theme_summary: pd.DataFrame) -> pd.DataFrame:
         frames = []
         for role, df in (("交易候選", trade_top20), ("今日可買", today_buy), ("等待拉回", wait_pullback), ("防守", defense)):
@@ -4689,6 +4842,8 @@ class FinalDecisionEngine:
             distribution_flag = FinalDecisionEngine._distribution_flag(row)
             final_trade_decision = str(row.get("final_trade_decision", trade_action) or trade_action).upper()
 
+            modules_pass_count = FinalDecisionEngine._safe_int(row.get("modules_pass_count", 0), 0)
+            operation_grade = str(row.get("operation_grade", "") or "")
             reasons = []
             if is_etf or sid in defense_ids or str(row.get("bucket", "")) == "防守":
                 decision_bucket = "防守"
@@ -4696,12 +4851,15 @@ class FinalDecisionEngine:
             elif trade_action == "AVOID" or final_trade_decision in ("AVOID", "ELIMINATE") or liquidity_status == "ELIMINATE":
                 decision_bucket = "排除"
                 reasons.append("AVOID/淘汰")
-            elif sid in today_buy_ids and trade_action in ("BUY", "WEAK BUY") and inst_status == "PASS" and suggested_qty > 0:
-                decision_bucket = "主攻"
-                reasons.append("今日可買且機構驗證通過")
-            elif sid in wait_ids or trade_action in ("WEAK BUY", "HOLD") or ui_state in ("預掛單", "準備買", "觀察"):
+            elif sid in wait_ids or distance > 3.5 or trade_action == "HOLD" or ui_state in ("預掛單", "觀察"):
                 decision_bucket = "等待拉回"
                 reasons.append("方向正確但未到執行條件")
+            elif trade_action in ("BUY", "WEAK BUY") and modules_pass_count >= 4 and position_bucket != "高位":
+                decision_bucket = "主攻"
+                reasons.append("策略層主攻成立")
+            elif modules_pass_count == 3 or trade_action in ("WEAK BUY", "HOLD") or ui_state in ("準備買",):
+                decision_bucket = "等待拉回"
+                reasons.append("模組成立數不足，保留觀察")
             else:
                 decision_bucket = "排除"
                 reasons.append("不符合唯一決策規則")
@@ -4711,10 +4869,8 @@ class FinalDecisionEngine:
                 reasons.append("高位/出貨警示降級")
 
             execution_ready = int(decision_bucket == "主攻" and inst_status == "PASS" and suggested_qty > 0 and trade_action in ("BUY", "WEAK BUY"))
-            if inst_status and inst_status != "PASS" and decision_bucket == "主攻":
-                decision_bucket = "等待拉回"
-                execution_ready = 0
-                reasons.append(f"盤中狀態={inst_status}")
+            if decision_bucket == "主攻" and inst_status and inst_status != "PASS":
+                reasons.append(f"盤中狀態={inst_status}，先保留策略主攻、暫不下單")
 
             reason_tail = []
             if str(row.get("signal", "")):
@@ -4731,6 +4887,7 @@ class FinalDecisionEngine:
                 reason_tail.append(f"建議張數={suggested_qty:g}")
 
             out = row.to_dict()
+            operation_grade = operation_grade or FinalDecisionEngine._operation_grade_from_row(row, decision_bucket, execution_ready, distribution_flag)
             out.update({
                 "distance_to_entry_pct": distance,
                 "position_bucket": position_bucket,
@@ -4741,6 +4898,7 @@ class FinalDecisionEngine:
                 "theme_weight": round(FinalDecisionEngine._safe_float(out.get("theme_weight", 0)), 2),
                 "inst_status": inst_status,
                 "suggested_qty": suggested_qty,
+                "operation_grade": operation_grade,
             })
             rows.append(out)
 
@@ -4748,7 +4906,7 @@ class FinalDecisionEngine:
         if not final_df.empty:
             priority_map = {"主攻": 0, "等待拉回": 1, "防守": 2, "排除": 3}
             final_df["decision_priority"] = final_df["decision_bucket"].map(priority_map).fillna(9)
-            final_df = final_df.sort_values(["decision_priority", "execution_ready", "theme_weight", "liquidity_score", "model_score", "trade_score", "win_rate"], ascending=[True, False, False, False, False, False, False]).reset_index(drop=True)
+            final_df = final_df.sort_values(["decision_priority", "execution_ready", "modules_pass_count", "theme_weight", "liquidity_score", "model_score", "trade_score", "win_rate"], ascending=[True, False, False, False, False, False, False, False]).reset_index(drop=True)
         return final_df
 
 
@@ -4766,6 +4924,8 @@ class AppUI:
         self.single_stock_narrative_engine = SingleStockNarrativeEngine()
         self.ui_tactical_presenter = UITacticalPresenter()
         self.last_top20_df = pd.DataFrame()
+        self.last_mainstream_top20_df = pd.DataFrame()
+        self.last_breakout_top20_df = pd.DataFrame()
         self.last_top5_df = pd.DataFrame()
         self.last_theme_summary_df = pd.DataFrame()
         self.last_attack_df = pd.DataFrame()
@@ -6604,6 +6764,10 @@ class AppUI:
                     tables["Theme"] = theme
                 if self.last_top20_df is not None and not self.last_top20_df.empty:
                     tables["Trade_TOP20"] = self.last_top20_df
+                if getattr(self, "last_mainstream_top20_df", pd.DataFrame()) is not None and not getattr(self, "last_mainstream_top20_df", pd.DataFrame()).empty:
+                    tables["Mainstream_TOP20"] = self.last_mainstream_top20_df
+                if getattr(self, "last_breakout_top20_df", pd.DataFrame()) is not None and not getattr(self, "last_breakout_top20_df", pd.DataFrame()).empty:
+                    tables["Breakout_TOP20"] = self.last_breakout_top20_df
                 if self.last_top5_df is not None and not self.last_top5_df.empty:
                     tables["Trade_TOP5"] = self.last_top5_df
                 if getattr(self, "last_today_buy_df", pd.DataFrame()) is not None and not getattr(self, "last_today_buy_df", pd.DataFrame()).empty:
@@ -6662,7 +6826,7 @@ class AppUI:
             plan = plan.merge(fd, left_on="代號", right_on="stock_id", how="left")
             plan["decision_bucket"] = plan.get("decision_bucket", "排除").fillna("排除")
             plan["execution_ready"] = pd.to_numeric(plan.get("execution_ready", 0), errors="coerce").fillna(0).astype(int)
-            plan = plan[(plan["decision_bucket"] == "主攻") & (plan["execution_ready"] == 1)].copy()
+            plan = plan[plan["execution_ready"] == 1].copy()
             if plan.empty:
                 self.last_institutional_plan_df = pd.DataFrame()
                 return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行"])
@@ -7292,6 +7456,8 @@ class AppUI:
                 )
                 market = trade["market"]
                 trade_top20 = self.enrich_trade_dataframe_with_tactical(trade["trade_top20"])
+                mainstream_top20 = self.enrich_trade_dataframe_with_tactical(trade.get("mainstream_top20", pd.DataFrame()))
+                breakout_top20 = self.enrich_trade_dataframe_with_tactical(trade.get("breakout_top20", pd.DataFrame()))
                 attack = self.enrich_trade_dataframe_with_tactical(trade["attack"])
                 today_buy = self.enrich_trade_dataframe_with_tactical(trade["today_buy"])
                 wait_pullback = self.enrich_trade_dataframe_with_tactical(trade["wait_pullback"])
@@ -7302,6 +7468,8 @@ class AppUI:
                 eliminated = trade.get("eliminated", pd.DataFrame())
 
                 self.last_top20_df = trade_top20.copy()
+                self.last_mainstream_top20_df = mainstream_top20.copy()
+                self.last_breakout_top20_df = breakout_top20.copy()
                 self.cache_trade_dataframe(self.last_top20_df)
                 self.last_top5_df = pd.DataFrame()
                 self.last_attack_df = attack.copy()
@@ -7322,8 +7490,12 @@ class AppUI:
                 self.last_final_decision_df = final_decision.copy()
 
                 top5_source = final_decision[(final_decision["decision_bucket"] == "主攻") & (final_decision["trade_action"].astype(str).str.upper().isin(["BUY", "WEAK BUY"]))].copy() if final_decision is not None and not final_decision.empty else pd.DataFrame()
+                if not top5_source.empty:
+                    top5_source["top5_source"] = "主攻"
                 if top5_source.empty:
                     top5_source = final_decision[final_decision["decision_bucket"].isin(["主攻", "等待拉回"])].copy() if final_decision is not None and not final_decision.empty else pd.DataFrame()
+                    if not top5_source.empty:
+                        top5_source["top5_source"] = top5_source["decision_bucket"].map(lambda x: "主攻" if x == "主攻" else "等待拉回補足")
                 top5_source = top5_source.head(5).copy() if not top5_source.empty else top5_source
                 if not top5_source.empty:
                     bt_rows = []
