@@ -4044,6 +4044,26 @@ class TradingPlanEngine:
         )
 
         ui_state = self._ui_trade_state(decision, close_, entry_low, entry_high, rr, win_rate, liquidity_status)
+        tactical_light = UITacticalPresenter.derive_signal_light(signal, model_score, 0, float(liquidity.get("intraday_trend_score", 0) or 0))
+        if is_etf:
+            bucket = "防守"
+            operation_grade = "B"
+        else:
+            if tactical_light in ("🔵", "🟢"):
+                bucket = "主攻"
+                operation_grade = "S" if tactical_light == "🔵" else "A"
+            elif tactical_light in ("🟡", "🟠"):
+                bucket = "觀察"
+                operation_grade = "B"
+            else:
+                bucket = "排除"
+                operation_grade = "C"
+        if tactical_light in ("🔴", "⚪"):
+            decision = "AVOID"
+            ui_state = "不可買" if liquidity_status != "ELIMINATE" else "淘汰"
+        elif tactical_light in ("🟡", "🟠") and decision == "BUY":
+            decision = "HOLD"
+            ui_state = "觀察"
 
         return {
             "stock_id": stock_id,
@@ -4053,6 +4073,7 @@ class TradingPlanEngine:
             "market": stock["market"],
             "price": round(close_, 2),
             "is_etf": 1 if is_etf else 0,
+            "tactical_light": tactical_light,
             "trade_action": decision,
             "ui_state": ui_state,
             "entry_low": round(entry_low, 2),
@@ -4709,6 +4730,42 @@ class FinalDecisionEngine:
         return "C"
 
     @staticmethod
+    def _normalize_light_value(light: str) -> str:
+        light = str(light or "").strip()
+        alias = {
+            "red": "🔴", "orange": "🟠", "yellow": "🟡", "green": "🟢", "blue": "🔵", "neutral": "⚪",
+            "light_red": "🔴", "light_orange": "🟠", "light_yellow": "🟡", "light_green": "🟢", "light_blue": "🔵", "light_neutral": "⚪",
+            "R": "🔴", "O": "🟠", "Y": "🟡", "G": "🟢", "B": "🔵", "N": "⚪",
+            "紅": "🔴", "橘": "🟠", "黃": "🟡", "綠": "🟢", "藍": "🔵", "白": "⚪",
+            "○": "⚪",
+        }
+        return alias.get(light, light if light in ("🔴", "🟠", "🟡", "🟢", "🔵", "⚪") else "⚪")
+
+    @staticmethod
+    def _bucket_from_light(light: str, is_etf: bool = False) -> str:
+        light = FinalDecisionEngine._normalize_light_value(light)
+        if is_etf:
+            return "防守"
+        if light in ("🔵", "🟢"):
+            return "主攻"
+        if light in ("🟡", "🟠"):
+            return "等待拉回"
+        return "排除"
+
+    @staticmethod
+    def _grade_from_light(light: str, is_etf: bool = False) -> str:
+        light = FinalDecisionEngine._normalize_light_value(light)
+        if is_etf:
+            return "B"
+        if light == "🔵":
+            return "S"
+        if light == "🟢":
+            return "A"
+        if light in ("🟡", "🟠"):
+            return "B"
+        return "C"
+
+    @staticmethod
     def finalize(trade_top20: pd.DataFrame, today_buy: pd.DataFrame, wait_pullback: pd.DataFrame, defense: pd.DataFrame, institutional_plan: pd.DataFrame, theme_summary: pd.DataFrame) -> pd.DataFrame:
         frames = []
         for role, df in (("交易候選", trade_top20), ("今日可買", today_buy), ("等待拉回", wait_pullback), ("防守", defense)):
@@ -4767,25 +4824,28 @@ class FinalDecisionEngine:
             empty_reason = ""
             strategy_layer_source = str(row.get("source_role", "交易候選") or "交易候選")
 
+            tactical_light = FinalDecisionEngine._normalize_light_value(row.get("tactical_light", "⚪"))
+            light_bucket = FinalDecisionEngine._bucket_from_light(tactical_light, is_etf=is_etf)
+
             if is_etf or sid in defense_ids or str(row.get("bucket", "")) == "防守":
                 decision_bucket = "防守"
                 reasons.append("ETF/防守池")
                 strategy_layer_source = "Defense"
-            elif trade_action == "AVOID" or final_trade_decision in ("AVOID", "ELIMINATE") or liquidity_status == "ELIMINATE":
+            elif tactical_light in ("🔴", "⚪") or trade_action == "AVOID" or final_trade_decision in ("AVOID", "ELIMINATE") or liquidity_status == "ELIMINATE":
                 decision_bucket = "排除"
-                reasons.append("AVOID/淘汰")
+                reasons.append(f"燈號={tactical_light} 不可列為主攻")
                 strategy_layer_source = "Eliminated"
-            elif sid in wait_ids or distance > 3.5 or trade_action == "HOLD" or ui_state in ("預掛單", "觀察"):
+            elif tactical_light in ("🟡", "🟠"):
+                decision_bucket = "等待拉回"
+                reasons.append(f"燈號={tactical_light}，僅保留等待拉回")
+                strategy_layer_source = "Wait_Pullback"
+            elif tactical_light in ("🔵", "🟢") and ((sid in today_buy_ids) or (trade_action in ("BUY", "WEAK BUY") and modules_pass_count >= 4 and position_bucket != "高位")):
+                decision_bucket = "主攻"
+                reasons.append(f"燈號={tactical_light}，策略層主攻成立")
+                strategy_layer_source = "Final主攻"
+            elif light_bucket == "等待拉回" or sid in wait_ids or distance > 3.5 or trade_action == "HOLD" or ui_state in ("預掛單", "觀察"):
                 decision_bucket = "等待拉回"
                 reasons.append("方向正確但未到執行條件")
-                strategy_layer_source = "Wait_Pullback"
-            elif (sid in today_buy_ids) or (trade_action in ("BUY", "WEAK BUY") and modules_pass_count >= 4 and position_bucket != "高位"):
-                decision_bucket = "主攻"
-                reasons.append("策略層主攻成立")
-                strategy_layer_source = "Final主攻"
-            elif modules_pass_count == 3 or trade_action in ("WEAK BUY", "HOLD") or ui_state in ("準備買",):
-                decision_bucket = "等待拉回"
-                reasons.append("模組成立數不足，保留觀察")
                 strategy_layer_source = "Wait_Pullback"
             else:
                 decision_bucket = "排除"
@@ -4836,7 +4896,7 @@ class FinalDecisionEngine:
                 reason_tail.append(f"建議張數={suggested_qty:g}")
 
             out = row.to_dict()
-            operation_grade = operation_grade or FinalDecisionEngine._operation_grade_from_row(row, decision_bucket, execution_ready, distribution_flag)
+            operation_grade = FinalDecisionEngine._grade_from_light(tactical_light, is_etf=is_etf)
             out.update({
                 "distance_to_entry_pct": distance,
                 "position_bucket": position_bucket,
@@ -5390,6 +5450,28 @@ class AppUI:
             "⚪": "白",
         }
         return mapping.get(light, "白")
+
+    def _derive_bucket_from_light(self, light, is_etf: bool = False):
+        light = self._normalize_light_value(light)
+        if is_etf:
+            return "防守"
+        if light in ("🔵", "🟢"):
+            return "主攻"
+        if light in ("🟡", "🟠"):
+            return "觀察"
+        return "排除"
+
+    def _derive_operation_grade_from_light(self, light, is_etf: bool = False):
+        light = self._normalize_light_value(light)
+        if is_etf:
+            return "B"
+        if light == "🔵":
+            return "S"
+        if light == "🟢":
+            return "A"
+        if light in ("🟡", "🟠"):
+            return "B"
+        return "C"
 
     def _resolve_light_tag(self, light=""):
         """燈號顏色唯一來源：只接受 tactical_light / signal fallback 的最終燈號。"""
@@ -6284,8 +6366,14 @@ class AppUI:
                     'state_bucket': state_bucket, 'light': light, 'leader_candidate': leader
                 }
                 scripts = self.single_stock_narrative_engine.build_trade_scripts_text(ctx)
+                derived_bucket = self._derive_bucket_from_light(light, is_etf=bool(int(r.get('is_etf', 0) or 0) == 1 or str(r.get('market', '')) == 'ETF'))
+                derived_grade = self._derive_operation_grade_from_light(light, is_etf=bool(int(r.get('is_etf', 0) or 0) == 1 or str(r.get('market', '')) == 'ETF'))
                 x.at[idx, 'price'] = close
                 x.at[idx, 'tactical_light'] = light
+                x.at[idx, 'bucket'] = derived_bucket
+                x.at[idx, 'decision_bucket'] = derived_bucket
+                x.at[idx, 'operation_grade'] = derived_grade
+                x.at[idx, 'trade_action'] = 'BUY' if light in ('🔵', '🟢') else ('HOLD' if light in ('🟡', '🟠') else 'AVOID')
                 x.at[idx, 'orderbook_bias'] = realtime.get('orderbook_bias', '無有效五檔')
                 x.at[idx, 'orderbook_ratio'] = realtime.get('orderbook_ratio', '-')
                 x.at[idx, 'intraday_score'] = intraday_score
@@ -7590,6 +7678,13 @@ class AppUI:
                 )
                 market = trade["market"]
                 trade_top20 = self.enrich_trade_dataframe_with_tactical(trade["trade_top20"])
+                if trade_top20 is not None and not trade_top20.empty and 'tactical_light' in trade_top20.columns:
+                    allowed = trade_top20[trade_top20['tactical_light'].astype(str).isin(['🔵','🟢','🟡','🟠'])].copy()
+                    if not allowed.empty:
+                        light_order = {'🔵':0, '🟢':1, '🟡':2, '🟠':3}
+                        allowed['_light_order'] = allowed['tactical_light'].astype(str).map(light_order).fillna(9)
+                        allowed = allowed.sort_values(['_light_order','selection_score','trade_score'], ascending=[True,False,False]).drop(columns=['_light_order'])
+                        trade_top20 = allowed.head(20).copy()
                 mainstream_top20 = self.enrich_trade_dataframe_with_tactical(trade.get("mainstream_top20", pd.DataFrame()))
                 breakout_top20 = self.enrich_trade_dataframe_with_tactical(trade.get("breakout_top20", pd.DataFrame()))
                 attack = self.enrich_trade_dataframe_with_tactical(trade["attack"])
