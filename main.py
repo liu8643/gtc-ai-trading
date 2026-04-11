@@ -248,7 +248,9 @@ CLASSIFICATION_DOWNLOAD_URL = "https://mopsfin.twse.com.tw/opendata/t187ap03_L.c
 CLASSIFICATION_LEGACY_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
 CLASSIFICATION_CACHE_DIR = EXTERNAL_DATA_DIR / "classification"
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-CLASSIFICATION_CACHE_CSV = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上市.csv"
+CLASSIFICATION_CACHE_CSV_TWSE = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上市.csv"
+CLASSIFICATION_CACHE_CSV_TPEX = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上櫃.csv"
+CLASSIFICATION_CACHE_CSV = CLASSIFICATION_CACHE_CSV_TWSE  # backward compatibility
 CLASSIFICATION_CACHE_XLS = CLASSIFICATION_CACHE_DIR / "台股類股分類.xls"
 CLASSIFICATION_CACHE_XLSX = CLASSIFICATION_CACHE_DIR / "台股類股分類.xlsx"
 CLASSIFICATION_META_PATH = CLASSIFICATION_CACHE_DIR / "classification_meta.json"
@@ -256,10 +258,10 @@ CLASSIFICATION_CACHE_PICKLE = CLASSIFICATION_CACHE_DIR / "classification_cache.p
 CLASSIFICATION_MAX_AGE_DAYS = 7
 CLASSIFICATION_DOWNLOAD_TIMEOUT = (10, 45)
 CLASSIFICATION_DOWNLOAD_RETRIES = 3
-CLASSIFICATION_MEMORY_CACHE = {"df": None, "path": None, "mtime": None, "meta": None}
+CLASSIFICATION_MEMORY_CACHE = {"df": None, "path": None, "mtime": None, "meta": None, "market": "ALL"}
 LAST_CLASSIFICATION_LOAD_INFO = {"loaded": False, "rows": 0, "path": "", "note": "尚未載入"}
 CLASSIFICATION_V2_SUMMARY_PATH = CLASSIFICATION_CACHE_DIR / "classification_v2_summary.json"
-CLASSIFICATION_V2_UNCLASSIFIED_PATH = CLASSIFICATION_CACHE_DIR / "unclassified_report.xlsx"
+CLASSIFICATION_V2_UNCLASSIFIED_PATH = CLASSIFICATION_CACHE_DIR / "未匹配分類清單.xlsx"
 CLASSIFICATION_V2_LAST_SUMMARY = {}
 
 CLASSIFICATION_LOG_CALLBACK = None
@@ -291,8 +293,12 @@ def classification_debug_log(message: str, level: str = "INFO"):
 CLASSIFICATION_BOOK_CANDIDATES = [
     RUNTIME_DIR / "台股官方產業分類_上市.csv",
     EXTERNAL_DATA_DIR / "台股官方產業分類_上市.csv",
-    CLASSIFICATION_CACHE_CSV,
+    CLASSIFICATION_CACHE_CSV_TWSE,
     BASE_DIR / "台股官方產業分類_上市.csv",
+    RUNTIME_DIR / "台股官方產業分類_上櫃.csv",
+    EXTERNAL_DATA_DIR / "台股官方產業分類_上櫃.csv",
+    CLASSIFICATION_CACHE_CSV_TPEX,
+    BASE_DIR / "台股官方產業分類_上櫃.csv",
     RUNTIME_DIR / "台股類股分類.csv",
     EXTERNAL_DATA_DIR / "台股類股分類.csv",
     BASE_DIR / "台股類股分類.csv",
@@ -792,171 +798,78 @@ def _extract_official_sheet_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFr
 
 
 
-def load_official_classification_book() -> pd.DataFrame:
+def _classification_csv_candidates_by_market(market: str = "ALL") -> list[Path]:
+    market = str(market or "ALL").strip()
+    if market == "上市":
+        return [
+            RUNTIME_DIR / "台股官方產業分類_上市.csv",
+            EXTERNAL_DATA_DIR / "台股官方產業分類_上市.csv",
+            CLASSIFICATION_CACHE_CSV_TWSE,
+            BASE_DIR / "台股官方產業分類_上市.csv",
+        ]
+    if market == "上櫃":
+        return [
+            RUNTIME_DIR / "台股官方產業分類_上櫃.csv",
+            EXTERNAL_DATA_DIR / "台股官方產業分類_上櫃.csv",
+            CLASSIFICATION_CACHE_CSV_TPEX,
+            BASE_DIR / "台股官方產業分類_上櫃.csv",
+        ]
+    return _classification_csv_candidates_by_market("上市") + _classification_csv_candidates_by_market("上櫃")
+
+
+def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]:
+    for p in _classification_csv_candidates_by_market(market):
+        if Path(p).exists():
+            return Path(p)
+    return None
+
+
+def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
     """
-    將官方分類來源視為「補充分類來源」，不是完整全市場主檔。
-    優先順序：
-    1. MOPS 官方 CSV
-    2. 本機 xlsx
-    3. xls 僅在可成功轉檔後才使用
+    官方分類來源支援：上市 / 上櫃 / ALL。
+    ALL 會合併上市 + 上櫃後再回傳。
     """
-    path = ensure_classification_book(force_refresh=False)
+    market = str(market or "ALL").strip() or "ALL"
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    if market == "ALL":
+        twse = load_official_classification_book("上市")
+        tpex = load_official_classification_book("上櫃")
+        parts = [df for df in [twse, tpex] if df is not None and not df.empty]
+        if not parts:
+            note = "找不到任何官方分類來源（ALL）"
+            classification_debug_log(note, "WARNING")
+            return empty_df
+        out = pd.concat(parts, ignore_index=True).fillna("")
+        out["stock_id"] = out["stock_id"].astype(str).map(normalize_stock_id)
+        out["industry_official"] = out["industry_official"].astype(str).map(normalize_official_industry_name)
+        out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
+        out = out.sort_values(["stock_id", "market_official", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
+        classification_debug_log(f"補充分類載入成功：ALL｜rows={len(out)}")
+        _set_classification_load_info(True, len(out), None, f"補充分類載入成功：ALL｜rows={len(out)}")
+        return out
+
+    path = resolve_classification_book_by_market(market)
     if path is None:
-        note = "找不到官方分類來源"
-        classification_debug_log(note, "ERROR")
-        CLASSIFICATION_MEMORY_CACHE["df"] = None
-        CLASSIFICATION_MEMORY_CACHE["path"] = None
-        CLASSIFICATION_MEMORY_CACHE["mtime"] = None
-        _mark_classification_meta_status("missing", note="no classification source found")
-        _set_classification_load_info(False, 0, None, note)
+        note = f"找不到官方分類來源：{market}"
+        classification_debug_log(note, "WARNING")
         return empty_df
 
-    path = Path(path)
-    classification_debug_log(f"實際讀到的分類來源：{path}")
-    final_read_path = path
-
-    if path.suffix.lower() == ".xls":
-        sibling_xlsx = path.with_suffix(".xlsx")
-        if sibling_xlsx.exists() and sibling_xlsx.stat().st_size > 0:
-            final_read_path = sibling_xlsx
-            classification_debug_log(f"偵測到同名 xlsx，優先改讀：{final_read_path}")
-        else:
-            classification_debug_log(f"偵測到 xls，嘗試轉成 xlsx：{path.name}")
-            converted = convert_xls_to_xlsx_force(path, CLASSIFICATION_CACHE_XLSX, log_cb=lambda m: classification_debug_log(m))
-            if converted is not None and converted.exists():
-                final_read_path = converted
-                classification_debug_log(f"轉檔完成，改讀：{final_read_path}")
-            else:
-                classification_debug_log(f"xls 轉 xlsx 失敗：{path}", "WARNING")
-                note = "分類檔未能轉成 xlsx，無法作為補充分類來源"
-                _mark_classification_meta_status("fallback", note=note, path=path)
-                _set_classification_load_info(False, 0, path, note)
-                return empty_df
-
+    classification_debug_log(f"實際讀到的分類來源（{market}）：{path}")
     try:
-        current_mtime = float(final_read_path.stat().st_mtime)
-    except Exception:
-        current_mtime = None
-
-    cached_df = CLASSIFICATION_MEMORY_CACHE.get("df")
-    cached_path = CLASSIFICATION_MEMORY_CACHE.get("path")
-    cached_mtime = CLASSIFICATION_MEMORY_CACHE.get("mtime")
-    if cached_df is not None and cached_path == str(final_read_path) and cached_mtime == current_mtime:
-        classification_debug_log(f"使用記憶體快取：{final_read_path.name}｜rows={len(cached_df)}")
-        _set_classification_load_info(True, len(cached_df), final_read_path, "memory cache")
-        return cached_df.copy()
-
-    if CLASSIFICATION_CACHE_PICKLE.exists():
-        try:
-            pickled = pd.read_pickle(CLASSIFICATION_CACHE_PICKLE)
-            meta = _read_classification_meta()
-            if (
-                isinstance(pickled, pd.DataFrame)
-                and not pickled.empty
-                and meta.get("path") == str(final_read_path)
-                and abs(float(meta.get("mtime", 0) or 0) - float(current_mtime or 0)) < 1e-6
-            ):
-                CLASSIFICATION_MEMORY_CACHE["df"] = pickled.copy()
-                CLASSIFICATION_MEMORY_CACHE["path"] = str(final_read_path)
-                CLASSIFICATION_MEMORY_CACHE["mtime"] = current_mtime
-                CLASSIFICATION_MEMORY_CACHE["meta"] = meta
-                classification_debug_log(f"使用 pickle 快取：{final_read_path.name}｜rows={len(pickled)}")
-                _set_classification_load_info(True, len(pickled), final_read_path, "pickle cache")
-                return pickled.copy()
-        except Exception as exc:
-            classification_debug_log(f"pickle 快取讀取失敗：{exc}", "WARNING")
-
-    try:
-        if final_read_path.suffix.lower() == ".csv":
-            classification_debug_log(f"開始解析官方CSV：{final_read_path}")
-            raw = safe_read_csv_auto(final_read_path)
-            out = _extract_official_csv_rows(raw, market="上市")
-            if out is None or out.empty:
-                raise RuntimeError("官方CSV可讀取，但沒有可用的公司代號/產業別資料")
-        else:
-            parts = []
-            sheet_debug_rows = []
-            classification_debug_log(f"開始解析 Excel：{final_read_path}")
-            xl = pd.ExcelFile(final_read_path, engine="openpyxl")
-            classification_debug_log(f"sheet 名稱：{', '.join([str(s) for s in xl.sheet_names]) if xl.sheet_names else '(無)'}")
-            for sheet in xl.sheet_names:
-                try:
-                    df = xl.parse(sheet)
-                except Exception as exc:
-                    classification_debug_log(f"sheet 讀取失敗：{sheet}｜{exc}", "WARNING")
-                    sheet_debug_rows.append({"sheet": str(sheet), "rows": 0, "cols": 0, "columns": [], "matched": 0, "error": str(exc)})
-                    continue
-
-                col_list = [str(c) for c in list(df.columns)]
-                parsed = _extract_official_sheet_rows(df, sheet)
-                matched_rows = len(parsed) if parsed is not None else 0
-                sheet_debug_rows.append({
-                    "sheet": str(sheet),
-                    "rows": int(len(df)),
-                    "cols": int(len(df.columns)),
-                    "columns": col_list[:50],
-                    "matched": int(matched_rows),
-                    "error": ""
-                })
-                classification_debug_log(
-                    f"sheet={sheet}｜原始 rows={len(df)} cols={len(df.columns)}｜欄位={col_list[:12]}｜匹配列數={matched_rows}"
-                )
-                if parsed is not None and not parsed.empty:
-                    parts.append(parsed)
-
-            if not parts:
-                details = []
-                for item in sheet_debug_rows:
-                    details.append(
-                        f"sheet={item['sheet']}｜rows={item['rows']} cols={item['cols']}｜matched={item['matched']}｜欄位={item['columns'][:12]}" + (f"｜error={item['error']}" if item.get('error') else "")
-                    )
-                note = "無可用工作表或欄位"
-                classification_debug_log(f"分類載入失敗：{note}", "ERROR")
-                if details:
-                    for line in details:
-                        classification_debug_log(line, "ERROR")
-                _mark_classification_meta_status("empty", note=(note + " | " + " || ".join(details[:10]))[:4000], path=final_read_path)
-                _set_classification_load_info(False, 0, final_read_path, note)
-                return empty_df
-
-            out = pd.concat(parts, ignore_index=True).fillna("")
-            out["stock_id"] = out["stock_id"].astype(str).map(normalize_stock_id)
-            out["industry_official"] = out["industry_official"].astype(str).str.strip()
-            out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
-            out = out.sort_values(["stock_id", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
-            if out.empty:
-                note = "標準化後無有效資料"
-                classification_debug_log(f"分類載入失敗：{note}", "ERROR")
-                _mark_classification_meta_status("empty", note=note, path=final_read_path)
-                _set_classification_load_info(False, 0, final_read_path, note)
-                return empty_df
+        raw = safe_read_csv_auto(path)
+        out = _extract_official_csv_rows(raw, market=market)
+        if out is None or out.empty:
+            raise RuntimeError(f"{market} 官方分類可讀取，但沒有有效資料")
+        out["stock_id"] = out["stock_id"].astype(str).map(normalize_stock_id)
+        out["industry_official"] = out["industry_official"].astype(str).map(normalize_official_industry_name)
+        out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
+        out = out.drop_duplicates(subset=["stock_id"], keep="first")
+        classification_debug_log(f"補充分類載入成功：{market}｜rows={len(out)}")
+        return out
     except Exception as exc:
-        note = str(exc)
-        classification_debug_log(f"分類來源解析失敗：{note}", "ERROR")
-        _mark_classification_meta_status("damaged", note=note, path=final_read_path)
-        CLASSIFICATION_MEMORY_CACHE["df"] = None
-        CLASSIFICATION_MEMORY_CACHE["path"] = None
-        CLASSIFICATION_MEMORY_CACHE["mtime"] = None
-        _set_classification_load_info(False, 0, final_read_path, note)
+        classification_debug_log(f"分類來源解析失敗（{market}）：{exc}", "ERROR")
         return empty_df
-
-    try:
-        out.to_pickle(CLASSIFICATION_CACHE_PICKLE)
-    except Exception as exc:
-        classification_debug_log(f"寫入分類 pickle 快取失敗：{exc}", "WARNING")
-
-    source_name = "MOPS-CSV" if final_read_path.suffix.lower() == ".csv" else "TWSE-XLSX"
-    meta = _build_classification_meta(final_read_path, source=source_name, note=f"supplement loaded rows={len(out)}")
-    _write_classification_meta(meta)
-    CLASSIFICATION_MEMORY_CACHE["df"] = out.copy()
-    CLASSIFICATION_MEMORY_CACHE["path"] = str(final_read_path)
-    CLASSIFICATION_MEMORY_CACHE["mtime"] = current_mtime
-    CLASSIFICATION_MEMORY_CACHE["meta"] = meta
-    classification_debug_log(f"補充分類載入成功：{final_read_path.name}｜rows={len(out)}")
-    _set_classification_load_info(True, len(out), final_read_path, "補充分類載入成功")
-    return out
-
 
 def load_manual_theme_mapping() -> pd.DataFrame:
 
@@ -1056,12 +969,12 @@ def _safe_int(v, default: int = 0) -> int:
 
 
 def _is_placeholder_text(v) -> bool:
-    return str(v or "").strip() in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
+    return str(v or "").strip() in ("", "未分類", "未匹配", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
 
 
 def _is_missing_classification_value(v) -> bool:
     s = str(v or "").strip()
-    return s in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
+    return s in ("", "未分類", "未匹配", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
 
 
 def _choose_text(*values, default: str = "") -> str:
@@ -1211,6 +1124,9 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
     CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
     _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
     _write_unclassified_report(unclassified)
+    coverage = 1.0 - float(x["industry_final"].isin(["未分類", "未匹配"]).mean()) if len(x) else 0.0
+    if coverage < 0.95:
+        log_warning(f"分類覆蓋率不足：{coverage:.2%}")
     return unclassified, summary
 
 
@@ -1371,7 +1287,10 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
         "classification_source", "classification_note"
     ])
 
-    official = load_official_classification_book()
+    official_twse = load_official_classification_book("上市")
+    official_tpex = load_official_classification_book("上櫃")
+    official_parts = [df for df in [official_twse, official_tpex] if df is not None and not df.empty]
+    official = pd.concat(official_parts, ignore_index=True).drop_duplicates(subset=["stock_id"], keep="first") if official_parts else pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
     manual = load_manual_theme_mapping()
 
     x["stock_id"] = _safe_text_series(x["stock_id"], "").map(normalize_stock_id)
@@ -1479,7 +1398,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
         x["industry_seed"] = x["industry_seed"].fillna(_safe_text_series(x["industry_official"], "").replace("", pd.NA))
     if "industry_manual" in x.columns:
         x["industry_seed"] = x["industry_seed"].fillna(_safe_text_series(x["industry_manual"], "").replace("", pd.NA))
-    x["industry_seed"] = _safe_text_series(x["industry_seed"].fillna("未分類"), "未分類")
+    x["industry_seed"] = _safe_text_series(x["industry_seed"].fillna("未匹配"), "未匹配")
 
     x["theme_seed"] = _safe_text_series(x["theme"] if "theme" in x.columns else "", "")
     x["sub_theme_seed"] = _safe_text_series(x["sub_theme"] if "sub_theme" in x.columns else "", "")
@@ -1516,7 +1435,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
         x[col] = _safe_text_series(x[col], "")
     x["confidence_ai"] = pd.to_numeric(x["confidence_ai"], errors="coerce").fillna(0).astype(int)
 
-    x["industry_final"] = _safe_text_series(x["industry_seed"], "未分類").map(normalize_official_industry_name)
+    x["industry_final"] = _safe_text_series(x["industry_seed"], "未匹配").map(normalize_official_industry_name)
     x["theme_final"] = _safe_text_series(x["theme_seed"], "")
     x["sub_theme_final"] = _safe_text_series(x["sub_theme_seed"], "")
 
@@ -1559,21 +1478,23 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
             x[col] = ""
         x[col] = _safe_text_series(x[col], "")
 
-    x["industry_final"] = _safe_text_series(x["industry_final"], "未分類").map(normalize_official_industry_name)
-    x["industry_final"] = _safe_text_series(x["industry_final"], "未分類").replace("", "未分類")
+    x["industry_final"] = _safe_text_series(x["industry_final"], "未匹配").map(normalize_official_industry_name)
+    x["industry_final"] = _safe_text_series(x["industry_final"], "未匹配").replace("", "未匹配")
     x["theme_final"] = _safe_text_series(x["theme_final"], "全市場").replace("", "全市場")
     x["sub_theme_final"] = _safe_text_series(x["sub_theme_final"], "系統掃描").replace("", "系統掃描")
     x.loc[x["is_etf"].eq(1), ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]] = ["ETF", "ETF", "ETF", "manual", 98, "ETF normalized"]
 
-    x["industry"] = _safe_text_series(x["industry_final"], "未分類")
+    x["industry"] = _safe_text_series(x["industry_final"], "未匹配")
     x["theme"] = _safe_text_series(x["theme_final"], "全市場")
     x["sub_theme"] = _safe_text_series(x["sub_theme_final"], "系統掃描")
     x["is_active"] = 1
     x["update_date"] = datetime.now().strftime("%Y-%m-%d")
 
-    _, summary = build_classification_quality_report(x)
+    unmatched_df, summary = build_classification_quality_report(x)
     try:
-        classification_debug_log(f"V2 覆蓋率 {summary.get('coverage_pct', 0):.2f}%｜官方 {summary.get('official', 0)}｜手動 {summary.get('manual', 0)}｜規則 {summary.get('rule_engine', 0)}｜AI {summary.get('ai_infer', 0)}｜未分類 {summary.get('unclassified', 0)}")
+        classification_debug_log(f"V2 覆蓋率 {summary.get('coverage_pct', 0):.2f}%｜官方 {summary.get('official', 0)}｜手動 {summary.get('manual', 0)}｜規則 {summary.get('rule_engine', 0)}｜AI {summary.get('ai_infer', 0)}｜未匹配 {summary.get('unclassified', 0)}")
+        if unmatched_df is not None and not unmatched_df.empty:
+            classification_debug_log(f"未匹配分類清單已輸出：{CLASSIFICATION_V2_UNCLASSIFIED_PATH}")
     except Exception:
         pass
 
