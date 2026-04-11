@@ -5320,8 +5320,8 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "engine", "id", "light", "name", "price", "bucket", "grade", "ui_action", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
-            "rank": "排序", "engine": "來源", "id": "代號", "light": "燈號", "name": "名稱", "price": "股價", "bucket": "分類", "grade": "操作權", "ui_action": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "light", "engine", "price", "bucket", "grade", "ui_action", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "light": "燈態", "engine": "來源", "price": "股價", "bucket": "分類", "grade": "操作權", "ui_action": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
@@ -5664,6 +5664,30 @@ class AppUI:
         self.last_selected_source = src
         self.last_selected_ts = now
         return False
+
+    def _resolve_stock_id_from_tree_values(self, values, source: str = "") -> str:
+        vals = list(values or [])
+        src = str(source or "").strip()
+        if not vals:
+            return ""
+        index_candidates = {
+            "排行榜": [1],
+            "AI交易TOP20": [1, 0, 4],
+            "AI選股TOP5": [1],
+            "下單清單": [1],
+            "機構交易計畫": [1],
+            "回測視覺化": [1],
+        }.get(src, [1, 2, 0])
+        for idx in index_candidates:
+            if idx < len(vals):
+                sid = normalize_stock_id(vals[idx])
+                if sid:
+                    return sid
+        for v in vals:
+            sid = normalize_stock_id(v)
+            if sid:
+                return sid
+        return ""
 
 
     def open_three_windows(self):
@@ -6939,8 +6963,19 @@ class AppUI:
         if self.last_top20_df is not None and not self.last_top20_df.empty:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
+                light = r.get('tactical_light', '⚪') or '⚪'
+                if light in ('', '-', '--'):
+                    ui_state = str(r.get("ui_state", "") or "")
+                    if ui_state in ("可買", "準備買"):
+                        light = '🟢'
+                    elif ui_state == "預掛單":
+                        light = '🟡'
+                    elif ui_state in ("不可買", "淘汰"):
+                        light = '🔴'
+                    else:
+                        light = '⚪'
                 self.top20_tree.insert("", "end", values=(
-                    i, r.get("candidate_engine", "混合"), r.get("stock_id", ""), r.get('tactical_light', '⚪'), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), r.get("operation_grade", "-"), ui_action,
+                    i, r.get("stock_id", ""), r.get("stock_name", ""), light, r.get("candidate_engine", "混合"), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), r.get("operation_grade", "-"), ui_action,
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
@@ -7006,7 +7041,10 @@ class AppUI:
         if not sel:
             return
         vals = self.top20_tree.item(sel[0], "values")
-        stock_id = str(vals[1])
+        stock_id = self._resolve_stock_id_from_tree_values(vals, "AI交易TOP20")
+        if not stock_id:
+            self.append_log(f"雙引擎TOP20 選取失敗：無法解析 stock_id｜values={vals}", "WARNING")
+            return
         if self._should_ignore_select_event(stock_id, "AI交易TOP20"):
             return
         self.sync_all_views(stock_id, source="AI交易TOP20")
@@ -7015,7 +7053,9 @@ class AppUI:
         if not sel:
             return
         vals = self.order_tree.item(sel[0], "values")
-        stock_id = str(vals[1])
+        stock_id = self._resolve_stock_id_from_tree_values(vals, "下單清單")
+        if not stock_id:
+            return
         if self._should_ignore_select_event(stock_id, "下單清單"):
             return
         self.sync_all_views(stock_id, source="下單清單")
@@ -7039,9 +7079,11 @@ class AppUI:
         lines = ["《下單清單摘要》", ""]
         if order_df is None or order_df.empty:
             lines.append("今日無下單清單資料。")
+            lines.append("原因：尚未執行機構交易計畫，或 Final_Decision 尚未完成收斂。")
         else:
             first_name = str(order_df.iloc[0].get("名稱", "") or "")
-            if first_name == "今日無可執行標的":
+            first_sid = normalize_stock_id(order_df.iloc[0].get("代號", ""))
+            if first_name == "今日無可執行標的" or not first_sid:
                 lines.append("今日無 execution_ready=1 的標的。")
                 lines.append(f"原因：{order_df.iloc[0].get('空表說明','-')}")
             else:
@@ -7103,7 +7145,9 @@ class AppUI:
         if not sel:
             return
         vals = self.top5_tree.item(sel[0], "values")
-        stock_id = str(vals[1])
+        stock_id = self._resolve_stock_id_from_tree_values(vals, "AI選股TOP5")
+        if not stock_id:
+            return
         if self._should_ignore_select_event(stock_id, "AI選股TOP5"):
             return
         self.sync_all_views(stock_id, source="AI選股TOP5")
@@ -7114,7 +7158,9 @@ class AppUI:
         if not sel:
             return
         vals = self.inst_tree.item(sel[0], "values")
-        stock_id = str(vals[1])
+        stock_id = self._resolve_stock_id_from_tree_values(vals, "機構交易計畫")
+        if not stock_id:
+            return
         if self._should_ignore_select_event(stock_id, "機構交易計畫"):
             return
         self.sync_all_views(stock_id, source="機構交易計畫")
@@ -7756,7 +7802,9 @@ class AppUI:
         if not sel:
             return
         vals = self.rank_tree.item(sel[0], "values")
-        stock_id = str(vals[1])
+        stock_id = self._resolve_stock_id_from_tree_values(vals, "排行榜")
+        if not stock_id:
+            return
         if self._should_ignore_select_event(stock_id, "排行榜"):
             return
         self.sync_all_views(stock_id, source="排行榜")
