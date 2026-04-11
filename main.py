@@ -4588,6 +4588,170 @@ class OperationGuideEngine:
         return mapping.get(str(ui_state or ""), "依 SOP 判斷，不做主觀硬拗。")
 
 
+class FinalDecisionEngine:
+    @staticmethod
+    def _safe_float(v, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _safe_int(v, default: int = 0) -> int:
+        try:
+            return int(float(v))
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _position_bucket(price: float, support: float, resistance: float) -> str:
+        if support <= 0 or resistance <= support:
+            return "未知"
+        width = max(resistance - support, 1e-6)
+        pos = (price - support) / width
+        if pos <= 0.33:
+            return "低位"
+        if pos <= 0.66:
+            return "中位"
+        return "高位"
+
+    @staticmethod
+    def _distribution_flag(row: pd.Series) -> str:
+        price = FinalDecisionEngine._safe_float(row.get("price", 0))
+        resistance = FinalDecisionEngine._safe_float(row.get("resistance", 0))
+        rsi = FinalDecisionEngine._safe_float(row.get("rsi", 50))
+        liq = FinalDecisionEngine._safe_float(row.get("liquidity_score", 0))
+        signal = str(row.get("signal", "") or "")
+        if resistance > 0 and price >= resistance * 0.985 and (rsi >= 72 or liq >= 85):
+            return "是"
+        if signal == "突破強勢" and rsi >= 75:
+            return "是"
+        return "否"
+
+    @staticmethod
+    def _distance_to_entry_pct(price: float, entry_high: float) -> float:
+        if entry_high <= 0:
+            return 0.0
+        return round((price - entry_high) / entry_high * 100.0, 2)
+
+    @staticmethod
+    def finalize(trade_top20: pd.DataFrame, today_buy: pd.DataFrame, wait_pullback: pd.DataFrame, defense: pd.DataFrame, institutional_plan: pd.DataFrame, theme_summary: pd.DataFrame) -> pd.DataFrame:
+        frames = []
+        for role, df in (("交易候選", trade_top20), ("今日可買", today_buy), ("等待拉回", wait_pullback), ("防守", defense)):
+            if df is not None and not df.empty:
+                part = df.copy()
+                part["source_role"] = role
+                frames.append(part)
+        if not frames:
+            return pd.DataFrame(columns=["stock_id", "stock_name", "decision_bucket", "decision_reason", "execution_ready"])
+
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        if "stock_id" in merged.columns:
+            merged["stock_id"] = merged["stock_id"].astype(str)
+            merged = merged.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+
+        theme_weight_map = {}
+        if theme_summary is not None and not theme_summary.empty and all(c in theme_summary.columns for c in ["theme", "hot_score"]):
+            ts = theme_summary[["theme", "hot_score"]].copy()
+            ts["hot_score"] = pd.to_numeric(ts["hot_score"], errors="coerce").fillna(0)
+            max_hot = float(ts["hot_score"].max()) if not ts.empty else 0.0
+            if max_hot > 0:
+                ts["theme_weight"] = (ts["hot_score"] / max_hot * 100).round(2)
+            else:
+                ts["theme_weight"] = 0.0
+            theme_weight_map = dict(zip(ts["theme"].astype(str), ts["theme_weight"]))
+        merged["theme_weight"] = merged.get("theme", pd.Series(dtype=object)).astype(str).map(theme_weight_map).fillna(0.0)
+
+        plan_lookup = {}
+        if institutional_plan is not None and not institutional_plan.empty and "代號" in institutional_plan.columns:
+            plan_lookup = institutional_plan.set_index(institutional_plan["代號"].astype(str)).to_dict("index")
+
+        today_buy_ids = set(today_buy["stock_id"].astype(str).tolist()) if today_buy is not None and not today_buy.empty and "stock_id" in today_buy.columns else set()
+        wait_ids = set(wait_pullback["stock_id"].astype(str).tolist()) if wait_pullback is not None and not wait_pullback.empty and "stock_id" in wait_pullback.columns else set()
+        defense_ids = set(defense["stock_id"].astype(str).tolist()) if defense is not None and not defense.empty and "stock_id" in defense.columns else set()
+
+        rows = []
+        for _, row in merged.iterrows():
+            sid = str(row.get("stock_id", "") or "")
+            price = FinalDecisionEngine._safe_float(row.get("price", 0))
+            entry_high = FinalDecisionEngine._safe_float(row.get("entry_high", 0))
+            support = FinalDecisionEngine._safe_float(row.get("support", 0))
+            resistance = FinalDecisionEngine._safe_float(row.get("resistance", 0))
+            trade_action = str(row.get("trade_action", row.get("decision", "")) or "").upper()
+            ui_state = str(row.get("ui_state", "") or "")
+            liquidity_status = str(row.get("liquidity_status", "") or "")
+            is_etf = FinalDecisionEngine._safe_int(row.get("is_etf", 0)) == 1
+            plan_row = plan_lookup.get(sid, {})
+            inst_status = str(plan_row.get("盤中狀態", "") or "")
+            suggested_qty = FinalDecisionEngine._safe_float(plan_row.get("建議張數", 0), 0)
+            distance = FinalDecisionEngine._distance_to_entry_pct(price, entry_high)
+            position_bucket = FinalDecisionEngine._position_bucket(price, support, resistance)
+            distribution_flag = FinalDecisionEngine._distribution_flag(row)
+            final_trade_decision = str(row.get("final_trade_decision", trade_action) or trade_action).upper()
+
+            reasons = []
+            if is_etf or sid in defense_ids or str(row.get("bucket", "")) == "防守":
+                decision_bucket = "防守"
+                reasons.append("ETF/防守池")
+            elif trade_action == "AVOID" or final_trade_decision in ("AVOID", "ELIMINATE") or liquidity_status == "ELIMINATE":
+                decision_bucket = "排除"
+                reasons.append("AVOID/淘汰")
+            elif sid in today_buy_ids and trade_action in ("BUY", "WEAK BUY") and inst_status == "PASS" and suggested_qty > 0:
+                decision_bucket = "主攻"
+                reasons.append("今日可買且機構驗證通過")
+            elif sid in wait_ids or trade_action in ("WEAK BUY", "HOLD") or ui_state in ("預掛單", "準備買", "觀察"):
+                decision_bucket = "等待拉回"
+                reasons.append("方向正確但未到執行條件")
+            else:
+                decision_bucket = "排除"
+                reasons.append("不符合唯一決策規則")
+
+            if distribution_flag == "是" and decision_bucket == "主攻":
+                decision_bucket = "等待拉回"
+                reasons.append("高位/出貨警示降級")
+
+            execution_ready = int(decision_bucket == "主攻" and inst_status == "PASS" and suggested_qty > 0 and trade_action in ("BUY", "WEAK BUY"))
+            if inst_status and inst_status != "PASS" and decision_bucket == "主攻":
+                decision_bucket = "等待拉回"
+                execution_ready = 0
+                reasons.append(f"盤中狀態={inst_status}")
+
+            reason_tail = []
+            if str(row.get("signal", "")):
+                reason_tail.append(str(row.get("signal", "")))
+            if str(row.get("wave", "")):
+                reason_tail.append(str(row.get("wave", "")))
+            if sid in today_buy_ids:
+                reason_tail.append("今日可買")
+            elif sid in wait_ids:
+                reason_tail.append("等待拉回")
+            if inst_status:
+                reason_tail.append(f"盤中={inst_status}")
+            if suggested_qty > 0:
+                reason_tail.append(f"建議張數={suggested_qty:g}")
+
+            out = row.to_dict()
+            out.update({
+                "distance_to_entry_pct": distance,
+                "position_bucket": position_bucket,
+                "distribution_flag": distribution_flag,
+                "execution_ready": execution_ready,
+                "decision_bucket": decision_bucket,
+                "decision_reason": "｜".join(reasons + reason_tail),
+                "theme_weight": round(FinalDecisionEngine._safe_float(out.get("theme_weight", 0)), 2),
+                "inst_status": inst_status,
+                "suggested_qty": suggested_qty,
+            })
+            rows.append(out)
+
+        final_df = pd.DataFrame(rows)
+        if not final_df.empty:
+            priority_map = {"主攻": 0, "等待拉回": 1, "防守": 2, "排除": 3}
+            final_df["decision_priority"] = final_df["decision_bucket"].map(priority_map).fillna(9)
+            final_df = final_df.sort_values(["decision_priority", "execution_ready", "theme_weight", "liquidity_score", "model_score", "trade_score", "win_rate"], ascending=[True, False, False, False, False, False, False]).reset_index(drop=True)
+        return final_df
+
+
 class AppUI:
     def __init__(self, root, db: DBManager):
         self.root = root
@@ -4610,6 +4774,7 @@ class AppUI:
         self.last_order_list_df = pd.DataFrame()
         self.last_institutional_plan_df = pd.DataFrame()
         self.last_execution_pool_df = pd.DataFrame()
+        self.last_final_decision_df = pd.DataFrame()
         self.last_today_buy_df = pd.DataFrame()
         self.last_wait_df = pd.DataFrame()
         self.last_operation_sop_df = pd.DataFrame()
@@ -4886,7 +5051,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "下單清單", "機構交易計畫", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "唯一決策", "下單清單", "機構交易計畫", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -6336,6 +6501,7 @@ class AppUI:
                 "主攻": self.last_attack_df,
                 "次強": self.last_watch_df,
                 "防守": self.last_defense_df,
+                "唯一決策": getattr(self, "last_final_decision_df", pd.DataFrame()),
                 "下單清單": self.last_order_list_df,
                 "機構交易計畫": getattr(self, "last_institutional_plan_df", pd.DataFrame()),
                 "操作SOP": getattr(self, "last_operation_sop_df", pd.DataFrame()),
@@ -6354,6 +6520,7 @@ class AppUI:
                     "TOP5": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
                     "今日可買": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
                     "等待拉回": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "唯一決策": ["stock_id", "stock_name", "decision_bucket", "trade_action", "ui_state", "execution_ready", "position_bucket", "distribution_flag", "distance_to_entry_pct", "inst_status", "suggested_qty", "decision_reason"],
                     "預掛單": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
                     "下單清單": ["優先級", "代號", "名稱", "現價", "分類", "狀態", "盤中狀態", "活性分", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "機構交易計畫": ["優先級", "代號", "名稱", "現價", "市場", "產業", "題材", "分類", "狀態", "盤中狀態", "活性分", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
@@ -6451,6 +6618,8 @@ class AppUI:
                     tables["Defense"] = self.last_defense_df
                 if getattr(self, "last_execution_pool_df", pd.DataFrame()) is not None and not getattr(self, "last_execution_pool_df", pd.DataFrame()).empty:
                     tables["Execution_Pool"] = self.last_execution_pool_df
+                if getattr(self, "last_final_decision_df", pd.DataFrame()) is not None and not getattr(self, "last_final_decision_df", pd.DataFrame()).empty:
+                    tables["Final_Decision"] = self.last_final_decision_df
                 if self.last_order_list_df is not None and not self.last_order_list_df.empty:
                     tables["Order_List"] = self.last_order_list_df
                 if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not getattr(self, "last_institutional_plan_df", pd.DataFrame()).empty:
@@ -6482,7 +6651,26 @@ class AppUI:
         plan = plan_df.copy() if plan_df is not None else self.portfolio_engine.build_institutional_plan(execution_pool)
         if plan.empty:
             self.last_institutional_plan_df = pd.DataFrame()
-            return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
+            return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行"])
+
+        final_df = getattr(self, "last_final_decision_df", pd.DataFrame()).copy()
+        if final_df is not None and not final_df.empty and "stock_id" in final_df.columns and "代號" in plan.columns:
+            fd = final_df[[c for c in ["stock_id", "decision_bucket", "decision_reason", "execution_ready"] if c in final_df.columns]].copy()
+            fd["stock_id"] = fd["stock_id"].astype(str)
+            plan = plan.copy()
+            plan["代號"] = plan["代號"].astype(str)
+            plan = plan.merge(fd, left_on="代號", right_on="stock_id", how="left")
+            plan["decision_bucket"] = plan.get("decision_bucket", "排除").fillna("排除")
+            plan["execution_ready"] = pd.to_numeric(plan.get("execution_ready", 0), errors="coerce").fillna(0).astype(int)
+            plan = plan[(plan["decision_bucket"] == "主攻") & (plan["execution_ready"] == 1)].copy()
+            if plan.empty:
+                self.last_institutional_plan_df = pd.DataFrame()
+                return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行"])
+        elif "盤中狀態" in plan.columns:
+            plan = plan[plan["盤中狀態"].astype(str).eq("PASS")].copy()
+        if plan.empty:
+            self.last_institutional_plan_df = pd.DataFrame()
+            return pd.DataFrame(columns=["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行"])
         order_df = pd.DataFrame({
             "優先級": plan["優先級"],
             "代號": plan["代號"],
@@ -6505,6 +6693,9 @@ class AppUI:
             "單檔曝險%": plan["單檔曝險%"],
             "投資組合狀態": plan["投資組合狀態"],
             "風險備註": plan["風險備註"],
+            "唯一決策": plan["decision_bucket"] if "decision_bucket" in plan.columns else "主攻",
+            "決策原因": plan["decision_reason"] if "decision_reason" in plan.columns else "",
+            "可執行": plan["execution_ready"] if "execution_ready" in plan.columns else 1,
         })
         self.last_institutional_plan_df = plan.copy()
         return order_df
@@ -7112,17 +7303,7 @@ class AppUI:
 
                 self.last_top20_df = trade_top20.copy()
                 self.cache_trade_dataframe(self.last_top20_df)
-                top5 = trade_top20.head(5).copy()
-                if not top5.empty:
-                    bt_rows = []
-                    for _, rr in top5.iterrows():
-                        bt = self.backtest_engine.estimate_trade_quality(str(rr["stock_id"]))
-                        bt_rows.append(bt)
-                    bt_df = pd.DataFrame(bt_rows)
-                    top5 = pd.concat([top5.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
-                self.last_top5_df = top5.copy()
-                self.cache_trade_dataframe(self.last_top5_df)
-                self.cache_backtest_dataframe(self.last_top5_df)
+                self.last_top5_df = pd.DataFrame()
                 self.last_attack_df = attack.copy()
                 self.cache_trade_dataframe(self.last_attack_df)
                 self.last_watch_df = watch.copy()
@@ -7137,6 +7318,24 @@ class AppUI:
                 self.last_execution_pool_df = execution_pool.copy()
                 institutional_plan = self.portfolio_engine.build_institutional_plan(execution_pool)
                 self.last_institutional_plan_df = institutional_plan.copy()
+                final_decision = FinalDecisionEngine.finalize(trade_top20, today_buy, wait_pullback, defense, institutional_plan, theme_summary)
+                self.last_final_decision_df = final_decision.copy()
+
+                top5_source = final_decision[(final_decision["decision_bucket"] == "主攻") & (final_decision["trade_action"].astype(str).str.upper().isin(["BUY", "WEAK BUY"]))].copy() if final_decision is not None and not final_decision.empty else pd.DataFrame()
+                if top5_source.empty:
+                    top5_source = final_decision[final_decision["decision_bucket"].isin(["主攻", "等待拉回"])].copy() if final_decision is not None and not final_decision.empty else pd.DataFrame()
+                top5_source = top5_source.head(5).copy() if not top5_source.empty else top5_source
+                if not top5_source.empty:
+                    bt_rows = []
+                    for _, rr in top5_source.iterrows():
+                        bt = self.backtest_engine.estimate_trade_quality(str(rr["stock_id"]))
+                        bt_rows.append(bt)
+                    bt_df = pd.DataFrame(bt_rows)
+                    top5_source = pd.concat([top5_source.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
+                self.last_top5_df = top5_source.copy()
+                self.cache_trade_dataframe(self.last_top5_df)
+                self.cache_backtest_dataframe(self.last_top5_df)
+
                 self.last_order_list_df = self.build_order_list(execution_pool, institutional_plan)
 
                 self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
