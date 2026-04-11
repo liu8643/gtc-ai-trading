@@ -5320,9 +5320,19 @@ class AppUI:
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=28)
-        narrow_cols = {"rank", "count", "avg_total", "avg_ai", "id", "total", "ai", "price", "intra", "liq_score", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "single_pct", "theme_pct", "industry_pct", "backtest", "cagr", "mdd", "win", "avg_ret", "samples"}
-        medium_cols = {"light", "state", "action", "signal", "liquidity", "market", "bucket", "ui_action", "priority"}
-        wide_cols = {"name", "industry", "theme", "entry", "stop", "target1382", "target1618", "portfolio_state", "risk_note", "elim_reason"}
+        try:
+            tree.tag_configure("light_red", foreground="#9f1239", background="#fff1f2")
+            tree.tag_configure("light_orange", foreground="#9a3412", background="#fff7ed")
+            tree.tag_configure("light_yellow", foreground="#854d0e", background="#fefce8")
+            tree.tag_configure("light_green", foreground="#166534", background="#f0fdf4")
+            tree.tag_configure("light_blue", foreground="#1d4ed8", background="#eff6ff")
+            tree.tag_configure("light_neutral", foreground="#374151", background="#f8fafc")
+            tree.tag_configure("light_disabled", foreground="#6b7280", background="#f3f4f6")
+        except Exception:
+            pass
+        narrow_cols = {"rank", "count", "avg_total", "avg_ai", "id", "total", "ai", "price", "intra", "liq_score", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "single_pct", "theme_pct", "industry_pct", "backtest", "cagr", "mdd", "win", "avg_ret", "samples", "light"}
+        medium_cols = {"state", "action", "signal", "liquidity", "market", "bucket", "ui_action", "priority", "engine", "grade"}
+        wide_cols = {"name", "industry", "theme", "entry", "stop", "target1382", "target1618", "portfolio_state", "risk_note", "elim_reason", "reason"}
         for c in cols:
             tree.heading(c, text=headers[c])
             width = 140
@@ -5342,6 +5352,39 @@ class AppUI:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         return tree
+
+    def _display_light_symbol(self, light):
+        light = str(light or "⚪").strip()
+        return "●" if light in ("🔴", "🟠", "🟡", "🟢", "🔵") else "○"
+
+    def _resolve_light_tag(self, light="", ui_state="", bucket="", liquidity_status=""):
+        light = str(light or "").strip()
+        ui_state = str(ui_state or "").strip()
+        bucket = str(bucket or "").strip()
+        liquidity_status = str(liquidity_status or "").strip().upper()
+        if liquidity_status == "ELIMINATE" or ui_state in ("淘汰", "不可買") or bucket == "排除":
+            return "light_disabled"
+        mapping = {
+            "🔴": "light_red",
+            "🟠": "light_orange",
+            "🟡": "light_yellow",
+            "🟢": "light_green",
+            "🔵": "light_blue",
+            "⚪": "light_neutral",
+        }
+        if light in mapping:
+            return mapping[light]
+        if ui_state in ("可買", "準備買") or bucket == "主攻":
+            return "light_green"
+        if ui_state == "預掛單" or bucket == "等待拉回":
+            return "light_yellow"
+        if ui_state == "觀察" or bucket == "觀察":
+            return "light_neutral"
+        return "light_neutral"
+
+    def _insert_colored_row(self, tree, values, light="", ui_state="", bucket="", liquidity_status=""):
+        tag = self._resolve_light_tag(light=light, ui_state=ui_state, bucket=bucket, liquidity_status=liquidity_status)
+        return tree.insert("", "end", values=values, tags=(tag,))
 
     def set_status(self, text):
         self.status_label.config(text=text)
@@ -6895,19 +6938,20 @@ class AppUI:
                         light = '🔴'
                     else:
                         light = '⚪'
-                self.top20_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get("stock_name", ""), light, r.get("candidate_engine", "混合"), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), r.get("operation_grade", "-"), ui_action,
+                self._insert_colored_row(self.top20_tree, values=(
+                    i, r.get("stock_id", ""), r.get("stock_name", ""), self._display_light_symbol(light), r.get("candidate_engine", "混合"), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), r.get("operation_grade", "-"), ui_action,
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}",
                     r.get("elimination_reason", "")
-                ))
+                ), light=light, ui_state=ui_action, bucket=r.get("bucket", ""), liquidity_status=r.get("liquidity_status", ""))
 
         if self.last_top5_df is not None and not self.last_top5_df.empty:
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
-                self.top5_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get('tactical_light', '⚪'), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("ui_state", "-"),
+                _light = str(r.get('tactical_light', '⚪') or '⚪')
+                self._insert_colored_row(self.top5_tree, values=(
+                    i, r.get("stock_id", ""), self._display_light_symbol(_light), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("ui_state", "-"),
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}",
@@ -6916,12 +6960,13 @@ class AppUI:
                     f"{float(r.get('backtest_win_rate', 0) or 0):.1f}",
                     f"{float(r.get('cagr', 0) or 0):.2f}",
                     f"{float(r.get('mdd', 0) or 0):.2f}"
-                ))
+                ), light=_light, ui_state=r.get("ui_state", "-"), bucket=r.get("bucket", ""), liquidity_status=r.get("liquidity_status", ""))
 
 
         if self.last_institutional_plan_df is not None and not self.last_institutional_plan_df.empty:
             for _, r in self.last_institutional_plan_df.iterrows():
-                self.inst_tree.insert("", "end", values=(
+                _inst_light = UITacticalPresenter.derive_signal_light(r.get("盤中狀態", ""), score=float(r.get('活性分', 0) or 0), intraday_score=float(r.get('活性分', 0) or 0))
+                self._insert_colored_row(self.inst_tree, values=(
                     int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), self._fmt_price(r.get("現價", "")), r.get("市場", ""),
                     r.get("產業", ""), r.get("題材", ""), r.get("分類", ""), r.get("狀態", ""),
                     r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
@@ -6937,11 +6982,12 @@ class AppUI:
                     f"{float(r.get('題材曝險%', 0) or 0):.2f}",
                     f"{float(r.get('產業曝險%', 0) or 0):.2f}",
                     r.get("投資組合狀態", "")
-                ))
+                ), light=_inst_light, ui_state=r.get("狀態", ""), bucket=r.get("分類", ""), liquidity_status=r.get("盤中狀態", ""))
 
         if self.last_order_list_df is not None and not self.last_order_list_df.empty:
             for _, r in self.last_order_list_df.iterrows():
-                self.order_tree.insert("", "end", values=(
+                _order_light = UITacticalPresenter.derive_signal_light(r.get("盤中狀態", ""), score=float(r.get('活性分', 0) or 0), intraday_score=float(r.get('活性分', 0) or 0))
+                self._insert_colored_row(self.order_tree, values=(
                     int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), self._fmt_price(r.get("現價", "")), r.get("分類", ""),
                     r.get("狀態", ""), r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
                     r.get("進場區", "-"), r.get("停損", "-"),
@@ -6951,7 +6997,7 @@ class AppUI:
                     (f"{float(r.get('建議張數', 0) or 0):.1f}".rstrip('0').rstrip('.') if pd.notna(r.get('建議張數', 0)) else "0"),
                     f"{float(r.get('建議金額', 0) or 0):.0f}", f"{float(r.get('單檔曝險%', 0) or 0):.2f}",
                     r.get("投資組合狀態", ""), r.get("風險備註", ""), r.get("空表說明", r.get("決策原因", ""))
-                ))
+                ), light=_order_light, ui_state=r.get("狀態", ""), bucket=r.get("分類", ""), liquidity_status=r.get("盤中狀態", ""))
 
         self.sync_multi_windows()
         if self.window_current_stock_id and self.current_chart_path and Path(self.current_chart_path).exists():
@@ -7342,10 +7388,11 @@ class AppUI:
             return pd.DataFrame()
         enriched = self.build_enriched_ranking_dataframe(df, scope="ui")
         for i, row in enriched.iterrows():
-            self.rank_tree.insert("", "end", values=(
+            _rank_light = UITacticalPresenter.derive_signal_light(row.get("signal", ""), score=float(row.get('total_score', 0) or 0), intraday_score=float(row.get('intraday_score', 0) or 0))
+            self._insert_colored_row(self.rank_tree, values=(
                 i + 1, row["stock_id"], row["stock_name"], row.get("display_price", self._get_stock_display_price(row["stock_id"], row)), row["industry"], row["theme"],
                 f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
-            ))
+            ), light=_rank_light, ui_state=row.get("action", ""), bucket=row.get("bucket", ""), liquidity_status=row.get("liquidity_status", ""))
         sector = (
             enriched.groupby("industry", as_index=False)
             .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
