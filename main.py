@@ -5358,12 +5358,8 @@ class AppUI:
         return "●" if light in ("🔴", "🟠", "🟡", "🟢", "🔵") else "○"
 
     def _resolve_light_tag(self, light="", ui_state="", bucket="", liquidity_status=""):
+        """燈號顏色唯一來源：tactical_light。ui_state / bucket 只顯示文字，不再干預燈號。"""
         light = str(light or "").strip()
-        ui_state = str(ui_state or "").strip()
-        bucket = str(bucket or "").strip()
-        liquidity_status = str(liquidity_status or "").strip().upper()
-        if liquidity_status == "ELIMINATE" or ui_state in ("淘汰", "不可買") or bucket == "排除":
-            return "light_disabled"
         mapping = {
             "🔴": "light_red",
             "🟠": "light_orange",
@@ -5372,15 +5368,7 @@ class AppUI:
             "🔵": "light_blue",
             "⚪": "light_neutral",
         }
-        if light in mapping:
-            return mapping[light]
-        if ui_state in ("可買", "準備買") or bucket == "主攻":
-            return "light_green"
-        if ui_state == "預掛單" or bucket == "等待拉回":
-            return "light_yellow"
-        if ui_state == "觀察" or bucket == "觀察":
-            return "light_neutral"
-        return "light_neutral"
+        return mapping.get(light, "light_neutral")
 
     def _insert_colored_row(self, tree, values, light="", ui_state="", bucket="", liquidity_status=""):
         tag = self._resolve_light_tag(light=light, ui_state=ui_state, bucket=bucket, liquidity_status=liquidity_status)
@@ -6927,17 +6915,14 @@ class AppUI:
         if self.last_top20_df is not None and not self.last_top20_df.empty:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
-                light = r.get('tactical_light', '⚪') or '⚪'
+                light = str(r.get('tactical_light', '') or '').strip()
                 if light in ('', '-', '--'):
-                    ui_state = str(r.get("ui_state", "") or "")
-                    if ui_state in ("可買", "準備買"):
-                        light = '🟢'
-                    elif ui_state == "預掛單":
-                        light = '🟡'
-                    elif ui_state in ("不可買", "淘汰"):
-                        light = '🔴'
-                    else:
-                        light = '⚪'
+                    light = UITacticalPresenter.derive_signal_light(
+                        r.get('signal', ''),
+                        score=float(r.get('score', r.get('selection_score', 0)) or 0),
+                        change_pct=float(r.get('change_pct', 0) or 0),
+                        intraday_score=float(r.get('intraday_score', 0) or 0),
+                    )
                 self._insert_colored_row(self.top20_tree, values=(
                     i, r.get("stock_id", ""), r.get("stock_name", ""), self._display_light_symbol(light), r.get("candidate_engine", "混合"), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), r.get("operation_grade", "-"), ui_action,
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
@@ -6949,7 +6934,14 @@ class AppUI:
 
         if self.last_top5_df is not None and not self.last_top5_df.empty:
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
-                _light = str(r.get('tactical_light', '⚪') or '⚪')
+                _light = str(r.get('tactical_light', '') or '').strip()
+                if _light in ('', '-', '--'):
+                    _light = UITacticalPresenter.derive_signal_light(
+                        r.get('signal', ''),
+                        score=float(r.get('score', r.get('selection_score', 0)) or 0),
+                        change_pct=float(r.get('change_pct', 0) or 0),
+                        intraday_score=float(r.get('intraday_score', 0) or 0),
+                    )
                 self._insert_colored_row(self.top5_tree, values=(
                     i, r.get("stock_id", ""), self._display_light_symbol(_light), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("ui_state", "-"),
                     r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
