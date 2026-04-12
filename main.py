@@ -245,12 +245,28 @@ def resolve_master_csv() -> Path:
 
 
 CLASSIFICATION_DOWNLOAD_URL = "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv"
+CLASSIFICATION_DOWNLOAD_URL_TWSE = CLASSIFICATION_DOWNLOAD_URL
+CLASSIFICATION_DOWNLOAD_URL_TPEX = "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv"
+CLASSIFICATION_DOWNLOAD_SOURCES = {
+    "上市": {
+        "url": CLASSIFICATION_DOWNLOAD_URL_TWSE,
+        "cache_path": CLASSIFICATION_CACHE_CSV_TWSE if "CLASSIFICATION_CACHE_CSV_TWSE" in globals() else None,
+        "source": "MOPS-CSV-TWSE",
+    },
+    "上櫃": {
+        "url": CLASSIFICATION_DOWNLOAD_URL_TPEX,
+        "cache_path": CLASSIFICATION_CACHE_CSV_TPEX if "CLASSIFICATION_CACHE_CSV_TPEX" in globals() else None,
+        "source": "MOPS-CSV-TPEX",
+    },
+}
 CLASSIFICATION_LEGACY_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
 CLASSIFICATION_CACHE_DIR = EXTERNAL_DATA_DIR / "classification"
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CLASSIFICATION_CACHE_CSV_TWSE = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上市.csv"
 CLASSIFICATION_CACHE_CSV_TPEX = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上櫃.csv"
 CLASSIFICATION_CACHE_CSV = CLASSIFICATION_CACHE_CSV_TWSE  # backward compatibility
+CLASSIFICATION_DOWNLOAD_SOURCES["上市"]["cache_path"] = CLASSIFICATION_CACHE_CSV_TWSE
+CLASSIFICATION_DOWNLOAD_SOURCES["上櫃"]["cache_path"] = CLASSIFICATION_CACHE_CSV_TPEX
 CLASSIFICATION_CACHE_XLS = CLASSIFICATION_CACHE_DIR / "台股類股分類.xls"
 CLASSIFICATION_CACHE_XLSX = CLASSIFICATION_CACHE_DIR / "台股類股分類.xlsx"
 CLASSIFICATION_META_PATH = CLASSIFICATION_CACHE_DIR / "classification_meta.json"
@@ -624,62 +640,92 @@ def convert_xls_to_xlsx_force(src: Path, dst: Path, log_cb=None) -> Optional[Pat
     return None
 
 
-def download_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
-    existing = None if force_refresh else next(iter(_iter_classification_candidates_prefer_xlsx()), None)
-    if existing is not None and not force_refresh:
-        return existing
+def _download_single_classification_csv(market: str, force_refresh: bool = False, log_cb=None) -> Optional[Path]:
+    market = str(market or "").strip()
+    cfg = CLASSIFICATION_DOWNLOAD_SOURCES.get(market)
+    if not cfg:
+        return None
+    cache_path = Path(cfg["cache_path"])
+    if cache_path.exists() and not force_refresh:
+        return cache_path
 
-    CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     last_error = None
     for attempt in range(1, CLASSIFICATION_DOWNLOAD_RETRIES + 1):
         try:
             if log_cb:
-                log_cb(f"分類來源下載開始（第 {attempt}/{CLASSIFICATION_DOWNLOAD_RETRIES} 次）：{CLASSIFICATION_DOWNLOAD_URL}")
+                log_cb(f"{market} 分類來源下載開始（第 {attempt}/{CLASSIFICATION_DOWNLOAD_RETRIES} 次）：{cfg['url']}")
             resp = requests.get(
-                CLASSIFICATION_DOWNLOAD_URL,
+                cfg["url"],
                 timeout=CLASSIFICATION_DOWNLOAD_TIMEOUT,
                 headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mopsfin.twse.com.tw/"}
             )
             resp.raise_for_status()
             content = resp.content or b""
-            if len(content) < 256:
+            if len(content) < 128:
                 raise ValueError("下載內容過小，疑似失敗或非有效檔案")
-
-            CLASSIFICATION_CACHE_CSV.write_bytes(content)
+            cache_path.write_bytes(content)
+            probe = safe_read_csv_auto(cache_path)
+            parsed = _extract_official_csv_rows(probe, market=market)
+            if parsed is None or parsed.empty:
+                raise RuntimeError(f"{market} CSV可讀取，但無可用官方產業資料")
             if log_cb:
-                log_cb(f"官方分類CSV已下載到快取：{CLASSIFICATION_CACHE_CSV}")
-
-            try:
-                probe = safe_read_csv_auto(CLASSIFICATION_CACHE_CSV)
-                parsed = _extract_official_csv_rows(probe, market="上市")
-                if parsed is None or parsed.empty:
-                    raise RuntimeError("CSV可讀取，但無可用官方產業資料")
-            except Exception as exc:
-                raise RuntimeError(f"分類來源下載成功，但驗證失敗：{exc}") from exc
-
-            meta = _build_classification_meta(CLASSIFICATION_CACHE_CSV, source="MOPS-CSV", note=f"download attempt {attempt}")
-            _write_classification_meta(meta)
-            CLASSIFICATION_MEMORY_CACHE["df"] = None
-            CLASSIFICATION_MEMORY_CACHE["path"] = None
-            CLASSIFICATION_MEMORY_CACHE["mtime"] = None
-            CLASSIFICATION_MEMORY_CACHE["meta"] = meta
-            _set_classification_load_info(False, 0, CLASSIFICATION_CACHE_CSV, "已下載官方CSV，待正式載入")
-            return CLASSIFICATION_CACHE_CSV
+                log_cb(f"{market} 官方分類CSV已下載到快取：{cache_path}｜rows={len(parsed)}")
+            return cache_path
         except Exception as exc:
             last_error = exc
-            log_warning(f"分類來源下載失敗（第 {attempt} 次）：{exc}")
+            log_warning(f"{market} 分類來源下載失敗（第 {attempt} 次）：{exc}")
             if log_cb:
-                log_cb(f"分類來源下載失敗（第 {attempt} 次）：{exc}")
+                log_cb(f"{market} 分類來源下載失敗（第 {attempt} 次）：{exc}")
             if attempt < CLASSIFICATION_DOWNLOAD_RETRIES:
                 time.sleep(min(2 * attempt, 5))
+    raise RuntimeError(f"{market} 分類來源下載失敗：{last_error}")
+
+
+def download_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
+    if not force_refresh:
+        existing = resolve_classification_book_by_market("上市")
+        existing_tpex = resolve_classification_book_by_market("上櫃")
+        if existing is not None and existing_tpex is not None:
+            return existing
+
+    CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    downloaded = []
+    errors = []
+    for market in ("上市", "上櫃"):
+        try:
+            p = _download_single_classification_csv(market, force_refresh=force_refresh, log_cb=log_cb)
+            if p is not None:
+                downloaded.append((market, p))
+        except Exception as exc:
+            errors.append(f"{market}: {exc}")
+
+    if downloaded:
+        meta_paths = [str(p) for _, p in downloaded]
+        meta = {
+            "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "MOPS-CSV-TWSE+TPEX",
+            "file": ", ".join(Path(p).name for _, p in downloaded),
+            "path": " | ".join(meta_paths),
+            "status": "ok" if len(downloaded) == 2 else "partial",
+            "note": f"downloaded markets={','.join(m for m,_ in downloaded)}" + (f" | errors={' ; '.join(errors)}" if errors else ""),
+        }
+        _write_classification_meta(meta)
+        CLASSIFICATION_MEMORY_CACHE["df"] = None
+        CLASSIFICATION_MEMORY_CACHE["path"] = None
+        CLASSIFICATION_MEMORY_CACHE["mtime"] = None
+        CLASSIFICATION_MEMORY_CACHE["meta"] = meta
+        first_path = downloaded[0][1]
+        note = "已下載官方分類CSV（上市+上櫃）" if len(downloaded) == 2 else f"部分下載成功：{','.join(m for m,_ in downloaded)}"
+        _set_classification_load_info(False, 0, first_path, note)
+        return first_path
 
     fallback = next(iter(_iter_classification_candidates_prefer_xlsx()), None)
     if fallback is not None:
-        _mark_classification_meta_status("fallback", note=f"download failed: {last_error}", path=fallback)
-        _set_classification_load_info(False, 0, fallback, f"下載失敗，使用既有檔：{last_error}")
+        _mark_classification_meta_status("fallback", note=f"download failed: {' ; '.join(errors)}", path=fallback)
+        _set_classification_load_info(False, 0, fallback, f"下載失敗，使用既有檔：{' ; '.join(errors)}")
         return fallback
-    _mark_classification_meta_status("download_failed", note=str(last_error or "unknown"))
-    _set_classification_load_info(False, 0, None, str(last_error or "unknown"))
+    _mark_classification_meta_status("download_failed", note=' ; '.join(errors) or "unknown")
+    _set_classification_load_info(False, 0, None, ' ; '.join(errors) or "unknown")
     return None
 
 
@@ -821,6 +867,13 @@ def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]
     for p in _classification_csv_candidates_by_market(market):
         if Path(p).exists():
             return Path(p)
+    if market in ("上市", "上櫃"):
+        try:
+            downloaded = _download_single_classification_csv(market, force_refresh=False, log_cb=classification_debug_log)
+            if downloaded is not None and Path(downloaded).exists():
+                return Path(downloaded)
+        except Exception as exc:
+            classification_debug_log(f"自動補抓官方分類失敗（{market}）：{exc}", "WARNING")
     return None
 
 
