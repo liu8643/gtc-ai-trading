@@ -567,6 +567,31 @@ def safe_read_csv_auto(path: Path) -> pd.DataFrame:
     raise RuntimeError(f"CSV讀取失敗：{path}｜{last_error}")
 
 
+
+
+def _coerce_unique_columns(columns) -> list[str]:
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for c in list(columns):
+        name = str(c).strip() if c is not None else ""
+        if not name:
+            name = "Unnamed"
+        count = seen.get(name, 0)
+        out_name = name if count == 0 else f"{name}__dup{count}"
+        seen[name] = count + 1
+        out.append(out_name)
+    return out
+
+
+def _validate_classification_helper_integrity():
+    missing = []
+    for fn_name in ['_coerce_unique_columns', 'normalize_stock_id', 'normalize_official_industry_name']:
+        if fn_name not in globals() or not callable(globals().get(fn_name)):
+            missing.append(fn_name)
+    if missing:
+        raise RuntimeError(f"分類模組缺少必要函式：{', '.join(missing)}")
+
+
 def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
@@ -887,6 +912,7 @@ def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]
     return None
 
 def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
+    _validate_classification_helper_integrity()
     market = str(market or "ALL").strip() or "ALL"
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
 
