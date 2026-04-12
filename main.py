@@ -3404,6 +3404,66 @@ class TradingPlanEngine:
 
     # legacy helper removed in v9.2 FINAL-RELEASE: _decision is no longer used
 
+    def _derive_tactical_light(self, signal: str, model_score: float, liquidity_status: str, rsi: float, decision: str, wave_label: str) -> str:
+        signal = str(signal or "").strip()
+        liquidity_status = str(liquidity_status or "WATCH").strip().upper()
+        decision = str(decision or "").strip().upper()
+        if liquidity_status == "ELIMINATE":
+            return "🔴"
+        if decision == "BUY" and liquidity_status == "PASS" and wave_label in ("第3浪", "推動浪") and float(model_score or 0) >= 80 and float(rsi or 0) <= 72:
+            return "🔵"
+        if decision in ("BUY", "WEAK BUY") and liquidity_status == "PASS":
+            return "🟢"
+        if decision in ("WEAK BUY", "HOLD") or liquidity_status == "WATCH":
+            return "🟡"
+        if signal in ("轉弱警戒", "急跌風險") or decision == "AVOID":
+            return "🟠"
+        return "⚪"
+
+    def _derive_final_trade_decision(self, tactical_light: str, is_etf: bool = False) -> str:
+        if is_etf:
+            return "DEFENSE"
+        light = str(tactical_light or "⚪")
+        if light == "🔵":
+            return "STRONG_BUY"
+        if light == "🟢":
+            return "BUY"
+        if light == "🟡":
+            return "WAIT_PULLBACK"
+        if light == "🟠":
+            return "AVOID"
+        if light == "🔴":
+            return "ELIMINATE"
+        return "IGNORE"
+
+    def _derive_bucket_from_light(self, tactical_light: str, is_etf: bool = False) -> str:
+        if is_etf:
+            return "防守"
+        light = str(tactical_light or "⚪")
+        if light in ("🔵", "🟢"):
+            return "主攻"
+        if light == "🟡":
+            return "觀察"
+        return "排除"
+
+    def _derive_ui_state_from_final_decision(self, final_trade_decision: str, liquidity_status: str, close_: float, entry_low: float, entry_high: float) -> str:
+        fd = str(final_trade_decision or "IGNORE").strip().upper()
+        liquidity_status = str(liquidity_status or "WATCH").strip().upper()
+        in_entry_zone = self._in_entry_zone(close_, entry_low, entry_high)
+        if fd in ("ELIMINATE", "IGNORE") or liquidity_status == "ELIMINATE":
+            return "淘汰" if liquidity_status == "ELIMINATE" else "不可買"
+        if fd == "STRONG_BUY":
+            return "可買" if in_entry_zone else "準備買"
+        if fd == "BUY":
+            return "可買" if in_entry_zone else "準備買"
+        if fd == "WAIT_PULLBACK":
+            return "預掛單" if liquidity_status == "PASS" else "觀察"
+        if fd == "AVOID":
+            return "不可買"
+        if fd == "DEFENSE":
+            return "防守"
+        return "觀察"
+
     def build_plan(self, stock_id: str) -> dict:
         stock = self.db.get_stock_row(stock_id)
         hist = self.db.get_price_history(stock_id)
@@ -3553,16 +3613,10 @@ class TradingPlanEngine:
         elif liquidity_status == "WATCH" and decision == "WEAK BUY":
             auto_state = "觀察"
 
-        if is_etf:
-            bucket = "防守"
-        elif liquidity_status == "ELIMINATE":
-            bucket = "淘汰"
-        elif decision == "BUY" and liquidity_status == "PASS":
-            bucket = "主攻"
-        elif decision in ("WEAK BUY", "HOLD") or liquidity_status == "WATCH":
-            bucket = "觀察"
-        else:
-            bucket = "排除"
+        tactical_light = self._derive_tactical_light(signal, model_score, liquidity_status, rsi, decision, wave_label)
+        final_trade_decision = self._derive_final_trade_decision(tactical_light, is_etf=is_etf)
+        bucket = self._derive_bucket_from_light(tactical_light, is_etf=is_etf)
+        ui_state = self._derive_ui_state_from_final_decision(final_trade_decision, liquidity_status, close_, entry_low, entry_high)
 
         selection_score = round(model_score * 0.45 + float(wave_trade["wave_trade_score"]) * 0.16 + win_rate * 0.12 + min(rr, 3.0) * 5 + float(liquidity.get("liquidity_score", 0)) * 0.22 + (6 if decision == "BUY" else 2 if decision == "WEAK BUY" else 0), 2)
         trade_score = round(model_score * 0.25 + float(wave_trade["wave_trade_score"]) * 0.18 + score["ai_score"] * 0.08 + win_rate * 0.14 + min(rr, 3.0) * 5 + float(liquidity.get("intraday_trend_score", 0)) * 0.14 + float(liquidity.get("attack_volume_score", 0)) * 0.11 + float(liquidity.get("leader_follow_score", 0)) * 0.10 + (6 if preferred_theme else 0), 2)
@@ -3573,8 +3627,6 @@ class TradingPlanEngine:
             f"六模組 {model_score:.1f}｜RR {rr:.2f}｜RSI {rsi:.1f}"
         )
 
-        ui_state = self._ui_trade_state(decision, close_, entry_low, entry_high, rr, win_rate, liquidity_status)
-
         return {
             "stock_id": stock_id,
             "stock_name": stock["stock_name"],
@@ -3584,6 +3636,8 @@ class TradingPlanEngine:
             "is_etf": 1 if is_etf else 0,
             "trade_action": decision,
             "ui_state": ui_state,
+            "tactical_light": tactical_light,
+            "candidate_engine": "混合",
             "entry_low": round(entry_low, 2),
             "entry_high": round(entry_high, 2),
             "entry_zone": f"{self._round_price(entry_low)} ~ {self._round_price(entry_high)}",
@@ -3597,6 +3651,7 @@ class TradingPlanEngine:
             "selection_score": selection_score,
             "trade_score": trade_score,
             "bucket": bucket,
+            "operation_grade": "S" if tactical_light == "🔵" else "A" if tactical_light == "🟢" else "B" if tactical_light == "🟡" else "C",
             "reason": reason,
             "wave": wave_label,
             "rsi": round(rsi, 2),
@@ -3636,7 +3691,7 @@ class TradingPlanEngine:
             "liquidity_score": round(float(liquidity.get("liquidity_score", 0) or 0), 2),
             "elimination_reason": elimination_reason,
             "is_mainstream_funding": int(liquidity.get("is_mainstream_funding", 0) or 0),
-            "final_trade_decision": decision if liquidity_status == "PASS" else ("WATCH" if liquidity_status == "WATCH" else "ELIMINATE"),
+            "final_trade_decision": final_trade_decision,
         }
 
 
@@ -3689,15 +3744,58 @@ class MasterTradingEngine:
         eliminated = eligible[eligible["liquidity_status"].eq("ELIMINATE")].copy()
         tradable = eligible[~eligible["liquidity_status"].eq("ELIMINATE")].copy()
 
+        mainstream_top20 = pd.DataFrame()
+        breakout_top20 = pd.DataFrame()
+        candidate_pool = pd.DataFrame()
+        tradable_top20 = pd.DataFrame()
         if not tradable.empty:
             tradable["decision_rank"] = tradable["decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1}).fillna(0)
             tradable["preferred_rank"] = preferred_mask.reindex(tradable.index).fillna(False).astype(int)
+            tradable["modules_pass_count"] = tradable[[c for c in ["trend_ok", "kd_ok", "macd_ok", "volume_ok"] if c in tradable.columns]].fillna(0).sum(axis=1)
+            tradable["mainstream_score"] = (
+                tradable.get("model_score", 0).fillna(0) * 0.30 +
+                tradable.get("liquidity_score", 0).fillna(0) * 0.22 +
+                tradable.get("leader_follow_score", 0).fillna(0) * 0.18 +
+                tradable.get("intraday_trend_score", 0).fillna(0) * 0.10 +
+                tradable.get("win_rate", 0).fillna(0) * 0.12 +
+                tradable.get("rr", 0).fillna(0).clip(upper=3) * 5 +
+                tradable["preferred_rank"] * 6
+            ).round(2)
+            tradable["breakout_score"] = (
+                tradable.get("wave_trade_score", tradable.get("trade_score", 0)).fillna(0) * 0.28 +
+                tradable.get("attack_volume_score", 0).fillna(0) * 0.20 +
+                tradable.get("range_breakout_score", 0).fillna(0) * 0.18 +
+                tradable.get("active_buy_score", 0).fillna(0) * 0.12 +
+                tradable.get("model_score", 0).fillna(0) * 0.10 +
+                tradable.get("rr", 0).fillna(0).clip(upper=3) * 5 +
+                tradable["preferred_rank"] * 5
+            ).round(2)
+            mainstream_top20 = tradable.sort_values(["mainstream_score", "modules_pass_count", "liquidity_score", "model_score"], ascending=False).head(20).copy()
+            breakout_top20 = tradable.sort_values(["breakout_score", "modules_pass_count", "attack_volume_score", "trade_score"], ascending=False).head(20).copy()
+            combined_parts = []
+            if not mainstream_top20.empty:
+                tmp = mainstream_top20.copy(); tmp["candidate_engine"] = "主流TOP20"; combined_parts.append(tmp)
+            if not breakout_top20.empty:
+                tmp = breakout_top20.copy(); tmp["candidate_engine"] = "起爆TOP20"; combined_parts.append(tmp)
+            if combined_parts:
+                candidate_pool = pd.concat(combined_parts, ignore_index=True)
+                candidate_pool["source_count"] = candidate_pool.groupby("stock_id")["stock_id"].transform("count")
+                candidate_pool["candidate_engine"] = np.where(candidate_pool["source_count"] >= 2, "雙引擎共振", candidate_pool["candidate_engine"])
+                candidate_pool = candidate_pool.sort_values(["source_count", "mainstream_score", "breakout_score", "liquidity_score", "model_score"], ascending=False)
+                candidate_pool = candidate_pool.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+            tradable_pool = candidate_pool[candidate_pool.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])].copy() if not candidate_pool.empty else pd.DataFrame()
+            if not tradable_pool.empty:
+                tradable_pool["light_rank"] = tradable_pool.get("tactical_light", "⚪").map({"🔵": 5, "🟢": 4, "🟡": 3, "🟠": 2, "🔴": 1, "⚪": 0}).fillna(0)
+                tradable_pool = tradable_pool.sort_values(["light_rank", "mainstream_score", "breakout_score", "liquidity_score", "model_score", "win_rate"], ascending=False)
+                tradable_top20 = tradable_pool.head(20).copy()
             tradable = tradable.sort_values(["liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
 
-        trade_top20 = tradable.head(20).copy()  # 依你的要求，TOP20 保留
+        trade_top20 = candidate_pool.head(20).copy() if not candidate_pool.empty else tradable.head(20).copy()
+        if tradable_top20.empty:
+            tradable_top20 = tradable[(tradable.get("decision", pd.Series(dtype=str)).isin(["BUY", "WEAK BUY"])) & (~tradable.get("ui_state", pd.Series(dtype=str)).isin(["淘汰", "不可買"]))].head(20).copy() if not tradable.empty else pd.DataFrame()
 
-        attack = trade_top20[(trade_top20["decision"] == "BUY") & (trade_top20["liquidity_status"] == "PASS")].copy()
-        watch = trade_top20[(trade_top20["liquidity_status"] == "WATCH") | (trade_top20["decision"].isin(["WEAK BUY", "HOLD"]))].copy()
+        attack = tradable_top20[tradable_top20["final_trade_decision"].astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])].copy() if not tradable_top20.empty else pd.DataFrame()
+        watch = trade_top20[(trade_top20["final_trade_decision"].astype(str).isin(["WAIT_PULLBACK", "AVOID"])) | (trade_top20.get("decision", pd.Series(dtype=str)).isin(["WEAK BUY", "HOLD"]))].copy() if not trade_top20.empty else pd.DataFrame()
 
         defense = plans_df[
             (plans_df["is_etf"] == 1) &
@@ -3725,6 +3823,9 @@ class MasterTradingEngine:
         return {
             "market": market,
             "trade_top20": trade_top20,
+            "tradable_top20": tradable_top20,
+            "mainstream_top20": mainstream_top20.head(20) if not mainstream_top20.empty else pd.DataFrame(),
+            "breakout_top20": breakout_top20.head(20) if not breakout_top20.empty else pd.DataFrame(),
             "attack": attack.head(10),
             "watch": watch.head(10),
             "defense": defense.head(10),
@@ -3949,7 +4050,7 @@ class PortfolioEngine:
 
     def build_institutional_plan(self, candidates: pd.DataFrame) -> pd.DataFrame:
         cols = [
-            "優先級","代號","名稱","市場","產業","題材","分類","狀態","盤中狀態","活性分","淘汰原因","進場區","停損",
+            "優先級","代號","名稱","市場","產業","題材","分類","狀態","盤中狀態","活性分","淘汰原因","進場區","停損","目標價",
             "1.382","1.618","RR","勝率","模型分數","交易分數","ATR%","Kelly%","建議張數","建議金額","單檔曝險%",
             "題材曝險%","產業曝險%","投資組合狀態","風險備註"
         ]
@@ -4048,6 +4149,7 @@ class PortfolioEngine:
                 "淘汰原因": r.get("elimination_reason",""),
                 "進場區": r.get("entry_zone","-"),
                 "停損": r.get("stop_loss","-"),
+                "目標價": r.get("target_price", f"{float(r.get('target_1382',0) or 0):.2f}"),
                 "1.382": f"{float(r.get('target_1382',0) or 0):.2f}",
                 "1.618": f"{float(r.get('target_1618',0) or 0):.2f}",
                 "RR": round(float(r.get("rr",0) or 0),2),
@@ -4126,6 +4228,7 @@ class AppUI:
         self.backtest_engine = BacktestEngine(db)
         self.portfolio_engine = PortfolioEngine(db)
         self.last_top20_df = pd.DataFrame()
+        self.last_candidate_top20_df = pd.DataFrame()
         self.last_top5_df = pd.DataFrame()
         self.last_theme_summary_df = pd.DataFrame()
         self.last_attack_df = pd.DataFrame()
@@ -4440,8 +4543,8 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "price", "chg", "chg_pct", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "light", "engine", "price", "chg", "chg_pct", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "light": "燈號", "engine": "來源引擎", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target": "目標價", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
@@ -4455,8 +4558,8 @@ class AppUI:
         })
         self.order_tree.bind("<<TreeviewSelect>>", self.on_select_order)
 
-        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "price", "chg", "chg_pct", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
+        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "price", "chg", "chg_pct", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target": "目標價", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
         })
         self.inst_tree.bind("<<TreeviewSelect>>", self.on_select_institutional)
 
@@ -5813,6 +5916,31 @@ class AppUI:
 
         self._run_in_thread(worker, "export_analysis")
 
+    def _normalize_light_value(self, light) -> str:
+        light = str(light or "").strip()
+        alias = {
+            "red": "🔴", "orange": "🟠", "yellow": "🟡", "green": "🟢", "blue": "🔵", "neutral": "⚪",
+            "R": "🔴", "O": "🟠", "Y": "🟡", "G": "🟢", "B": "🔵", "N": "⚪",
+            "紅": "🔴", "橘": "🟠", "黃": "🟡", "綠": "🟢", "藍": "🔵", "白": "⚪", "○": "⚪",
+        }
+        return alias.get(light, light if light in ("🔴", "🟠", "🟡", "🟢", "🔵", "⚪") else "⚪")
+
+    def _get_display_light(self, row):
+        row = dict(row or {})
+        light = self._normalize_light_value(row.get("tactical_light", ""))
+        if light and light != "⚪":
+            return light
+        signal = str(row.get("signal", "") or "").strip()
+        mapping = {
+            "突破強勢": "🔵", "強勢追蹤": "🟢", "整理偏多": "🟢", "偏多觀察": "🟡",
+            "區間整理": "🟡", "轉弱警戒": "🟠", "急跌風險": "🔴"
+        }
+        return mapping.get(signal, "⚪")
+
+    def _display_light_symbol(self, light):
+        light = self._normalize_light_value(light)
+        return {"🔴":"紅","🟠":"橘","🟡":"黃","🟢":"綠","🔵":"藍","⚪":"白"}.get(light, "白")
+
     def build_order_list(self, today_buy_df: pd.DataFrame, wait_df: pd.DataFrame | None = None) -> pd.DataFrame:
         x1 = today_buy_df.copy() if today_buy_df is not None else pd.DataFrame()
         x2 = wait_df.copy() if wait_df is not None else pd.DataFrame()
@@ -5833,7 +5961,7 @@ class AppUI:
             "活性分": plan["活性分"] if "活性分" in plan.columns else 0,
             "進場區": plan["進場區"],
             "停損": plan["停損"],
-            "目標價": plan["1.382"] if "1.382" in plan.columns else "",
+            "目標價": plan["目標價"] if "目標價" in plan.columns else (plan["1.382"] if "1.382" in plan.columns else ""),
             "1.382": plan["1.382"],
             "1.618": plan["1.618"],
             "RR": plan["RR"],
@@ -5859,14 +5987,15 @@ class AppUI:
         if self.last_top20_df is not None and not self.last_top20_df.empty:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
+                light = self._get_display_light(r.to_dict())
                 self.top20_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get("stock_name", ""),
+                    i, r.get("stock_id", ""), r.get("stock_name", ""), self._display_light_symbol(light), r.get("candidate_engine", "混合"),
                     f"{float(r.get('現價', np.nan)):.2f}" if pd.notna(r.get("現價", np.nan)) else "-",
                     f"{float(r.get('漲跌', np.nan)):.2f}" if pd.notna(r.get("漲跌", np.nan)) else "-",
                     f"{float(r.get('漲跌幅%', np.nan)):.2f}" if pd.notna(r.get("漲跌幅%", np.nan)) else "-",
                     r.get("bucket", ""), ui_action,
                     r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
-                    r.get("entry_zone", "-"), r.get("stop_loss", "-"),
+                    r.get("entry_zone", "-"), r.get("stop_loss", "-"), str(r.get("target_price", r.get("目標價", "-"))),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}",
                     r.get("elimination_reason", "")
@@ -5897,7 +6026,7 @@ class AppUI:
                     int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("市場", ""),
                     r.get("產業", ""), r.get("題材", ""), r.get("分類", ""), r.get("狀態", ""),
                     r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
-                    r.get("進場區", "-"), r.get("停損", "-"),
+                    r.get("進場區", "-"), r.get("停損", "-"), r.get("目標價", "-"),
                     f"{float(r.get('RR', 0) or 0):.2f}", f"{float(r.get('勝率', 0) or 0):.1f}",
                     f"{float(r.get('模型分數', 0) or 0):.2f}",
                     f"{float(r.get('交易分數', 0) or 0):.2f}",
@@ -6400,6 +6529,8 @@ class AppUI:
                 )
                 market = trade["market"]
                 trade_top20 = trade["trade_top20"]
+                tradable_top20 = trade.get("tradable_top20", pd.DataFrame())
+                self.last_candidate_top20_df = self.enrich_price_and_export_fields(trade_top20.copy(), id_col="stock_id") if trade_top20 is not None and not trade_top20.empty else pd.DataFrame()
                 attack = trade["attack"]
                 watch = trade["watch"]
                 defense = trade["defense"]
@@ -6408,9 +6539,10 @@ class AppUI:
                 theme_summary = trade["theme_summary"]
                 eliminated = trade.get("eliminated", pd.DataFrame())
 
-                self.last_top20_df = self.enrich_price_and_export_fields(trade_top20.copy(), id_col="stock_id")
+                ui_top20_source = tradable_top20 if tradable_top20 is not None and not tradable_top20.empty else trade_top20
+                self.last_top20_df = self.enrich_price_and_export_fields(ui_top20_source.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_top20_df)
-                top5 = trade_top20.head(5).copy()
+                top5 = (tradable_top20 if tradable_top20 is not None and not tradable_top20.empty else trade_top20).head(5).copy()
                 if not top5.empty:
                     bt_rows = []
                     for _, rr in top5.iterrows():
