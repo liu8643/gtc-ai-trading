@@ -4136,6 +4136,7 @@ class AppUI:
         self.last_today_buy_df = pd.DataFrame()
         self.last_wait_df = pd.DataFrame()
         self.last_operation_sop_df = pd.DataFrame()
+        self.last_unique_decision_df = pd.DataFrame()
         self.current_chart_path = None
         self.plan_cache = {}
         self.backtest_cache = {}
@@ -4361,7 +4362,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "下單清單", "機構交易計畫", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "下單清單", "機構交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -4426,8 +4427,8 @@ class AppUI:
             "industry": "產業", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "trend_count": "強勢數", "hot_score": "輪動分", "rotation": "輪動狀態"
         })
 
-        self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "industry", "theme", "total", "ai", "signal", "action"), {
-            "rank": "排名", "id": "代號", "name": "名稱", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
+        self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "price", "chg", "chg_pct", "industry", "theme", "total", "ai", "signal", "action"), {
+            "rank": "排名", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
         })
         self.rank_tree.bind("<<TreeviewSelect>>", self.on_select_stock)
 
@@ -4439,23 +4440,23 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "price", "chg", "chg_pct", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
-        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "state": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
+        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "price", "chg", "chg_pct", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "state": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
         })
         self.top5_tree.bind("<<TreeviewSelect>>", self.on_select_top5)
 
-        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
+        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "chg", "chg_pct", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
         })
         self.order_tree.bind("<<TreeviewSelect>>", self.on_select_order)
 
-        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
+        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "price", "chg", "chg_pct", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
         })
         self.inst_tree.bind("<<TreeviewSelect>>", self.on_select_institutional)
 
@@ -4864,6 +4865,97 @@ class AppUI:
                 self.backtest_cache[sid] = payload
         except Exception:
             pass
+
+    def _price_snapshot(self, stock_id: str) -> dict:
+        sid = str(stock_id or "").strip()
+        empty = {"現價": np.nan, "漲跌": np.nan, "漲跌幅%": np.nan}
+        if not sid:
+            return empty
+        try:
+            hist = self.db.get_price_history(sid)
+            if hist is None or hist.empty:
+                return empty
+            x = hist.sort_values("date").reset_index(drop=True)
+            close_now = float(x.iloc[-1]["close"]) if pd.notna(x.iloc[-1]["close"]) else np.nan
+            if len(x) >= 2 and pd.notna(x.iloc[-2]["close"]):
+                prev_close = float(x.iloc[-2]["close"])
+            else:
+                prev_close = np.nan
+            change = close_now - prev_close if pd.notna(close_now) and pd.notna(prev_close) else np.nan
+            chg_pct = (change / prev_close * 100.0) if pd.notna(change) and pd.notna(prev_close) and prev_close != 0 else np.nan
+            return {"現價": round(close_now, 2) if pd.notna(close_now) else np.nan, "漲跌": round(change, 2) if pd.notna(change) else np.nan, "漲跌幅%": round(chg_pct, 2) if pd.notna(chg_pct) else np.nan}
+        except Exception:
+            return empty
+
+    def enrich_price_and_export_fields(self, df: pd.DataFrame, id_col: str | None = None) -> pd.DataFrame:
+        if df is None:
+            return pd.DataFrame()
+        x = df.copy()
+        if x.empty:
+            return x
+        if id_col is None:
+            for candidate in ["stock_id", "代號", "id"]:
+                if candidate in x.columns:
+                    id_col = candidate
+                    break
+        if id_col is None or id_col not in x.columns:
+            return x
+        x[id_col] = x[id_col].astype(str).map(normalize_stock_id)
+        snapshots = {sid: self._price_snapshot(sid) for sid in x[id_col].astype(str).tolist() if str(sid).strip()}
+        x["現價"] = x[id_col].map(lambda s: snapshots.get(str(s), {}).get("現價", np.nan))
+        x["漲跌"] = x[id_col].map(lambda s: snapshots.get(str(s), {}).get("漲跌", np.nan))
+        x["漲跌幅%"] = x[id_col].map(lambda s: snapshots.get(str(s), {}).get("漲跌幅%", np.nan))
+        if "進場區" not in x.columns:
+            if "entry_zone" in x.columns:
+                x["進場區"] = x["entry_zone"]
+            elif "entry" in x.columns:
+                x["進場區"] = x["entry"]
+        if "停損" not in x.columns:
+            if "stop_loss" in x.columns:
+                x["停損"] = x["stop_loss"]
+            elif "stop" in x.columns:
+                x["停損"] = x["stop"]
+        if "目標價" not in x.columns:
+            if "target_price" in x.columns:
+                x["目標價"] = x["target_price"]
+            elif "1.382" in x.columns:
+                x["目標價"] = x["1.382"]
+            elif "target_1382" in x.columns:
+                x["目標價"] = x["target_1382"]
+            elif "target1382" in x.columns:
+                x["目標價"] = x["target1382"]
+        return x
+
+    def build_unique_decision_df(self, *dfs: pd.DataFrame) -> pd.DataFrame:
+        parts = []
+        for df in dfs:
+            if df is not None and not df.empty:
+                parts.append(df.copy())
+        if not parts:
+            return pd.DataFrame()
+        x = pd.concat(parts, ignore_index=True)
+        if "stock_id" not in x.columns:
+            return pd.DataFrame()
+        x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id)
+        if "final_trade_decision" in x.columns:
+            mask = ~x["final_trade_decision"].astype(str).str.upper().isin(["ELIMINATE", "淘汰", "AVOID", "不可買"])
+            x = x[mask].copy()
+        if "ui_state" in x.columns:
+            x = x[~x["ui_state"].astype(str).isin(["淘汰", "不可買"])].copy()
+        if x.empty:
+            return x
+        if "decision" in x.columns:
+            x["decision_rank"] = x["decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1}).fillna(0)
+        elif "final_trade_decision" in x.columns:
+            x["decision_rank"] = x["final_trade_decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1, "WATCH": 1}).fillna(0)
+        else:
+            x["decision_rank"] = 0
+        sort_cols = [c for c in ["decision_rank", "liquidity_score", "model_score", "trade_score", "win_rate", "rr"] if c in x.columns]
+        if sort_cols:
+            x = x.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        x = x.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+        x = self.enrich_price_and_export_fields(x, id_col="stock_id")
+        return x
 
     def get_cached_trade_plan(self, stock_id: str):
         sid = str(stock_id).strip()
@@ -5613,18 +5705,23 @@ class AppUI:
                 "未分類清單": pd.read_excel(CLASSIFICATION_V2_UNCLASSIFIED_PATH) if CLASSIFICATION_V2_UNCLASSIFIED_PATH.exists() else pd.DataFrame(),
                 "分類V2摘要": pd.DataFrame([get_classification_v2_summary()]) if get_classification_v2_summary() else pd.DataFrame(),
             }
+            mapping["唯一決策"] = getattr(self, "last_unique_decision_df", pd.DataFrame())
             df = mapping.get(target, pd.DataFrame())
             if df is None:
                 df = pd.DataFrame()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                id_col = "stock_id" if "stock_id" in df.columns else ("代號" if "代號" in df.columns else None)
+                df = self.enrich_price_and_export_fields(df, id_col=id_col)
             if df.empty:
                 empty_columns = {
-                    "TOP20": ["stock_id", "stock_name", "bucket", "ui_state", "liquidity_status", "liquidity_score", "elimination_reason", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "TOP5": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
-                    "今日可買": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "等待拉回": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "預掛單": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "下單清單": ["優先級", "代號", "名稱", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
-                    "機構交易計畫": ["優先級", "代號", "名稱", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
+                    "TOP20": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "bucket", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
+                    "TOP5": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
+                    "今日可買": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
+                    "等待拉回": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
+                    "預掛單": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
+                    "下單清單": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
+                    "機構交易計畫": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
+                    "唯一決策": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "market", "industry", "theme", "ui_state", "entry_zone", "stop_loss", "target_price", "rr", "win_rate", "decision", "final_trade_decision"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                     "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
                     "分類V2摘要": ["total", "official", "manual", "rule_engine", "ai_infer", "unclassified", "covered", "coverage_pct", "report_time", "unclassified_report"],
@@ -5694,6 +5791,15 @@ class AppUI:
                         tables["Unclassified_Report"] = pd.read_excel(CLASSIFICATION_V2_UNCLASSIFIED_PATH)
                 except Exception:
                     pass
+                if "Ranking" in tables:
+                    tables["Ranking"] = self.enrich_price_and_export_fields(tables["Ranking"], id_col="stock_id")
+                for name in ["Trade_TOP20", "Trade_TOP5", "Today_Buy", "Wait_Pullback", "Attack", "Watch", "Defense", "Order_List", "Institutional_Plan"]:
+                    if name in tables and isinstance(tables[name], pd.DataFrame) and not tables[name].empty:
+                        id_col = "stock_id" if "stock_id" in tables[name].columns else ("代號" if "代號" in tables[name].columns else None)
+                        tables[name] = self.enrich_price_and_export_fields(tables[name], id_col=id_col)
+                unique_df = getattr(self, "last_unique_decision_df", pd.DataFrame())
+                if unique_df is not None and not unique_df.empty:
+                    tables["Unique_Decision"] = self.enrich_price_and_export_fields(unique_df, id_col="stock_id")
                 tables["Detail"] = pd.DataFrame({"detail": [detail_text]})
                 self.ui_call(self.update_task, "匯出分析", 3, 5, item="寫入檔案")
                 base = RUNTIME_DIR / f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -5713,17 +5819,21 @@ class AppUI:
         pool = pd.concat([x1, x2], ignore_index=True) if (not x1.empty or not x2.empty) else pd.DataFrame()
         plan = self.portfolio_engine.build_institutional_plan(pool)
         if plan.empty:
-            return pd.DataFrame(columns=["優先級","代號","名稱","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
+            return pd.DataFrame(columns=["優先級","代號","名稱","現價","漲跌","漲跌幅%","分類","狀態","盤中狀態","活性分","進場區","停損","目標價","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
         order_df = pd.DataFrame({
             "優先級": plan["優先級"],
             "代號": plan["代號"],
             "名稱": plan["名稱"],
+            "現價": plan["現價"] if "現價" in plan.columns else np.nan,
+            "漲跌": plan["漲跌"] if "漲跌" in plan.columns else np.nan,
+            "漲跌幅%": plan["漲跌幅%"] if "漲跌幅%" in plan.columns else np.nan,
             "分類": plan["分類"],
             "狀態": plan["狀態"],
             "盤中狀態": plan["盤中狀態"] if "盤中狀態" in plan.columns else "",
             "活性分": plan["活性分"] if "活性分" in plan.columns else 0,
             "進場區": plan["進場區"],
             "停損": plan["停損"],
+            "目標價": plan["1.382"] if "1.382" in plan.columns else "",
             "1.382": plan["1.382"],
             "1.618": plan["1.618"],
             "RR": plan["RR"],
@@ -5736,7 +5846,8 @@ class AppUI:
             "投資組合狀態": plan["投資組合狀態"],
             "風險備註": plan["風險備註"],
         })
-        self.last_institutional_plan_df = plan.copy()
+        self.last_institutional_plan_df = self.enrich_price_and_export_fields(plan.copy(), id_col="代號")
+        order_df = self.enrich_price_and_export_fields(order_df, id_col="代號")
         return order_df
 
 
@@ -5749,7 +5860,11 @@ class AppUI:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
                 self.top20_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("bucket", ""), ui_action,
+                    i, r.get("stock_id", ""), r.get("stock_name", ""),
+                    f"{float(r.get('現價', np.nan)):.2f}" if pd.notna(r.get("現價", np.nan)) else "-",
+                    f"{float(r.get('漲跌', np.nan)):.2f}" if pd.notna(r.get("漲跌", np.nan)) else "-",
+                    f"{float(r.get('漲跌幅%', np.nan)):.2f}" if pd.notna(r.get("漲跌幅%", np.nan)) else "-",
+                    r.get("bucket", ""), ui_action,
                     r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
@@ -5760,7 +5875,11 @@ class AppUI:
         if self.last_top5_df is not None and not self.last_top5_df.empty:
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
                 self.top5_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("ui_state", "-"),
+                    i, r.get("stock_id", ""), r.get("stock_name", ""),
+                    f"{float(r.get('現價', np.nan)):.2f}" if pd.notna(r.get("現價", np.nan)) else "-",
+                    f"{float(r.get('漲跌', np.nan)):.2f}" if pd.notna(r.get("漲跌", np.nan)) else "-",
+                    f"{float(r.get('漲跌幅%', np.nan)):.2f}" if pd.notna(r.get("漲跌幅%", np.nan)) else "-",
+                    r.get("ui_state", "-"),
                     r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}",
@@ -6102,7 +6221,8 @@ class AppUI:
         q = self.search_var.get().strip()
         if q:
             df = self._apply_search_filter(df, q)
-        return df.sort_values(["rank_all"]).reset_index(drop=True)
+        df = df.sort_values(["rank_all"]).reset_index(drop=True)
+        return self.enrich_price_and_export_fields(df, id_col="stock_id")
 
     def refresh_all_tables(self):
         for tree in (self.dashboard_tree, self.sop_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
@@ -6125,7 +6245,11 @@ class AppUI:
 
         for i, row in df.iterrows():
             self.rank_tree.insert("", "end", values=(
-                i + 1, row["stock_id"], row["stock_name"], row["industry"], row["theme"],
+                i + 1, row["stock_id"], row["stock_name"],
+                f"{float(row.get('現價', np.nan)):.2f}" if pd.notna(row.get("現價", np.nan)) else "-",
+                f"{float(row.get('漲跌', np.nan)):.2f}" if pd.notna(row.get("漲跌", np.nan)) else "-",
+                f"{float(row.get('漲跌幅%', np.nan)):.2f}" if pd.notna(row.get("漲跌幅%", np.nan)) else "-",
+                row["industry"], row["theme"],
                 f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
             ))
 
@@ -6284,7 +6408,7 @@ class AppUI:
                 theme_summary = trade["theme_summary"]
                 eliminated = trade.get("eliminated", pd.DataFrame())
 
-                self.last_top20_df = trade_top20.copy()
+                self.last_top20_df = self.enrich_price_and_export_fields(trade_top20.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_top20_df)
                 top5 = trade_top20.head(5).copy()
                 if not top5.empty:
@@ -6294,22 +6418,23 @@ class AppUI:
                         bt_rows.append(bt)
                     bt_df = pd.DataFrame(bt_rows)
                     top5 = pd.concat([top5.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
-                self.last_top5_df = top5.copy()
+                self.last_top5_df = self.enrich_price_and_export_fields(top5.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_top5_df)
                 self.cache_backtest_dataframe(self.last_top5_df)
-                self.last_attack_df = attack.copy()
+                self.last_attack_df = self.enrich_price_and_export_fields(attack.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_attack_df)
-                self.last_watch_df = watch.copy()
+                self.last_watch_df = self.enrich_price_and_export_fields(watch.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_watch_df)
-                self.last_defense_df = defense.copy()
+                self.last_defense_df = self.enrich_price_and_export_fields(defense.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_defense_df)
                 self.last_theme_summary_df = theme_summary.copy()
-                self.last_today_buy_df = today_buy.copy()
+                self.last_today_buy_df = self.enrich_price_and_export_fields(today_buy.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_today_buy_df)
-                self.last_wait_df = wait_pullback.copy()
+                self.last_wait_df = self.enrich_price_and_export_fields(wait_pullback.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_wait_df)
-                self.last_order_list_df = self.build_order_list(today_buy, wait_pullback)
-                self.last_institutional_plan_df = self.portfolio_engine.build_institutional_plan(pd.concat([today_buy.copy(), wait_pullback.copy()], ignore_index=True))
+                self.last_order_list_df = self.build_order_list(self.last_today_buy_df, self.last_wait_df)
+                self.last_institutional_plan_df = self.enrich_price_and_export_fields(self.portfolio_engine.build_institutional_plan(pd.concat([self.last_today_buy_df.copy(), self.last_wait_df.copy()], ignore_index=True)), id_col="代號")
+                self.last_unique_decision_df = self.build_unique_decision_df(self.last_today_buy_df, self.last_wait_df, self.last_attack_df, self.last_watch_df, self.last_defense_df, self.last_top20_df)
 
                 self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
                 self.ui_call(self.refresh_top20_and_order_views)
