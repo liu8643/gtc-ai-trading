@@ -151,33 +151,6 @@ BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
 APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V3.5 OPERATION"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
-STARTUP_BOOTSTRAP_LOCK = threading.Lock()
-STARTUP_BOOTSTRAP_EVENT = threading.Event()
-
-
-def startup_bootstrap_guard(label: str = "startup_bootstrap") -> bool:
-    if STARTUP_BOOTSTRAP_EVENT.is_set():
-        log_warning(f"背景作業略過：{label} 已完成")
-        _append_classification_debug_trace("bootstrap_guard_skip", {"label": label})
-        return False
-    acquired = STARTUP_BOOTSTRAP_LOCK.acquire(blocking=False)
-    if not acquired:
-        log_warning(f"背景作業略過：{label} 已在執行中")
-        _append_classification_debug_trace("bootstrap_guard_skip", {"label": label, "reason": "already_running"})
-        return False
-    _append_classification_debug_trace("bootstrap_guard_enter", {"label": label})
-    return True
-
-def startup_bootstrap_guard_done(label: str = "startup_bootstrap"):
-    try:
-        STARTUP_BOOTSTRAP_EVENT.set()
-        _append_classification_debug_trace("bootstrap_guard_done", {"label": label})
-    finally:
-        try:
-            STARTUP_BOOTSTRAP_LOCK.release()
-        except Exception:
-            pass
-
 
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -274,26 +247,12 @@ def resolve_master_csv() -> Path:
 CLASSIFICATION_DOWNLOAD_URL = "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv"
 CLASSIFICATION_DOWNLOAD_URL_TWSE = CLASSIFICATION_DOWNLOAD_URL
 CLASSIFICATION_DOWNLOAD_URL_TPEX = "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv"
-CLASSIFICATION_DOWNLOAD_SOURCES = {
-    "上市": {
-        "url": CLASSIFICATION_DOWNLOAD_URL_TWSE,
-        "cache_path": CLASSIFICATION_CACHE_CSV_TWSE if "CLASSIFICATION_CACHE_CSV_TWSE" in globals() else None,
-        "source": "MOPS-CSV-TWSE",
-    },
-    "上櫃": {
-        "url": CLASSIFICATION_DOWNLOAD_URL_TPEX,
-        "cache_path": CLASSIFICATION_CACHE_CSV_TPEX if "CLASSIFICATION_CACHE_CSV_TPEX" in globals() else None,
-        "source": "MOPS-CSV-TPEX",
-    },
-}
 CLASSIFICATION_LEGACY_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
 CLASSIFICATION_CACHE_DIR = EXTERNAL_DATA_DIR / "classification"
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CLASSIFICATION_CACHE_CSV_TWSE = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上市.csv"
 CLASSIFICATION_CACHE_CSV_TPEX = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上櫃.csv"
 CLASSIFICATION_CACHE_CSV = CLASSIFICATION_CACHE_CSV_TWSE  # backward compatibility
-CLASSIFICATION_DOWNLOAD_SOURCES["上市"]["cache_path"] = CLASSIFICATION_CACHE_CSV_TWSE
-CLASSIFICATION_DOWNLOAD_SOURCES["上櫃"]["cache_path"] = CLASSIFICATION_CACHE_CSV_TPEX
 CLASSIFICATION_CACHE_XLS = CLASSIFICATION_CACHE_DIR / "台股類股分類.xls"
 CLASSIFICATION_CACHE_XLSX = CLASSIFICATION_CACHE_DIR / "台股類股分類.xlsx"
 CLASSIFICATION_META_PATH = CLASSIFICATION_CACHE_DIR / "classification_meta.json"
@@ -306,9 +265,8 @@ LAST_CLASSIFICATION_LOAD_INFO = {"loaded": False, "rows": 0, "path": "", "note":
 CLASSIFICATION_V2_SUMMARY_PATH = CLASSIFICATION_CACHE_DIR / "classification_v2_summary.json"
 CLASSIFICATION_V2_UNCLASSIFIED_PATH = CLASSIFICATION_CACHE_DIR / "未匹配分類清單.xlsx"
 CLASSIFICATION_V2_LAST_SUMMARY = {}
-CLASSIFICATION_DEBUG_TRACE_PATH = CLASSIFICATION_CACHE_DIR / "classification_debug_trace.json"
-CLASSIFICATION_UI_STATE_SNAPSHOT_PATH = CLASSIFICATION_CACHE_DIR / "classification_ui_state_snapshot.json"
-CLASSIFICATION_DEBUG_TRACE_LIMIT = 300
+CLASSIFICATION_V2_SUMMARY_HISTORY = []
+CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS = 500
 
 CLASSIFICATION_LOG_CALLBACK = None
 CLASSIFICATION_STABILITY_LOCK = threading.RLock()
@@ -317,130 +275,20 @@ CLASSIFICATION_OFFICIAL_CACHE = {
     "上櫃": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
     "ALL": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
 }
-CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS = 500
-DEBUG_CLASSIFICATION_MONITOR = False
-
-def _append_classification_debug_trace(event_type: str, payload: dict | None = None):
-    try:
-        payload = dict(payload or {})
-        existing = []
-        if CLASSIFICATION_DEBUG_TRACE_PATH.exists():
-            raw = json.loads(CLASSIFICATION_DEBUG_TRACE_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                existing = raw
-        payload["event_type"] = str(event_type or "")
-        payload["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        existing.append(payload)
-        if len(existing) > CLASSIFICATION_DEBUG_TRACE_LIMIT:
-            existing = existing[-CLASSIFICATION_DEBUG_TRACE_LIMIT:]
-        CLASSIFICATION_DEBUG_TRACE_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-def snapshot_classification_ui_state(status: dict | None = None, summary: dict | None = None, extra: dict | None = None) -> dict:
-    payload = {
-        "snapshot_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "status": dict(status or get_classification_status()),
-        "summary": dict(summary or get_classification_v2_summary()),
-        "extra": dict(extra or {}),
-    }
-    try:
-        CLASSIFICATION_UI_STATE_SNAPSHOT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-    return payload
-
-def _select_best_classification_summary(candidates: list[dict]) -> dict:
-    valid = []
-    for item in candidates or []:
-        if isinstance(item, dict) and item:
-            valid.append(dict(item))
-    if not valid:
-        return {}
-    def _score(item: dict):
-        total = int(item.get("total", 0) or 0)
-        official = int(item.get("official", 0) or 0)
-        covered = int(item.get("covered", 0) or 0)
-        coverage = float(item.get("coverage_pct", 0) or 0)
-        report_time = str(item.get("report_time", "") or "")
-        is_large = 1 if total >= CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS else 0
-        return (is_large, total, covered, official, coverage, report_time)
-    valid.sort(key=_score, reverse=True)
-    return valid[0]
-
-def _debug_classification_monitor(message: str):
-    try:
-        if DEBUG_CLASSIFICATION_MONITOR:
-            log_info(f"[分類監控] {message}")
-    except Exception:
-        pass
-
-def _read_json_file_safe(path: Path) -> dict:
-    try:
-        p = Path(path)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                return dict(raw)
-    except Exception:
-        pass
-    return {}
-
-def _should_promote_classification_summary(summary: dict) -> bool:
-    total = int(summary.get("total", 0) or 0)
-    official = int(summary.get("official", 0) or 0)
-    if total < CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS:
-        _debug_classification_monitor(f"忽略小樣本覆蓋率摘要：total={total} official={official}")
-        return False
-    current = _read_json_file_safe(CLASSIFICATION_V2_SUMMARY_PATH) if "CLASSIFICATION_V2_SUMMARY_PATH" in globals() else {}
-    current_total = int(current.get("total", 0) or 0)
-    current_official = int(current.get("official", 0) or 0)
-    current_cov = float(current.get("coverage_pct", 0) or 0)
-    new_cov = float(summary.get("coverage_pct", 0) or 0)
-    if current_total <= 0:
-        return True
-    if total > current_total:
-        return True
-    if official > current_official and total >= int(current_total * 0.85):
-        return True
-    if new_cov >= current_cov and total >= current_total:
-        return True
-    _debug_classification_monitor(f"保留既有全市場摘要：existing_total={current_total} new_total={total} existing_cov={current_cov:.2f} new_cov={new_cov:.2f}")
-    return False
-
-def _get_cached_official_classification(market: str, path: Path | None = None) -> Optional[pd.DataFrame]:
-    market = str(market or "").strip() or "ALL"
-    with CLASSIFICATION_STABILITY_LOCK:
-        slot = CLASSIFICATION_OFFICIAL_CACHE.get(market)
-        if not slot or slot.get("df") is None:
-            return None
-        cached_df = slot.get("df")
-        cached_path = str(slot.get("path") or "")
-        cached_mtime = float(slot.get("mtime", 0) or 0)
-        if path is None:
-            if cached_df is None:
-                return None
-            return cached_df.copy()
-        p = Path(path)
-        if (not p.exists()) or cached_df is None:
-            return None
-        if cached_path == str(p) and abs(float(p.stat().st_mtime) - cached_mtime) < 1e-6:
-            return cached_df.copy()
-    return None
-
-def _set_cached_official_classification(market: str, path: Path | None, df: pd.DataFrame):
-    market = str(market or "").strip() or "ALL"
-    try:
-        cached_df = df.copy() if df is not None else None
-    except Exception:
-        cached_df = df
-    with CLASSIFICATION_STABILITY_LOCK:
-        slot = CLASSIFICATION_OFFICIAL_CACHE.setdefault(market, {"df": None, "path": "", "mtime": 0.0, "rows": 0})
-        slot["df"] = cached_df
-        slot["path"] = str(path) if path else ""
-        slot["mtime"] = float(Path(path).stat().st_mtime) if path and Path(path).exists() else 0.0
-        slot["rows"] = int(len(df) if df is not None else 0)
-
+CLASSIFICATION_DOWNLOAD_SOURCES = {
+    "上市": {
+        "url": CLASSIFICATION_DOWNLOAD_URL_TWSE,
+        "cache_path": CLASSIFICATION_CACHE_CSV_TWSE,
+        "source": "MOPS-CSV-TWSE",
+    },
+    "上櫃": {
+        "url": CLASSIFICATION_DOWNLOAD_URL_TPEX,
+        "cache_path": CLASSIFICATION_CACHE_CSV_TPEX,
+        "source": "MOPS-CSV-TPEX",
+    },
+}
+BOOTSTRAP_LOCK = threading.Lock()
+BOOTSTRAP_EVENT = threading.Event()
 
 def set_classification_log_callback(cb):
     global CLASSIFICATION_LOG_CALLBACK
@@ -464,6 +312,85 @@ def classification_debug_log(message: str, level: str = "INFO"):
             cb(msg, level)
     except Exception:
         pass
+
+def _append_classification_summary_history(summary: dict, promoted: bool = False):
+    global CLASSIFICATION_V2_SUMMARY_HISTORY
+    try:
+        item = dict(summary or {})
+        item["promoted"] = bool(promoted)
+        item["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        history = list(CLASSIFICATION_V2_SUMMARY_HISTORY or [])
+        history.append(item)
+        CLASSIFICATION_V2_SUMMARY_HISTORY = history[-100:]
+    except Exception:
+        pass
+
+def _summary_sort_key(summary: dict) -> tuple:
+    if not isinstance(summary, dict):
+        return (-1, -1, -1.0, "")
+    total = int(summary.get("total", 0) or 0)
+    covered = int(summary.get("covered", 0) or 0)
+    coverage = float(summary.get("coverage_pct", 0) or 0.0)
+    report_time = str(summary.get("report_time", "") or "")
+    return (total, covered, coverage, report_time)
+
+def _pick_best_classification_summary(*candidates) -> dict:
+    valid = []
+    for item in candidates:
+        if isinstance(item, dict) and item:
+            valid.append(dict(item))
+    if not valid:
+        return {}
+    return max(valid, key=_summary_sort_key)
+
+def _should_promote_classification_summary(summary: dict) -> bool:
+    total = int(summary.get("total", 0) or 0)
+    if total < CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS:
+        return False
+    current = {}
+    try:
+        if CLASSIFICATION_V2_SUMMARY_PATH.exists():
+            raw = json.loads(CLASSIFICATION_V2_SUMMARY_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                current = dict(raw)
+    except Exception:
+        current = {}
+    best = _pick_best_classification_summary(current, CLASSIFICATION_V2_LAST_SUMMARY)
+    if not best:
+        return True
+    return _summary_sort_key(summary) >= _summary_sort_key(best)
+
+def _get_cached_official_classification(market: str = "ALL", path: Path | None = None) -> Optional[pd.DataFrame]:
+    market = str(market or "ALL").strip() or "ALL"
+    with CLASSIFICATION_STABILITY_LOCK:
+        slot = CLASSIFICATION_OFFICIAL_CACHE.get(market)
+        if not slot or slot.get("df") is None:
+            return None
+        cached_df = slot.get("df")
+        cached_path = str(slot.get("path") or "")
+        cached_mtime = float(slot.get("mtime", 0) or 0)
+        if path is None:
+            return cached_df.copy() if cached_df is not None else None
+        p = Path(path)
+        if (not p.exists()) or cached_df is None:
+            return None
+        if cached_path == str(p) and abs(float(p.stat().st_mtime) - cached_mtime) < 1e-6:
+            return cached_df.copy()
+    return None
+
+def _set_cached_official_classification(market: str, path: Path | None, df: pd.DataFrame):
+    market = str(market or "ALL").strip() or "ALL"
+    try:
+        cached_df = df.copy() if df is not None else None
+    except Exception:
+        cached_df = df
+    with CLASSIFICATION_STABILITY_LOCK:
+        slot = CLASSIFICATION_OFFICIAL_CACHE.setdefault(market, {"df": None, "path": "", "mtime": 0.0, "rows": 0})
+        slot["df"] = cached_df
+        slot["path"] = str(path) if path else ""
+        slot["mtime"] = float(Path(path).stat().st_mtime) if path and Path(path).exists() else 0.0
+        slot["rows"] = int(len(df) if df is not None else 0)
+
 
 
 CLASSIFICATION_BOOK_CANDIDATES = [
@@ -564,8 +491,6 @@ def _set_classification_load_info(loaded: bool, rows: int = 0, path: Path | None
         "path": str(path) if path else "",
         "note": str(note or "")
     }
-    _append_classification_debug_trace("load_info_update", LAST_CLASSIFICATION_LOAD_INFO)
-    snapshot_classification_ui_state(extra={"source": "_set_classification_load_info"})
 
 def get_classification_load_info() -> dict:
     try:
@@ -595,10 +520,6 @@ def get_classification_status() -> dict:
         out["exists"] = False
         out["is_stale"] = True
         out.setdefault("status", "missing")
-    if (not out.get("loaded")) and CLASSIFICATION_OFFICIAL_CACHE.get("ALL", {}).get("rows", 0):
-        out["loaded"] = True
-        out["loaded_rows"] = int(CLASSIFICATION_OFFICIAL_CACHE.get("ALL", {}).get("rows", 0) or 0)
-        out["load_note"] = out.get("load_note") or "由官方分類快取推定已載入"
     if out.get("loaded") and out.get("loaded_rows", 0) > 0:
         out["status"] = "ok"
     elif out.get("exists"):
@@ -806,6 +727,7 @@ def convert_xls_to_xlsx_force(src: Path, dst: Path, log_cb=None) -> Optional[Pat
     return None
 
 
+
 def _download_single_classification_csv(market: str, force_refresh: bool = False, log_cb=None) -> Optional[Path]:
     market = str(market or "").strip()
     cfg = CLASSIFICATION_DOWNLOAD_SOURCES.get(market)
@@ -846,7 +768,6 @@ def _download_single_classification_csv(market: str, force_refresh: bool = False
                 time.sleep(min(2 * attempt, 5))
     raise RuntimeError(f"{market} 分類來源下載失敗：{last_error}")
 
-
 def download_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
     if not force_refresh:
         existing = resolve_classification_book_by_market("上市")
@@ -866,12 +787,11 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
             errors.append(f"{market}: {exc}")
 
     if downloaded:
-        meta_paths = [str(p) for _, p in downloaded]
         meta = {
             "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "source": "MOPS-CSV-TWSE+TPEX",
             "file": ", ".join(Path(p).name for _, p in downloaded),
-            "path": " | ".join(meta_paths),
+            "path": " | ".join(str(p) for _, p in downloaded),
             "status": "ok" if len(downloaded) == 2 else "partial",
             "note": f"downloaded markets={','.join(m for m,_ in downloaded)}" + (f" | errors={' ; '.join(errors)}" if errors else ""),
         }
@@ -880,6 +800,7 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
         CLASSIFICATION_MEMORY_CACHE["path"] = None
         CLASSIFICATION_MEMORY_CACHE["mtime"] = None
         CLASSIFICATION_MEMORY_CACHE["meta"] = meta
+        CLASSIFICATION_MEMORY_CACHE["market"] = "ALL"
         first_path = downloaded[0][1]
         note = "已下載官方分類CSV（上市+上櫃）" if len(downloaded) == 2 else f"部分下載成功：{','.join(m for m,_ in downloaded)}"
         _set_classification_load_info(False, 0, first_path, note)
@@ -893,7 +814,6 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
     _mark_classification_meta_status("download_failed", note=' ; '.join(errors) or "unknown")
     _set_classification_load_info(False, 0, None, ' ; '.join(errors) or "unknown")
     return None
-
 
 def _iter_classification_candidates_prefer_xlsx():
     csv_first = []
@@ -923,92 +843,17 @@ def _iter_classification_candidates_prefer_xlsx():
         ordered.append(pp)
     return ordered
 
-
 def ensure_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
     if not force_refresh:
         for p in _iter_classification_candidates_prefer_xlsx():
             meta = _read_classification_meta()
-            if not meta or Path(meta.get("path", "")) != p:
+            if not meta or Path(str(meta.get("path", "")).split(" | ")[0]) != p:
                 _write_classification_meta(_build_classification_meta(p, source="LOCAL", note="discovered existing file"))
             return p
     return download_classification_book(force_refresh=force_refresh, log_cb=log_cb)
 
 def resolve_classification_book() -> Optional[Path]:
     return ensure_classification_book(force_refresh=False)
-
-
-def _coerce_unique_columns(columns) -> list[str]:
-    seen = {}
-    out = []
-    for c in list(columns):
-        name = str(c).strip() if c is not None else ""
-        if not name:
-            name = "Unnamed"
-        count = seen.get(name, 0)
-        out_name = name if count == 0 else f"{name}__dup{count}"
-        seen[name] = count + 1
-        out.append(out_name)
-    return out
-
-def _extract_official_sheet_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
-
-    x = df.copy().fillna("")
-    x.columns = _coerce_unique_columns(x.columns)
-    market = "上市" if "上市" in str(sheet_name) else ("上櫃" if "上櫃" in str(sheet_name) else ("興櫃" if "興櫃" in str(sheet_name) else ""))
-
-    code_candidates = []
-    name_col = None
-    industry_name_col = None
-    industry_code_col = None
-
-    for c in x.columns:
-        s = str(c).strip()
-        base = s.split("__dup")[0].strip()
-        if base in ("公司名稱", "公司簡稱", "股票名稱", "證券名稱"):
-            name_col = c if name_col is None else name_col
-        elif base in ("新產業類別", "新產業別", "產業名稱", "industry_name"):
-            industry_name_col = c if industry_name_col is None else industry_name_col
-        elif base in ("產業別", "產業類別", "產業代碼", "產業類別代號", "industry_code"):
-            industry_code_col = c if industry_code_col is None else industry_code_col
-        elif base in ("股票代號", "證券代號", "公司代號"):
-            code_candidates.append(c)
-        elif base == "代號":
-            code_candidates.append(c)
-
-    industry_col = industry_name_col or industry_code_col
-    if industry_col is None or not code_candidates:
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
-
-    preferred = []
-    for c in code_candidates:
-        base = str(c).split("__dup")[0]
-        if base in ("股票代號", "證券代號", "公司代號"):
-            preferred.append(c)
-    code_candidates = preferred + [c for c in code_candidates if c not in preferred]
-
-    stock_id_series = pd.Series([""] * len(x), index=x.index, dtype="object")
-    for c in code_candidates:
-        vals = x[c].map(normalize_stock_id)
-        fill_mask = stock_id_series.eq("") & vals.ne("")
-        if fill_mask.any():
-            stock_id_series.loc[fill_mask] = vals.loc[fill_mask]
-
-    out = pd.DataFrame({
-        "stock_id": stock_id_series.astype(str),
-        "stock_name_official": x[name_col].astype(str).str.strip() if name_col in x.columns else "",
-        "industry_official": x[industry_col].astype(str).str.strip(),
-    })
-    out["industry_official"] = out["industry_official"].map(normalize_official_industry_name)
-    out["stock_name_norm_official"] = out["stock_name_official"].map(_normalize_stock_name_for_match)
-    out["market_official"] = market
-    out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
-    if out.empty:
-        return out
-    return out[["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]].drop_duplicates(subset=["stock_id"], keep="first")
-
-
 
 def _classification_csv_candidates_by_market(market: str = "ALL") -> list[Path]:
     market = str(market or "ALL").strip()
@@ -1028,7 +873,6 @@ def _classification_csv_candidates_by_market(market: str = "ALL") -> list[Path]:
         ]
     return _classification_csv_candidates_by_market("上市") + _classification_csv_candidates_by_market("上櫃")
 
-
 def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]:
     for p in _classification_csv_candidates_by_market(market):
         if Path(p).exists():
@@ -1042,12 +886,7 @@ def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]
             classification_debug_log(f"自動補抓官方分類失敗（{market}）：{exc}", "WARNING")
     return None
 
-
 def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
-    """
-    官方分類來源支援：上市 / 上櫃 / ALL。
-    ALL 會合併上市 + 上櫃後再回傳。
-    """
     market = str(market or "ALL").strip() or "ALL"
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
 
@@ -1067,10 +906,9 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         out["industry_official"] = out["industry_official"].astype(str).map(normalize_official_industry_name)
         out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
         out = out.sort_values(["stock_id", "market_official", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
-        classification_debug_log(f"補充分類載入成功：ALL｜rows={len(out)}")
-        _set_classification_load_info(True, len(out), None, f"補充分類載入成功：ALL｜rows={len(out)}")
-        _append_classification_debug_trace("official_load_success", {"market": "ALL", "rows": int(len(out)), "path": ""})
         _set_cached_official_classification("ALL", None, out)
+        _set_classification_load_info(True, len(out), None, f"補充分類載入成功：ALL｜rows={len(out)}")
+        classification_debug_log(f"補充分類載入成功：ALL｜rows={len(out)}")
         return out
 
     path = resolve_classification_book_by_market(market)
@@ -1093,16 +931,16 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         out["industry_official"] = out["industry_official"].astype(str).map(normalize_official_industry_name)
         out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
         out = out.drop_duplicates(subset=["stock_id"], keep="first")
-        classification_debug_log(f"補充分類載入成功：{market}｜rows={len(out)}")
-        _set_classification_load_info(True, len(out), path, f"補充分類載入成功：{market}｜rows={len(out)}")
-        _append_classification_debug_trace("official_load_success", {"market": market, "rows": int(len(out)), "path": str(path)})
         _set_cached_official_classification(market, path, out)
+        _set_classification_load_info(True, len(out), path, f"補充分類載入成功：{market}｜rows={len(out)}")
+        classification_debug_log(f"補充分類載入成功：{market}｜rows={len(out)}")
         return out
     except Exception as exc:
         classification_debug_log(f"分類來源解析失敗（{market}）：{exc}", "ERROR")
         return empty_df
 
 def load_manual_theme_mapping() -> pd.DataFrame:
+
 
     manual_parts = []
     try:
@@ -1200,12 +1038,12 @@ def _safe_int(v, default: int = 0) -> int:
 
 
 def _is_placeholder_text(v) -> bool:
-    return str(v or "").strip() in ("", "未分類", "未匹配", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
+    return str(v or "").strip() in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
 
 
 def _is_missing_classification_value(v) -> bool:
     s = str(v or "").strip()
-    return s in ("", "未分類", "未匹配", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
+    return s in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
 
 
 def _choose_text(*values, default: str = "") -> str:
@@ -1250,44 +1088,22 @@ def _write_unclassified_report(df: pd.DataFrame):
         pass
 
 
-def export_classification_diagnostics() -> dict:
-    summary = get_classification_v2_summary()
-    status = get_classification_status()
-    payload = {
-        "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "classification_status": status,
-        "classification_summary": summary,
-        "official_cache": {k: {"rows": int(v.get("rows", 0) or 0), "path": str(v.get("path", "") or "")} for k, v in CLASSIFICATION_OFFICIAL_CACHE.items()},
-        "debug_trace_path": str(CLASSIFICATION_DEBUG_TRACE_PATH),
-        "ui_state_snapshot_path": str(CLASSIFICATION_UI_STATE_SNAPSHOT_PATH),
-    }
-    try:
-        out_path = CLASSIFICATION_CACHE_DIR / "classification_diagnostics.json"
-        _write_json_safe(out_path, payload)
-        payload["output_path"] = str(out_path)
-    except Exception:
-        pass
-    return payload
 
 def get_classification_v2_summary() -> dict:
     global CLASSIFICATION_V2_LAST_SUMMARY
-    candidates = []
+    file_data = {}
     try:
         if CLASSIFICATION_V2_SUMMARY_PATH.exists():
             raw = json.loads(CLASSIFICATION_V2_SUMMARY_PATH.read_text(encoding='utf-8'))
-            if isinstance(raw, dict) and raw:
-                candidates.append(dict(raw))
+            if isinstance(raw, dict):
+                file_data = dict(raw)
     except Exception:
-        pass
-    if isinstance(CLASSIFICATION_V2_LAST_SUMMARY, dict) and CLASSIFICATION_V2_LAST_SUMMARY:
-        candidates.append(dict(CLASSIFICATION_V2_LAST_SUMMARY))
-    best = _select_best_classification_summary(candidates)
+        file_data = {}
+    best = _pick_best_classification_summary(file_data, CLASSIFICATION_V2_LAST_SUMMARY)
     if best:
         CLASSIFICATION_V2_LAST_SUMMARY = dict(best)
         return dict(best)
     return {}
-
-
 
 def infer_ai_classification(stock_name: str, industry_hint: str = "", market_hint: str = "", is_etf: int = 0) -> tuple[str, str, str, str, int, str]:
     name = str(stock_name or "").strip()
@@ -1324,6 +1140,7 @@ def infer_ai_classification(stock_name: str, industry_hint: str = "", market_hin
     return (_choose_text(industry_hint, fallback_industry, default="未分類"), _choose_text(fallback_theme, default="全市場"), _choose_text(fallback_sub, default="系統掃描"), "rule_engine", 68, "generic keyword fallback")
 
 
+
 def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     global CLASSIFICATION_V2_LAST_SUMMARY
     if df is None or df.empty:
@@ -1332,11 +1149,12 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
             "unclassified": 0, "covered": 0, "coverage_pct": 0.0,
             "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
-        _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
-        _append_classification_debug_trace("quality_report_empty", dict(summary))
+        best = _pick_best_classification_summary(CLASSIFICATION_V2_LAST_SUMMARY, summary)
+        CLASSIFICATION_V2_LAST_SUMMARY = dict(best or summary)
+        if _should_promote_classification_summary(summary):
+            _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
+        _append_classification_summary_history(summary, promoted=False)
         _write_unclassified_report(pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]))
-        snapshot_classification_ui_state(summary=summary, extra={"source": "build_classification_quality_report.empty"})
         return pd.DataFrame(), summary
 
     x = df.copy()
@@ -1370,32 +1188,26 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
         "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "unclassified_report": str(CLASSIFICATION_V2_UNCLASSIFIED_PATH),
     }
-    promote = _should_promote_classification_summary(summary)
-    if promote:
+
+    promoted = _should_promote_classification_summary(summary)
+    if promoted:
         CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
         _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
-        _debug_classification_monitor(f"更新全市場覆蓋率摘要：total={summary.get('total', 0)} official={summary.get('official', 0)} coverage={summary.get('coverage_pct', 0)}%")
     else:
-        current_best = get_classification_v2_summary()
-        if not current_best:
-            CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
-        _debug_classification_monitor(f"略過覆蓋率摘要覆蓋：total={summary.get('total', 0)} official={summary.get('official', 0)} coverage={summary.get('coverage_pct', 0)}%")
-    trace_payload = dict(summary)
-    trace_payload["promoted"] = bool(promote)
-    trace_payload["current_best_total"] = int((CLASSIFICATION_V2_LAST_SUMMARY or {}).get("total", 0) or 0)
-    _append_classification_debug_trace("quality_report", trace_payload)
+        best = _pick_best_classification_summary(CLASSIFICATION_V2_LAST_SUMMARY, get_classification_v2_summary())
+        if best:
+            CLASSIFICATION_V2_LAST_SUMMARY = dict(best)
+
+    _append_classification_summary_history(summary, promoted=promoted)
     _write_unclassified_report(unclassified)
+
     coverage = 1.0 - float(x["industry_final"].isin(["未分類", "未匹配"]).mean()) if len(x) else 0.0
     if coverage < 0.95:
         log_warning(f"分類覆蓋率不足：{coverage:.2%}")
-    snapshot_classification_ui_state(summary=get_classification_v2_summary(), extra={"source": "build_classification_quality_report", "candidate_total": int(summary.get("total", 0) or 0), "promoted": bool(promote)})
     return unclassified, summary
 
-
-
-
-
 THEME_RULES = [
+
     (r"台積電|創意|世芯|世芯-KY|晶心|聯發科|聯詠|矽力|祥碩|M31|力旺|智原|信驊|創惟|威鋒電子", ("半導體", "AI/晶圓代工", "半導體")),
     (r"華星光|聯亞|光聖|波若威|上詮|聯鈞|眾達|環宇|前鼎|立碁|光環|聯光通|聯合再生|聯亞光|IET-KY", ("光通訊", "CPO/光模組", "高速光通訊")),
     (r"智邦|智易|中磊|啟碁|正文|建漢|神準|明泰|友訊|合勤控|振曜|康全電訊|仲琦", ("網通", "資料中心交換器", "高階網通")),
@@ -1549,10 +1361,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
         "classification_source", "classification_note"
     ])
 
-    official_twse = load_official_classification_book("上市")
-    official_tpex = load_official_classification_book("上櫃")
-    official_parts = [df for df in [official_twse, official_tpex] if df is not None and not df.empty]
-    official = pd.concat(official_parts, ignore_index=True).drop_duplicates(subset=["stock_id"], keep="first") if official_parts else pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+    official = load_official_classification_book("ALL")
     manual = load_manual_theme_mapping()
 
     x["stock_id"] = _safe_text_series(x["stock_id"], "").map(normalize_stock_id)
@@ -1660,7 +1469,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
         x["industry_seed"] = x["industry_seed"].fillna(_safe_text_series(x["industry_official"], "").replace("", pd.NA))
     if "industry_manual" in x.columns:
         x["industry_seed"] = x["industry_seed"].fillna(_safe_text_series(x["industry_manual"], "").replace("", pd.NA))
-    x["industry_seed"] = _safe_text_series(x["industry_seed"].fillna("未匹配"), "未匹配")
+    x["industry_seed"] = _safe_text_series(x["industry_seed"].fillna("未分類"), "未分類")
 
     x["theme_seed"] = _safe_text_series(x["theme"] if "theme" in x.columns else "", "")
     x["sub_theme_seed"] = _safe_text_series(x["sub_theme"] if "sub_theme" in x.columns else "", "")
@@ -1697,7 +1506,7 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
         x[col] = _safe_text_series(x[col], "")
     x["confidence_ai"] = pd.to_numeric(x["confidence_ai"], errors="coerce").fillna(0).astype(int)
 
-    x["industry_final"] = _safe_text_series(x["industry_seed"], "未匹配").map(normalize_official_industry_name)
+    x["industry_final"] = _safe_text_series(x["industry_seed"], "未分類").map(normalize_official_industry_name)
     x["theme_final"] = _safe_text_series(x["theme_seed"], "")
     x["sub_theme_final"] = _safe_text_series(x["sub_theme_seed"], "")
 
@@ -1740,23 +1549,21 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
             x[col] = ""
         x[col] = _safe_text_series(x[col], "")
 
-    x["industry_final"] = _safe_text_series(x["industry_final"], "未匹配").map(normalize_official_industry_name)
-    x["industry_final"] = _safe_text_series(x["industry_final"], "未匹配").replace("", "未匹配")
+    x["industry_final"] = _safe_text_series(x["industry_final"], "未分類").map(normalize_official_industry_name)
+    x["industry_final"] = _safe_text_series(x["industry_final"], "未分類").replace("", "未分類")
     x["theme_final"] = _safe_text_series(x["theme_final"], "全市場").replace("", "全市場")
     x["sub_theme_final"] = _safe_text_series(x["sub_theme_final"], "系統掃描").replace("", "系統掃描")
     x.loc[x["is_etf"].eq(1), ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]] = ["ETF", "ETF", "ETF", "manual", 98, "ETF normalized"]
 
-    x["industry"] = _safe_text_series(x["industry_final"], "未匹配")
+    x["industry"] = _safe_text_series(x["industry_final"], "未分類")
     x["theme"] = _safe_text_series(x["theme_final"], "全市場")
     x["sub_theme"] = _safe_text_series(x["sub_theme_final"], "系統掃描")
     x["is_active"] = 1
     x["update_date"] = datetime.now().strftime("%Y-%m-%d")
 
-    unmatched_df, summary = build_classification_quality_report(x)
+    _, summary = build_classification_quality_report(x)
     try:
-        classification_debug_log(f"V2 覆蓋率 {summary.get('coverage_pct', 0):.2f}%｜官方 {summary.get('official', 0)}｜手動 {summary.get('manual', 0)}｜規則 {summary.get('rule_engine', 0)}｜AI {summary.get('ai_infer', 0)}｜未匹配 {summary.get('unclassified', 0)}")
-        if unmatched_df is not None and not unmatched_df.empty:
-            classification_debug_log(f"未匹配分類清單已輸出：{CLASSIFICATION_V2_UNCLASSIFIED_PATH}")
+        classification_debug_log(f"V2 覆蓋率 {summary.get('coverage_pct', 0):.2f}%｜官方 {summary.get('official', 0)}｜手動 {summary.get('manual', 0)}｜規則 {summary.get('rule_engine', 0)}｜AI {summary.get('ai_infer', 0)}｜未分類 {summary.get('unclassified', 0)}")
     except Exception:
         pass
 
@@ -1931,6 +1738,7 @@ def write_table_bundle(base_path: Path, tables: Dict[str, pd.DataFrame], preferr
 
 
 
+
 def _normalize_master_df(df: pd.DataFrame, market_label: str, persist_classification_summary: bool = True) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
@@ -1972,8 +1780,8 @@ def _normalize_master_df(df: pd.DataFrame, market_label: str, persist_classifica
         x = apply_classification_layers(x)
     return x[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]].drop_duplicates(subset=["stock_id"]).reset_index(drop=True)
 
-
 def fetch_twse_universe() -> pd.DataFrame:
+
     urls = [
         "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
         "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json",
@@ -2381,24 +2189,6 @@ class DataEngine:
                 continue
         return latest
 
-    def get_realtime_quote(self, stock_id: str, market: str, hist: pd.DataFrame | None = None) -> dict:
-        fallback = {}
-        try:
-            x = hist if hist is not None and not hist.empty else self.db.get_price_history(stock_id)
-            if x is not None and not x.empty:
-                x = x.copy()
-                last = x.iloc[-1]
-                fallback = {
-                    'close': float(last.get('close', 0) or 0),
-                    'prev_close': float(x.iloc[-2].get('close', last.get('close', 0)) or 0) if len(x) >= 2 else float(last.get('close', 0) or 0),
-                    'open': float(last.get('open', last.get('close', 0)) or 0),
-                    'high': float(last.get('high', last.get('close', 0)) or 0),
-                    'low': float(last.get('low', last.get('close', 0)) or 0),
-                }
-        except Exception:
-            fallback = {}
-        return RealtimeQuoteEngine.build_realtime_snapshot(stock_id, market, fallback=fallback)
-
 
     def build_full_history(self, min_days: int = 240, batch_size: int = 25, sleep_sec: float = 0.6, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
         master = self.db.get_master()
@@ -2539,460 +2329,6 @@ class DataEngine:
         x["k"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
         x["d"] = x["k"].ewm(alpha=1 / 3, adjust=False).mean()
         return x
-
-
-class RealtimeQuoteEngine:
-    """Phase 1 tactical layer: unify TWSE MIS and Yahoo near-live quote."""
-
-    @staticmethod
-    def _safe_float(v, default=None):
-        try:
-            if v in (None, "", "-", "--"):
-                return default
-            return float(v)
-        except Exception:
-            return default
-
-    @staticmethod
-    def _safe_int(v, default=None):
-        try:
-            if v in (None, "", "-", "--"):
-                return default
-            return int(float(v))
-        except Exception:
-            return default
-
-    @staticmethod
-    def _round_price(v):
-        try:
-            return round(float(v), 2)
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def _split_prices(text):
-        vals = []
-        for x in str(text or '').split('_'):
-            v = RealtimeQuoteEngine._safe_float(x)
-            if v is not None and v > 0:
-                vals.append(RealtimeQuoteEngine._round_price(v))
-        return vals
-
-    @staticmethod
-    def _split_ints(text):
-        vals = []
-        for x in str(text or '').split('_'):
-            v = RealtimeQuoteEngine._safe_int(x)
-            if v is not None and v >= 0:
-                vals.append(v)
-        return vals
-
-    @staticmethod
-    def compute_orderbook_bias(bid_vols, ask_vols):
-        buy_qty = int(sum((bid_vols or [])[:5])) if bid_vols else 0
-        sell_qty = int(sum((ask_vols or [])[:5])) if ask_vols else 0
-        if buy_qty == 0 and sell_qty == 0:
-            return {"buy_qty": 0, "sell_qty": 0, "ratio": "-", "bias": "無有效五檔"}
-        if sell_qty == 0:
-            return {"buy_qty": buy_qty, "sell_qty": sell_qty, "ratio": "∞", "bias": "買盤明顯偏強"}
-        ratio = buy_qty / max(sell_qty, 1)
-        if ratio >= 1.5:
-            bias = "買盤偏強"
-        elif ratio <= 0.67:
-            bias = "賣盤偏強"
-        else:
-            bias = "多空均衡"
-        return {"buy_qty": buy_qty, "sell_qty": sell_qty, "ratio": f"{ratio:.2f}", "bias": bias}
-
-    @staticmethod
-    def fetch_twse_mis_quote(stock_id: str, market: str) -> dict | None:
-        market = str(market or '')
-        if market not in ('上市', '上櫃', 'ETF'):
-            return None
-        ex_prefix = 'otc' if market == '上櫃' else 'tse'
-        ex_ch = f"{ex_prefix}_{stock_id}.tw"
-        url = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp'
-        params = {"ex_ch": ex_ch, "json": "1", "delay": "0", "_": str(int(time.time() * 1000))}
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"}
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=8)
-            r.raise_for_status()
-            data = r.json()
-            msg_array = data.get('msgArray', [])
-            if not msg_array:
-                return None
-            item = msg_array[0]
-            last_trade = RealtimeQuoteEngine._safe_float(item.get('z'))
-            open_price = RealtimeQuoteEngine._safe_float(item.get('o'))
-            high_price = RealtimeQuoteEngine._safe_float(item.get('h'))
-            low_price = RealtimeQuoteEngine._safe_float(item.get('l'))
-            prev_close = RealtimeQuoteEngine._safe_float(item.get('y'))
-            ask_prices = RealtimeQuoteEngine._split_prices(item.get('a'))
-            bid_prices = RealtimeQuoteEngine._split_prices(item.get('b'))
-            ask_vols = RealtimeQuoteEngine._split_ints(item.get('f'))
-            bid_vols = RealtimeQuoteEngine._split_ints(item.get('g'))
-            indicative_price = None
-            if bid_prices and ask_prices:
-                indicative_price = RealtimeQuoteEngine._round_price((bid_prices[0] + ask_prices[0]) / 2)
-            elif bid_prices:
-                indicative_price = bid_prices[0]
-            elif ask_prices:
-                indicative_price = ask_prices[0]
-            display_price = last_trade if last_trade is not None else indicative_price
-            if display_price is None and prev_close is not None:
-                display_price = prev_close
-            if display_price is None:
-                return None
-            ob = RealtimeQuoteEngine.compute_orderbook_bias(bid_vols, ask_vols)
-            return {
-                'close': RealtimeQuoteEngine._round_price(display_price),
-                'prev_close': RealtimeQuoteEngine._round_price(prev_close if prev_close is not None else display_price),
-                'open': RealtimeQuoteEngine._round_price(open_price if open_price is not None else display_price),
-                'high': RealtimeQuoteEngine._round_price(high_price if high_price is not None else display_price),
-                'low': RealtimeQuoteEngine._round_price(low_price if low_price is not None else display_price),
-                'last_trade': RealtimeQuoteEngine._round_price(last_trade) if last_trade is not None else None,
-                'indicative_price': RealtimeQuoteEngine._round_price(indicative_price) if indicative_price is not None else None,
-                'bid_prices': bid_prices,
-                'ask_prices': ask_prices,
-                'bid_vols': bid_vols,
-                'ask_vols': ask_vols,
-                'buy_qty': ob['buy_qty'],
-                'sell_qty': ob['sell_qty'],
-                'orderbook_ratio': ob['ratio'],
-                'orderbook_bias': ob['bias'],
-                'quote_time': item.get('t') or item.get('tt') or '',
-                'source': 'TWSE MIS 即時',
-            }
-        except Exception:
-            return None
-
-    @staticmethod
-    def fetch_yahoo_live_quote(stock_id: str, market: str, fallback: dict | None = None) -> dict:
-        fallback = dict(fallback or {})
-        live_price = float(fallback.get('close', 0) or 0)
-        prev_close = float(fallback.get('prev_close', live_price) or live_price)
-        open_price = float(fallback.get('open', live_price) or live_price)
-        high_price = float(fallback.get('high', live_price) or live_price)
-        low_price = float(fallback.get('low', live_price) or live_price)
-        symbol = DataEngine.yahoo_symbol(stock_id, market)
-        if yf is not None:
-            try:
-                ticker = yf.Ticker(symbol)
-                try:
-                    fi = ticker.fast_info
-                    if fi:
-                        live_price = float(fi.get('lastPrice') or live_price)
-                        prev_close = float(fi.get('previousClose') or prev_close)
-                        open_price = float(fi.get('open') or open_price)
-                        high_price = float(fi.get('dayHigh') or high_price)
-                        low_price = float(fi.get('dayLow') or low_price)
-                except Exception:
-                    pass
-                try:
-                    info = ticker.info or {}
-                    live_price = float(info.get('regularMarketPrice') or live_price)
-                    prev_close = float(info.get('regularMarketPreviousClose') or prev_close)
-                    open_price = float(info.get('regularMarketOpen') or open_price)
-                    high_price = float(info.get('regularMarketDayHigh') or high_price)
-                    low_price = float(info.get('regularMarketDayLow') or low_price)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        return {
-            'close': RealtimeQuoteEngine._round_price(live_price),
-            'prev_close': RealtimeQuoteEngine._round_price(prev_close),
-            'open': RealtimeQuoteEngine._round_price(open_price),
-            'high': RealtimeQuoteEngine._round_price(high_price),
-            'low': RealtimeQuoteEngine._round_price(low_price),
-            'last_trade': RealtimeQuoteEngine._round_price(live_price),
-            'indicative_price': RealtimeQuoteEngine._round_price(live_price),
-            'bid_prices': [], 'ask_prices': [], 'bid_vols': [], 'ask_vols': [],
-            'buy_qty': 0, 'sell_qty': 0, 'orderbook_ratio': '-', 'orderbook_bias': '不適用',
-            'quote_time': '', 'source': 'Yahoo Finance',
-        }
-
-    @staticmethod
-    def build_realtime_snapshot(stock_id: str, market: str, fallback: dict | None = None) -> dict:
-        fallback = dict(fallback or {})
-        quote = None
-        if market in ('上市', '上櫃', 'ETF'):
-            quote = RealtimeQuoteEngine.fetch_twse_mis_quote(stock_id, market)
-        if quote is None:
-            quote = RealtimeQuoteEngine.fetch_yahoo_live_quote(stock_id, market, fallback=fallback)
-        if not quote:
-            quote = {
-                'close': float(fallback.get('close', 0) or 0),
-                'prev_close': float(fallback.get('prev_close', fallback.get('close', 0)) or 0),
-                'open': float(fallback.get('open', fallback.get('close', 0)) or 0),
-                'high': float(fallback.get('high', fallback.get('close', 0)) or 0),
-                'low': float(fallback.get('low', fallback.get('close', 0)) or 0),
-                'bid_prices': [], 'ask_prices': [], 'bid_vols': [], 'ask_vols': [],
-                'buy_qty': 0, 'sell_qty': 0, 'orderbook_ratio': '-', 'orderbook_bias': '無有效五檔',
-                'quote_time': '', 'source': 'fallback', 'last_trade': None, 'indicative_price': None,
-            }
-        quote['stock_id'] = str(stock_id)
-        quote['market'] = str(market)
-        return quote
-
-
-class TacticalScoreEngine:
-    @staticmethod
-    def calc_intraday_tactical_score(close, prev_close, open_price, high_price, low_price, support, resistance, orderbook_bias, change_pct):
-        score = 50
-        if change_pct >= 3:
-            score += 20
-        elif change_pct >= 1:
-            score += 10
-        elif change_pct <= -9:
-            score -= 35
-        elif change_pct <= -5:
-            score -= 20
-        elif change_pct < 0:
-            score -= 8
-        if close >= open_price:
-            score += 8
-        else:
-            score -= 8
-        if close >= prev_close:
-            score += 8
-        else:
-            score -= 8
-        day_range = max(high_price - low_price, 0.01)
-        pos = (close - low_price) / day_range
-        if pos >= 0.8:
-            score += 12
-        elif pos <= 0.2:
-            score -= 12
-        if resistance and close > resistance:
-            score += 18
-        elif resistance and close >= resistance * 0.995:
-            score += 6
-        elif support and close < support:
-            score -= 18
-        if change_pct >= 1.5 and close >= open_price and close >= prev_close:
-            score += 10
-        if orderbook_bias == '買盤明顯偏強':
-            score += 12
-        elif orderbook_bias == '買盤偏強':
-            score += 7
-        elif orderbook_bias == '賣盤偏強':
-            score -= 8
-        return max(0, min(100, int(score)))
-
-    @staticmethod
-    def evaluate_intraday_trade_state(close, prev_close, open_price, support, resistance, change_pct, trend_score, intraday_score, score, orderbook_bias, ma20=0, ma60=0, rsi=50):
-        near_resistance = close >= resistance * 0.988 if resistance else False
-        at_breakout = close >= resistance * 0.998 if resistance else False
-        above_open = close >= open_price
-        above_prev = close >= prev_close
-        bullish_orderbook = orderbook_bias in ('買盤偏強', '買盤明顯偏強')
-        structure_bullish = (close >= ma20 and close >= ma60 and ma20 >= ma60) if ma20 and ma60 else False
-        if change_pct <= -9.0 or intraday_score <= 15:
-            return '急跌風險', '觀望為主', 'weak'
-        if support and (close < support * 0.997 or (close < support and intraday_score < 42)):
-            return '跌破支撐', '減碼/防守', 'weak'
-        if score >= 95 and trend_score >= 90 and intraday_score >= 85:
-            if at_breakout and bullish_orderbook:
-                return '突破強勢', '突破可追', 'strong'
-            return '強勢追蹤', '拉回加碼', 'strong'
-        if resistance and close > resistance and trend_score >= 82 and intraday_score >= 78 and score >= 86 and change_pct >= 1.8 and above_open and above_prev and bullish_orderbook:
-            return '突破強勢', '突破可追', 'strong'
-        if trend_score >= 82 and intraday_score >= 70 and score >= 82 and change_pct >= 0.8 and above_open and above_prev and bullish_orderbook:
-            return '強勢追蹤', '拉回加碼', 'strong'
-        if trend_score >= 80 and intraday_score >= 70 and score >= 75 and structure_bullish:
-            return '整理偏多', '低接布局', 'bullish'
-        if trend_score >= 72 and intraday_score >= 58 and score >= 70 and change_pct >= 0.3 and (above_open or structure_bullish):
-            return '偏多觀察', '低接布局', 'bullish'
-        if support and resistance and score >= 45 and support <= close <= resistance:
-            return '區間整理', '區間操作', 'range'
-        if score >= 30:
-            return '轉弱警戒', '減碼/防守', 'weak'
-        return '轉弱警戒', '減碼/防守', 'weak'
-
-    @staticmethod
-    def classify_leader_candidate(score, trend_score, intraday_score, close, ma20, ma60, resistance, rsi, signal, orderbook_bias):
-        if (score >= 90 and trend_score >= 85 and intraday_score >= 80 and 50 <= rsi <= 70 and
-            close > ma20 > ma60 and signal in ('強勢追蹤', '突破強勢', '偏多觀察') and
-            orderbook_bias in ('買盤偏強', '買盤明顯偏強', '多空均衡') and
-            (not resistance or close <= resistance * 1.01)):
-            return '是'
-        if (score >= 85 and trend_score >= 80 and intraday_score >= 70 and close > ma20 >= ma60 and
-            48 <= rsi <= 72 and signal in ('強勢追蹤', '突破強勢', '偏多觀察') and orderbook_bias != '賣盤偏強' and
-            (not resistance or close <= resistance * 1.003)):
-            return '觀察'
-        return '-'
-
-
-class SingleStockNarrativeEngine:
-    @staticmethod
-    def build_tactical_risk_note(close, support, resistance, rsi, score, change_pct=None):
-        notes = []
-        if change_pct is not None and change_pct <= -7:
-            notes.append('當日跌幅偏大，短線波動風險升高')
-        if change_pct is not None and change_pct <= -9:
-            notes.append('接近跌停級別，避免把急跌誤判為強勢買點')
-        if support and close <= support * 1.01:
-            notes.append('接近支撐，觀察是否守穩')
-        if support and close < support:
-            notes.append('已跌破支撐，需提高風險控管')
-        if resistance and close >= resistance * 0.99:
-            notes.append('逼近壓力，留意獲利了結賣壓')
-        if resistance and close > resistance:
-            notes.append('已突破壓力，觀察是否假突破')
-        if rsi >= 70:
-            notes.append('RSI 偏高，短線過熱風險上升')
-        if rsi <= 30:
-            notes.append('RSI 偏低，可能進入超跌區')
-        if score < 30:
-            notes.append('綜合評分偏弱，不宜積極追價')
-        return '；'.join(notes) if notes else '目前技術面無明顯異常，但仍須控管部位'
-
-    @staticmethod
-    def build_ai_summary_text(ctx: dict) -> str:
-        close = float(ctx.get('close', 0) or 0)
-        ma20 = float(ctx.get('ma20', close) or close)
-        ma60 = float(ctx.get('ma60', close) or close)
-        rsi = float(ctx.get('rsi', 50) or 50)
-        score = float(ctx.get('score', 0) or 0)
-        trend_score = float(ctx.get('trend_score', score) or score)
-        intraday_score = float(ctx.get('intraday_score', score) or score)
-        support = float(ctx.get('support', 0) or 0)
-        resistance = float(ctx.get('resistance', 0) or 0)
-        signal = str(ctx.get('signal', '-'))
-        advice = str(ctx.get('advice', '-'))
-        orderbook_bias = str(ctx.get('orderbook_bias', '無'))
-        orderbook_ratio = str(ctx.get('orderbook_ratio', '-'))
-        change_pct = float(ctx.get('change_pct', 0) or 0)
-        if close >= ma20 and close >= ma60:
-            trend_text = '目前股價位於20日線與60日線之上，中期趨勢偏強。'
-        elif close >= ma20 and close < ma60:
-            trend_text = '目前股價站上20日線，但仍在60日線下方，屬短強中性結構。'
-        elif close < ma20 and close >= ma60:
-            trend_text = '目前股價跌破20日線但仍守住60日線，短線轉弱、中期待觀察。'
-        else:
-            trend_text = '目前股價位於20日線與60日線下方，技術面偏弱。'
-        pos_text = f'目前股價位於支撐 {support:.2f} 與壓力 {resistance:.2f} 之間，仍屬區間內。' if support and resistance and support <= close <= resistance else (f'目前股價 {close:.2f} 已跌破支撐 {support:.2f}。' if support and close < support else f'目前股價 {close:.2f} 已突破壓力 {resistance:.2f}。' if resistance and close > resistance else f'目前股價 {close:.2f} 尚待確認位置。')
-        rsi_text = f'RSI為 {rsi:.1f}。'
-        ob_text = f'五檔力道為「{orderbook_bias}」，委買/委賣比 {orderbook_ratio}。'
-        score_text = f'波段分={trend_score:.1f} / 盤中分={intraday_score:.1f} / 綜合分={score:.1f}'
-        final_text = f'AI綜合判斷：訊號「{signal}」，建議「{advice}」。'
-        if change_pct <= -9:
-            final_text += ' 今日屬急跌型態，避免誤判強勢。'
-        return '\n'.join([
-            '【AI個股分析】',
-            f'1. 趨勢判讀：{trend_text}',
-            f'2. 位置判讀：{pos_text}',
-            f'3. 動能狀態：{rsi_text}',
-            f'4. 五檔力道：{ob_text}',
-            f'5. 分數解讀：{score_text}',
-            f'6. AI結論：{final_text}',
-        ])
-
-    @staticmethod
-    def build_wave_summary_text(ctx: dict) -> str:
-        return '\n'.join([
-            '【波浪理論分析】',
-            f"1. 波浪結構：{ctx.get('wave_structure', '-')}",
-            f"2. 可能位置：{ctx.get('wave_position', '-')}",
-            f"3. 交易訊號：{ctx.get('signal', '-')}｜交易型態：{ctx.get('trade_type', '-')}",
-        ])
-
-    @staticmethod
-    def build_fibo_summary_text(ctx: dict) -> str:
-        return '\n'.join([
-            '【費波南西目標位】',
-            f"1. 支撐位 / 壓力位：{float(ctx.get('support',0) or 0):.2f} / {float(ctx.get('resistance',0) or 0):.2f}",
-            f"2. Fib 1.382：{float(ctx.get('target_1382',0) or 0):.2f}",
-            f"3. Fib 1.618：{float(ctx.get('target_1618',0) or 0):.2f}",
-            f"4. 進場區 / 停損 / RR：{ctx.get('entry_zone','-')} / {ctx.get('stop_loss','-')} / {float(ctx.get('rr',0) or 0):.2f}",
-        ])
-
-    @staticmethod
-    def build_bull_bear_path_text(ctx: dict) -> str:
-        support = float(ctx.get('support',0) or 0)
-        resistance = float(ctx.get('resistance',0) or 0)
-        target = float(ctx.get('target_1382', resistance) or resistance)
-        return '\n'.join([
-            '【多空路徑圖示】',
-            f'◎ 多方：守住 {support:.2f} → 挑戰 {resistance:.2f} → 續強看 {target:.2f}',
-            f'◎ 空方：跌破 {support:.2f} → 結構轉弱 → 反彈無法站回 {resistance:.2f} 則弱勢延續',
-        ])
-
-    @staticmethod
-    def build_trade_scripts_text(ctx: dict) -> dict:
-        support = float(ctx.get('support',0) or 0)
-        resistance = float(ctx.get('resistance',0) or 0)
-        target = float(ctx.get('target_1382', resistance) or resistance)
-        bucket = str(ctx.get('state_bucket', 'range'))
-        if bucket == 'strong':
-            return {
-                'script_a': f'劇本A（強勢突破）: 站穩 {resistance:.2f} 之上且量能續強，可順勢追蹤，下一目標看 {target:.2f}',
-                'script_b': f'劇本B（拉回承接）: 回測 {support:.2f} 附近不破，可分批承接；失守則降級。',
-                'script_c': f'劇本C（壓力震盪）: 接近 {resistance:.2f} 但量能不足，先等整理後再攻。',
-            }
-        if bucket == 'bullish':
-            return {
-                'script_a': f'劇本A（偏多延續）: 守住 {support:.2f} 可維持偏多，等待再挑戰 {resistance:.2f}',
-                'script_b': f'劇本B（回測確認）: 回測 {support:.2f} 但止穩，可偏向低接；跌破則觀望。',
-                'script_c': f'劇本C（轉強升級）: 有效突破 {resistance:.2f} 並量價配合，可升級為強勢追蹤。',
-            }
-        if bucket == 'weak':
-            return {
-                'script_a': f'劇本A（弱勢反彈）: 反彈至 {resistance:.2f} 下方仍無法突破，先視為弱勢反彈。',
-                'script_b': f'劇本B（跌破續弱）: 若失守 {support:.2f}，優先控管部位。',
-                'script_c': f'劇本C（止穩觀察）: 只有重新站回 {support:.2f} 並伴隨量價轉強，才考慮恢復偏多。',
-            }
-        return {
-            'script_a': f'劇本A（區間低接）: 靠近 {support:.2f} 觀察承接力道。',
-            'script_b': f'劇本B（跌破下緣）: 跌破 {support:.2f} 先轉為保守觀察。',
-            'script_c': f'劇本C（突破上緣）: 有效突破 {resistance:.2f} 並量能配合，可由整理升級為偏多追蹤。',
-        }
-
-    @staticmethod
-    def build_summary_block(ctx: dict) -> str:
-        return f"{ctx.get('light','⚪')} {ctx.get('orderbook_bias','無')}｜盤中分 {float(ctx.get('intraday_score',0) or 0):.1f}｜{ctx.get('state_bucket','-')}｜主升候選 {ctx.get('leader_candidate','-')}"
-
-
-class UITacticalPresenter:
-    @staticmethod
-    def derive_signal_light(signal, score=0, change_pct=0, intraday_score=0):
-        if signal == '急跌風險' or change_pct <= -9.0:
-            return '🔴'
-        if signal in ('跌破支撐', '轉弱警戒'):
-            return '🟠'
-        if signal == '突破強勢':
-            return '🔵'
-        if signal in ('偏多觀察', '強勢追蹤', '整理偏多'):
-            return '🟢'
-        if signal == '區間整理':
-            return '🟡'
-        if score >= 45 or intraday_score >= 45:
-            return '🟡'
-        return '⚪'
-
-
-class TacticalPlanAdapter:
-    @staticmethod
-    def calc_intraday_trade_plan(ctx: dict) -> dict:
-        support = float(ctx.get('support', 0) or 0)
-        resistance = float(ctx.get('resistance', 0) or 0)
-        state = str(ctx.get('state_bucket', 'range'))
-        target_1382 = float(ctx.get('target_1382', resistance) or resistance)
-        if support <= 0:
-            return {'entry_zone': '-', 'stop_loss': '-', 'intraday_target': '-', 'intraday_rr': None}
-        if state == 'strong':
-            entry_low = support * 1.002; entry_high = min(support * 1.012, resistance * 0.995) if resistance > 0 else support * 1.012; stop = support * 0.982
-        elif state == 'bullish':
-            entry_low = support * 1.000; entry_high = min(support * 1.010, resistance * 0.992) if resistance > 0 else support * 1.010; stop = support * 0.978
-        elif state == 'range':
-            entry_low = support * 0.998; entry_high = min(support * 1.006, resistance * 0.988) if resistance > 0 else support * 1.006; stop = support * 0.972
-        else:
-            return {'entry_zone': '-', 'stop_loss': f"{support * 0.968:.2f}", 'intraday_target': '-', 'intraday_rr': None}
-        risk = entry_high - stop
-        reward = max(target_1382, resistance) - entry_high
-        rr = round(reward / risk, 2) if risk > 0 and reward > 0 else None
-        return {'entry_zone': f"{entry_low:.2f} ~ {entry_high:.2f}", 'stop_loss': f"{stop:.2f}", 'intraday_target': f"{max(target_1382, resistance):.2f}", 'intraday_rr': rr}
 
 
 class IndicatorEngine:
@@ -4040,93 +3376,6 @@ class TradingPlanEngine:
 
         return round(self._clamp(base), 2)
 
-    def _calc_position_score(self, close_: float, recent_high: float, recent_low: float, wave_label: str, vol_ratio: float, range_pos60: float) -> tuple[float, str]:
-        recent_high = float(recent_high or close_)
-        recent_low = float(recent_low or close_)
-        width = max(recent_high - recent_low, 1e-6)
-        dist_to_high_pct = (recent_high - close_) / max(recent_high, 1e-6) * 100.0
-        if close_ >= recent_high * 0.995 and vol_ratio >= 1.2 and wave_label in ("第3浪", "推動浪"):
-            return 100.0, "突破"
-        if 0.45 <= range_pos60 <= 0.78 and vol_ratio >= 0.9 and wave_label in ("整理浪", "第3浪", "推動浪"):
-            return 80.0, "平台整理"
-        if wave_label == "修正浪" and range_pos60 <= 0.45:
-            return 30.0, "反彈"
-        if wave_label == "第5浪" or dist_to_high_pct <= 1.2 or range_pos60 >= 0.88:
-            return -50.0, "高檔"
-        return 55.0, "中位"
-
-    def _theme_bonus_score(self, theme: str) -> tuple[float, str]:
-        t = str(theme or "")
-        if any(k in t for k in ["AI", "CPO", "網通"]):
-            return 15.0, "主流題材"
-        if any(k in t for k in ["伺服器", "半導體", "光通訊", "散熱", "電源"]):
-            return 8.0, "次主流題材"
-        return 0.0, "一般題材"
-
-    def _module_pass_flags(self, signal: str, wave_label: str, fib_score: float, sakata_label: str, volume_label: str, rsi: float, macd_hist: float, k: float, d: float) -> dict:
-        kline_pass = int(str(signal) in ("突破強勢", "強勢追蹤", "整理偏多", "偏多觀察"))
-        wave_pass = int(str(wave_label) in ("第3浪", "推動浪", "修正浪"))
-        fib_pass = int(float(fib_score or 0) >= 65)
-        sakata_pass = int(str(sakata_label) in ("拉回承接", "偏多低接", "整理偏多", "區間低接"))
-        volume_pass = int(str(volume_label) in ("買盤明顯偏強", "買盤偏強"))
-        indicator_pass = int((45 <= float(rsi or 0) <= 72) and float(macd_hist or 0) >= 0 and float(k or 0) >= float(d or 0))
-        modules_pass_count = int(kline_pass + wave_pass + fib_pass + sakata_pass + volume_pass + indicator_pass)
-        strong_signal_flag = int(modules_pass_count >= 5)
-        tradable_flag = int(modules_pass_count >= 4)
-        return {
-            "kline_pass": kline_pass,
-            "wave_pass": wave_pass,
-            "fib_pass": fib_pass,
-            "sakata_pass": sakata_pass,
-            "volume_pass": volume_pass,
-            "indicator_pass": indicator_pass,
-            "modules_pass_count": modules_pass_count,
-            "strong_signal_flag": strong_signal_flag,
-            "tradable_flag": tradable_flag,
-        }
-
-    def _path_probabilities(self, wave_label: str, modules_pass_count: int, position_tag: str, rsi: float, distribution_flag: str = "否") -> tuple[float, float, float]:
-        bull = 33.0
-        rng = 34.0
-        bear = 33.0
-        if wave_label == "第3浪":
-            bull += 18; bear -= 8
-        elif wave_label == "推動浪":
-            bull += 10; rng -= 2
-        elif wave_label == "整理浪":
-            rng += 12
-        elif wave_label == "第5浪":
-            bear += 15; bull -= 10
-        elif wave_label == "修正浪":
-            bear += 8; bull -= 6
-        if modules_pass_count >= 5:
-            bull += 10; bear -= 5
-        elif modules_pass_count <= 2:
-            bear += 12; bull -= 8
-        if position_tag == "高檔":
-            bear += 12; bull -= 10
-        elif position_tag == "突破":
-            bull += 8
-        if distribution_flag == "是" or float(rsi or 0) >= 75:
-            bear += 10; bull -= 8
-        vals = [max(5.0, bull), max(5.0, rng), max(5.0, bear)]
-        s = sum(vals)
-        vals = [round(v / s * 100.0, 1) for v in vals]
-        diff = round(100.0 - sum(vals), 1)
-        vals[0] = round(vals[0] + diff, 1)
-        return tuple(vals)
-
-    def _operation_grade(self, wave_label: str, modules_pass_count: int, bucket: str, execution_ready: int = 0, distribution_flag: str = "否") -> str:
-        if distribution_flag == "是" or wave_label == "第5浪" or bucket == "排除":
-            return "C"
-        if wave_label == "第3浪" and modules_pass_count >= 5 and execution_ready == 1:
-            return "S"
-        if modules_pass_count >= 4 and bucket == "主攻":
-            return "A"
-        if modules_pass_count >= 3 or bucket in ("等待拉回", "觀察"):
-            return "B"
-        return "C"
-
     # legacy helper removed in v9.2 FINAL-RELEASE: _decision is no longer used
 
     def build_plan(self, stock_id: str) -> dict:
@@ -4159,7 +3408,6 @@ class TradingPlanEngine:
                 "macd_ok": 0,
                 "volume_ok": 0,
                 "decision": "AVOID",
-                "price": 0.0,
                 "support": 0.0,
                 "resistance": 0.0,
                 "model_score": 0.0,
@@ -4224,10 +3472,6 @@ class TradingPlanEngine:
         vol_ma20 = x["volume"].tail(20).mean()
         vol_ratio = float(last["volume"] / vol_ma20) if vol_ma20 and pd.notna(vol_ma20) else 1.0
         volume_label = self._volume_label(vol_ratio, close_, ma20)
-        recent_low60 = float(recent["low"].min()) if not recent.empty else close_
-        range_pos60 = (close_ - recent_low60) / max(recent_high - recent_low60, 1e-6)
-        position_score, position_tag = self._calc_position_score(close_, recent_high, recent_low60, wave_label, vol_ratio, range_pos60)
-        theme_bonus, theme_bonus_tag = self._theme_bonus_score(stock.get("theme", ""))
 
         kline_score = float(V80_KLINE_SCORE.get(signal, 55))
         wave_score = float(V80_WAVE_SCORE.get(wave_label, 60))
@@ -4235,7 +3479,6 @@ class TradingPlanEngine:
         sakata_score = float(V80_SAKATA_SCORE.get(sakata_label, 20))
         volume_score = float(V80_VOLUME_SCORE.get(volume_label, 60))
         indicator_score = float(self._indicator_score(rsi, macd_hist, k, d))
-        module_flags = self._module_pass_flags(signal, wave_label, fib_score, sakata_label, volume_label, rsi, macd_hist, k, d)
 
         model_score = round(
             kline_score * V80_WEIGHTS["kline"] +
@@ -4269,9 +3512,6 @@ class TradingPlanEngine:
 
         win_grade, win_rate = WinRateEngine.estimate(hist)
         decision, auto_state = StrategyEngineV91.decide_signal(model_score, float(wave_trade["wave_trade_score"]), rr, rsi, wave_label)
-        if module_flags["modules_pass_count"] < 4:
-            decision = "HOLD" if module_flags["modules_pass_count"] == 3 and decision != "AVOID" else "AVOID"
-            auto_state = "觀察" if decision == "HOLD" else "不可買"
 
         preferred_theme = any(key.lower() in str(stock.get("theme", "")).lower() for key in ThemeStrengthEngine.PREFERRED_KEYWORDS)
         liquidity = self.intraday_engine.evaluate(stock, hist, theme_hot=preferred_theme)
@@ -4291,49 +3531,23 @@ class TradingPlanEngine:
             bucket = "防守"
         elif liquidity_status == "ELIMINATE":
             bucket = "淘汰"
-        elif decision == "BUY" and module_flags["modules_pass_count"] >= 4:
+        elif decision == "BUY" and liquidity_status == "PASS":
             bucket = "主攻"
-        elif decision in ("WEAK BUY", "HOLD") or liquidity_status == "WATCH" or module_flags["modules_pass_count"] == 3:
+        elif decision in ("WEAK BUY", "HOLD") or liquidity_status == "WATCH":
             bucket = "觀察"
         else:
             bucket = "排除"
 
-        mainstream_score = round(score["momentum_score"] * 0.35 + score["volume_score"] * 0.25 + score["trend_score"] * 0.20 + score["ai_score"] * 0.20 - score["risk_score"] * 0.25 + theme_bonus, 2)
-        breakout_score = round(score["momentum_score"] * 0.30 + score["volume_score"] * 0.25 + score["trend_score"] * 0.20 + score["ai_score"] * 0.15 + position_score * 0.10 - score["risk_score"] * 0.30 + theme_bonus, 2)
-
-        selection_score = round(model_score * 0.38 + float(wave_trade["wave_trade_score"]) * 0.12 + win_rate * 0.10 + min(rr, 3.0) * 5 + float(liquidity.get("liquidity_score", 0)) * 0.18 + module_flags["modules_pass_count"] * 3.8 + max(position_score, 0) * 0.05 + theme_bonus * 0.8 + (6 if decision == "BUY" else 2 if decision == "WEAK BUY" else 0), 2)
-        trade_score = round(model_score * 0.22 + float(wave_trade["wave_trade_score"]) * 0.18 + score["ai_score"] * 0.06 + win_rate * 0.10 + min(rr, 3.0) * 5 + float(liquidity.get("intraday_trend_score", 0)) * 0.12 + float(liquidity.get("attack_volume_score", 0)) * 0.10 + float(liquidity.get("leader_follow_score", 0)) * 0.08 + module_flags["modules_pass_count"] * 4.0 + max(position_score, 0) * 0.06 + theme_bonus * 0.9 + (6 if preferred_theme else 0), 2)
-
-        bull_prob, range_prob, bear_prob = self._path_probabilities(wave_label, module_flags["modules_pass_count"], position_tag, rsi)
-        operation_grade = self._operation_grade(wave_label, module_flags["modules_pass_count"], bucket, 0, "否")
+        selection_score = round(model_score * 0.45 + float(wave_trade["wave_trade_score"]) * 0.16 + win_rate * 0.12 + min(rr, 3.0) * 5 + float(liquidity.get("liquidity_score", 0)) * 0.22 + (6 if decision == "BUY" else 2 if decision == "WEAK BUY" else 0), 2)
+        trade_score = round(model_score * 0.25 + float(wave_trade["wave_trade_score"]) * 0.18 + score["ai_score"] * 0.08 + win_rate * 0.14 + min(rr, 3.0) * 5 + float(liquidity.get("intraday_trend_score", 0)) * 0.14 + float(liquidity.get("attack_volume_score", 0)) * 0.11 + float(liquidity.get("leader_follow_score", 0)) * 0.10 + (6 if preferred_theme else 0), 2)
 
         reason = (
-            f"{signal}｜{wave_label}｜{trade_type}｜{volume_label}｜{position_tag}｜{theme_bonus_tag}｜"
+            f"{signal}｜{wave_label}｜{trade_type}｜{volume_label}｜"
             f"活性 {float(liquidity.get('liquidity_score',0) or 0):.1f}｜{liquidity_status}｜{elimination_reason or '盤中結構可接受'}｜"
-            f"六模組 {model_score:.1f}｜成立數 {module_flags['modules_pass_count']}｜RR {rr:.2f}｜RSI {rsi:.1f}"
+            f"六模組 {model_score:.1f}｜RR {rr:.2f}｜RSI {rsi:.1f}"
         )
 
         ui_state = self._ui_trade_state(decision, close_, entry_low, entry_high, rr, win_rate, liquidity_status)
-        tactical_light = UITacticalPresenter.derive_signal_light(signal, model_score, 0, float(liquidity.get("intraday_trend_score", 0) or 0))
-        if is_etf:
-            bucket = "防守"
-            operation_grade = "B"
-        else:
-            if tactical_light in ("🔵", "🟢"):
-                bucket = "主攻"
-                operation_grade = "S" if tactical_light == "🔵" else "A"
-            elif tactical_light in ("🟡", "🟠"):
-                bucket = "觀察"
-                operation_grade = "B"
-            else:
-                bucket = "排除"
-                operation_grade = "C"
-        if tactical_light in ("🔴", "⚪"):
-            decision = "AVOID"
-            ui_state = "不可買" if liquidity_status != "ELIMINATE" else "淘汰"
-        elif tactical_light in ("🟡", "🟠") and decision == "BUY":
-            decision = "HOLD"
-            ui_state = "觀察"
 
         return {
             "stock_id": stock_id,
@@ -4341,9 +3555,7 @@ class TradingPlanEngine:
             "industry": stock["industry"],
             "theme": stock["theme"],
             "market": stock["market"],
-            "price": round(close_, 2),
             "is_etf": 1 if is_etf else 0,
-            "tactical_light": tactical_light,
             "trade_action": decision,
             "ui_state": ui_state,
             "entry_low": round(entry_low, 2),
@@ -4377,24 +3589,6 @@ class TradingPlanEngine:
             "sakata_score": round(sakata_score, 2),
             "volume_score": round(volume_score, 2),
             "indicator_score": round(indicator_score, 2),
-            "position_score": round(position_score, 2),
-            "position_tag": position_tag,
-            "theme_bonus": round(theme_bonus, 2),
-            "mainstream_score": mainstream_score,
-            "breakout_score": breakout_score,
-            "kline_pass": module_flags["kline_pass"],
-            "wave_pass": module_flags["wave_pass"],
-            "fib_pass": module_flags["fib_pass"],
-            "sakata_pass": module_flags["sakata_pass"],
-            "volume_pass_flag": module_flags["volume_pass"],
-            "indicator_pass": module_flags["indicator_pass"],
-            "modules_pass_count": module_flags["modules_pass_count"],
-            "strong_signal_flag": module_flags["strong_signal_flag"],
-            "tradable_flag": module_flags["tradable_flag"],
-            "operation_grade": operation_grade,
-            "bull_prob": bull_prob,
-            "range_prob": range_prob,
-            "bear_prob": bear_prob,
             "model_score": model_score,
             "wave_trade_score": round(float(wave_trade["wave_trade_score"]), 2),
             "atr14": round(atr14, 4),
@@ -4432,8 +3626,7 @@ class MasterTradingEngine:
             market = self.market_engine.get_market_regime()
             return {
                 "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
-                "today_buy": empty, "wait_pullback": empty, "execution_pool": empty,
-                "theme_summary": empty, "eliminated": empty
+                "today_buy": empty, "wait_pullback": empty, "theme_summary": empty, "eliminated": empty
             }
 
         base = filtered_df.copy()
@@ -4446,7 +3639,7 @@ class MasterTradingEngine:
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷 AI選股TOP20")
             plans.append(self.plan_engine.build_plan(sid))
-            if progress_cb and (idx2 % 25 == 0 or idx2 == total):
+            if progress_cb:
                 progress_cb(idx2, total, sid)
             if log_cb and (idx2 % 100 == 0 or idx2 == total):
                 log_cb(f"AI選股分析進度 {idx2}/{total}｜{sid}")
@@ -4457,19 +3650,10 @@ class MasterTradingEngine:
             empty = pd.DataFrame()
             return {
                 "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
-                "today_buy": empty, "wait_pullback": empty, "execution_pool": empty,
-                "theme_summary": ThemeStrengthEngine.summarize(base), "eliminated": empty
+                "today_buy": empty, "wait_pullback": empty, "theme_summary": ThemeStrengthEngine.summarize(base), "eliminated": empty
             }
 
         preferred_mask = plans_df["theme"].isin(hot_themes) if hot_themes else pd.Series([True] * len(plans_df), index=plans_df.index)
-        top_themes = ThemeStrengthEngine.summarize(base).head(3)["theme"].astype(str).tolist() if not base.empty else []
-        plans_df["theme_bonus_dynamic"] = plans_df["theme"].astype(str).apply(lambda t: 15.0 if t in top_themes else (8.0 if t in hot_themes else 0.0))
-        if "mainstream_score" not in plans_df.columns:
-            plans_df["mainstream_score"] = plans_df.get("selection_score", 0)
-        plans_df["mainstream_score"] = pd.to_numeric(plans_df["mainstream_score"], errors="coerce").fillna(0) + plans_df["theme_bonus_dynamic"]
-        if "breakout_score" not in plans_df.columns:
-            plans_df["breakout_score"] = plans_df.get("selection_score", 0)
-        plans_df["breakout_score"] = pd.to_numeric(plans_df["breakout_score"], errors="coerce").fillna(0) + plans_df["theme_bonus_dynamic"]
 
         # 依 SOP 順序：先篩決策，再支撐>0，再壓力>支撐，最後按六模組總分排序
         eligible = plans_df[
@@ -4482,21 +3666,9 @@ class MasterTradingEngine:
         if not tradable.empty:
             tradable["decision_rank"] = tradable["decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1}).fillna(0)
             tradable["preferred_rank"] = preferred_mask.reindex(tradable.index).fillna(False).astype(int)
-            tradable = tradable.sort_values(["modules_pass_count", "liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
+            tradable = tradable.sort_values(["liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
 
-        mainstream_top20 = tradable.sort_values(["mainstream_score", "modules_pass_count", "liquidity_score", "model_score"], ascending=False).head(20).copy() if not tradable.empty else pd.DataFrame()
-        breakout_top20 = tradable.sort_values(["breakout_score", "modules_pass_count", "position_score", "trade_score"], ascending=False).head(20).copy() if not tradable.empty else pd.DataFrame()
-        combined_parts = []
-        if not mainstream_top20.empty:
-            tmp = mainstream_top20.copy(); tmp["candidate_engine"] = "主流TOP20"; combined_parts.append(tmp)
-        if not breakout_top20.empty:
-            tmp = breakout_top20.copy(); tmp["candidate_engine"] = "起爆TOP20"; combined_parts.append(tmp)
-        trade_top20 = pd.concat(combined_parts, ignore_index=True) if combined_parts else tradable.head(20).copy()
-        if not trade_top20.empty:
-            trade_top20["stock_id"] = trade_top20["stock_id"].astype(str)
-            trade_top20 = trade_top20.sort_values(["modules_pass_count", "liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
-            trade_top20 = trade_top20.drop_duplicates(subset=["stock_id"], keep="first").head(20).copy()
-            trade_top20["pool_role"] = "交易候選池"
+        trade_top20 = tradable.head(20).copy()  # 依你的要求，TOP20 保留
 
         attack = trade_top20[(trade_top20["decision"] == "BUY") & (trade_top20["liquidity_status"] == "PASS")].copy()
         watch = trade_top20[(trade_top20["liquidity_status"] == "WATCH") | (trade_top20["decision"].isin(["WEAK BUY", "HOLD"]))].copy()
@@ -4508,38 +3680,21 @@ class MasterTradingEngine:
         ].copy()
         if not defense.empty:
             defense = defense.sort_values(["model_score", "trade_score", "rr", "win_rate"], ascending=False).head(10)
-            defense["pool_role"] = "防守池"
 
-        # 依規格書：Today_Buy / Wait_Pullback 必須只從 Trade_TOP20 派生，不可從 tradable 另選
-        today_buy = trade_top20[
-            (trade_top20["decision"].isin(["BUY", "WEAK BUY"])) &
-            (trade_top20["modules_pass_count"] >= 4) &
-            (trade_top20["liquidity_status"].isin(["PASS", "WATCH"])) &
-            (trade_top20["rr"] >= 1.15) &
-            (trade_top20["win_rate"] >= max(55.0, market["min_win_rate"] - 12))
-        ].sort_values(["modules_pass_count", "liquidity_score", "model_score"], ascending=False).copy()
-        if not today_buy.empty:
-            today_buy["pool_role"] = "今日可買"
+        today_buy = tradable[
+            (tradable["decision"] == "BUY") &
+            (tradable["liquidity_status"] == "PASS") &
+            (tradable["rr"] >= 1.2) &
+            (tradable["win_rate"] >= max(55.0, market["min_win_rate"] - 10))
+        ].sort_values(["liquidity_score", "model_score"], ascending=False)
 
-        wait_pullback = trade_top20[
-            ((trade_top20["decision"].isin(["WEAK BUY", "HOLD"])) | (trade_top20["modules_pass_count"] == 3)) &
-            (trade_top20["liquidity_status"].isin(["PASS", "WATCH"])) &
-            (trade_top20["rr"] >= 1.0)
-        ].sort_values(["modules_pass_count", "liquidity_score", "model_score"], ascending=False).copy()
-        if not wait_pullback.empty:
-            wait_pullback["pool_role"] = "等待拉回"
-
-        execution_parts = []
-        if not today_buy.empty:
-            execution_parts.append(today_buy.copy())
-        if not wait_pullback.empty:
-            execution_parts.append(wait_pullback.copy())
-        execution_pool = pd.concat(execution_parts, ignore_index=True) if execution_parts else pd.DataFrame(columns=trade_top20.columns.tolist() + ["pool_role"])
-        if not execution_pool.empty and "stock_id" in execution_pool.columns:
-            execution_pool = execution_pool.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+        wait_pullback = tradable[
+            (tradable["decision"].isin(["WEAK BUY", "HOLD"])) &
+            (tradable["liquidity_status"].isin(["PASS", "WATCH"])) &
+            (tradable["rr"] >= 1.0)
+        ].sort_values(["liquidity_score", "model_score"], ascending=False)
 
         dynamic_n = max(1, min(10, market["max_positions"] + 2))
-        execution_pool = execution_pool.head(dynamic_n * 2).copy() if not execution_pool.empty else execution_pool
 
         return {
             "market": market,
@@ -4549,10 +3704,7 @@ class MasterTradingEngine:
             "defense": defense.head(10),
             "today_buy": today_buy.head(dynamic_n),
             "wait_pullback": wait_pullback.head(dynamic_n),
-            "execution_pool": execution_pool,
             "theme_summary": ThemeStrengthEngine.summarize(base),
-            "mainstream_top20": mainstream_top20.head(20) if not mainstream_top20.empty else pd.DataFrame(),
-            "breakout_top20": breakout_top20.head(20) if not breakout_top20.empty else pd.DataFrame(),
             "eliminated": eliminated.head(20),
         }
 
@@ -4771,7 +3923,7 @@ class PortfolioEngine:
 
     def build_institutional_plan(self, candidates: pd.DataFrame) -> pd.DataFrame:
         cols = [
-            "優先級","代號","名稱","現價","市場","產業","題材","分類","狀態","盤中狀態","活性分","淘汰原因","進場區","停損",
+            "優先級","代號","名稱","市場","產業","題材","分類","狀態","盤中狀態","活性分","淘汰原因","進場區","停損",
             "1.382","1.618","RR","勝率","模型分數","交易分數","ATR%","Kelly%","建議張數","建議金額","單檔曝險%",
             "題材曝險%","產業曝險%","投資組合狀態","風險備註"
         ]
@@ -4860,7 +4012,6 @@ class PortfolioEngine:
                 "優先級": i,
                 "代號": r.get("stock_id",""),
                 "名稱": r.get("stock_name",""),
-                "現價": f"{float(r.get('price', 0) or 0):.2f}",
                 "市場": r.get("market",""),
                 "產業": industry,
                 "題材": theme,
@@ -4939,259 +4090,6 @@ class OperationGuideEngine:
         return mapping.get(str(ui_state or ""), "依 SOP 判斷，不做主觀硬拗。")
 
 
-class FinalDecisionEngine:
-    @staticmethod
-    def _safe_float(v, default: float = 0.0) -> float:
-        try:
-            return float(v)
-        except Exception:
-            return float(default)
-
-    @staticmethod
-    def _safe_int(v, default: int = 0) -> int:
-        try:
-            return int(float(v))
-        except Exception:
-            return int(default)
-
-    @staticmethod
-    def _position_bucket(price: float, support: float, resistance: float) -> str:
-        if support <= 0 or resistance <= support:
-            return "未知"
-        width = max(resistance - support, 1e-6)
-        pos = (price - support) / width
-        if pos <= 0.33:
-            return "低位"
-        if pos <= 0.66:
-            return "中位"
-        return "高位"
-
-    @staticmethod
-    def _distribution_flag(row: pd.Series) -> str:
-        price = FinalDecisionEngine._safe_float(row.get("price", 0))
-        resistance = FinalDecisionEngine._safe_float(row.get("resistance", 0))
-        rsi = FinalDecisionEngine._safe_float(row.get("rsi", 50))
-        liq = FinalDecisionEngine._safe_float(row.get("liquidity_score", 0))
-        signal = str(row.get("signal", "") or "")
-        if resistance > 0 and price >= resistance * 0.985 and (rsi >= 72 or liq >= 85):
-            return "是"
-        if signal == "突破強勢" and rsi >= 75:
-            return "是"
-        return "否"
-
-    @staticmethod
-    def _distance_to_entry_pct(price: float, entry_high: float) -> float:
-        if entry_high <= 0:
-            return 0.0
-        return round((price - entry_high) / entry_high * 100.0, 2)
-
-    @staticmethod
-    def _operation_grade_from_row(row: pd.Series, decision_bucket: str, execution_ready: int, distribution_flag: str) -> str:
-        wave = str(row.get("wave", "") or "")
-        count = FinalDecisionEngine._safe_int(row.get("modules_pass_count", 0), 0)
-        if distribution_flag == "是" or decision_bucket == "排除" or wave == "第5浪":
-            return "C"
-        if wave == "第3浪" and count >= 5 and execution_ready == 1:
-            return "S"
-        if count >= 4 and decision_bucket == "主攻":
-            return "A"
-        if count >= 3 or decision_bucket == "等待拉回":
-            return "B"
-        return "C"
-
-    @staticmethod
-    def _normalize_light_value(light: str) -> str:
-        light = str(light or "").strip()
-        alias = {
-            "red": "🔴", "orange": "🟠", "yellow": "🟡", "green": "🟢", "blue": "🔵", "neutral": "⚪",
-            "light_red": "🔴", "light_orange": "🟠", "light_yellow": "🟡", "light_green": "🟢", "light_blue": "🔵", "light_neutral": "⚪",
-            "R": "🔴", "O": "🟠", "Y": "🟡", "G": "🟢", "B": "🔵", "N": "⚪",
-            "紅": "🔴", "橘": "🟠", "黃": "🟡", "綠": "🟢", "藍": "🔵", "白": "⚪",
-            "○": "⚪",
-        }
-        return alias.get(light, light if light in ("🔴", "🟠", "🟡", "🟢", "🔵", "⚪") else "⚪")
-
-    @staticmethod
-    def _bucket_from_light(light: str, is_etf: bool = False) -> str:
-        light = FinalDecisionEngine._normalize_light_value(light)
-        if is_etf:
-            return "防守"
-        if light in ("🔵", "🟢"):
-            return "主攻"
-        if light in ("🟡", "🟠"):
-            return "等待拉回"
-        return "排除"
-
-    @staticmethod
-    def _grade_from_light(light: str, is_etf: bool = False) -> str:
-        light = FinalDecisionEngine._normalize_light_value(light)
-        if is_etf:
-            return "B"
-        if light == "🔵":
-            return "S"
-        if light == "🟢":
-            return "A"
-        if light in ("🟡", "🟠"):
-            return "B"
-        return "C"
-
-    @staticmethod
-    def finalize(trade_top20: pd.DataFrame, today_buy: pd.DataFrame, wait_pullback: pd.DataFrame, defense: pd.DataFrame, institutional_plan: pd.DataFrame, theme_summary: pd.DataFrame) -> pd.DataFrame:
-        frames = []
-        for role, df in (("交易候選", trade_top20), ("今日可買", today_buy), ("等待拉回", wait_pullback), ("防守", defense)):
-            if df is not None and not df.empty:
-                part = df.copy()
-                part["source_role"] = role
-                frames.append(part)
-        if not frames:
-            return pd.DataFrame(columns=["stock_id", "stock_name", "decision_bucket", "decision_reason", "risk_reason", "execution_ready", "empty_reason", "strategy_layer_source"])
-
-        merged = pd.concat(frames, ignore_index=True, sort=False)
-        if "stock_id" in merged.columns:
-            merged["stock_id"] = merged["stock_id"].astype(str)
-            merged = merged.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
-
-        theme_weight_map = {}
-        if theme_summary is not None and not theme_summary.empty and all(c in theme_summary.columns for c in ["theme", "hot_score"]):
-            ts = theme_summary[["theme", "hot_score"]].copy()
-            ts["hot_score"] = pd.to_numeric(ts["hot_score"], errors="coerce").fillna(0)
-            ts["top_name"] = ""
-            max_hot = float(ts["hot_score"].max()) if not ts.empty else 0.0
-            ts["theme_weight"] = (ts["hot_score"] / max_hot * 100).round(2) if max_hot > 0 else 0.0
-            theme_weight_map = dict(zip(ts["theme"].astype(str), ts["theme_weight"]))
-        merged["theme_weight"] = merged.get("theme", pd.Series(dtype=object)).astype(str).map(theme_weight_map).fillna(0.0)
-
-        plan_lookup = {}
-        if institutional_plan is not None and not institutional_plan.empty and "代號" in institutional_plan.columns:
-            plan_lookup = institutional_plan.set_index(institutional_plan["代號"].astype(str)).to_dict("index")
-
-        today_buy_ids = set(today_buy["stock_id"].astype(str).tolist()) if today_buy is not None and not today_buy.empty and "stock_id" in today_buy.columns else set()
-        wait_ids = set(wait_pullback["stock_id"].astype(str).tolist()) if wait_pullback is not None and not wait_pullback.empty and "stock_id" in wait_pullback.columns else set()
-        defense_ids = set(defense["stock_id"].astype(str).tolist()) if defense is not None and not defense.empty and "stock_id" in defense.columns else set()
-
-        rows = []
-        for _, row in merged.iterrows():
-            sid = str(row.get("stock_id", "") or "")
-            price = FinalDecisionEngine._safe_float(row.get("price", 0))
-            entry_high = FinalDecisionEngine._safe_float(row.get("entry_high", 0))
-            support = FinalDecisionEngine._safe_float(row.get("support", 0))
-            resistance = FinalDecisionEngine._safe_float(row.get("resistance", 0))
-            trade_action = str(row.get("trade_action", row.get("decision", "")) or "").upper()
-            ui_state = str(row.get("ui_state", "") or "")
-            liquidity_status = str(row.get("liquidity_status", "") or "")
-            is_etf = FinalDecisionEngine._safe_int(row.get("is_etf", 0)) == 1
-            plan_row = plan_lookup.get(sid, {})
-            inst_status = str(plan_row.get("盤中狀態", "") or "")
-            suggested_qty = FinalDecisionEngine._safe_float(plan_row.get("建議張數", 0), 0)
-            distance = FinalDecisionEngine._distance_to_entry_pct(price, entry_high)
-            position_bucket = FinalDecisionEngine._position_bucket(price, support, resistance)
-            distribution_flag = FinalDecisionEngine._distribution_flag(row)
-            final_trade_decision = str(row.get("final_trade_decision", trade_action) or trade_action).upper()
-            modules_pass_count = FinalDecisionEngine._safe_int(row.get("modules_pass_count", 0), 0)
-            operation_grade = str(row.get("operation_grade", "") or "")
-            risk_reasons = []
-            reasons = []
-            empty_reason = ""
-            strategy_layer_source = str(row.get("source_role", "交易候選") or "交易候選")
-
-            tactical_light = FinalDecisionEngine._normalize_light_value(row.get("tactical_light", "⚪"))
-            light_bucket = FinalDecisionEngine._bucket_from_light(tactical_light, is_etf=is_etf)
-
-            if is_etf or sid in defense_ids or str(row.get("bucket", "")) == "防守":
-                decision_bucket = "防守"
-                reasons.append("ETF/防守池")
-                strategy_layer_source = "Defense"
-            elif tactical_light in ("🔴", "⚪") or trade_action == "AVOID" or final_trade_decision in ("AVOID", "ELIMINATE") or liquidity_status == "ELIMINATE":
-                decision_bucket = "排除"
-                reasons.append(f"燈號={tactical_light} 不可列為主攻")
-                strategy_layer_source = "Eliminated"
-            elif tactical_light in ("🟡", "🟠"):
-                decision_bucket = "等待拉回"
-                reasons.append(f"燈號={tactical_light}，僅保留等待拉回")
-                strategy_layer_source = "Wait_Pullback"
-            elif tactical_light in ("🔵", "🟢") and ((sid in today_buy_ids) or (trade_action in ("BUY", "WEAK BUY") and modules_pass_count >= 4 and position_bucket != "高位")):
-                decision_bucket = "主攻"
-                reasons.append(f"燈號={tactical_light}，策略層主攻成立")
-                strategy_layer_source = "Final主攻"
-            elif light_bucket == "等待拉回" or sid in wait_ids or distance > 3.5 or trade_action == "HOLD" or ui_state in ("預掛單", "觀察"):
-                decision_bucket = "等待拉回"
-                reasons.append("方向正確但未到執行條件")
-                strategy_layer_source = "Wait_Pullback"
-            else:
-                decision_bucket = "排除"
-                reasons.append("不符合唯一決策規則")
-                strategy_layer_source = "Eliminated"
-
-            if distribution_flag == "是":
-                risk_reasons.append("高位/出貨警示")
-                if decision_bucket == "主攻":
-                    decision_bucket = "等待拉回"
-                    reasons.append("高位/出貨警示降級")
-                    strategy_layer_source = "Wait_Pullback"
-            if position_bucket == "高位":
-                risk_reasons.append("位置偏高")
-            rsi_val = FinalDecisionEngine._safe_float(row.get("rsi", row.get("rsi14", 50)), 50)
-            if rsi_val >= 72:
-                risk_reasons.append("RSI偏高")
-            if liquidity_status == "WATCH":
-                risk_reasons.append("盤中狀態WATCH")
-            if liquidity_status == "ELIMINATE":
-                risk_reasons.append("盤中結構淘汰")
-
-            execution_ready = int(decision_bucket == "主攻" and inst_status == "PASS" and suggested_qty > 0 and trade_action in ("BUY", "WEAK BUY"))
-            if decision_bucket == "主攻" and not execution_ready:
-                fail_reasons = []
-                if inst_status != "PASS":
-                    fail_reasons.append(f"盤中狀態={inst_status or '未評級'}")
-                if suggested_qty <= 0:
-                    fail_reasons.append("建議張數=0")
-                if trade_action not in ("BUY", "WEAK BUY"):
-                    fail_reasons.append(f"交易動作={trade_action or '-'}")
-                empty_reason = " / ".join(fail_reasons)
-                if empty_reason:
-                    reasons.append(f"暫不可執行：{empty_reason}")
-
-            reason_tail = []
-            if str(row.get("signal", "")):
-                reason_tail.append(str(row.get("signal", "")))
-            if str(row.get("wave", "")):
-                reason_tail.append(str(row.get("wave", "")))
-            if sid in today_buy_ids:
-                reason_tail.append("今日可買")
-            elif sid in wait_ids:
-                reason_tail.append("等待拉回")
-            if inst_status:
-                reason_tail.append(f"盤中={inst_status}")
-            if suggested_qty > 0:
-                reason_tail.append(f"建議張數={suggested_qty:g}")
-
-            out = row.to_dict()
-            operation_grade = FinalDecisionEngine._grade_from_light(tactical_light, is_etf=is_etf)
-            out.update({
-                "distance_to_entry_pct": distance,
-                "position_bucket": position_bucket,
-                "distribution_flag": distribution_flag,
-                "execution_ready": execution_ready,
-                "decision_bucket": decision_bucket,
-                "decision_reason": "｜".join(reasons + reason_tail),
-                "risk_reason": "｜".join(dict.fromkeys([r for r in risk_reasons if r])) if risk_reasons else "",
-                "empty_reason": empty_reason,
-                "strategy_layer_source": strategy_layer_source,
-                "theme_weight": round(FinalDecisionEngine._safe_float(out.get("theme_weight", 0)), 2),
-                "inst_status": inst_status,
-                "suggested_qty": suggested_qty,
-                "operation_grade": operation_grade,
-            })
-            rows.append(out)
-
-        final_df = pd.DataFrame(rows)
-        if not final_df.empty:
-            priority_map = {"主攻": 0, "等待拉回": 1, "防守": 2, "排除": 3}
-            final_df["decision_priority"] = final_df["decision_bucket"].map(priority_map).fillna(9)
-            final_df = final_df.sort_values(["decision_priority", "execution_ready", "modules_pass_count", "theme_weight", "liquidity_score", "model_score", "trade_score", "win_rate"], ascending=[True, False, False, False, False, False, False, False]).reset_index(drop=True)
-        return final_df
-
-
 class AppUI:
     def __init__(self, root, db: DBManager):
         self.root = root
@@ -5201,13 +4099,7 @@ class AppUI:
         self.master_trading_engine = MasterTradingEngine(db)
         self.backtest_engine = BacktestEngine(db)
         self.portfolio_engine = PortfolioEngine(db)
-        self.realtime_quote_engine = RealtimeQuoteEngine()
-        self.tactical_score_engine = TacticalScoreEngine()
-        self.single_stock_narrative_engine = SingleStockNarrativeEngine()
-        self.ui_tactical_presenter = UITacticalPresenter()
         self.last_top20_df = pd.DataFrame()
-        self.last_mainstream_top20_df = pd.DataFrame()
-        self.last_breakout_top20_df = pd.DataFrame()
         self.last_top5_df = pd.DataFrame()
         self.last_theme_summary_df = pd.DataFrame()
         self.last_attack_df = pd.DataFrame()
@@ -5215,8 +4107,6 @@ class AppUI:
         self.last_defense_df = pd.DataFrame()
         self.last_order_list_df = pd.DataFrame()
         self.last_institutional_plan_df = pd.DataFrame()
-        self.last_execution_pool_df = pd.DataFrame()
-        self.last_final_decision_df = pd.DataFrame()
         self.last_today_buy_df = pd.DataFrame()
         self.last_wait_df = pd.DataFrame()
         self.last_operation_sop_df = pd.DataFrame()
@@ -5235,8 +4125,6 @@ class AppUI:
         self.history_batch_size = 25
         self.history_sleep_sec = 0.6
         self.last_job_summary = {}
-        self.quote_cache = {}
-        self.last_filter_signature = None
 
         self.root.title(APP_NAME)
         self._configure_startup_window()
@@ -5264,13 +4152,13 @@ class AppUI:
         self.search_var = tk.StringVar(value="")
 
         self._build_ui()
-        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level, False)))
-        self.root.after(80, self.refresh_filters)
-        self.root.after(120, self.show_welcome_message)
+        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
+        self.refresh_filters()
+        self.show_welcome_message()
+        self.refresh_all_tables()
         self.root.after(180, self._apply_initial_layout)
-        self.root.after(260, self.bootstrap_after_startup)
         self.root.after(600, self._apply_initial_layout)
-        self.set_status(f"啟動畫面已建立｜PACKED={PACKED_DATA_DIR.name} | EXTERNAL={EXTERNAL_DATA_DIR.name}")
+        self.set_status(f"PACKED={PACKED_DATA_DIR} | EXTERNAL={EXTERNAL_DATA_DIR} | CSV={MASTER_CSV}")
 
     def _configure_startup_window(self):
         """啟動時自動貼齊可視區域，避免主視窗超出螢幕範圍。"""
@@ -5294,54 +4182,6 @@ class AppUI:
             self.root.geometry(f"{width}x{height}+{x}+{y}")
         except Exception:
             self.root.geometry("1500x860")
-
-    def bootstrap_after_startup(self):
-        with STARTUP_BOOTSTRAP_LOCK:
-            if getattr(self, "_bootstrap_started", False) or STARTUP_BOOTSTRAP_EVENT.is_set():
-                return
-            self._bootstrap_started = True
-            STARTUP_BOOTSTRAP_EVENT.set()
-
-        def worker():
-            try:
-                self.ui_call(self.set_status, "啟動中：載入主檔 / 排行...")
-                master = self.db.get_master()
-                init_message = f"股票主檔已載入，共 {len(master)} 檔" if master is not None and not master.empty else "股票主檔尚未建立"
-                if master is None or master.empty:
-                    universe = build_full_market_universe()
-                    if universe is not None and not universe.empty:
-                        self.db.import_master_df(universe)
-                        master = self.db.get_master()
-                        init_message = f"已於背景建立全市場股票主檔，共 {len(master)} 檔"
-                    else:
-                        csv_path = resolve_master_csv()
-                        self.db.import_master_csv(csv_path)
-                        master = self.db.get_master()
-                        init_message = f"已於背景改用本地主檔，共 {len(master)} 檔 | {csv_path}"
-
-                rank_count = self.db.get_ranking_rows_count()
-                if rank_count == 0 and self.db.get_total_price_rows() > 0:
-                    self.ui_call(self.set_status, "啟動中：背景重建排行...")
-                    rank_count = self.rank_engine.rebuild(
-                        log_cb=lambda msg: self.ui_call(self.append_log, msg),
-                        cancel_cb=lambda: self.cancel_event.is_set(),
-                    )
-                    if rank_count > 0:
-                        init_message += f"｜已於背景重建排行 {rank_count} 檔"
-                    else:
-                        init_message += "｜已有歷史資料，但目前不足以形成排行"
-
-                self.ui_call(self.refresh_filters)
-                self.ui_call(self.refresh_all_tables)
-                self.ui_call(self.refresh_classification_summary_ui)
-                self.ui_call(self.show_welcome_message)
-                self.ui_call(self.set_status, init_message)
-            except Exception as e:
-                log_exception("background bootstrap failed", e)
-                self.ui_call(self.append_log, f"背景初始化失敗：{e}", "ERROR")
-                self.ui_call(self.set_status, f"背景初始化失敗：{e}")
-
-        self._run_in_thread(worker, "startup_bootstrap")
 
     def _apply_initial_layout(self):
         """啟動後固定三區比例，減少人工手動調整。"""
@@ -5368,7 +4208,7 @@ class AppUI:
             log_warning(f"套用啟動版型失敗：{exc}")
 
     def show_welcome_message(self):
-        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level, False)))
+        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
         last_date = self.db.get_last_price_date() or "尚未建立"
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
@@ -5388,8 +4228,6 @@ class AppUI:
         if cls_v2:
             coverage_text = f"{float(cls_v2.get('coverage_pct', 0) or 0):.2f}%"
             coverage_detail = f"官方 {int(cls_v2.get('official', 0) or 0)}｜手動 {int(cls_v2.get('manual', 0) or 0)}｜規則 {int(cls_v2.get('rule_engine', 0) or 0)}｜AI {int(cls_v2.get('ai_infer', 0) or 0)}｜未分類 {int(cls_v2.get('unclassified', 0) or 0)}"
-            if int(cls_v2.get('total', 0) or 0) < CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS:
-                coverage_detail += "｜摘要保護中"
         lines = [
             "《GTC AI Trading System v9.2 FINAL-RELEASE》",
             "",
@@ -5497,7 +4335,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "唯一決策", "下單清單", "機構交易計畫", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可買", "等待拉回", "預掛單", "主攻", "次強", "防守", "下單清單", "機構交易計畫", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -5544,7 +4382,7 @@ class AppUI:
         self.left_notebook.add(self.tab_rank, text="排行榜")
         self.left_notebook.add(self.tab_sector, text="類股熱度")
         self.left_notebook.add(self.tab_theme, text="題材輪動")
-        self.left_notebook.add(self.tab_top20, text="雙引擎TOP20")
+        self.left_notebook.add(self.tab_top20, text="AI交易TOP20")
         self.left_notebook.add(self.tab_top5, text="AI選股TOP5")
         self.left_notebook.add(self.tab_order, text="下單清單")
         self.left_notebook.add(self.tab_inst, text="機構交易計畫")
@@ -5562,8 +4400,8 @@ class AppUI:
             "industry": "產業", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "trend_count": "強勢數", "hot_score": "輪動分", "rotation": "輪動狀態"
         })
 
-        self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "price", "industry", "theme", "total", "ai", "signal", "action"), {
-            "rank": "排名", "id": "代號", "name": "名稱", "price": "股價", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
+        self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "industry", "theme", "total", "ai", "signal", "action"), {
+            "rank": "排名", "id": "代號", "name": "名稱", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
         })
         self.rank_tree.bind("<<TreeviewSelect>>", self.on_select_stock)
 
@@ -5575,31 +4413,30 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "light", "engine", "price", "bucket", "grade", "ui_action", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "light": "燈態", "engine": "來源", "price": "股價", "bucket": "分類", "grade": "操作權", "ui_action": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
-        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "light", "name", "price", "state", "orderbook", "intra", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
-            "rank": "排序", "id": "代號", "light": "燈號", "name": "名稱", "price": "股價", "state": "狀態", "orderbook": "五檔偏向", "intra": "盤中分", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
+        self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "state": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
         })
         self.top5_tree.bind("<<TreeviewSelect>>", self.on_select_top5)
 
-        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note", "reason"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "price": "股價", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註", "reason": "決策/空表說明"
+        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
         })
         self.order_tree.bind("<<TreeviewSelect>>", self.on_select_order)
 
-        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "price", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "price": "股價", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
+        self.inst_tree = self._make_tree(self.tab_inst, ("priority", "id", "name", "market", "industry", "theme", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "rr", "win_rate", "model_score", "trade_score", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "theme_pct", "industry_pct", "portfolio_state"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "market": "市場", "industry": "產業", "theme": "題材", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "rr": "RR", "win_rate": "勝率%", "model_score": "模型分數", "trade_score": "交易分數", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "theme_pct": "題材曝險%", "industry_pct": "產業曝險%", "portfolio_state": "組合狀態"
         })
         self.inst_tree.bind("<<TreeviewSelect>>", self.on_select_institutional)
 
-        self.backtest_tree = self._make_tree(self.tab_backtest, ("rank", "id", "name", "price", "win", "avg_ret", "cagr", "mdd", "sharpe", "samples"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "price": "股價", "win": "勝率%", "avg_ret": "平均報酬%", "cagr": "CAGR%", "mdd": "MDD%", "sharpe": "Sharpe", "samples": "樣本數"
+        self.backtest_tree = self._make_tree(self.tab_backtest, ("rank", "id", "name", "win", "avg_ret", "cagr", "mdd", "sharpe", "samples"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "win": "勝率%", "avg_ret": "平均報酬%", "cagr": "CAGR%", "mdd": "MDD%", "sharpe": "Sharpe", "samples": "樣本數"
         })
         self.backtest_tree.bind("<<TreeviewSelect>>", self.on_select_backtest)
-        self.left_notebook.bind("<<NotebookTabChanged>>", self.on_left_tab_changed)
 
         self.right_paned = ttk.Panedwindow(right, orient="vertical")
         self.right_paned.pack(fill="both", expand=True)
@@ -5654,29 +4491,9 @@ class AppUI:
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=28)
-        try:
-            tree.tag_configure("light_red", foreground="#9f1239", background="#fff1f2")
-            tree.tag_configure("light_orange", foreground="#9a3412", background="#fff7ed")
-            tree.tag_configure("light_yellow", foreground="#854d0e", background="#fefce8")
-            tree.tag_configure("light_green", foreground="#166534", background="#f0fdf4")
-            tree.tag_configure("light_blue", foreground="#1d4ed8", background="#eff6ff")
-            tree.tag_configure("light_neutral", foreground="#374151", background="#f8fafc")
-            tree.tag_configure("light_disabled", foreground="#6b7280", background="#f3f4f6")
-        except Exception:
-            pass
-        narrow_cols = {"rank", "count", "avg_total", "avg_ai", "id", "total", "ai", "price", "intra", "liq_score", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "single_pct", "theme_pct", "industry_pct", "backtest", "cagr", "mdd", "win", "avg_ret", "samples", "light"}
-        medium_cols = {"state", "action", "signal", "liquidity", "market", "bucket", "ui_action", "priority", "engine", "grade"}
-        wide_cols = {"name", "industry", "theme", "entry", "stop", "target1382", "target1618", "portfolio_state", "risk_note", "elim_reason", "reason"}
         for c in cols:
             tree.heading(c, text=headers[c])
-            width = 140
-            if c in narrow_cols:
-                width = 90
-            elif c in medium_cols:
-                width = 110
-            elif c in wide_cols:
-                width = 130
-            tree.column(c, width=width, anchor="center")
+            tree.column(c, width=140 if c not in ("rank", "count", "avg_total", "avg_ai", "id", "total", "ai") else 90, anchor="center")
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -5686,83 +4503,6 @@ class AppUI:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         return tree
-
-    def _normalize_light_value(self, light):
-        light = str(light or "").strip()
-        alias = {
-            "red": "🔴", "orange": "🟠", "yellow": "🟡", "green": "🟢", "blue": "🔵", "neutral": "⚪",
-            "light_red": "🔴", "light_orange": "🟠", "light_yellow": "🟡", "light_green": "🟢", "light_blue": "🔵", "light_neutral": "⚪",
-            "R": "🔴", "O": "🟠", "Y": "🟡", "G": "🟢", "B": "🔵", "N": "⚪",
-            "紅": "🔴", "橘": "🟠", "黃": "🟡", "綠": "🟢", "藍": "🔵", "白": "⚪",
-            "○": "⚪",
-        }
-        return alias.get(light, light if light in ("🔴", "🟠", "🟡", "🟢", "🔵", "⚪") else "⚪")
-
-    def _get_display_light(self, row):
-        row = dict(row or {})
-        light = self._normalize_light_value(row.get("tactical_light", ""))
-        if light and light != "⚪":
-            return light
-        signal = str(row.get("signal", "") or "").strip()
-        if signal:
-            return self._normalize_light_value(UITacticalPresenter.derive_signal_light(
-                signal,
-                score=float(row.get("score", row.get("selection_score", 0)) or 0),
-                change_pct=float(row.get("change_pct", 0) or 0),
-                intraday_score=float(row.get("intraday_score", 0) or 0),
-            ))
-        return "⚪"
-
-    def _display_light_symbol(self, light):
-        light = self._normalize_light_value(light)
-        mapping = {
-            "🔴": "紅",
-            "🟠": "橘",
-            "🟡": "黃",
-            "🟢": "綠",
-            "🔵": "藍",
-            "⚪": "白",
-        }
-        return mapping.get(light, "白")
-
-    def _derive_bucket_from_light(self, light, is_etf: bool = False):
-        light = self._normalize_light_value(light)
-        if is_etf:
-            return "防守"
-        if light in ("🔵", "🟢"):
-            return "主攻"
-        if light in ("🟡", "🟠"):
-            return "觀察"
-        return "排除"
-
-    def _derive_operation_grade_from_light(self, light, is_etf: bool = False):
-        light = self._normalize_light_value(light)
-        if is_etf:
-            return "B"
-        if light == "🔵":
-            return "S"
-        if light == "🟢":
-            return "A"
-        if light in ("🟡", "🟠"):
-            return "B"
-        return "C"
-
-    def _resolve_light_tag(self, light=""):
-        """燈號顏色唯一來源：只接受 tactical_light / signal fallback 的最終燈號。"""
-        light = self._normalize_light_value(light)
-        mapping = {
-            "🔴": "light_red",
-            "🟠": "light_orange",
-            "🟡": "light_yellow",
-            "🟢": "light_green",
-            "🔵": "light_blue",
-            "⚪": "light_neutral",
-        }
-        return mapping.get(light, "light_neutral")
-
-    def _insert_colored_row(self, tree, values, light=""):
-        tag = self._resolve_light_tag(light=light)
-        return tree.insert("", "end", values=values, tags=(tag,))
 
     def set_status(self, text):
         self.status_label.config(text=text)
@@ -5796,66 +4536,19 @@ class AppUI:
     def finish_task(self, stage: str, summary: str = ""):
         self.set_status(summary or f"{stage} 完成")
 
-    def _fmt_price(self, value) -> str:
-        try:
-            return f"{float(value):.2f}"
-        except Exception:
-            return "-"
-
-    def _get_stock_display_price(self, stock_id: str, row: dict | pd.Series | None = None) -> str:
-        try:
-            if row is not None:
-                for key in ("price", "close", "last_price", "現價"):
-                    if hasattr(row, "get"):
-                        v = row.get(key, None)
-                        if v not in (None, "", "-", "--"):
-                            return self._fmt_price(v)
-        except Exception:
-            pass
-        try:
-            hist = self.db.get_price_history(str(stock_id))
-            if hist is not None and not hist.empty:
-                return self._fmt_price(hist.iloc[-1].get("close", 0))
-        except Exception:
-            pass
-        return "-"
-
-    def build_enriched_ranking_dataframe(self, df: pd.DataFrame, scope: str = "ui", max_rows: int | None = None) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame() if df is None else df.copy()
-        x = df.copy()
-        if max_rows is not None and max_rows > 0:
-            head = x.head(max_rows).copy()
-            tail = x.iloc[max_rows:].copy() if len(x) > max_rows else pd.DataFrame(columns=x.columns)
-        else:
-            head = x
-            tail = pd.DataFrame(columns=x.columns)
-        prices = []
-        for _, row in head.iterrows():
-            sid = str(row.get("stock_id", "") or "")
-            prices.append(self._get_stock_display_price(sid, row))
-        head["display_price"] = prices
-        if not tail.empty:
-            tail["display_price"] = tail.apply(lambda r: self._get_stock_display_price(str(r.get("stock_id", "") or ""), r), axis=1)
-        out = pd.concat([head, tail], ignore_index=True) if not tail.empty else head
-        if "現價" not in out.columns:
-            out["現價"] = out["display_price"]
-        return out
-
-    def append_log(self, text, level: str = "INFO", mirror_to_logger: bool = True):
+    def append_log(self, text, level: str = "INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
         level_upper = str(level or "INFO").upper()
         msg = f"[{ts}] [{level_upper}] {text}"
-        if mirror_to_logger:
-            try:
-                if level_upper == "ERROR":
-                    log_error(text)
-                elif level_upper == "WARNING":
-                    log_warning(text)
-                else:
-                    log_info(text)
-            except Exception:
-                pass
+        try:
+            if level_upper == "ERROR":
+                log_error(text)
+            elif level_upper == "WARNING":
+                log_warning(text)
+            else:
+                log_info(text)
+        except Exception:
+            pass
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
@@ -5885,7 +4578,7 @@ class AppUI:
             pass
 
     def update_classification_book(self):
-        set_classification_log_callback(lambda message, level="INFO": self.ui_call(self.append_log, message, level, False))
+        set_classification_log_callback(lambda message, level="INFO": self.ui_call(self.append_log, message, level))
         def worker():
             self.ui_call(self.start_task, "更新分類檔", 4)
             self.ui_call(self.update_task, "更新分類檔", 1, 4, item="檢查本機快取")
@@ -5968,6 +4661,7 @@ class AppUI:
             self.ui_call(self.set_busy, True)
             self.ui_call(self.reset_progress)
             self.ui_call(self.append_log, f"背景作業啟動：{name}")
+            log_info(f"背景作業啟動：{name}")
             try:
                 target()
                 self.ui_call(self.append_log, f"背景作業完成：{name}")
@@ -6007,52 +4701,9 @@ class AppUI:
         self.last_selected_ts = now
         return False
 
-    def _resolve_stock_id_from_tree_values(self, values, source: str = "") -> str:
-        vals = list(values or [])
-        src = str(source or "").strip()
-        if not vals:
-            return ""
-        index_candidates = {
-            "排行榜": [1],
-            "AI交易TOP20": [1, 0, 4],
-            "AI選股TOP5": [1],
-            "下單清單": [1],
-            "機構交易計畫": [1],
-            "回測視覺化": [1],
-        }.get(src, [1, 2, 0])
-        for idx in index_candidates:
-            if idx < len(vals):
-                sid = normalize_stock_id(vals[idx])
-                if sid:
-                    return sid
-        for v in vals:
-            sid = normalize_stock_id(v)
-            if sid:
-                return sid
-        return ""
-
 
     def open_three_windows(self):
         self.left_notebook.select(self.tab_top20)
-        # 題材頁改用最新題材摘要，避免後端有資料但 UI 空白
-        if self.theme_tree is not None:
-            for item in self.theme_tree.get_children():
-                self.theme_tree.delete(item)
-            theme_df = getattr(self, "last_theme_summary_df", pd.DataFrame())
-            if theme_df is not None and not theme_df.empty:
-                tdf = theme_df.copy()
-                if "top_name" not in tdf.columns:
-                    top_map = {}
-                    source_df = self.last_top20_df if self.last_top20_df is not None and not self.last_top20_df.empty else pd.DataFrame()
-                    if source_df is not None and not source_df.empty and "theme" in source_df.columns:
-                        for theme_name, grp in source_df.groupby("theme"):
-                            try:
-                                top_map[str(theme_name)] = str(grp.sort_values(["model_score", "trade_score", "win_rate"], ascending=False).iloc[0].get("stock_name", ""))
-                            except Exception:
-                                top_map[str(theme_name)] = ""
-                    tdf["top_name"] = tdf["theme"].astype(str).map(top_map).fillna("")
-                for _, r in tdf.iterrows():
-                    self.theme_tree.insert("", "end", values=(r.get("theme", ""), int(r.get("count", 0) or 0), f"{float(r.get('avg_total', 0) or 0):.2f}", f"{float(r.get('avg_ai', 0) or 0):.2f}", r.get("top_name", "")))
         self.sync_multi_windows()
         stock_id = self.window_current_stock_id
         if not stock_id:
@@ -6117,7 +4768,7 @@ class AppUI:
             return self.window_current_stock_id
         if self.last_top20_df is not None and not self.last_top20_df.empty:
             return str(self.last_top20_df.iloc[0]["stock_id"])
-        ranking = self.build_enriched_ranking_dataframe(self._filtered_ranking(), scope="export")
+        ranking = self._filtered_ranking()
         if ranking is not None and not ranking.empty:
             return str(ranking.iloc[0]["stock_id"])
         return None
@@ -6234,7 +4885,6 @@ class AppUI:
                 "market": stock.get("market", "") if stock is not None else "",
                 "industry": stock.get("industry", "") if stock is not None else "",
                 "theme": stock.get("theme", "") if stock is not None else "",
-                "price": round(close_, 2),
                 "ui_state": "觀察", "trade_action": "HOLD", "entry_zone": "-", "stop_loss": "-",
                 "target_1382": 0.0, "target_1618": 0.0, "support": 0.0, "resistance": 0.0, "rr": 0.0,
                 "win_rate": 0.0, "wave": "資料不足", "signal": "載入中", "trade_type": "快速模式", "bucket": "觀察",
@@ -6572,165 +5222,9 @@ class AppUI:
             f"平均報酬 / CAGR / MDD / Sharpe：{float(bt.get('avg_return',0) or 0):.2f}% / {float(bt.get('cagr',0) or 0):.2f}% / {float(bt.get('mdd',0) or 0):.2f}% / {float(bt.get('sharpe',0) or 0):.2f}",
             f"一句話：{reason_text}",
         ]
-        try:
-            lines.extend(self.build_tactical_section_lines(stock_id, hist, stock, trade_plan))
-        except Exception as e:
-            lines.extend(["", f"【Phase 1 Tactical Layer】載入失敗：{e}"])
         if quick_only:
             lines.extend(["", "備註：目前為快速模式，完整 AI 分析與回測背景完成後會自動更新。"])
         return lines
-    def _find_trade_row_snapshot(self, stock_id: str) -> dict:
-        stock_id = str(stock_id or '').strip()
-        frames = [
-            getattr(self, 'last_top20_df', pd.DataFrame()),
-            getattr(self, 'last_top5_df', pd.DataFrame()),
-            getattr(self, 'last_today_buy_df', pd.DataFrame()),
-            getattr(self, 'last_wait_df', pd.DataFrame()),
-            getattr(self, 'last_execution_pool_df', pd.DataFrame()),
-        ]
-        for df in frames:
-            try:
-                if df is not None and not df.empty and 'stock_id' in df.columns:
-                    row = df[df['stock_id'].astype(str) == stock_id]
-                    if not row.empty:
-                        return dict(row.iloc[0])
-            except Exception:
-                continue
-        return {}
-
-    def enrich_trade_dataframe_with_tactical(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame() if df is None else df.copy()
-        x = df.copy()
-        for idx, r in x.iterrows():
-            try:
-                stock_id = str(r.get('stock_id', '') or '')
-                stock = self.db.get_stock_row(stock_id)
-                hist = self.db.get_price_history(stock_id)
-                if stock is None or hist is None or hist.empty:
-                    continue
-                hist = DataEngine.attach(hist.copy())
-                last = hist.iloc[-1]
-                realtime = self.data_engine.get_realtime_quote(stock_id, str(stock.get('market', '上市')), hist=hist)
-                close = float(realtime.get('close', last.get('close', 0)) or 0)
-                prev_close = float(realtime.get('prev_close', hist.iloc[-2]['close']) if len(hist) >= 2 else realtime.get('prev_close', close) or close)
-                open_price = float(realtime.get('open', close) or close)
-                high_price = float(realtime.get('high', close) or close)
-                low_price = float(realtime.get('low', close) or close)
-                change_pct = round(((close - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
-                ma20 = float(last.get('ma20', close) or close)
-                ma60 = float(last.get('ma60', close) or close)
-                rsi = float(last.get('rsi14', 50) or 50)
-                trend_score = float(r.get('total_score', r.get('model_score', 0)) or 0)
-                support = float(r.get('support', 0) or 0)
-                resistance = float(r.get('resistance', 0) or 0)
-                if support <= 0 or resistance <= 0 or resistance <= support:
-                    recent = hist.tail(40)
-                    support = float(recent['low'].min()) if not recent.empty else close
-                    resistance = float(recent['high'].max()) if not recent.empty else close
-                intraday_score = self.tactical_score_engine.calc_intraday_tactical_score(close, prev_close, open_price, high_price, low_price, support, resistance, realtime.get('orderbook_bias', '無有效五檔'), change_pct)
-                signal, advice, state_bucket = self.tactical_score_engine.evaluate_intraday_trade_state(close, prev_close, open_price, support, resistance, change_pct, trend_score, intraday_score, trend_score, realtime.get('orderbook_bias', '無有效五檔'), ma20=ma20, ma60=ma60, rsi=rsi)
-                leader = self.tactical_score_engine.classify_leader_candidate(trend_score, trend_score, intraday_score, close, ma20, ma60, resistance, rsi, signal, realtime.get('orderbook_bias', '無有效五檔'))
-                light = self.ui_tactical_presenter.derive_signal_light(signal, trend_score, change_pct, intraday_score)
-                ctx = {
-                    'close': close, 'ma20': ma20, 'ma60': ma60, 'rsi': rsi, 'score': trend_score, 'trend_score': trend_score, 'intraday_score': intraday_score,
-                    'support': support, 'resistance': resistance, 'signal': signal, 'advice': advice, 'orderbook_bias': realtime.get('orderbook_bias', '無有效五檔'),
-                    'orderbook_ratio': realtime.get('orderbook_ratio', '-'), 'change_pct': change_pct, 'wave_structure': r.get('wave_structure', '-'), 'wave_position': r.get('wave_position', '-'),
-                    'trade_type': r.get('trade_type', '-'), 'entry_zone': r.get('entry_zone', '-'), 'stop_loss': r.get('stop_loss', '-'), 'rr': r.get('rr', 0), 'target_1382': r.get('target_1382', 0), 'target_1618': r.get('target_1618', 0),
-                    'state_bucket': state_bucket, 'light': light, 'leader_candidate': leader
-                }
-                scripts = self.single_stock_narrative_engine.build_trade_scripts_text(ctx)
-                derived_bucket = self._derive_bucket_from_light(light, is_etf=bool(int(r.get('is_etf', 0) or 0) == 1 or str(r.get('market', '')) == 'ETF'))
-                derived_grade = self._derive_operation_grade_from_light(light, is_etf=bool(int(r.get('is_etf', 0) or 0) == 1 or str(r.get('market', '')) == 'ETF'))
-                x.at[idx, 'price'] = close
-                x.at[idx, 'tactical_light'] = light
-                x.at[idx, 'bucket'] = derived_bucket
-                x.at[idx, 'decision_bucket'] = derived_bucket
-                x.at[idx, 'operation_grade'] = derived_grade
-                x.at[idx, 'trade_action'] = 'BUY' if light in ('🔵', '🟢') else ('HOLD' if light in ('🟡', '🟠') else 'AVOID')
-                x.at[idx, 'orderbook_bias'] = realtime.get('orderbook_bias', '無有效五檔')
-                x.at[idx, 'orderbook_ratio'] = realtime.get('orderbook_ratio', '-')
-                x.at[idx, 'intraday_score'] = intraday_score
-                x.at[idx, 'state_bucket'] = state_bucket
-                x.at[idx, 'leader_candidate'] = leader
-                x.at[idx, 'summary_block'] = self.single_stock_narrative_engine.build_summary_block(ctx)
-                x.at[idx, 'ai_analysis_text'] = self.single_stock_narrative_engine.build_ai_summary_text(ctx)
-                x.at[idx, 'wave_analysis_text'] = self.single_stock_narrative_engine.build_wave_summary_text(ctx)
-                x.at[idx, 'fibo_analysis_text'] = self.single_stock_narrative_engine.build_fibo_summary_text(ctx)
-                x.at[idx, 'path_analysis_text'] = self.single_stock_narrative_engine.build_bull_bear_path_text(ctx)
-                x.at[idx, 'risk_note_tactical'] = self.single_stock_narrative_engine.build_tactical_risk_note(close, support, resistance, rsi, trend_score, change_pct)
-                x.at[idx, 'script_a'] = scripts.get('script_a', '')
-                x.at[idx, 'script_b'] = scripts.get('script_b', '')
-                x.at[idx, 'script_c'] = scripts.get('script_c', '')
-            except Exception as e:
-                try:
-                    self.append_log(f'戰術欄位補強失敗：{r.get("stock_id", "")}｜{e}', 'WARNING')
-                except Exception:
-                    pass
-        return x
-
-    def build_tactical_section_lines(self, stock_id: str, hist: pd.DataFrame, stock: pd.Series, trade_plan: dict) -> list[str]:
-        cached = self._find_trade_row_snapshot(stock_id)
-        hist = DataEngine.attach(hist.copy())
-        last = hist.iloc[-1]
-        realtime = self.data_engine.get_realtime_quote(stock_id, str(stock.get('market', '上市')), hist=hist)
-        close = float(realtime.get('close', last.get('close', 0)) or 0)
-        prev_close = float(realtime.get('prev_close', hist.iloc[-2]['close']) if len(hist) >= 2 else realtime.get('prev_close', close) or close)
-        open_price = float(realtime.get('open', close) or close)
-        high_price = float(realtime.get('high', close) or close)
-        low_price = float(realtime.get('low', close) or close)
-        ma20 = float(last.get('ma20', close) or close)
-        ma60 = float(last.get('ma60', close) or close)
-        rsi = float(last.get('rsi14', 50) or 50)
-        support = float(trade_plan.get('support', cached.get('support', 0)) or 0)
-        resistance = float(trade_plan.get('resistance', cached.get('resistance', 0)) or 0)
-        if support <= 0 or resistance <= 0 or resistance <= support:
-            recent = hist.tail(40)
-            support = float(recent['low'].min()) if not recent.empty else close
-            resistance = float(recent['high'].max()) if not recent.empty else close
-        base_score = float(trade_plan.get('model_score', trade_plan.get('total_score', trade_plan.get('wave_trade_score', 0))) or 0)
-        change_pct = round(((close - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
-        intraday_score = float(cached.get('intraday_score', 0) or 0)
-        signal = str(cached.get('signal', trade_plan.get('signal', '-')) or '-')
-        advice = str(cached.get('trade_action', trade_plan.get('trade_action', '-')) or '-')
-        state_bucket = str(cached.get('state_bucket', 'range') or 'range')
-        leader = str(cached.get('leader_candidate', '-') or '-')
-        light = str(cached.get('tactical_light', '') or '')
-        if intraday_score <= 0 or not light:
-            intraday_score = self.tactical_score_engine.calc_intraday_tactical_score(close, prev_close, open_price, high_price, low_price, support, resistance, realtime.get('orderbook_bias', '無有效五檔'), change_pct)
-            signal, advice, state_bucket = self.tactical_score_engine.evaluate_intraday_trade_state(close, prev_close, open_price, support, resistance, change_pct, base_score, intraday_score, base_score, realtime.get('orderbook_bias', '無有效五檔'), ma20=ma20, ma60=ma60, rsi=rsi)
-            leader = self.tactical_score_engine.classify_leader_candidate(base_score, base_score, intraday_score, close, ma20, ma60, resistance, rsi, signal, realtime.get('orderbook_bias', '無有效五檔'))
-            light = self.ui_tactical_presenter.derive_signal_light(signal, base_score, change_pct, intraday_score)
-        ctx = {
-            'close': close, 'ma20': ma20, 'ma60': ma60, 'rsi': rsi, 'score': base_score, 'trend_score': base_score, 'intraday_score': intraday_score,
-            'support': support, 'resistance': resistance, 'signal': signal, 'advice': advice, 'orderbook_bias': realtime.get('orderbook_bias', '無有效五檔'),
-            'orderbook_ratio': realtime.get('orderbook_ratio', '-'), 'change_pct': change_pct, 'wave_structure': trade_plan.get('wave_structure', '-'), 'wave_position': trade_plan.get('wave_position', '-'),
-            'trade_type': trade_plan.get('trade_type', '-'), 'entry_zone': trade_plan.get('entry_zone', '-'), 'stop_loss': trade_plan.get('stop_loss', '-'), 'rr': trade_plan.get('rr', 0), 'target_1382': trade_plan.get('target_1382', 0), 'target_1618': trade_plan.get('target_1618', 0),
-            'state_bucket': state_bucket, 'light': light, 'leader_candidate': leader
-        }
-        scripts = self.single_stock_narrative_engine.build_trade_scripts_text(ctx)
-        return [
-            '',
-            '【Phase 1 Tactical Layer】',
-            f"燈號 / 五檔 / 比率：{light} / {realtime.get('orderbook_bias','無有效五檔')} / {realtime.get('orderbook_ratio','-')}",
-            f"盤中分 / 狀態 / 主升候選：{intraday_score:.1f} / {state_bucket} / {leader}",
-            f"即時價 / 昨收 / 開高低：{close:.2f} / {prev_close:.2f} / {open_price:.2f}-{high_price:.2f}-{low_price:.2f}",
-            f"風險提示：{self.single_stock_narrative_engine.build_tactical_risk_note(close, support, resistance, rsi, base_score, change_pct)}",
-            '',
-            self.single_stock_narrative_engine.build_ai_summary_text(ctx),
-            '',
-            self.single_stock_narrative_engine.build_wave_summary_text(ctx),
-            '',
-            self.single_stock_narrative_engine.build_fibo_summary_text(ctx),
-            '',
-            self.single_stock_narrative_engine.build_bull_bear_path_text(ctx),
-            '',
-            '【交易劇本】',
-            scripts.get('script_a', ''),
-            scripts.get('script_b', ''),
-            scripts.get('script_c', ''),
-        ]
-
     def update_detail_panel(self, stock_id: str, source: str = ""):
         lines = self.build_unified_detail_lines(stock_id, source=source or "多來源同步模式")
         self.detail.delete("1.0", tk.END)
@@ -7084,7 +5578,6 @@ class AppUI:
                 "主攻": self.last_attack_df,
                 "次強": self.last_watch_df,
                 "防守": self.last_defense_df,
-                "唯一決策": getattr(self, "last_final_decision_df", pd.DataFrame()),
                 "下單清單": self.last_order_list_df,
                 "機構交易計畫": getattr(self, "last_institutional_plan_df", pd.DataFrame()),
                 "操作SOP": getattr(self, "last_operation_sop_df", pd.DataFrame()),
@@ -7099,14 +5592,13 @@ class AppUI:
                 df = pd.DataFrame()
             if df.empty:
                 empty_columns = {
-                    "TOP20": ["stock_id", "stock_name", "price", "bucket", "ui_state", "liquidity_status", "liquidity_score", "elimination_reason", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "TOP5": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
-                    "今日可買": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "等待拉回": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "唯一決策": ["stock_id", "stock_name", "decision_bucket", "trade_action", "ui_state", "execution_ready", "position_bucket", "distribution_flag", "distance_to_entry_pct", "inst_status", "suggested_qty", "decision_reason"],
-                    "預掛單": ["stock_id", "stock_name", "price", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
-                    "下單清單": ["優先級", "代號", "名稱", "現價", "分類", "狀態", "盤中狀態", "活性分", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
-                    "機構交易計畫": ["優先級", "代號", "名稱", "現價", "市場", "產業", "題材", "分類", "狀態", "盤中狀態", "活性分", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
+                    "TOP20": ["stock_id", "stock_name", "bucket", "ui_state", "liquidity_status", "liquidity_score", "elimination_reason", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "TOP5": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
+                    "今日可買": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "等待拉回": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "預掛單": ["stock_id", "stock_name", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_1382", "target_1618", "rr", "win_rate"],
+                    "下單清單": ["優先級", "代號", "名稱", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
+                    "機構交易計畫": ["優先級", "代號", "名稱", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                     "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
                     "分類V2摘要": ["total", "official", "manual", "rule_engine", "ai_infer", "unclassified", "covered", "coverage_pct", "report_time", "unclassified_report"],
@@ -7130,10 +5622,9 @@ class AppUI:
         self._run_in_thread(worker, f"export_{target}")
 
 
-
     def export_analysis_excel(self):
-        ranking_raw = self._filtered_ranking()
-        if ranking_raw is None or ranking_raw.empty:
+        ranking = self._filtered_ranking()
+        if ranking is None or ranking.empty:
             return messagebox.showwarning("提醒", "目前沒有可匯出的分析資料。")
 
         def worker():
@@ -7142,51 +5633,9 @@ class AppUI:
                 theme = pd.DataFrame()
                 self.ui_call(self.start_task, "匯出分析", 5)
                 self.ui_call(self.update_task, "匯出分析", 1, 5, item="整理排行")
-
-                ranking = self.build_enriched_ranking_dataframe(ranking_raw, scope="export")
-                if ranking is None or ranking.empty:
-                    raise RuntimeError("排行資料整理失敗，無法匯出。")
-
-                if "display_price" in ranking.columns:
-                    ranking["price"] = ranking["display_price"]
-                elif "現價" in ranking.columns and "price" not in ranking.columns:
-                    ranking["price"] = ranking["現價"]
-                elif "price" not in ranking.columns:
-                    ranking["price"] = ranking.apply(
-                        lambda r: self._get_stock_display_price(str(r.get("stock_id", "") or ""), r), axis=1
-                    )
-
-                preferred_cols = [
-                    "rank_all", "stock_id", "stock_name", "price",
-                    "market", "industry", "theme",
-                    "momentum_score", "trend_score", "reversal_score",
-                    "volume_score", "risk_score", "ai_score", "total_score",
-                    "signal", "action", "rank_industry", "display_price", "現價"
-                ]
-                existing_cols = [c for c in preferred_cols if c in ranking.columns]
-                other_cols = [c for c in ranking.columns if c not in existing_cols]
-                ranking = ranking[existing_cols + other_cols].copy()
-
                 if not ranking.empty:
-                    sector = ranking.groupby("industry", as_index=False).agg(
-                        count=("stock_id", "count"),
-                        avg_total=("total_score", "mean"),
-                        avg_ai=("ai_score", "mean")
-                    ).sort_values(["avg_total", "avg_ai"], ascending=False)
-                    if not sector.empty:
-                        sector["top_name"] = sector["industry"].astype(str).map(
-                            ranking.sort_values(["industry", "total_score", "ai_score"], ascending=[True, False, False]).drop_duplicates("industry").set_index("industry")["stock_name"].to_dict()
-                        ).fillna("")
-                    theme = ranking.groupby("theme", as_index=False).agg(
-                        count=("stock_id", "count"),
-                        avg_total=("total_score", "mean"),
-                        avg_ai=("ai_score", "mean")
-                    ).sort_values(["avg_total", "avg_ai"], ascending=False)
-                    if not theme.empty:
-                        theme["top_name"] = theme["theme"].astype(str).map(
-                            ranking.sort_values(["theme", "total_score", "ai_score"], ascending=[True, False, False]).drop_duplicates("theme").set_index("theme")["stock_name"].to_dict()
-                        ).fillna("")
-
+                    sector = ranking.groupby("industry", as_index=False).agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean")).sort_values(["avg_total", "avg_ai"], ascending=False)
+                    theme = ranking.groupby("theme", as_index=False).agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean")).sort_values(["avg_total", "avg_ai"], ascending=False)
                 detail_text = self.detail.get("1.0", tk.END).strip()
                 tables = {"Ranking": ranking}
                 if not sector.empty:
@@ -7195,10 +5644,6 @@ class AppUI:
                     tables["Theme"] = theme
                 if self.last_top20_df is not None and not self.last_top20_df.empty:
                     tables["Trade_TOP20"] = self.last_top20_df
-                if getattr(self, "last_mainstream_top20_df", pd.DataFrame()) is not None and not getattr(self, "last_mainstream_top20_df", pd.DataFrame()).empty:
-                    tables["Mainstream_TOP20"] = self.last_mainstream_top20_df
-                if getattr(self, "last_breakout_top20_df", pd.DataFrame()) is not None and not getattr(self, "last_breakout_top20_df", pd.DataFrame()).empty:
-                    tables["Breakout_TOP20"] = self.last_breakout_top20_df
                 if self.last_top5_df is not None and not self.last_top5_df.empty:
                     tables["Trade_TOP5"] = self.last_top5_df
                 if getattr(self, "last_today_buy_df", pd.DataFrame()) is not None and not getattr(self, "last_today_buy_df", pd.DataFrame()).empty:
@@ -7211,12 +5656,10 @@ class AppUI:
                     tables["Watch"] = self.last_watch_df
                 if self.last_defense_df is not None and not self.last_defense_df.empty:
                     tables["Defense"] = self.last_defense_df
-                if getattr(self, "last_execution_pool_df", pd.DataFrame()) is not None and not getattr(self, "last_execution_pool_df", pd.DataFrame()).empty:
-                    tables["Execution_Pool"] = self.last_execution_pool_df
-                if getattr(self, "last_final_decision_df", pd.DataFrame()) is not None and not getattr(self, "last_final_decision_df", pd.DataFrame()).empty:
-                    tables["Final_Decision"] = self.last_final_decision_df
-                tables["Order_List"] = self.last_order_list_df.copy() if self.last_order_list_df is not None and not self.last_order_list_df.empty else pd.DataFrame([{"message":"今日無可執行標的","reason":"請檢查 Final_Decision / execution_ready / suggested_qty"}])
-                tables["Institutional_Plan"] = self.last_institutional_plan_df.copy() if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not getattr(self, "last_institutional_plan_df", pd.DataFrame()).empty else pd.DataFrame([{"message":"今日無機構交易計畫","reason":"execution_pool 為空或過濾後無資料"}])
+                if self.last_order_list_df is not None and not self.last_order_list_df.empty:
+                    tables["Order_List"] = self.last_order_list_df
+                if getattr(self, "last_institutional_plan_df", pd.DataFrame()) is not None and not getattr(self, "last_institutional_plan_df", pd.DataFrame()).empty:
+                    tables["Institutional_Plan"] = self.last_institutional_plan_df
                 cls_v2 = get_classification_v2_summary()
                 if cls_v2:
                     tables["Classification_V2_Summary"] = pd.DataFrame([cls_v2])
@@ -7238,45 +5681,17 @@ class AppUI:
 
         self._run_in_thread(worker, "export_analysis")
 
-    def build_order_list(self, execution_pool_df: pd.DataFrame | None = None, plan_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        execution_pool = execution_pool_df.copy() if execution_pool_df is not None else pd.DataFrame()
-        self.last_execution_pool_df = execution_pool.copy()
-        plan = plan_df.copy() if plan_df is not None else self.portfolio_engine.build_institutional_plan(execution_pool)
-        empty_columns = ["優先級","代號","名稱","現價","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註","唯一決策","決策原因","可執行","空表說明"]
+    def build_order_list(self, today_buy_df: pd.DataFrame, wait_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        x1 = today_buy_df.copy() if today_buy_df is not None else pd.DataFrame()
+        x2 = wait_df.copy() if wait_df is not None else pd.DataFrame()
+        pool = pd.concat([x1, x2], ignore_index=True) if (not x1.empty or not x2.empty) else pd.DataFrame()
+        plan = self.portfolio_engine.build_institutional_plan(pool)
         if plan.empty:
-            self.last_institutional_plan_df = pd.DataFrame()
-            return pd.DataFrame([{"優先級":0,"代號":"-","名稱":"今日無可執行標的","現價":"","分類":"-","狀態":"說明","盤中狀態":"-","活性分":"0","進場區":"-","停損":"-","1.382":"-","1.618":"-","RR":"0","勝率":"0","ATR%":"0","Kelly%":"0","建議張數":"0","建議金額":"0","單檔曝險%":"0","投資組合狀態":"空表","風險備註":"請先執行AI選股TOP20 / 機構交易計畫","唯一決策":"-","決策原因":"-","可執行":0,"空表說明":"機構交易計畫為空，因此下單清單沒有資料"}], columns=empty_columns)
-
-        final_df = getattr(self, "last_final_decision_df", pd.DataFrame()).copy()
-        if final_df is not None and not final_df.empty and "stock_id" in final_df.columns and "代號" in plan.columns:
-            fd_cols = [c for c in ["stock_id", "decision_bucket", "decision_reason", "execution_ready", "risk_reason", "empty_reason", "strategy_layer_source"] if c in final_df.columns]
-            fd = final_df[fd_cols].copy()
-            fd["stock_id"] = fd["stock_id"].astype(str)
-            plan = plan.copy()
-            plan["代號"] = plan["代號"].astype(str)
-            plan = plan.merge(fd, left_on="代號", right_on="stock_id", how="left")
-            plan["decision_bucket"] = plan.get("decision_bucket", "排除").fillna("排除")
-            plan["execution_ready"] = pd.to_numeric(plan.get("execution_ready", 0), errors="coerce").fillna(0).astype(int)
-            filtered = plan[plan["execution_ready"] == 1].copy()
-            if filtered.empty:
-                self.last_institutional_plan_df = plan.copy()
-                empty_reason = "所有股票未同時滿足 主攻 + execution_ready=1"
-                if "empty_reason" in plan.columns:
-                    candidates = [str(x).strip() for x in plan["empty_reason"].fillna("").tolist() if str(x).strip()]
-                    if candidates:
-                        empty_reason = "；".join(candidates[:5])
-                return pd.DataFrame([{"優先級":0,"代號":"-","名稱":"今日無可執行標的","現價":"","分類":"-","狀態":"說明","盤中狀態":"-","活性分":"0","進場區":"-","停損":"-","1.382":"-","1.618":"-","RR":"0","勝率":"0","ATR%":"0","Kelly%":"0","建議張數":"0","建議金額":"0","單檔曝險%":"0","投資組合狀態":"空表","風險備註":empty_reason,"唯一決策":"-","決策原因":"請檢查 Final_Decision / Institutional_Plan","可執行":0,"空表說明":empty_reason}], columns=empty_columns)
-            plan = filtered
-        elif "盤中狀態" in plan.columns:
-            plan = plan[plan["盤中狀態"].astype(str).eq("PASS")].copy()
-        if plan.empty:
-            self.last_institutional_plan_df = pd.DataFrame()
-            return pd.DataFrame([{"優先級":0,"代號":"-","名稱":"今日無可執行標的","現價":"","分類":"-","狀態":"說明","盤中狀態":"-","活性分":"0","進場區":"-","停損":"-","1.382":"-","1.618":"-","RR":"0","勝率":"0","ATR%":"0","Kelly%":"0","建議張數":"0","建議金額":"0","單檔曝險%":"0","投資組合狀態":"空表","風險備註":"過濾後無 PASS 資料","唯一決策":"-","決策原因":"-","可執行":0,"空表說明":"請檢查盤中狀態 / suggested_qty"}], columns=empty_columns)
+            return pd.DataFrame(columns=["優先級","代號","名稱","分類","狀態","盤中狀態","活性分","進場區","停損","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
         order_df = pd.DataFrame({
             "優先級": plan["優先級"],
             "代號": plan["代號"],
             "名稱": plan["名稱"],
-            "現價": plan["現價"] if "現價" in plan.columns else "",
             "分類": plan["分類"],
             "狀態": plan["狀態"],
             "盤中狀態": plan["盤中狀態"] if "盤中狀態" in plan.columns else "",
@@ -7294,10 +5709,6 @@ class AppUI:
             "單檔曝險%": plan["單檔曝險%"],
             "投資組合狀態": plan["投資組合狀態"],
             "風險備註": plan["風險備註"],
-            "唯一決策": plan["decision_bucket"] if "decision_bucket" in plan.columns else "主攻",
-            "決策原因": plan["decision_reason"] if "decision_reason" in plan.columns else "",
-            "可執行": plan["execution_ready"] if "execution_ready" in plan.columns else 1,
-            "空表說明": "",
         })
         self.last_institutional_plan_df = plan.copy()
         return order_df
@@ -7311,22 +5722,20 @@ class AppUI:
         if self.last_top20_df is not None and not self.last_top20_df.empty:
             for i, (_, r) in enumerate(self.last_top20_df.iterrows(), start=1):
                 ui_action = str(r.get("ui_state", "不可買"))
-                light = self._get_display_light(r.to_dict())
-                self._insert_colored_row(self.top20_tree, values=(
-                    i, r.get("stock_id", ""), r.get("stock_name", ""), self._display_light_symbol(light), r.get("candidate_engine", "混合"), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("bucket", ""), r.get("operation_grade", "-"), ui_action,
-                    r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
+                self.top20_tree.insert("", "end", values=(
+                    i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("bucket", ""), ui_action,
+                    r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}",
                     r.get("elimination_reason", "")
-                ), light=light)
+                ))
 
         if self.last_top5_df is not None and not self.last_top5_df.empty:
             for i, (_, r) in enumerate(self.last_top5_df.iterrows(), start=1):
-                _light = self._get_display_light(r.to_dict())
-                self._insert_colored_row(self.top5_tree, values=(
-                    i, r.get("stock_id", ""), self._display_light_symbol(_light), r.get("stock_name", ""), self._get_stock_display_price(r.get("stock_id", ""), r), r.get("ui_state", "-"),
-                    r.get('orderbook_bias', '-'), f"{float(r.get('intraday_score', 0) or 0):.1f}", r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
+                self.top5_tree.insert("", "end", values=(
+                    i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("ui_state", "-"),
+                    r.get("liquidity_status", ""), f"{float(r.get('liquidity_score', 0) or 0):.1f}",
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"),
                     f"{float(r.get('target_1382', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}",
@@ -7334,14 +5743,13 @@ class AppUI:
                     f"{float(r.get('backtest_win_rate', 0) or 0):.1f}",
                     f"{float(r.get('cagr', 0) or 0):.2f}",
                     f"{float(r.get('mdd', 0) or 0):.2f}"
-                ), light=_light)
+                ))
 
 
         if self.last_institutional_plan_df is not None and not self.last_institutional_plan_df.empty:
             for _, r in self.last_institutional_plan_df.iterrows():
-                _inst_light = UITacticalPresenter.derive_signal_light(r.get("盤中狀態", ""), score=float(r.get('活性分', 0) or 0), intraday_score=float(r.get('活性分', 0) or 0))
-                self._insert_colored_row(self.inst_tree, values=(
-                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), self._fmt_price(r.get("現價", "")), r.get("市場", ""),
+                self.inst_tree.insert("", "end", values=(
+                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("市場", ""),
                     r.get("產業", ""), r.get("題材", ""), r.get("分類", ""), r.get("狀態", ""),
                     r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
                     r.get("進場區", "-"), r.get("停損", "-"),
@@ -7356,22 +5764,20 @@ class AppUI:
                     f"{float(r.get('題材曝險%', 0) or 0):.2f}",
                     f"{float(r.get('產業曝險%', 0) or 0):.2f}",
                     r.get("投資組合狀態", "")
-                ), light=_inst_light)
+                ))
 
         if self.last_order_list_df is not None and not self.last_order_list_df.empty:
             for _, r in self.last_order_list_df.iterrows():
-                _order_light = UITacticalPresenter.derive_signal_light(r.get("盤中狀態", ""), score=float(r.get('活性分', 0) or 0), intraday_score=float(r.get('活性分', 0) or 0))
-                self._insert_colored_row(self.order_tree, values=(
-                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), self._fmt_price(r.get("現價", "")), r.get("分類", ""),
-                    r.get("狀態", ""), r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
-                    r.get("進場區", "-"), r.get("停損", "-"),
+                self.order_tree.insert("", "end", values=(
+                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("分類", ""),
+                    r.get("狀態", ""), r.get("進場區", "-"), r.get("停損", "-"),
                     r.get("1.382", "-"), r.get("1.618", "-"),
                     f"{float(r.get('RR', 0) or 0):.2f}", f"{float(r.get('勝率', 0) or 0):.1f}",
                     f"{float(r.get('ATR%', 0) or 0):.2f}", f"{float(r.get('Kelly%', 0) or 0):.2f}",
                     (f"{float(r.get('建議張數', 0) or 0):.1f}".rstrip('0').rstrip('.') if pd.notna(r.get('建議張數', 0)) else "0"),
                     f"{float(r.get('建議金額', 0) or 0):.0f}", f"{float(r.get('單檔曝險%', 0) or 0):.2f}",
-                    r.get("投資組合狀態", ""), r.get("風險備註", ""), r.get("空表說明", r.get("決策原因", ""))
-                ), light=_order_light)
+                    r.get("投資組合狀態", ""), r.get("風險備註", "")
+                ))
 
         self.sync_multi_windows()
         if self.window_current_stock_id and self.current_chart_path and Path(self.current_chart_path).exists():
@@ -7382,10 +5788,7 @@ class AppUI:
         if not sel:
             return
         vals = self.top20_tree.item(sel[0], "values")
-        stock_id = self._resolve_stock_id_from_tree_values(vals, "AI交易TOP20")
-        if not stock_id:
-            self.append_log(f"雙引擎TOP20 選取失敗：無法解析 stock_id｜values={vals}", "WARNING")
-            return
+        stock_id = str(vals[1])
         if self._should_ignore_select_event(stock_id, "AI交易TOP20"):
             return
         self.sync_all_views(stock_id, source="AI交易TOP20")
@@ -7394,57 +5797,11 @@ class AppUI:
         if not sel:
             return
         vals = self.order_tree.item(sel[0], "values")
-        stock_id = self._resolve_stock_id_from_tree_values(vals, "下單清單")
-        if not stock_id:
-            return
+        stock_id = str(vals[1])
         if self._should_ignore_select_event(stock_id, "下單清單"):
             return
         self.sync_all_views(stock_id, source="下單清單")
 
-
-    def _show_theme_detail_summary(self):
-        theme_df = getattr(self, "last_theme_summary_df", pd.DataFrame())
-        lines = ["《題材輪動摘要》", ""]
-        if theme_df is None or theme_df.empty:
-            lines.append("目前沒有題材摘要資料。請先執行 AI選股TOP20 或重建排行。")
-        else:
-            lines.append("用途：先看題材，再看個股，不要只看單一股票分數。")
-            lines.append("")
-            for i, (_, r) in enumerate(theme_df.head(10).iterrows(), start=1):
-                lines.append(f"{i}. {r.get('theme','-')}｜檔數 {int(r.get('count',0) or 0)}｜熱度 {float(r.get('hot_score',0) or 0):.2f}｜平均總分 {float(r.get('avg_total',0) or 0):.2f}")
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
-
-    def _show_order_detail_summary(self):
-        order_df = getattr(self, "last_order_list_df", pd.DataFrame())
-        lines = ["《下單清單摘要》", ""]
-        if order_df is None or order_df.empty:
-            lines.append("今日無下單清單資料。")
-            lines.append("原因：尚未執行機構交易計畫，或 Final_Decision 尚未完成收斂。")
-        else:
-            first_name = str(order_df.iloc[0].get("名稱", "") or "")
-            first_sid = normalize_stock_id(order_df.iloc[0].get("代號", ""))
-            if first_name == "今日無可執行標的" or not first_sid:
-                lines.append("今日無 execution_ready=1 的標的。")
-                lines.append(f"原因：{order_df.iloc[0].get('空表說明','-')}")
-            else:
-                lines.append("用途：這裡只保留 execution_ready=1 的最終可下單名單。")
-                lines.append("")
-                for i, (_, r) in enumerate(order_df.head(10).iterrows(), start=1):
-                    lines.append(f"{i}. {r.get('代號','-')} {r.get('名稱','-')}｜狀態 {r.get('狀態','-')}｜進場 {r.get('進場區','-')}｜RR {float(r.get('RR',0) or 0):.2f}")
-        self.detail.delete("1.0", tk.END)
-        self.detail.insert("1.0", "\n".join(lines))
-
-    def on_left_tab_changed(self, event=None):
-        try:
-            current = self.left_notebook.select()
-            current_text = self.left_notebook.tab(current, "text")
-        except Exception:
-            return
-        if current_text in ("題材輪動",):
-            self._show_theme_detail_summary()
-        elif current_text in ("下單清單",):
-            self._show_order_detail_summary()
 
     def show_top5(self):
         def render_top5():
@@ -7486,9 +5843,7 @@ class AppUI:
         if not sel:
             return
         vals = self.top5_tree.item(sel[0], "values")
-        stock_id = self._resolve_stock_id_from_tree_values(vals, "AI選股TOP5")
-        if not stock_id:
-            return
+        stock_id = str(vals[1])
         if self._should_ignore_select_event(stock_id, "AI選股TOP5"):
             return
         self.sync_all_views(stock_id, source="AI選股TOP5")
@@ -7499,9 +5854,7 @@ class AppUI:
         if not sel:
             return
         vals = self.inst_tree.item(sel[0], "values")
-        stock_id = self._resolve_stock_id_from_tree_values(vals, "機構交易計畫")
-        if not stock_id:
-            return
+        stock_id = str(vals[1])
         if self._should_ignore_select_event(stock_id, "機構交易計畫"):
             return
         self.sync_all_views(stock_id, source="機構交易計畫")
@@ -7541,33 +5894,13 @@ class AppUI:
                 self.ui_call(self.start_task, "建立完整歷史", total)
                 self.ui_call(self.update_task, "建立完整歷史", 0, total, 0, 0, 0, "準備中")
                 counters = {"ok": 0, "fail": 0}
-                progress_every = 25
-                status_every = 25
-                log_every = 25
-
-                def throttled_log(msg: str):
-                    text_msg = str(msg or "")
-                    emit = False
-                    if "分批節點" in text_msg or "完成" in text_msg or "錯誤" in text_msg or "失敗" in text_msg:
-                        emit = True
-                    else:
-                        m = re.search(r"\[(\d+)/(\d+)\]", text_msg)
-                        if m:
-                            idx_num = int(m.group(1))
-                            total_num = int(m.group(2))
-                            emit = (idx_num == 1) or (idx_num == total_num) or (idx_num % log_every == 0)
-                    if emit:
-                        self.ui_call(self.append_log, text_msg)
 
                 def progress(idx, total_count, sid, existing_count, flag):
                     if flag in ("fail", "error"):
                         counters["fail"] += 1
                     elif flag == "ok":
                         counters["ok"] += 1
-
-                    if idx == 1 or idx == total_count or idx % progress_every == 0 or flag in ("fail", "error"):
-                        self.ui_call(self.update_task, "建立完整歷史", idx, total_count, counters["ok"], counters["fail"], 0, sid)
-
+                    self.ui_call(self.update_task, "建立完整歷史", idx, total_count, counters["ok"], counters["fail"], 0, sid)
                     self.save_history_state({
                         "mode": "build_history",
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -7579,14 +5912,14 @@ class AppUI:
                         "failed": counters["fail"],
                         "existing_count": int(existing_count),
                     })
-                    if idx == 1 or idx == total_count or idx % status_every == 0 or flag in ("fail", "error"):
+                    if idx % 10 == 0 or idx == total_count:
                         self.ui_call(self.set_status, f"建立歷史中 {idx}/{total_count}｜{sid}｜成功 {counters['ok']}｜失敗 {counters['fail']}")
 
                 success, failed, rows = self.data_engine.build_full_history(
                     batch_size=self.history_batch_size,
                     sleep_sec=self.history_sleep_sec,
                     progress_cb=progress,
-                    log_cb=throttled_log,
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
                     cancel_cb=lambda: self.cancel_event.is_set(),
                 )
                 self.clear_history_state()
@@ -7689,24 +6022,16 @@ class AppUI:
         self.detail.insert("1.0", "\n".join(lines))
         self.left_notebook.select(self.tab_sop)
 
-    def refresh_filters(self, force: bool = False):
+    def refresh_filters(self):
         master = self.db.get_master()
         if master.empty:
             self.market_cb["values"] = ["全部"]
             self.industry_cb["values"] = ["全部"]
             self.theme_cb["values"] = ["全部"]
-            self.last_filter_signature = ((), (), ())
             return
-        markets = tuple(sorted([x for x in master["market"].dropna().unique().tolist() if str(x).strip() != ""]))
-        industries = tuple(sorted([x for x in master["industry"].dropna().unique().tolist() if str(x).strip() != ""]))
-        themes = tuple(sorted([x for x in master["theme"].dropna().unique().tolist() if str(x).strip() != ""]))
-        signature = (markets, industries, themes)
-        if (not force) and signature == self.last_filter_signature:
-            return
-        self.market_cb["values"] = ["全部"] + list(markets)
-        self.industry_cb["values"] = ["全部"] + list(industries)
-        self.theme_cb["values"] = ["全部"] + list(themes)
-        self.last_filter_signature = signature
+        self.market_cb["values"] = ["全部"] + sorted([x for x in master["market"].dropna().unique().tolist() if str(x).strip() != ""])
+        self.industry_cb["values"] = ["全部"] + sorted([x for x in master["industry"].dropna().unique().tolist() if str(x).strip() != ""])
+        self.theme_cb["values"] = ["全部"] + sorted([x for x in master["theme"].dropna().unique().tolist() if str(x).strip() != ""])
 
     def _parse_search_tokens(self, raw_query: str):
         raw = str(raw_query or "").strip()
@@ -7753,48 +6078,57 @@ class AppUI:
             df = self._apply_search_filter(df, q)
         return df.sort_values(["rank_all"]).reset_index(drop=True)
 
-    def refresh_ranking_table_only(self):
-        for tree in (self.rank_tree, self.sector_tree, self.theme_tree):
+    def refresh_all_tables(self):
+        for tree in (self.dashboard_tree, self.sop_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
             for item in tree.get_children():
                 tree.delete(item)
+
+        if not self.ensure_ranking_ready(auto_rebuild=True):
+            price_rows = self.db.get_total_price_rows()
+            if price_rows > 0:
+                self.set_status("已有歷史資料，但尚未形成有效排行；請先補足歷史或重建排行。")
+            else:
+                self.set_status("目前尚無排行資料，請先初始化、建立歷史，再重建排行。")
+            self.show_welcome_message()
+            return
+
         df = self._filtered_ranking()
-        if df is None or df.empty:
-            return pd.DataFrame()
-        enriched = self.build_enriched_ranking_dataframe(df, scope="ui")
-        for i, row in enriched.iterrows():
-            _rank_light = UITacticalPresenter.derive_signal_light(row.get("signal", ""), score=float(row.get('total_score', 0) or 0), intraday_score=float(row.get('intraday_score', 0) or 0))
-            self._insert_colored_row(self.rank_tree, values=(
-                i + 1, row["stock_id"], row["stock_name"], row.get("display_price", self._get_stock_display_price(row["stock_id"], row)), row["industry"], row["theme"],
+        if df.empty:
+            self.set_status("目前篩選條件下沒有資料。")
+            return
+
+        for i, row in df.iterrows():
+            self.rank_tree.insert("", "end", values=(
+                i + 1, row["stock_id"], row["stock_name"], row["industry"], row["theme"],
                 f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
-            ), light=_rank_light)
+            ))
+
         sector = (
-            enriched.groupby("industry", as_index=False)
+            df.groupby("industry", as_index=False)
             .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
             .sort_values(["avg_total", "avg_ai"], ascending=False)
         )
         for _, r in sector.iterrows():
-            top_name = enriched[enriched["industry"] == r["industry"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
-            self.sector_tree.insert("", "end", values=(r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name))
+            top_name = df[df["industry"] == r["industry"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
+            self.sector_tree.insert("", "end", values=(
+                r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name
+            ))
+
         theme = (
-            enriched.groupby("theme", as_index=False)
+            df.groupby("theme", as_index=False)
             .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
             .sort_values(["avg_total", "avg_ai"], ascending=False)
         )
         for _, r in theme.iterrows():
-            top_name = enriched[enriched["theme"] == r["theme"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
-            self.theme_tree.insert("", "end", values=(r["theme"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name))
-        return enriched
+            top_name = df[df["theme"] == r["theme"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
+            self.theme_tree.insert("", "end", values=(
+                r["theme"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name
+            ))
 
-    def refresh_trade_summary_only(self):
-        for tree in (self.dashboard_tree, self.rotation_tree):
-            for item in tree.get_children():
-                tree.delete(item)
-        df = self._filtered_ranking()
-        if df is None or df.empty:
-            return
         market_engine = self.master_trading_engine.market_engine
         regime = market_engine.get_market_regime()
         rotation = IndustryRotationEngine.summarize(df)
+
         dash_rows = [
             ("市場狀態", regime["regime"], f"Regime score {regime['score']:.2f}"),
             ("市場廣度", f"{regime['breadth']:.1f}", "強勢訊號占比"),
@@ -7805,58 +6139,18 @@ class AppUI:
         for m, v, d in dash_rows:
             self.dashboard_tree.insert("", "end", values=(m, v, d))
         for _, r in rotation.iterrows():
-            self.rotation_tree.insert("", "end", values=(r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", int(r["trend_count"]), f"{r['hot_score']:.2f}", r["rotation"]))
+            self.rotation_tree.insert("", "end", values=(
+                r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", int(r["trend_count"]),
+                f"{r['hot_score']:.2f}", r["rotation"]
+            ))
 
-    def refresh_optional_views_lazy(self):
-        try:
-            if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
-                self.refresh_top20_and_order_views()
-        except Exception:
-            pass
-        try:
-            self.refresh_classification_summary_ui()
-        except Exception:
-            pass
-
-    def _finish_rebuild_rank_fast(self, count: int, stage_name: str = "重建排行"):
-        try:
-            self.refresh_ranking_table_only()
-        except Exception:
-            pass
-        try:
-            self.refresh_trade_summary_only()
-        except Exception:
-            pass
-        self.finish_task(stage_name, f"排行已完成，共 {count} 檔")
-        self.append_log(f"{stage_name}已完成，共 {count} 檔；其餘頁面將延後刷新。")
-        self.root.after(200, self._post_refresh_after_rank)
-
-    def _post_refresh_after_rank(self):
-        self.refresh_trade_summary_only()
-        self.root.after(200, self.refresh_optional_views_lazy)
-
-    def refresh_all_tables(self):
-        if not self.ensure_ranking_ready(auto_rebuild=True):
-            price_rows = self.db.get_total_price_rows()
-            if price_rows > 0:
-                self.set_status("已有歷史資料，但尚未形成有效排行；請先補足歷史或重建排行。")
-            else:
-                self.set_status("目前尚無排行資料，請先初始化、建立歷史，再重建排行。")
-            self.show_welcome_message()
-            return
-        df = self.refresh_ranking_table_only()
-        if df is None or df.empty:
-            self.set_status("目前篩選條件下沒有資料。")
-            return
-        self.refresh_trade_summary_only()
-        try:
-            trade = self.master_trading_engine.get_trade_pool(df.head(200))
-            self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
-            attack_cnt = len(trade["attack"])
-            defense_cnt = len(trade["defense"])
-            self.set_status(f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}")
-        except Exception:
-            self.set_status(f"已載入資料，共 {len(df)} 檔")
+        trade = self.master_trading_engine.get_trade_pool(df)
+        self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
+        attack_cnt = len(trade["attack"])
+        defense_cnt = len(trade["defense"])
+        self.set_status(
+            f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}"
+        )
         if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
             self.refresh_top20_and_order_views()
 
@@ -7892,10 +6186,11 @@ class AppUI:
                     rank_skip["skip"] = skip_count
                     self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
                 rank_count = self.rank_engine.rebuild(progress_cb=rank_progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
-                self.ui_call(self.refresh_filters, False)
-                self.ui_call(self._finish_rebuild_rank_fast, rank_count, "每日增量更新")
+                self.ui_call(self.refresh_filters)
+                self.ui_call(self.refresh_all_tables)
                 self.ui_call(self.show_welcome_message)
-                self.ui_call(self.append_log, f"每日增量更新完成｜成功 {success} 檔｜寫入 {rows} 筆｜排行 {rank_count} 檔")
+                self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。")
+                self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n排行 {rank_count} 檔\n（TWSE/TPEX 官方優先，只更新今日）")
             except OperationCancelled:
                 self.ui_call(self.append_log, "每日更新/重排行已中斷")
                 self.ui_call(self.finish_task, "每日增量更新", "作業已中斷")
@@ -7915,10 +6210,14 @@ class AppUI:
                 def progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
                     self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
                 count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
-                self.ui_call(self.refresh_filters, False)
-                self.ui_call(self._finish_rebuild_rank_fast, count, "重建排行")
+                self.ui_call(self.refresh_filters)
+                self.ui_call(self.refresh_all_tables)
+                self.ui_call(self.refresh_classification_summary_ui)
+                self.ui_call(self.finish_task, "重建排行", f"排行已完成，共 {count} 檔")
                 if count <= 0:
                     self.ui_call(messagebox.showwarning, "提醒", "排行重建完成，但目前可計算檔數為 0。\n請先建立至少 70 根以上歷史K線資料。")
+                else:
+                    self.ui_call(messagebox.showinfo, "完成", f"排行已完成，共 {count} 檔")
             except OperationCancelled:
                 self.ui_call(self.finish_task, "重建排行", "重建排行已中斷")
             except Exception as e:
@@ -7936,8 +6235,7 @@ class AppUI:
 
         def worker():
             try:
-                candidate_df = df.head(300).copy()
-                total = len(candidate_df)
+                total = len(df)
                 self.ui_call(self.clear_log)
                 self.ui_call(self.start_task, "AI選股TOP20", total)
 
@@ -7945,36 +6243,34 @@ class AppUI:
                     self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
 
                 trade = self.master_trading_engine.get_trade_pool(
-                    candidate_df,
+                    df,
                     progress_cb=progress,
                     log_cb=lambda msg: self.ui_call(self.append_log, msg),
                     cancel_cb=lambda: self.cancel_event.is_set(),
                 )
                 market = trade["market"]
-                trade_top20 = self.enrich_trade_dataframe_with_tactical(trade["trade_top20"])
-                if trade_top20 is not None and not trade_top20.empty and 'tactical_light' in trade_top20.columns:
-                    allowed = trade_top20[trade_top20['tactical_light'].astype(str).isin(['🔵','🟢','🟡','🟠'])].copy()
-                    if not allowed.empty:
-                        light_order = {'🔵':0, '🟢':1, '🟡':2, '🟠':3}
-                        allowed['_light_order'] = allowed['tactical_light'].astype(str).map(light_order).fillna(9)
-                        allowed = allowed.sort_values(['_light_order','selection_score','trade_score'], ascending=[True,False,False]).drop(columns=['_light_order'])
-                        trade_top20 = allowed.head(20).copy()
-                mainstream_top20 = self.enrich_trade_dataframe_with_tactical(trade.get("mainstream_top20", pd.DataFrame()))
-                breakout_top20 = self.enrich_trade_dataframe_with_tactical(trade.get("breakout_top20", pd.DataFrame()))
-                attack = self.enrich_trade_dataframe_with_tactical(trade["attack"])
-                today_buy = self.enrich_trade_dataframe_with_tactical(trade["today_buy"])
-                wait_pullback = self.enrich_trade_dataframe_with_tactical(trade["wait_pullback"])
-                execution_pool = self.enrich_trade_dataframe_with_tactical(trade.get("execution_pool", pd.DataFrame()))
-                watch = trade["watch"].copy()
-                defense = trade["defense"].copy()
+                trade_top20 = trade["trade_top20"]
+                attack = trade["attack"]
+                watch = trade["watch"]
+                defense = trade["defense"]
+                today_buy = trade["today_buy"]
+                wait_pullback = trade["wait_pullback"]
                 theme_summary = trade["theme_summary"]
                 eliminated = trade.get("eliminated", pd.DataFrame())
 
                 self.last_top20_df = trade_top20.copy()
-                self.last_mainstream_top20_df = mainstream_top20.copy()
-                self.last_breakout_top20_df = breakout_top20.copy()
                 self.cache_trade_dataframe(self.last_top20_df)
-                self.last_top5_df = pd.DataFrame()
+                top5 = trade_top20.head(5).copy()
+                if not top5.empty:
+                    bt_rows = []
+                    for _, rr in top5.iterrows():
+                        bt = self.backtest_engine.estimate_trade_quality(str(rr["stock_id"]))
+                        bt_rows.append(bt)
+                    bt_df = pd.DataFrame(bt_rows)
+                    top5 = pd.concat([top5.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
+                self.last_top5_df = top5.copy()
+                self.cache_trade_dataframe(self.last_top5_df)
+                self.cache_backtest_dataframe(self.last_top5_df)
                 self.last_attack_df = attack.copy()
                 self.cache_trade_dataframe(self.last_attack_df)
                 self.last_watch_df = watch.copy()
@@ -7986,33 +6282,8 @@ class AppUI:
                 self.cache_trade_dataframe(self.last_today_buy_df)
                 self.last_wait_df = wait_pullback.copy()
                 self.cache_trade_dataframe(self.last_wait_df)
-                self.last_execution_pool_df = execution_pool.copy()
-                institutional_plan = self.portfolio_engine.build_institutional_plan(execution_pool)
-                self.last_institutional_plan_df = institutional_plan.copy()
-                final_decision = FinalDecisionEngine.finalize(trade_top20, today_buy, wait_pullback, defense, institutional_plan, theme_summary)
-                self.last_final_decision_df = final_decision.copy()
-
-                top5_source = final_decision[(final_decision["decision_bucket"] == "主攻") & (final_decision["trade_action"].astype(str).str.upper().isin(["BUY", "WEAK BUY"]))].copy() if final_decision is not None and not final_decision.empty else pd.DataFrame()
-                if not top5_source.empty:
-                    top5_source["top5_source"] = "Final主攻"
-                if len(top5_source) < 5 and final_decision is not None and not final_decision.empty:
-                    supplement = final_decision[final_decision["decision_bucket"] == "等待拉回"].copy()
-                    if not supplement.empty:
-                        supplement["top5_source"] = "Wait fallback"
-                        top5_source = pd.concat([top5_source, supplement], ignore_index=True)
-                top5_source = top5_source.head(5).copy() if not top5_source.empty else top5_source
-                if not top5_source.empty:
-                    bt_rows = []
-                    for _, rr in top5_source.iterrows():
-                        bt = self.backtest_engine.estimate_trade_quality(str(rr["stock_id"]))
-                        bt_rows.append(bt)
-                    bt_df = pd.DataFrame(bt_rows)
-                    top5_source = pd.concat([top5_source.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
-                self.last_top5_df = top5_source.copy()
-                self.cache_trade_dataframe(self.last_top5_df)
-                self.cache_backtest_dataframe(self.last_top5_df)
-
-                self.last_order_list_df = self.build_order_list(execution_pool, institutional_plan)
+                self.last_order_list_df = self.build_order_list(today_buy, wait_pullback)
+                self.last_institutional_plan_df = self.portfolio_engine.build_institutional_plan(pd.concat([today_buy.copy(), wait_pullback.copy()], ignore_index=True))
 
                 self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
                 self.ui_call(self.refresh_top20_and_order_views)
@@ -8035,25 +6306,25 @@ class AppUI:
                     lines.append("目前無符合條件標的")
                 else:
                     for i, (_, r) in enumerate(trade_top20.head(5).iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r.get('tactical_light','⚪')} {r.get('orderbook_bias','-')}｜盤中分 {float(r.get('intraday_score',0) or 0):.1f}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
 
                 lines.extend(["", "【今日可買】"])
                 if today_buy.empty:
                     lines.append("今日無符合 SOP 的可買名單（允許空白，不為湊數放寬）。")
                 else:
                     for i, (_, r) in enumerate(today_buy.iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r.get('tactical_light','⚪')} {r.get('orderbook_bias','-')}｜盤中分 {float(r.get('intraday_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
 
                 lines.extend(["", "【預掛單】"])
                 if wait_pullback.empty:
                     lines.append("無預掛單")
                 else:
                     for i, (_, r) in enumerate(wait_pullback.iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r.get('tactical_light','⚪')} {r.get('orderbook_bias','-')}｜盤中分 {float(r.get('intraday_score',0) or 0):.1f}｜預掛單｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜預掛單｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
 
                 self.ui_call(self.detail.delete, "1.0", tk.END)
                 self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
-                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：候選 {len(candidate_df)}｜TOP20 {len(trade_top20)}｜今日可買 {len(today_buy)}｜等待 {len(wait_pullback)}")
+                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：TOP20 {len(trade_top20)}｜今日可買 {len(today_buy)}｜等待 {len(wait_pullback)}")
             except OperationCancelled:
                 self.ui_call(self.finish_task, "AI選股TOP20", "AI選股TOP20 已中斷")
             except Exception as e:
@@ -8066,16 +6337,12 @@ class AppUI:
     def show_strategy_backtest(self):
         if self.last_top20_df is None or self.last_top20_df.empty:
             return messagebox.showwarning("提醒", "請先執行 AI選股TOP20。")
-
         rows = []
         for _, r in self.last_top20_df.head(10).iterrows():
-            stock_id = str(r["stock_id"])
-            bt = self.backtest_engine.estimate_trade_quality(stock_id)
-            price = self._get_stock_display_price(stock_id, r)
+            bt = self.backtest_engine.estimate_trade_quality(str(r["stock_id"]))
             rows.append({
-                "stock_id": stock_id,
+                "stock_id": r["stock_id"],
                 "stock_name": r["stock_name"],
-                "price": price,
                 "backtest_win_rate": bt.get("backtest_win_rate", 0),
                 "avg_return": bt.get("avg_return", 0),
                 "cagr": bt.get("cagr", 0),
@@ -8083,34 +6350,17 @@ class AppUI:
                 "sharpe": bt.get("sharpe", 0),
                 "samples": bt.get("samples", 0),
             })
-
         out = pd.DataFrame(rows).sort_values(["backtest_win_rate", "cagr", "sharpe"], ascending=False).reset_index(drop=True)
-
         for item in self.backtest_tree.get_children():
             self.backtest_tree.delete(item)
-
-        expected_cols = 10
         for i, (_, r) in enumerate(out.iterrows(), start=1):
-            values = (
-                i,
-                r["stock_id"],
-                r["stock_name"],
-                r["price"],
-                f"{float(r['backtest_win_rate']):.1f}",
-                f"{float(r['avg_return']):.2f}",
-                f"{float(r['cagr']):.2f}",
-                f"{float(r['mdd']):.2f}",
-                f"{float(r['sharpe']):.2f}",
-                int(r["samples"]),
-            )
-            assert len(values) == expected_cols, "backtest_tree 欄位數與寫入值數量不一致"
-            self.backtest_tree.insert("", "end", values=values)
-
+            self.backtest_tree.insert("", "end", values=(
+                i, r["stock_id"], r["stock_name"], f"{r['backtest_win_rate']:.1f}", f"{r['avg_return']:.2f}",
+                f"{r['cagr']:.2f}", f"{r['mdd']:.2f}", f"{r['sharpe']:.2f}", int(r["samples"])
+            ))
         lines = ["《v9.2 FINAL-RELEASE 策略回測摘要》", ""]
         for i, (_, r) in enumerate(out.iterrows(), start=1):
-            lines.append(
-                f"{i}. {r['stock_id']} {r['stock_name']}｜現價 {r['price']}｜勝率 {float(r['backtest_win_rate']):.1f}%｜CAGR {float(r['cagr']):.2f}%｜MDD {float(r['mdd']):.2f}%｜Sharpe {float(r['sharpe']):.2f}｜樣本 {int(r['samples'])}"
-            )
+            lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜勝率 {r['backtest_win_rate']:.1f}%｜CAGR {r['cagr']:.2f}%｜MDD {r['mdd']:.2f}%｜Sharpe {r['sharpe']:.2f}｜樣本 {int(r['samples'])}")
         self.detail.delete("1.0", tk.END)
         self.detail.insert("1.0", "\n".join(lines))
         self.left_notebook.select(self.tab_backtest)
@@ -8151,9 +6401,7 @@ class AppUI:
         if not sel:
             return
         vals = self.rank_tree.item(sel[0], "values")
-        stock_id = self._resolve_stock_id_from_tree_values(vals, "排行榜")
-        if not stock_id:
-            return
+        stock_id = str(vals[1])
         if self._should_ignore_select_event(stock_id, "排行榜"):
             return
         self.sync_all_views(stock_id, source="排行榜")
@@ -8239,55 +6487,63 @@ class AppUI:
 
 
 
+
 def bootstrap():
-    log_info("bootstrap start")
-    db = DBManager(DB_PATH)
-    db.init_db()
+    if BOOTSTRAP_EVENT.is_set():
+        db = DBManager(DB_PATH)
+        db.init_db()
+        return db, "bootstrap 已執行，直接載入現有資料"
+    with BOOTSTRAP_LOCK:
+        if BOOTSTRAP_EVENT.is_set():
+            db = DBManager(DB_PATH)
+            db.init_db()
+            return db, "bootstrap 已執行，直接載入現有資料"
 
-    init_message = "股票主檔已就緒"
-    try:
-        master = db.get_master()
-        if master.empty:
-            universe = build_full_market_universe()
-            if universe is not None and not universe.empty:
-                db.import_master_df(universe)
-                master = db.get_master()
-                init_message = f"已自動建立全市場股票主檔，共 {len(master)} 檔"
+        log_info("bootstrap start")
+        db = DBManager(DB_PATH)
+        db.init_db()
+
+        init_message = "股票主檔已就緒"
+        try:
+            master = db.get_master()
+            if master.empty:
+                universe = build_full_market_universe()
+                if universe is not None and not universe.empty:
+                    db.import_master_df(universe)
+                    master = db.get_master()
+                    init_message = f"已自動建立全市場股票主檔，共 {len(master)} 檔"
+                else:
+                    csv_path = resolve_master_csv()
+                    db.import_master_csv(csv_path)
+                    master = db.get_master()
+                    init_message = f"已改用本地主檔，共 {len(master)} 檔 | {csv_path}"
             else:
-                csv_path = resolve_master_csv()
-                db.import_master_csv(csv_path)
-                master = db.get_master()
-                init_message = f"已改用本地主檔，共 {len(master)} 檔 | {csv_path}"
-        else:
-            init_message = f"股票主檔已載入，共 {len(master)} 檔"
+                init_message = f"股票主檔已載入，共 {len(master)} 檔"
 
-        if db.get_ranking_rows_count() == 0 and db.get_total_price_rows() > 0:
-            rank_count = RankingEngine(db).rebuild()
-            if rank_count > 0:
-                init_message += f"｜已自動重建排行 {rank_count} 檔"
-            else:
-                init_message += "｜已有歷史資料，但目前不足以形成排行"
-    except Exception as e:
-        init_message = f"股票主檔初始化失敗：{e}"
+            if db.get_ranking_rows_count() == 0 and db.get_total_price_rows() > 0:
+                rank_count = RankingEngine(db).rebuild()
+                if rank_count > 0:
+                    init_message += f"｜已自動重建排行 {rank_count} 檔"
+                else:
+                    init_message += "｜已有歷史資料，但目前不足以形成排行"
+        except Exception as e:
+            init_message = f"股票主檔初始化失敗：{e}"
 
-    log_info(f"bootstrap done｜{init_message}")
-    return db, init_message
+        BOOTSTRAP_EVENT.set()
+        log_info(f"bootstrap done｜{init_message}")
+        return db, init_message
 
 
 def main():
     log_info("main start")
-    db = DBManager(DB_PATH)
-    db.init_db()
+    db, init_message = bootstrap()
     root = tk.Tk()
     app = AppUI(root, db)
-    app.set_status("UI 已啟動，背景初始化中...")
+    app.set_status(init_message)
 
     def _close():
         log_info("application closing")
-        try:
-            db.close()
-        except Exception:
-            pass
+        db.close()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _close)
