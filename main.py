@@ -155,6 +155,30 @@ STARTUP_BOOTSTRAP_LOCK = threading.Lock()
 STARTUP_BOOTSTRAP_EVENT = threading.Event()
 
 
+def startup_bootstrap_guard(label: str = "startup_bootstrap") -> bool:
+    if STARTUP_BOOTSTRAP_EVENT.is_set():
+        log_warning(f"背景作業略過：{label} 已完成")
+        _append_classification_debug_trace("bootstrap_guard_skip", {"label": label})
+        return False
+    acquired = STARTUP_BOOTSTRAP_LOCK.acquire(blocking=False)
+    if not acquired:
+        log_warning(f"背景作業略過：{label} 已在執行中")
+        _append_classification_debug_trace("bootstrap_guard_skip", {"label": label, "reason": "already_running"})
+        return False
+    _append_classification_debug_trace("bootstrap_guard_enter", {"label": label})
+    return True
+
+def startup_bootstrap_guard_done(label: str = "startup_bootstrap"):
+    try:
+        STARTUP_BOOTSTRAP_EVENT.set()
+        _append_classification_debug_trace("bootstrap_guard_done", {"label": label})
+    finally:
+        try:
+            STARTUP_BOOTSTRAP_LOCK.release()
+        except Exception:
+            pass
+
+
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH = LOG_DIR / f"gtc_ai_trading_{datetime.now().strftime('%Y%m%d')}.log"
@@ -282,6 +306,9 @@ LAST_CLASSIFICATION_LOAD_INFO = {"loaded": False, "rows": 0, "path": "", "note":
 CLASSIFICATION_V2_SUMMARY_PATH = CLASSIFICATION_CACHE_DIR / "classification_v2_summary.json"
 CLASSIFICATION_V2_UNCLASSIFIED_PATH = CLASSIFICATION_CACHE_DIR / "未匹配分類清單.xlsx"
 CLASSIFICATION_V2_LAST_SUMMARY = {}
+CLASSIFICATION_DEBUG_TRACE_PATH = CLASSIFICATION_CACHE_DIR / "classification_debug_trace.json"
+CLASSIFICATION_UI_STATE_SNAPSHOT_PATH = CLASSIFICATION_CACHE_DIR / "classification_ui_state_snapshot.json"
+CLASSIFICATION_DEBUG_TRACE_LIMIT = 300
 
 CLASSIFICATION_LOG_CALLBACK = None
 CLASSIFICATION_STABILITY_LOCK = threading.RLock()
@@ -292,6 +319,54 @@ CLASSIFICATION_OFFICIAL_CACHE = {
 }
 CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS = 500
 DEBUG_CLASSIFICATION_MONITOR = False
+
+def _append_classification_debug_trace(event_type: str, payload: dict | None = None):
+    try:
+        payload = dict(payload or {})
+        existing = []
+        if CLASSIFICATION_DEBUG_TRACE_PATH.exists():
+            raw = json.loads(CLASSIFICATION_DEBUG_TRACE_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                existing = raw
+        payload["event_type"] = str(event_type or "")
+        payload["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        existing.append(payload)
+        if len(existing) > CLASSIFICATION_DEBUG_TRACE_LIMIT:
+            existing = existing[-CLASSIFICATION_DEBUG_TRACE_LIMIT:]
+        CLASSIFICATION_DEBUG_TRACE_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def snapshot_classification_ui_state(status: dict | None = None, summary: dict | None = None, extra: dict | None = None) -> dict:
+    payload = {
+        "snapshot_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": dict(status or get_classification_status()),
+        "summary": dict(summary or get_classification_v2_summary()),
+        "extra": dict(extra or {}),
+    }
+    try:
+        CLASSIFICATION_UI_STATE_SNAPSHOT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return payload
+
+def _select_best_classification_summary(candidates: list[dict]) -> dict:
+    valid = []
+    for item in candidates or []:
+        if isinstance(item, dict) and item:
+            valid.append(dict(item))
+    if not valid:
+        return {}
+    def _score(item: dict):
+        total = int(item.get("total", 0) or 0)
+        official = int(item.get("official", 0) or 0)
+        covered = int(item.get("covered", 0) or 0)
+        coverage = float(item.get("coverage_pct", 0) or 0)
+        report_time = str(item.get("report_time", "") or "")
+        is_large = 1 if total >= CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS else 0
+        return (is_large, total, covered, official, coverage, report_time)
+    valid.sort(key=_score, reverse=True)
+    return valid[0]
 
 def _debug_classification_monitor(message: str):
     try:
@@ -489,6 +564,8 @@ def _set_classification_load_info(loaded: bool, rows: int = 0, path: Path | None
         "path": str(path) if path else "",
         "note": str(note or "")
     }
+    _append_classification_debug_trace("load_info_update", LAST_CLASSIFICATION_LOAD_INFO)
+    snapshot_classification_ui_state(extra={"source": "_set_classification_load_info"})
 
 def get_classification_load_info() -> dict:
     try:
@@ -518,6 +595,10 @@ def get_classification_status() -> dict:
         out["exists"] = False
         out["is_stale"] = True
         out.setdefault("status", "missing")
+    if (not out.get("loaded")) and CLASSIFICATION_OFFICIAL_CACHE.get("ALL", {}).get("rows", 0):
+        out["loaded"] = True
+        out["loaded_rows"] = int(CLASSIFICATION_OFFICIAL_CACHE.get("ALL", {}).get("rows", 0) or 0)
+        out["load_note"] = out.get("load_note") or "由官方分類快取推定已載入"
     if out.get("loaded") and out.get("loaded_rows", 0) > 0:
         out["status"] = "ok"
     elif out.get("exists"):
@@ -988,6 +1069,7 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         out = out.sort_values(["stock_id", "market_official", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
         classification_debug_log(f"補充分類載入成功：ALL｜rows={len(out)}")
         _set_classification_load_info(True, len(out), None, f"補充分類載入成功：ALL｜rows={len(out)}")
+        _append_classification_debug_trace("official_load_success", {"market": "ALL", "rows": int(len(out)), "path": ""})
         _set_cached_official_classification("ALL", None, out)
         return out
 
@@ -1012,6 +1094,8 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
         out = out.drop_duplicates(subset=["stock_id"], keep="first")
         classification_debug_log(f"補充分類載入成功：{market}｜rows={len(out)}")
+        _set_classification_load_info(True, len(out), path, f"補充分類載入成功：{market}｜rows={len(out)}")
+        _append_classification_debug_trace("official_load_success", {"market": market, "rows": int(len(out)), "path": str(path)})
         _set_cached_official_classification(market, path, out)
         return out
     except Exception as exc:
@@ -1174,6 +1258,8 @@ def export_classification_diagnostics() -> dict:
         "classification_status": status,
         "classification_summary": summary,
         "official_cache": {k: {"rows": int(v.get("rows", 0) or 0), "path": str(v.get("path", "") or "")} for k, v in CLASSIFICATION_OFFICIAL_CACHE.items()},
+        "debug_trace_path": str(CLASSIFICATION_DEBUG_TRACE_PATH),
+        "ui_state_snapshot_path": str(CLASSIFICATION_UI_STATE_SNAPSHOT_PATH),
     }
     try:
         out_path = CLASSIFICATION_CACHE_DIR / "classification_diagnostics.json"
@@ -1185,23 +1271,20 @@ def export_classification_diagnostics() -> dict:
 
 def get_classification_v2_summary() -> dict:
     global CLASSIFICATION_V2_LAST_SUMMARY
-    file_data = {}
+    candidates = []
     try:
         if CLASSIFICATION_V2_SUMMARY_PATH.exists():
             raw = json.loads(CLASSIFICATION_V2_SUMMARY_PATH.read_text(encoding='utf-8'))
-            if isinstance(raw, dict):
-                file_data = dict(raw)
+            if isinstance(raw, dict) and raw:
+                candidates.append(dict(raw))
     except Exception:
-        file_data = {}
-    if file_data:
-        mem = CLASSIFICATION_V2_LAST_SUMMARY if isinstance(CLASSIFICATION_V2_LAST_SUMMARY, dict) else {}
-        mem_time = str(mem.get("report_time", "") or "")
-        file_time = str(file_data.get("report_time", "") or "")
-        if not mem or (file_time and file_time >= mem_time):
-            CLASSIFICATION_V2_LAST_SUMMARY = dict(file_data)
-            return dict(file_data)
+        pass
     if isinstance(CLASSIFICATION_V2_LAST_SUMMARY, dict) and CLASSIFICATION_V2_LAST_SUMMARY:
-        return dict(CLASSIFICATION_V2_LAST_SUMMARY)
+        candidates.append(dict(CLASSIFICATION_V2_LAST_SUMMARY))
+    best = _select_best_classification_summary(candidates)
+    if best:
+        CLASSIFICATION_V2_LAST_SUMMARY = dict(best)
+        return dict(best)
     return {}
 
 
@@ -1251,7 +1334,9 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
         }
         CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
         _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
+        _append_classification_debug_trace("quality_report_empty", dict(summary))
         _write_unclassified_report(pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]))
+        snapshot_classification_ui_state(summary=summary, extra={"source": "build_classification_quality_report.empty"})
         return pd.DataFrame(), summary
 
     x = df.copy()
@@ -1285,16 +1370,25 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
         "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "unclassified_report": str(CLASSIFICATION_V2_UNCLASSIFIED_PATH),
     }
-    CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
-    if _should_promote_classification_summary(summary):
+    promote = _should_promote_classification_summary(summary)
+    if promote:
+        CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
         _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
         _debug_classification_monitor(f"更新全市場覆蓋率摘要：total={summary.get('total', 0)} official={summary.get('official', 0)} coverage={summary.get('coverage_pct', 0)}%")
     else:
+        current_best = get_classification_v2_summary()
+        if not current_best:
+            CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
         _debug_classification_monitor(f"略過覆蓋率摘要覆蓋：total={summary.get('total', 0)} official={summary.get('official', 0)} coverage={summary.get('coverage_pct', 0)}%")
+    trace_payload = dict(summary)
+    trace_payload["promoted"] = bool(promote)
+    trace_payload["current_best_total"] = int((CLASSIFICATION_V2_LAST_SUMMARY or {}).get("total", 0) or 0)
+    _append_classification_debug_trace("quality_report", trace_payload)
     _write_unclassified_report(unclassified)
     coverage = 1.0 - float(x["industry_final"].isin(["未分類", "未匹配"]).mean()) if len(x) else 0.0
     if coverage < 0.95:
         log_warning(f"分類覆蓋率不足：{coverage:.2%}")
+    snapshot_classification_ui_state(summary=get_classification_v2_summary(), extra={"source": "build_classification_quality_report", "candidate_total": int(summary.get("total", 0) or 0), "promoted": bool(promote)})
     return unclassified, summary
 
 
