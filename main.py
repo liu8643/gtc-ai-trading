@@ -151,6 +151,9 @@ BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
 APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V3.5 OPERATION"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
+STARTUP_BOOTSTRAP_LOCK = threading.Lock()
+STARTUP_BOOTSTRAP_EVENT = threading.Event()
+
 
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -281,6 +284,88 @@ CLASSIFICATION_V2_UNCLASSIFIED_PATH = CLASSIFICATION_CACHE_DIR / "未匹配分�
 CLASSIFICATION_V2_LAST_SUMMARY = {}
 
 CLASSIFICATION_LOG_CALLBACK = None
+CLASSIFICATION_STABILITY_LOCK = threading.RLock()
+CLASSIFICATION_OFFICIAL_CACHE = {
+    "上市": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
+    "上櫃": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
+    "ALL": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
+}
+CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS = 500
+DEBUG_CLASSIFICATION_MONITOR = False
+
+def _debug_classification_monitor(message: str):
+    try:
+        if DEBUG_CLASSIFICATION_MONITOR:
+            log_info(f"[分類監控] {message}")
+    except Exception:
+        pass
+
+def _read_json_file_safe(path: Path) -> dict:
+    try:
+        p = Path(path)
+        if p.exists():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return dict(raw)
+    except Exception:
+        pass
+    return {}
+
+def _should_promote_classification_summary(summary: dict) -> bool:
+    total = int(summary.get("total", 0) or 0)
+    official = int(summary.get("official", 0) or 0)
+    if total < CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS:
+        _debug_classification_monitor(f"忽略小樣本覆蓋率摘要：total={total} official={official}")
+        return False
+    current = _read_json_file_safe(CLASSIFICATION_V2_SUMMARY_PATH) if "CLASSIFICATION_V2_SUMMARY_PATH" in globals() else {}
+    current_total = int(current.get("total", 0) or 0)
+    current_official = int(current.get("official", 0) or 0)
+    current_cov = float(current.get("coverage_pct", 0) or 0)
+    new_cov = float(summary.get("coverage_pct", 0) or 0)
+    if current_total <= 0:
+        return True
+    if total > current_total:
+        return True
+    if official > current_official and total >= int(current_total * 0.85):
+        return True
+    if new_cov >= current_cov and total >= current_total:
+        return True
+    _debug_classification_monitor(f"保留既有全市場摘要：existing_total={current_total} new_total={total} existing_cov={current_cov:.2f} new_cov={new_cov:.2f}")
+    return False
+
+def _get_cached_official_classification(market: str, path: Path | None = None) -> Optional[pd.DataFrame]:
+    market = str(market or "").strip() or "ALL"
+    with CLASSIFICATION_STABILITY_LOCK:
+        slot = CLASSIFICATION_OFFICIAL_CACHE.get(market)
+        if not slot or slot.get("df") is None:
+            return None
+        cached_df = slot.get("df")
+        cached_path = str(slot.get("path") or "")
+        cached_mtime = float(slot.get("mtime", 0) or 0)
+        if path is None:
+            if cached_df is None:
+                return None
+            return cached_df.copy()
+        p = Path(path)
+        if (not p.exists()) or cached_df is None:
+            return None
+        if cached_path == str(p) and abs(float(p.stat().st_mtime) - cached_mtime) < 1e-6:
+            return cached_df.copy()
+    return None
+
+def _set_cached_official_classification(market: str, path: Path | None, df: pd.DataFrame):
+    market = str(market or "").strip() or "ALL"
+    try:
+        cached_df = df.copy() if df is not None else None
+    except Exception:
+        cached_df = df
+    with CLASSIFICATION_STABILITY_LOCK:
+        slot = CLASSIFICATION_OFFICIAL_CACHE.setdefault(market, {"df": None, "path": "", "mtime": 0.0, "rows": 0})
+        slot["df"] = cached_df
+        slot["path"] = str(path) if path else ""
+        slot["mtime"] = float(Path(path).stat().st_mtime) if path and Path(path).exists() else 0.0
+        slot["rows"] = int(len(df) if df is not None else 0)
+
 
 def set_classification_log_callback(cb):
     global CLASSIFICATION_LOG_CALLBACK
@@ -886,6 +971,9 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
 
     if market == "ALL":
+        cached_all = _get_cached_official_classification("ALL")
+        if cached_all is not None and not cached_all.empty:
+            return cached_all
         twse = load_official_classification_book("上市")
         tpex = load_official_classification_book("上櫃")
         parts = [df for df in [twse, tpex] if df is not None and not df.empty]
@@ -900,6 +988,7 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         out = out.sort_values(["stock_id", "market_official", "industry_official"]).drop_duplicates(subset=["stock_id"], keep="first")
         classification_debug_log(f"補充分類載入成功：ALL｜rows={len(out)}")
         _set_classification_load_info(True, len(out), None, f"補充分類載入成功：ALL｜rows={len(out)}")
+        _set_cached_official_classification("ALL", None, out)
         return out
 
     path = resolve_classification_book_by_market(market)
@@ -907,6 +996,10 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         note = f"找不到官方分類來源：{market}"
         classification_debug_log(note, "WARNING")
         return empty_df
+
+    cached_market = _get_cached_official_classification(market, path)
+    if cached_market is not None and not cached_market.empty:
+        return cached_market
 
     classification_debug_log(f"實際讀到的分類來源（{market}）：{path}")
     try:
@@ -919,6 +1012,7 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
         out = out.drop_duplicates(subset=["stock_id"], keep="first")
         classification_debug_log(f"補充分類載入成功：{market}｜rows={len(out)}")
+        _set_cached_official_classification(market, path, out)
         return out
     except Exception as exc:
         classification_debug_log(f"分類來源解析失敗（{market}）：{exc}", "ERROR")
@@ -1072,6 +1166,23 @@ def _write_unclassified_report(df: pd.DataFrame):
         pass
 
 
+def export_classification_diagnostics() -> dict:
+    summary = get_classification_v2_summary()
+    status = get_classification_status()
+    payload = {
+        "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "classification_status": status,
+        "classification_summary": summary,
+        "official_cache": {k: {"rows": int(v.get("rows", 0) or 0), "path": str(v.get("path", "") or "")} for k, v in CLASSIFICATION_OFFICIAL_CACHE.items()},
+    }
+    try:
+        out_path = CLASSIFICATION_CACHE_DIR / "classification_diagnostics.json"
+        _write_json_safe(out_path, payload)
+        payload["output_path"] = str(out_path)
+    except Exception:
+        pass
+    return payload
+
 def get_classification_v2_summary() -> dict:
     global CLASSIFICATION_V2_LAST_SUMMARY
     file_data = {}
@@ -1175,7 +1286,11 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
         "unclassified_report": str(CLASSIFICATION_V2_UNCLASSIFIED_PATH),
     }
     CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
-    _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
+    if _should_promote_classification_summary(summary):
+        _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
+        _debug_classification_monitor(f"更新全市場覆蓋率摘要：total={summary.get('total', 0)} official={summary.get('official', 0)} coverage={summary.get('coverage_pct', 0)}%")
+    else:
+        _debug_classification_monitor(f"略過覆蓋率摘要覆蓋：total={summary.get('total', 0)} official={summary.get('official', 0)} coverage={summary.get('coverage_pct', 0)}%")
     _write_unclassified_report(unclassified)
     coverage = 1.0 - float(x["industry_final"].isin(["未分類", "未匹配"]).mean()) if len(x) else 0.0
     if coverage < 0.95:
@@ -1722,7 +1837,7 @@ def write_table_bundle(base_path: Path, tables: Dict[str, pd.DataFrame], preferr
 
 
 
-def _normalize_master_df(df: pd.DataFrame, market_label: str) -> pd.DataFrame:
+def _normalize_master_df(df: pd.DataFrame, market_label: str, persist_classification_summary: bool = True) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
 
@@ -1752,7 +1867,15 @@ def _normalize_master_df(df: pd.DataFrame, market_label: str) -> pd.DataFrame:
     x["is_active"] = 1
     x["update_date"] = datetime.now().strftime("%Y-%m-%d")
 
-    x = apply_classification_layers(x)
+    if not persist_classification_summary:
+        original_threshold = CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS
+        try:
+            globals()["CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS"] = max(int(CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS), len(x) + 1)
+            x = apply_classification_layers(x)
+        finally:
+            globals()["CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS"] = original_threshold
+    else:
+        x = apply_classification_layers(x)
     return x[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]].drop_duplicates(subset=["stock_id"]).reset_index(drop=True)
 
 
@@ -1811,7 +1934,7 @@ def build_full_market_universe() -> pd.DataFrame:
         csv_path = resolve_master_csv()
         if csv_path.exists():
             x = pd.read_csv(csv_path, dtype=str).fillna("")
-            x = _normalize_master_df(x, "上市")
+            x = _normalize_master_df(x, "上市", persist_classification_summary=False)
             if x is not None and not x.empty and "stock_id" in x.columns:
                 x["stock_id"] = x["stock_id"].astype(str).str.strip()
                 x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
@@ -5047,7 +5170,7 @@ class AppUI:
         self.search_var = tk.StringVar(value="")
 
         self._build_ui()
-        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
+        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level, False)))
         self.root.after(80, self.refresh_filters)
         self.root.after(120, self.show_welcome_message)
         self.root.after(180, self._apply_initial_layout)
@@ -5079,9 +5202,11 @@ class AppUI:
             self.root.geometry("1500x860")
 
     def bootstrap_after_startup(self):
-        if getattr(self, "_bootstrap_started", False):
-            return
-        self._bootstrap_started = True
+        with STARTUP_BOOTSTRAP_LOCK:
+            if getattr(self, "_bootstrap_started", False) or STARTUP_BOOTSTRAP_EVENT.is_set():
+                return
+            self._bootstrap_started = True
+            STARTUP_BOOTSTRAP_EVENT.set()
 
         def worker():
             try:
@@ -5149,7 +5274,7 @@ class AppUI:
             log_warning(f"套用啟動版型失敗：{exc}")
 
     def show_welcome_message(self):
-        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
+        set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level, False)))
         last_date = self.db.get_last_price_date() or "尚未建立"
         ranking_count = self.db.get_ranking_rows_count()
         price_rows = self.db.get_total_price_rows()
@@ -5169,6 +5294,8 @@ class AppUI:
         if cls_v2:
             coverage_text = f"{float(cls_v2.get('coverage_pct', 0) or 0):.2f}%"
             coverage_detail = f"官方 {int(cls_v2.get('official', 0) or 0)}｜手動 {int(cls_v2.get('manual', 0) or 0)}｜規則 {int(cls_v2.get('rule_engine', 0) or 0)}｜AI {int(cls_v2.get('ai_infer', 0) or 0)}｜未分類 {int(cls_v2.get('unclassified', 0) or 0)}"
+            if int(cls_v2.get('total', 0) or 0) < CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS:
+                coverage_detail += "｜摘要保護中"
         lines = [
             "《GTC AI Trading System v9.2 FINAL-RELEASE》",
             "",
@@ -5621,19 +5748,20 @@ class AppUI:
             out["現價"] = out["display_price"]
         return out
 
-    def append_log(self, text, level: str = "INFO"):
+    def append_log(self, text, level: str = "INFO", mirror_to_logger: bool = True):
         ts = datetime.now().strftime("%H:%M:%S")
         level_upper = str(level or "INFO").upper()
         msg = f"[{ts}] [{level_upper}] {text}"
-        try:
-            if level_upper == "ERROR":
-                log_error(text)
-            elif level_upper == "WARNING":
-                log_warning(text)
-            else:
-                log_info(text)
-        except Exception:
-            pass
+        if mirror_to_logger:
+            try:
+                if level_upper == "ERROR":
+                    log_error(text)
+                elif level_upper == "WARNING":
+                    log_warning(text)
+                else:
+                    log_info(text)
+            except Exception:
+                pass
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
@@ -5663,7 +5791,7 @@ class AppUI:
             pass
 
     def update_classification_book(self):
-        set_classification_log_callback(lambda message, level="INFO": self.ui_call(self.append_log, message, level))
+        set_classification_log_callback(lambda message, level="INFO": self.ui_call(self.append_log, message, level, False))
         def worker():
             self.ui_call(self.start_task, "更新分類檔", 4)
             self.ui_call(self.update_task, "更新分類檔", 1, 4, item="檢查本機快取")
@@ -5746,7 +5874,6 @@ class AppUI:
             self.ui_call(self.set_busy, True)
             self.ui_call(self.reset_progress)
             self.ui_call(self.append_log, f"背景作業啟動：{name}")
-            log_info(f"背景作業啟動：{name}")
             try:
                 target()
                 self.ui_call(self.append_log, f"背景作業完成：{name}")
