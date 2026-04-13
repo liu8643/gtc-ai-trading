@@ -1043,6 +1043,20 @@ def _safe_numeric_flag_series(series: pd.Series, default: int = 0) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").fillna(default)
     return s.astype(int)
 
+def _safe_num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if isinstance(df, pd.DataFrame) and col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").fillna(default)
+    if isinstance(df, pd.DataFrame):
+        return pd.Series(default, index=df.index, dtype="float64")
+    return pd.Series(dtype="float64")
+
+def _safe_text_fill_series(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
+    if isinstance(df, pd.DataFrame) and col in df.columns:
+        return pd.Series(df[col], index=df.index, copy=True).fillna(default).astype(str)
+    if isinstance(df, pd.DataFrame):
+        return pd.Series(default, index=df.index, dtype="object")
+    return pd.Series(dtype="object")
+
 def _assign_object_values(df: pd.DataFrame, mask: pd.Series, col: str, values) -> pd.DataFrame:
     x = df
     if col not in x.columns:
@@ -3759,21 +3773,21 @@ class MasterTradingEngine:
             tradable["preferred_rank"] = preferred_mask.reindex(tradable.index).fillna(False).astype(int)
             tradable["modules_pass_count"] = tradable[[c for c in ["trend_ok", "kd_ok", "macd_ok", "volume_ok"] if c in tradable.columns]].fillna(0).sum(axis=1)
             tradable["mainstream_score"] = (
-                tradable.get("model_score", 0).fillna(0) * 0.30 +
-                tradable.get("liquidity_score", 0).fillna(0) * 0.22 +
-                tradable.get("leader_follow_score", 0).fillna(0) * 0.18 +
-                tradable.get("intraday_trend_score", 0).fillna(0) * 0.10 +
-                tradable.get("win_rate", 0).fillna(0) * 0.12 +
-                tradable.get("rr", 0).fillna(0).clip(upper=3) * 5 +
+                _safe_num_series(tradable, "model_score", 0) * 0.30 +
+                _safe_num_series(tradable, "liquidity_score", 0) * 0.22 +
+                _safe_num_series(tradable, "leader_follow_score", 0) * 0.18 +
+                _safe_num_series(tradable, "intraday_trend_score", 0) * 0.10 +
+                _safe_num_series(tradable, "win_rate", 0) * 0.12 +
+                _safe_num_series(tradable, "rr", 0).clip(upper=3) * 5 +
                 tradable["preferred_rank"] * 6
             ).round(2)
             tradable["breakout_score"] = (
-                tradable.get("wave_trade_score", tradable.get("trade_score", 0)).fillna(0) * 0.28 +
+                (_safe_num_series(tradable, "wave_trade_score", np.nan).fillna(_safe_num_series(tradable, "trade_score", 0))) * 0.28 +
                 tradable.get("attack_volume_score", 0).fillna(0) * 0.20 +
                 tradable.get("range_breakout_score", 0).fillna(0) * 0.18 +
                 tradable.get("active_buy_score", 0).fillna(0) * 0.12 +
-                tradable.get("model_score", 0).fillna(0) * 0.10 +
-                tradable.get("rr", 0).fillna(0).clip(upper=3) * 5 +
+                _safe_num_series(tradable, "model_score", 0) * 0.10 +
+                _safe_num_series(tradable, "rr", 0).clip(upper=3) * 5 +
                 tradable["preferred_rank"] * 5
             ).round(2)
             mainstream_top20 = tradable.sort_values(["mainstream_score", "modules_pass_count", "liquidity_score", "model_score"], ascending=False).head(20).copy()
@@ -3791,7 +3805,7 @@ class MasterTradingEngine:
                 candidate_pool = candidate_pool.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
             tradable_pool = candidate_pool[candidate_pool.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])].copy() if not candidate_pool.empty else pd.DataFrame()
             if not tradable_pool.empty:
-                tradable_pool["light_rank"] = tradable_pool.get("tactical_light", "⚪").map({"🔵": 5, "🟢": 4, "🟡": 3, "🟠": 2, "🔴": 1, "⚪": 0}).fillna(0)
+                tradable_pool["light_rank"] = _safe_text_fill_series(tradable_pool, "tactical_light", "⚪").map({"🔵": 5, "🟢": 4, "🟡": 3, "🟠": 2, "🔴": 1, "⚪": 0}).fillna(0)
                 tradable_pool = tradable_pool.sort_values(["light_rank", "mainstream_score", "breakout_score", "liquidity_score", "model_score", "win_rate"], ascending=False)
                 tradable_top20 = tradable_pool.head(20).copy()
             tradable = tradable.sort_values(["liquidity_score", "model_score", "trade_score", "win_rate"], ascending=False)
@@ -3801,17 +3815,17 @@ class MasterTradingEngine:
             trade_top20 = trade_top20.copy()
             trade_top20["pool_role"] = "強勢候選20"
             trade_top20["candidate20_score"] = (
-                trade_top20.get("model_score", 0).fillna(0) * 0.22 +
-                trade_top20.get("wave_trade_score", 0).fillna(0) * 0.12 +
-                trade_top20.get("liquidity_score", 0).fillna(0) * 0.14 +
-                trade_top20.get("mainstream_score", 0).fillna(0) * 0.14 +
-                trade_top20.get("breakout_score", 0).fillna(0) * 0.12 +
-                trade_top20.get("leader_follow_score", 0).fillna(0) * 0.08 +
-                trade_top20.get("active_buy_score", 0).fillna(0) * 0.06 +
-                trade_top20.get("orderflow_aggression_score", 0).fillna(0) * 0.06 +
-                trade_top20.get("win_rate", 0).fillna(0) * 0.04 +
-                trade_top20.get("rr", 0).fillna(0).clip(upper=3) * 4 +
-                trade_top20.get("modules_pass_count", 0).fillna(0) * 2
+                _safe_num_series(trade_top20, "model_score", 0) * 0.22 +
+                _safe_num_series(trade_top20, "wave_trade_score", 0) * 0.12 +
+                _safe_num_series(trade_top20, "liquidity_score", 0) * 0.14 +
+                _safe_num_series(trade_top20, "mainstream_score", 0) * 0.14 +
+                _safe_num_series(trade_top20, "breakout_score", 0) * 0.12 +
+                _safe_num_series(trade_top20, "leader_follow_score", 0) * 0.08 +
+                _safe_num_series(trade_top20, "active_buy_score", 0) * 0.06 +
+                _safe_num_series(trade_top20, "orderflow_aggression_score", 0) * 0.06 +
+                _safe_num_series(trade_top20, "win_rate", 0) * 0.04 +
+                _safe_num_series(trade_top20, "rr", 0).clip(upper=3) * 4 +
+                _safe_num_series(trade_top20, "modules_pass_count", 0) * 2
             ).round(2)
             trade_top20 = trade_top20.sort_values(["candidate20_score", "mainstream_score", "breakout_score", "liquidity_score", "model_score"], ascending=False).head(20).copy()
 
@@ -3819,18 +3833,18 @@ class MasterTradingEngine:
             tradable_top20 = tradable[(tradable.get("decision", pd.Series(dtype=str)).isin(["BUY", "WEAK BUY"])) & (~tradable.get("ui_state", pd.Series(dtype=str)).isin(["淘汰", "不可買"]))].copy() if not tradable.empty else pd.DataFrame()
         if not tradable_top20.empty:
             tradable_top20 = tradable_top20.copy()
-            tradable_top20["light_rank"] = tradable_top20.get("tactical_light", "⚪").map({"🔵": 5, "🟢": 4, "🟡": 3, "🟠": 2, "🔴": 1, "⚪": 0}).fillna(0)
-            rel_market_norm = (((pd.to_numeric(tradable_top20.get("relative_strength_market", 0), errors="coerce").fillna(0) + 10) / 20.0) * 100.0).clip(0, 100)
-            rel_ind_norm = pd.to_numeric(tradable_top20.get("relative_strength_industry", 0), errors="coerce").fillna(0).clip(0, 100)
-            tradable_top20["candidate20_score"] = pd.to_numeric(tradable_top20.get("candidate20_score", 0), errors="coerce").fillna(0)
-            tradable_top20["source_count"] = pd.to_numeric(tradable_top20.get("source_count", 1), errors="coerce").fillna(1)
+            tradable_top20["light_rank"] = _safe_text_fill_series(tradable_top20, "tactical_light", "⚪").map({"🔵": 5, "🟢": 4, "🟡": 3, "🟠": 2, "🔴": 1, "⚪": 0}).fillna(0)
+            rel_market_norm = (((_safe_num_series(tradable_top20, "relative_strength_market", 0) + 10) / 20.0) * 100.0).clip(0, 100)
+            rel_ind_norm = _safe_num_series(tradable_top20, "relative_strength_industry", 0).clip(0, 100)
+            tradable_top20["candidate20_score"] = _safe_num_series(tradable_top20, "candidate20_score", 0)
+            tradable_top20["source_count"] = _safe_num_series(tradable_top20, "source_count", 1)
             tradable_top20["core_attack5_score"] = (
                 tradable_top20["candidate20_score"] * 0.30 +
-                tradable_top20.get("mainstream_score", 0).fillna(0) * 0.18 +
-                tradable_top20.get("breakout_score", 0).fillna(0) * 0.14 +
-                tradable_top20.get("leader_follow_score", 0).fillna(0) * 0.10 +
-                tradable_top20.get("active_buy_score", 0).fillna(0) * 0.08 +
-                tradable_top20.get("orderflow_aggression_score", 0).fillna(0) * 0.08 +
+                _safe_num_series(tradable_top20, "mainstream_score", 0) * 0.18 +
+                _safe_num_series(tradable_top20, "breakout_score", 0) * 0.14 +
+                _safe_num_series(tradable_top20, "leader_follow_score", 0) * 0.10 +
+                _safe_num_series(tradable_top20, "active_buy_score", 0) * 0.08 +
+                _safe_num_series(tradable_top20, "orderflow_aggression_score", 0) * 0.08 +
                 rel_market_norm * 0.04 +
                 rel_ind_norm * 0.04 +
                 tradable_top20["source_count"] * 4 +
@@ -3861,19 +3875,19 @@ class MasterTradingEngine:
         wait_pullback = pd.DataFrame()
         if not execution_base.empty:
             execution_base = execution_base.copy()
-            execution_base["entry_mid"] = pd.to_numeric(execution_base.get("entry_mid", 0), errors="coerce").fillna(0)
-            execution_base["price_deviation"] = pd.to_numeric(execution_base.get("price_deviation", 0), errors="coerce").fillna(0)
-            execution_base["rr_live"] = pd.to_numeric(execution_base.get("rr_live", 0), errors="coerce").fillna(0)
-            execution_base["candidate20_score"] = pd.to_numeric(execution_base.get("candidate20_score", 0), errors="coerce").fillna(0)
-            execution_base["core_attack5_score"] = pd.to_numeric(execution_base.get("core_attack5_score", execution_base.get("candidate20_score", 0)), errors="coerce").fillna(0)
+            execution_base["entry_mid"] = _safe_num_series(execution_base, "entry_mid", 0)
+            execution_base["price_deviation"] = _safe_num_series(execution_base, "price_deviation", 0)
+            execution_base["rr_live"] = _safe_num_series(execution_base, "rr_live", 0)
+            execution_base["candidate20_score"] = _safe_num_series(execution_base, "candidate20_score", 0)
+            execution_base["core_attack5_score"] = (_safe_num_series(execution_base, "core_attack5_score", np.nan).fillna(_safe_num_series(execution_base, "candidate20_score", 0)))
             execution_base["execution_score"] = (
                 execution_base["core_attack5_score"] * 0.35 +
                 (1 - execution_base["price_deviation"].abs().clip(0, 1)) * 25 +
                 execution_base["rr_live"].clip(upper=3) * 10 +
-                (100 - execution_base.get("atr_pct", 0).fillna(0).clip(lower=0) * 5) * 0.10 +
-                execution_base.get("liquidity_score", 0).fillna(0) * 0.10 +
-                execution_base.get("win_rate", 0).fillna(0) * 0.05 +
-                execution_base.get("model_score", 0).fillna(0) * 0.05
+                (100 - _safe_num_series(execution_base, "atr_pct", 0).clip(lower=0) * 5) * 0.10 +
+                _safe_num_series(execution_base, "liquidity_score", 0) * 0.10 +
+                _safe_num_series(execution_base, "win_rate", 0) * 0.05 +
+                _safe_num_series(execution_base, "model_score", 0) * 0.05
             ).round(2)
 
             today_buy = execution_base[
