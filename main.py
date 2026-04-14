@@ -2682,6 +2682,39 @@ V80_WEIGHTS = {
     "kline": 0.18, "wave": 0.22, "fib": 0.14, "sakata": 0.14, "volume": 0.16, "indicator": 0.16,
 }
 
+ORDER_COLUMNS = [
+    "優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "盤中狀態", "活性分",
+    "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%",
+    "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"
+]
+
+INSTITUTIONAL_COLUMNS = [
+    "優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態",
+    "盤中狀態", "活性分", "淘汰原因", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率",
+    "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%",
+    "產業曝險%", "投資組合狀態", "風險備註"
+]
+
+ORDER_TREE_SCHEMA = [
+    ("priority", "優先級", 80), ("id", "代號", 90), ("name", "名稱", 120), ("price", "現價", 90),
+    ("chg", "漲跌", 90), ("chg_pct", "漲跌幅%", 95), ("bucket", "分類", 95), ("action", "狀態", 95),
+    ("liquidity", "盤中狀態", 100), ("liq_score", "活性分", 90), ("entry", "進場區", 130), ("stop", "停損", 100),
+    ("target", "目標價", 100), ("target1382", "1.382", 90), ("target1618", "1.618", 90), ("rr", "RR", 80),
+    ("win_rate", "勝率%", 85), ("atr_pct", "ATR%", 85), ("kelly_pct", "Kelly%", 85), ("qty", "建議張數", 90),
+    ("amount", "建議金額", 100), ("single_pct", "單檔曝險%", 95), ("portfolio_state", "組合狀態", 105), ("risk_note", "風險備註", 220),
+]
+
+INSTITUTIONAL_TREE_SCHEMA = [
+    ("priority", "優先級", 80), ("id", "代號", 90), ("name", "名稱", 120), ("price", "現價", 90),
+    ("chg", "漲跌", 90), ("chg_pct", "漲跌幅%", 95), ("market", "市場", 85), ("industry", "產業", 110),
+    ("theme", "題材", 110), ("bucket", "分類", 95), ("action", "狀態", 95), ("liquidity", "盤中狀態", 100),
+    ("liq_score", "活性分", 90), ("elim_reason", "淘汰原因", 160), ("entry", "進場區", 130), ("stop", "停損", 100),
+    ("target", "目標價", 100), ("target1382", "1.382", 90), ("target1618", "1.618", 90), ("rr", "RR", 80),
+    ("win_rate", "勝率%", 85), ("model_score", "模型分數", 95), ("trade_score", "交易分數", 95), ("atr_pct", "ATR%", 85),
+    ("kelly_pct", "Kelly%", 85), ("qty", "建議張數", 90), ("amount", "建議金額", 100), ("single_pct", "單檔曝險%", 95),
+    ("theme_pct", "題材曝險%", 95), ("industry_pct", "產業曝險%", 95), ("portfolio_state", "投資組合狀態", 110), ("risk_note", "風險備註", 220),
+]
+
 
 
 
@@ -4609,6 +4642,7 @@ class AppUI:
         self.left_notebook.add(self.tab_order, text="執行下單清單")
         self.left_notebook.add(self.tab_inst, text="組合交易計畫")
         self.left_notebook.add(self.tab_backtest, text="回測視覺化")
+        self.left_notebook.bind("<<NotebookTabChanged>>", self.on_left_tab_changed)
 
         self.dashboard_tree = self._make_tree(self.tab_dashboard, ("metric", "value", "desc"), {
             "metric": "指標", "value": "數值", "desc": "說明"
@@ -4621,6 +4655,7 @@ class AppUI:
         self.rotation_tree = self._make_tree(self.tab_rotation, ("industry", "count", "avg_total", "avg_ai", "trend_count", "hot_score", "rotation"), {
             "industry": "產業", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "trend_count": "強勢數", "hot_score": "輪動分", "rotation": "輪動狀態"
         })
+        self.rotation_tree.bind("<<TreeviewSelect>>", self.on_select_rotation)
 
         self.rank_tree = self._make_tree(self.tab_rank, ("rank", "id", "name", "price", "chg", "chg_pct", "industry", "theme", "total", "ai", "signal", "action"), {
             "rank": "排名", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "industry": "產業", "theme": "題材", "total": "總分", "ai": "AI分", "signal": "訊號", "action": "建議"
@@ -4679,6 +4714,8 @@ class AppUI:
         self.detail_hsb.grid(row=1, column=0, sticky="ew")
         upper_body.rowconfigure(0, weight=1)
         upper_body.columnconfigure(0, weight=1)
+        self.right_panel_mode = "個股模式"
+        self.right_panel_source = "-"
 
         self.win_plan_text = None
         self.win_top20_tree = None
@@ -4725,6 +4762,128 @@ class AppUI:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         return tree
+
+    def _make_tree_from_schema(self, parent, schema):
+        cols = tuple(item[0] for item in schema)
+        headers = {item[0]: item[1] for item in schema}
+        tree = self._make_tree(parent, cols, headers)
+        for key, _, width in schema:
+            tree.column(key, width=width, anchor="center")
+        return tree
+
+    def _reconfigure_tree_from_schema(self, tree, schema):
+        cols = tuple(item[0] for item in schema)
+        tree.configure(columns=cols)
+        for c in cols:
+            tree.heading(c, text="")
+        for key, title, width in schema:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, anchor="center")
+
+    def _normalize_schema_df(self, df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=columns)
+        x = df.copy()
+        for col in columns:
+            if col not in x.columns:
+                x[col] = ""
+        x = x[columns].copy()
+        return x.fillna("")
+
+    def normalize_order_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        x = self._normalize_schema_df(df, ORDER_COLUMNS)
+        if not x.empty:
+            assert list(x.columns) == ORDER_COLUMNS
+        return x
+
+    def normalize_institutional_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        x = self._normalize_schema_df(df, INSTITUTIONAL_COLUMNS)
+        if not x.empty:
+            assert list(x.columns) == INSTITUTIONAL_COLUMNS
+        return x
+
+    def _render_order_tree(self, df: pd.DataFrame):
+        self._reconfigure_tree_from_schema(self.order_tree, ORDER_TREE_SCHEMA)
+        df = self.normalize_order_df(df)
+        for _, r in df.iterrows():
+            self.order_tree.insert("", "end", values=(
+                int(float(r.get("優先級", 0) or 0)), r.get("代號", ""), r.get("名稱", ""), r.get("現價", "-"),
+                r.get("漲跌", "-"), r.get("漲跌幅%", "-"), r.get("分類", ""), r.get("狀態", ""),
+                r.get("盤中狀態", ""), r.get("活性分", ""), r.get("進場區", "-"), r.get("停損", "-"),
+                r.get("目標價", "-"), r.get("1.382", "-"), r.get("1.618", "-"), r.get("RR", ""),
+                r.get("勝率", ""), r.get("ATR%", ""), r.get("Kelly%", ""), r.get("建議張數", ""),
+                r.get("建議金額", ""), r.get("單檔曝險%", ""), r.get("投資組合狀態", ""), r.get("風險備註", "")
+            ))
+
+    def _render_institutional_tree(self, df: pd.DataFrame):
+        self._reconfigure_tree_from_schema(self.inst_tree, INSTITUTIONAL_TREE_SCHEMA)
+        df = self.normalize_institutional_df(df)
+        for _, r in df.iterrows():
+            self.inst_tree.insert("", "end", values=(
+                int(float(r.get("優先級", 0) or 0)), r.get("代號", ""), r.get("名稱", ""), r.get("現價", "-"),
+                r.get("漲跌", "-"), r.get("漲跌幅%", "-"), r.get("市場", ""), r.get("產業", ""), r.get("題材", ""),
+                r.get("分類", ""), r.get("狀態", ""), r.get("盤中狀態", ""), r.get("活性分", ""), r.get("淘汰原因", ""),
+                r.get("進場區", "-"), r.get("停損", "-"), r.get("目標價", "-"), r.get("1.382", "-"), r.get("1.618", "-"),
+                r.get("RR", ""), r.get("勝率", ""), r.get("模型分數", ""), r.get("交易分數", ""), r.get("ATR%", ""),
+                r.get("Kelly%", ""), r.get("建議張數", ""), r.get("建議金額", ""), r.get("單檔曝險%", ""), r.get("題材曝險%", ""),
+                r.get("產業曝險%", ""), r.get("投資組合狀態", ""), r.get("風險備註", "")
+            ))
+
+    def clear_right_panel(self, source: str = ""):
+        self.right_panel_mode = "產業輪動模式" if source else "個股模式"
+        self.right_panel_source = source or "-"
+        self.detail.delete("1.0", tk.END)
+        lines = [
+            "《右側面板已刷新》",
+            f"模式：{self.right_panel_mode}",
+            f"資料來源：{self.right_panel_source}",
+            "",
+            "目前尚未指定個股。",
+            "請點選左側列表股票，或在產業輪動頁點選產業後帶出代表股。",
+        ]
+        self.detail.insert("1.0", "\n".join(lines))
+
+    def _find_rotation_representative_stock(self, industry_name: str) -> str:
+        industry_name = str(industry_name or "").strip()
+        if not industry_name:
+            return ""
+        candidates = []
+        for df in [getattr(self, "last_top20_df", pd.DataFrame()), self.db.get_latest_ranking()]:
+            if df is None or df.empty or "industry" not in df.columns:
+                continue
+            x = df[df["industry"].astype(str).str.strip() == industry_name].copy()
+            if x.empty:
+                continue
+            sort_cols = [c for c in ["total_score", "ai_score", "candidate20_score", "trade_score", "rank_all"] if c in x.columns]
+            if sort_cols:
+                ascending = [False if c != "rank_all" else True for c in sort_cols]
+                x = x.sort_values(sort_cols, ascending=ascending)
+            sid_col = "stock_id" if "stock_id" in x.columns else ("代號" if "代號" in x.columns else None)
+            if sid_col:
+                sid = str(x.iloc[0][sid_col])
+                if sid:
+                    return sid
+        return ""
+
+    def on_left_tab_changed(self, event=None):
+        try:
+            current_tab = self.left_notebook.select()
+        except Exception:
+            return
+        if current_tab == str(self.tab_rotation):
+            self.clear_right_panel(source="產業輪動模式")
+
+    def on_select_rotation(self, event=None):
+        sel = self.rotation_tree.selection()
+        if not sel:
+            return
+        vals = self.rotation_tree.item(sel[0], "values")
+        industry_name = str(vals[0]) if vals else ""
+        stock_id = self._find_rotation_representative_stock(industry_name)
+        if stock_id:
+            self.sync_all_views(stock_id, source=f"產業輪動/代表股/{industry_name}")
+        else:
+            self.clear_right_panel(source=f"產業輪動/{industry_name}")
 
     def set_status(self, text):
         self.status_label.config(text=text)
@@ -5654,6 +5813,8 @@ class AppUI:
             self.append_log(f"選股同步更新失敗：{stock_id}｜{e}")
 
     def sync_all_views(self, stock_id: str, source: str = ""):
+        self.right_panel_mode = "個股模式"
+        self.right_panel_source = source or "-"
         self.safe_sync_stock_views(stock_id, source=source)
 
     def _schedule_chart_update(self, stock_id: str):
@@ -6066,8 +6227,8 @@ class AppUI:
             "投資組合狀態": plan["投資組合狀態"],
             "風險備註": plan["風險備註"],
         })
-        self.last_institutional_plan_df = self.enrich_price_and_export_fields(plan.copy(), id_col="代號")
-        order_df = self.enrich_price_and_export_fields(order_df, id_col="代號")
+        self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(plan.copy(), id_col="代號"))
+        order_df = self.normalize_order_df(self.enrich_price_and_export_fields(order_df, id_col="代號"))
         return order_df
 
 
@@ -6110,40 +6271,10 @@ class AppUI:
                     f"{float(r.get('cagr', 0) or 0):.2f}",
                     f"{float(r.get('mdd', 0) or 0):.2f}"
                 ))
-
-
         if self.last_institutional_plan_df is not None and not self.last_institutional_plan_df.empty:
-            for _, r in self.last_institutional_plan_df.iterrows():
-                self.inst_tree.insert("", "end", values=(
-                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("市場", ""),
-                    r.get("產業", ""), r.get("題材", ""), r.get("分類", ""), r.get("狀態", ""),
-                    r.get("盤中狀態", ""), f"{float(r.get('活性分', 0) or 0):.1f}",
-                    r.get("進場區", "-"), r.get("停損", "-"), r.get("目標價", "-"),
-                    f"{float(r.get('RR', 0) or 0):.2f}", f"{float(r.get('勝率', 0) or 0):.1f}",
-                    f"{float(r.get('模型分數', 0) or 0):.2f}",
-                    f"{float(r.get('交易分數', 0) or 0):.2f}",
-                    f"{float(r.get('ATR%', 0) or 0):.2f}",
-                    f"{float(r.get('Kelly%', 0) or 0):.2f}",
-                    (f"{float(r.get('建議張數', 0) or 0):.1f}".rstrip('0').rstrip('.') if pd.notna(r.get('建議張數', 0)) else "0"),
-                    f"{float(r.get('建議金額', 0) or 0):.0f}",
-                    f"{float(r.get('單檔曝險%', 0) or 0):.2f}",
-                    f"{float(r.get('題材曝險%', 0) or 0):.2f}",
-                    f"{float(r.get('產業曝險%', 0) or 0):.2f}",
-                    r.get("投資組合狀態", "")
-                ))
-
+            self._render_institutional_tree(self.last_institutional_plan_df)
         if self.last_order_list_df is not None and not self.last_order_list_df.empty:
-            for _, r in self.last_order_list_df.iterrows():
-                self.order_tree.insert("", "end", values=(
-                    int(r.get("優先級", 0) or 0), r.get("代號", ""), r.get("名稱", ""), r.get("分類", ""),
-                    r.get("狀態", ""), r.get("進場區", "-"), r.get("停損", "-"),
-                    r.get("1.382", "-"), r.get("1.618", "-"),
-                    f"{float(r.get('RR', 0) or 0):.2f}", f"{float(r.get('勝率', 0) or 0):.1f}",
-                    f"{float(r.get('ATR%', 0) or 0):.2f}", f"{float(r.get('Kelly%', 0) or 0):.2f}",
-                    (f"{float(r.get('建議張數', 0) or 0):.1f}".rstrip('0').rstrip('.') if pd.notna(r.get('建議張數', 0)) else "0"),
-                    f"{float(r.get('建議金額', 0) or 0):.0f}", f"{float(r.get('單檔曝險%', 0) or 0):.2f}",
-                    r.get("投資組合狀態", ""), r.get("風險備註", "")
-                ))
+            self._render_order_tree(self.last_order_list_df)
 
         self.sync_multi_windows()
         if self.window_current_stock_id and self.current_chart_path and Path(self.current_chart_path).exists():
@@ -6656,8 +6787,9 @@ class AppUI:
                 self.cache_trade_dataframe(self.last_today_buy_df)
                 self.last_wait_df = self.enrich_price_and_export_fields(wait_pullback.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_wait_df)
-                self.last_order_list_df = self.build_order_list(self.last_today_buy_df, self.last_wait_df)
-                self.last_institutional_plan_df = self.enrich_price_and_export_fields(self.portfolio_engine.build_institutional_plan(pd.concat([self.last_today_buy_df.copy(), self.last_wait_df.copy()], ignore_index=True)), id_col="代號")
+                self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df, self.last_wait_df))
+                inst_plan_raw = self.portfolio_engine.build_institutional_plan(pd.concat([self.last_today_buy_df.copy(), self.last_wait_df.copy()], ignore_index=True))
+                self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(inst_plan_raw, id_col="代號"))
                 self.last_unique_decision_df = self.build_unique_decision_df(self.last_today_buy_df, self.last_wait_df, self.last_attack_df, self.last_watch_df, self.last_defense_df, self.last_top20_df)
 
                 self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
