@@ -149,7 +149,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V3.5 OPERATION"
+APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V16.2 OPERATION"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -2716,6 +2716,188 @@ INSTITUTIONAL_TREE_SCHEMA = [
 ]
 
 
+CORE_ANALYSIS_COLUMNS = [
+    "stock_id", "stock_name", "market", "industry", "theme", "is_etf",
+    "candidate_engine", "signal", "wave", "trade_type",
+    "model_score", "wave_trade_score", "candidate20_score", "core_attack5_score", "execution_score",
+    "mainstream_score", "breakout_score", "liquidity_score",
+    "entry_low", "entry_high", "entry_mid", "price_deviation", "rr_live",
+    "stop_loss", "target_price", "target_1382", "target_1618",
+    "rr", "win_grade", "win_rate", "tactical_light", "final_trade_decision",
+    "ui_state", "bucket", "pool_role", "liquidity_status", "elimination_reason",
+]
+
+DISPLAY_COLUMN_MAP = {
+    "priority": "優先級",
+    "id": "代號",
+    "name": "名稱",
+    "price": "現價",
+    "chg": "漲跌",
+    "chg_pct": "漲跌幅%",
+    "bucket": "分類",
+    "action": "狀態",
+    "liquidity": "盤中狀態",
+    "liq_score": "活性分",
+    "elim_reason": "淘汰原因",
+    "entry": "進場區",
+    "stop": "停損",
+    "target": "目標價",
+    "target1382": "1.382",
+    "target1618": "1.618",
+    "rr": "RR",
+    "win_rate": "勝率",
+    "model_score": "模型分數",
+    "trade_score": "交易分數",
+    "atr_pct": "ATR%",
+    "kelly_pct": "Kelly%",
+    "qty": "建議張數",
+    "amount": "建議金額",
+    "single_pct": "單檔曝險%",
+    "theme_pct": "題材曝險%",
+    "industry_pct": "產業曝險%",
+    "portfolio_state": "投資組合狀態",
+    "risk_note": "風險備註",
+}
+
+
+SCORE_FORMULA_WEIGHTS = {
+    "candidate20": {
+        "model_score": 0.22, "wave_trade_score": 0.12, "liquidity_score": 0.14,
+        "mainstream_score": 0.14, "breakout_score": 0.12, "leader_follow_score": 0.08,
+        "active_buy_score": 0.06, "orderflow_aggression_score": 0.06,
+        "win_rate": 0.04, "rr_factor": 4.0, "modules_pass_count": 2.0,
+    },
+    "core_attack5": {
+        "candidate20_score": 0.30, "mainstream_score": 0.18, "breakout_score": 0.14,
+        "leader_follow_score": 0.10, "active_buy_score": 0.08, "orderflow_aggression_score": 0.08,
+        "rel_market_norm": 0.04, "rel_ind_norm": 0.04, "source_count_factor": 4.0, "light_rank_factor": 3.0,
+    },
+    "execution": {
+        "core_attack5_score": 0.40, "price_fit_factor": 25.0, "rr_live_factor": 10.0,
+        "liquidity_score": 0.12, "win_rate": 0.08, "model_score": 0.05,
+    },
+}
+
+REPORT_DECISION_LIMITS = {
+    "candidate20": 20,
+    "core_attack5": 5,
+    "today_buy": 10,
+    "unique_decision": 5,
+}
+
+
+
+def normalize_core_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=CORE_ANALYSIS_COLUMNS)
+    x = df.copy()
+    numeric_cols = {
+        "model_score", "wave_trade_score", "candidate20_score", "core_attack5_score", "execution_score",
+        "mainstream_score", "breakout_score", "liquidity_score",
+        "entry_low", "entry_high", "entry_mid", "price_deviation", "rr_live",
+        "target_1382", "target_1618", "rr", "win_rate",
+    }
+    for col in CORE_ANALYSIS_COLUMNS:
+        if col not in x.columns:
+            x[col] = 0.0 if col in numeric_cols else ""
+    for col in numeric_cols:
+        x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+    return x[CORE_ANALYSIS_COLUMNS].copy()
+
+
+def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    if "close" not in x.columns:
+        x["close"] = np.nan
+    x["close"] = pd.to_numeric(x["close"], errors="coerce")
+    if "prev_close" not in x.columns:
+        x["prev_close"] = x["close"]
+    x["prev_close"] = pd.to_numeric(x["prev_close"], errors="coerce").replace(0, np.nan)
+    x["現價"] = pd.to_numeric(x.get("現價", x["close"]), errors="coerce").fillna(x["close"])
+    chg = (x["close"] - x["prev_close"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    chg_pct = ((x["close"] / x["prev_close"] - 1.0) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    x["漲跌"] = pd.to_numeric(x.get("漲跌", chg), errors="coerce").fillna(chg).round(2)
+    x["漲跌幅%"] = pd.to_numeric(x.get("漲跌幅%", chg_pct), errors="coerce").fillna(chg_pct).round(2)
+
+    if "進場區" not in x.columns:
+        if "entry_zone" in x.columns:
+            x["進場區"] = x["entry_zone"]
+        elif {"entry_low", "entry_high"}.issubset(x.columns):
+            x["進場區"] = x.apply(lambda r: f"{float(r.get('entry_low', 0) or 0):.2f} ~ {float(r.get('entry_high', 0) or 0):.2f}", axis=1)
+        elif "entry" in x.columns:
+            x["進場區"] = x["entry"]
+    if "停損" not in x.columns:
+        if "stop_loss" in x.columns:
+            x["停損"] = x["stop_loss"]
+        elif "stop" in x.columns:
+            x["停損"] = x["stop"]
+    if "目標價" not in x.columns:
+        if "target_price" in x.columns:
+            x["目標價"] = x["target_price"]
+        elif "1.382" in x.columns:
+            x["目標價"] = x["1.382"]
+        elif "target_1382" in x.columns:
+            x["目標價"] = x["target_1382"]
+        elif "target1382" in x.columns:
+            x["目標價"] = x["target1382"]
+
+    alias_pairs = [
+        ("分類", "bucket"), ("狀態", "ui_state"), ("盤中狀態", "liquidity_status"), ("活性分", "liquidity_score"),
+        ("1.382", "target_1382"), ("1.618", "target_1618"), ("RR", "rr_live"), ("勝率", "win_rate"),
+        ("ATR%", "atr_pct"), ("Kelly%", "position_pct"), ("建議張數", "建議張數"), ("建議金額", "建議金額"),
+        ("單檔曝險%", "單檔曝險%"), ("題材曝險%", "題材曝險%"), ("產業曝險%", "產業曝險%"),
+        ("投資組合狀態", "投資組合狀態"), ("風險備註", "風險備註"), ("模型分數", "model_score"),
+        ("交易分數", "trade_score"), ("淘汰原因", "elimination_reason"), ("市場", "market"), ("產業", "industry"), ("題材", "theme"),
+        ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "優先級"),
+    ]
+    for zh, src in alias_pairs:
+        if zh not in x.columns and src in x.columns:
+            x[zh] = x[src]
+
+    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%"]
+    for col in numeric_display:
+        if col in x.columns:
+            x[col] = pd.to_numeric(x[col], errors="coerce")
+
+    if "建議張數" in x.columns:
+        x["建議張數"] = pd.to_numeric(x["建議張數"], errors="coerce").fillna(0).astype(int)
+    for pct_col in ["單檔曝險%", "題材曝險%", "產業曝險%"]:
+        if pct_col in x.columns:
+            x[pct_col] = pd.to_numeric(x[pct_col], errors="coerce").fillna(0.0).round(2)
+
+    for text_col, default in [("投資組合狀態", "未配置"), ("風險備註", ""), ("盤中狀態", ""), ("淘汰原因", "")]:
+        if text_col in x.columns:
+            x[text_col] = x[text_col].fillna(default).astype(str)
+    return x
+
+
+def assert_schema(df: pd.DataFrame, expected_columns: list[str], schema_name: str) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame(columns=expected_columns)
+    x = df.copy()
+    for col in expected_columns:
+        if col not in x.columns:
+            x[col] = ""
+    x = x[expected_columns].copy()
+    return x.fillna("")
+
+
+def assert_pool_consistency(pool_dict: dict):
+    candidate20 = set(pool_dict.get("candidate20", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
+    core_attack5 = set(pool_dict.get("core_attack5", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
+    today_buy = set(pool_dict.get("today_buy", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
+    execution_ready = set(pool_dict.get("execution_ready", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
+    unique_decision = set(pool_dict.get("unique_decision", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
+    if core_attack5 and not core_attack5.issubset(candidate20):
+        raise ValueError("V16.2 pool error: core_attack5 必須為 candidate20 子集合")
+    if today_buy and not today_buy.issubset(core_attack5):
+        raise ValueError("V16.2 pool error: today_buy 必須為 core_attack5 子集合")
+    if unique_decision and not unique_decision.issubset(execution_ready):
+        raise ValueError("V16.2 pool error: unique_decision 必須為 execution_ready 子集合")
+
+
 
 
 
@@ -3511,6 +3693,39 @@ class TradingPlanEngine:
             return "防守"
         return "觀察"
 
+    def _gate_mainstream(self, metrics: dict) -> tuple[int, str]:
+        score = 0
+        if float(metrics.get("mainstream_score", 0) or 0) >= 70:
+            score += 1
+        if float(metrics.get("leader_follow_score", 0) or 0) >= 55:
+            score += 1
+        if float(metrics.get("relative_strength_market", 0) or 0) > 0:
+            score += 1
+        if float(metrics.get("relative_strength_industry", 0) or 0) >= 55:
+            score += 1
+        passed = int(score >= 3)
+        return passed, "主力成立" if passed else "非主流資金"
+
+    def _gate_structure(self, metrics: dict) -> tuple[int, str]:
+        score = 0
+        if str(metrics.get("wave", "")).strip() in ("第3浪", "推動浪"):
+            score += 1
+        if str(metrics.get("signal", "")).strip() in ("突破強勢", "強勢追蹤", "整理偏多"):
+            score += 1
+        if int(metrics.get("trend_ok", 0) or 0) == 1:
+            score += 1
+        if int(metrics.get("macd_ok", 0) or 0) == 1:
+            score += 1
+        passed = int(score >= 3)
+        return passed, "主升成立" if passed else "結構不足"
+
+    def _gate_execution(self, metrics: dict) -> tuple[int, str]:
+        price_deviation = float(metrics.get("price_deviation", 0) or 0)
+        rr_live = float(metrics.get("rr_live", 0) or 0)
+        liquidity_status = str(metrics.get("liquidity_status", "WATCH") or "WATCH").strip().upper()
+        passed = int((price_deviation <= 0.03) and (rr_live >= 1.5) and (liquidity_status == "PASS"))
+        return passed, "可執行" if passed else "位置不對"
+
     def build_plan(self, stock_id: str) -> dict:
         stock = self.db.get_stock_row(stock_id)
         hist = self.db.get_price_history(stock_id)
@@ -3660,19 +3875,69 @@ class TradingPlanEngine:
         elif liquidity_status == "WATCH" and decision == "WEAK BUY":
             auto_state = "觀察"
 
-        tactical_light = self._derive_tactical_light(signal, model_score, liquidity_status, rsi, decision, wave_label)
-        final_trade_decision = self._derive_final_trade_decision(tactical_light, is_etf=is_etf)
-        bucket = self._derive_bucket_from_light(tactical_light, is_etf=is_etf)
-        ui_state = self._derive_ui_state_from_final_decision(final_trade_decision, liquidity_status, close_, entry_low, entry_high)
-
-        selection_score = round(model_score * 0.45 + float(wave_trade["wave_trade_score"]) * 0.16 + win_rate * 0.12 + min(rr, 3.0) * 5 + float(liquidity.get("liquidity_score", 0)) * 0.22 + (6 if decision == "BUY" else 2 if decision == "WEAK BUY" else 0), 2)
-        trade_score = round(model_score * 0.25 + float(wave_trade["wave_trade_score"]) * 0.18 + score["ai_score"] * 0.08 + win_rate * 0.14 + min(rr, 3.0) * 5 + float(liquidity.get("intraday_trend_score", 0)) * 0.14 + float(liquidity.get("attack_volume_score", 0)) * 0.11 + float(liquidity.get("leader_follow_score", 0)) * 0.10 + (6 if preferred_theme else 0), 2)
         entry_mid = round((entry_low + entry_high) / 2.0, 2)
         price_deviation = round((close_ - entry_mid) / max(entry_mid, 0.01), 4)
         rr_live = round(max(target - close_, 0.0) / max(close_ - stop, 0.01), 2)
 
+        selection_score = round(model_score * 0.45 + float(wave_trade["wave_trade_score"]) * 0.16 + win_rate * 0.12 + min(rr, 3.0) * 5 + float(liquidity.get("liquidity_score", 0)) * 0.22 + (6 if decision == "BUY" else 2 if decision == "WEAK BUY" else 0), 2)
+        trade_score = round(model_score * 0.25 + float(wave_trade["wave_trade_score"]) * 0.18 + score["ai_score"] * 0.08 + win_rate * 0.14 + min(rr, 3.0) * 5 + float(liquidity.get("intraday_trend_score", 0)) * 0.14 + float(liquidity.get("attack_volume_score", 0)) * 0.11 + float(liquidity.get("leader_follow_score", 0)) * 0.10 + (6 if preferred_theme else 0), 2)
+
+        mainstream_score = round(
+            model_score * 0.24 +
+            float(liquidity.get("liquidity_score", 0) or 0) * 0.20 +
+            float(liquidity.get("leader_follow_score", 0) or 0) * 0.18 +
+            float(liquidity.get("institutional_participation_score", 0) or 0) * 0.12 +
+            float(liquidity.get("relative_strength_industry", 0) or 0) * 0.10 +
+            float(liquidity.get("relative_strength_market", 0) or 0) * 0.06 +
+            win_rate * 0.06 + min(rr, 3.0) * 4,
+            2
+        )
+        breakout_score = round(
+            float(wave_trade["wave_trade_score"]) * 0.26 +
+            float(liquidity.get("attack_volume_score", 0) or 0) * 0.18 +
+            float(liquidity.get("range_breakout_score", 0) or 0) * 0.16 +
+            float(liquidity.get("active_buy_score", 0) or 0) * 0.12 +
+            model_score * 0.12 +
+            min(rr, 3.0) * 6,
+            2
+        )
+
+        mainstream_pass, mainstream_reason = self._gate_mainstream({
+            "mainstream_score": mainstream_score,
+            "leader_follow_score": liquidity.get("leader_follow_score", 0),
+            "relative_strength_market": liquidity.get("relative_strength_market", 0),
+            "relative_strength_industry": liquidity.get("relative_strength_industry", 0),
+        })
+        structure_pass, structure_reason = self._gate_structure({
+            "wave": wave_label,
+            "signal": signal,
+            "trend_ok": trend_ok,
+            "macd_ok": macd_ok,
+        })
+        execution_pass, execution_reason = self._gate_execution({
+            "price_deviation": price_deviation,
+            "rr_live": rr_live,
+            "liquidity_status": liquidity_status,
+        })
+
+        if is_etf:
+            final_trade_decision = "DEFENSE"
+        elif not mainstream_pass:
+            final_trade_decision = "IGNORE"
+        elif not structure_pass:
+            final_trade_decision = "WAIT_PULLBACK"
+        elif execution_pass:
+            final_trade_decision = "BUY"
+        else:
+            final_trade_decision = "WAIT_PULLBACK"
+
+        tactical_light = self._derive_tactical_light(signal, model_score, liquidity_status, rsi, decision, wave_label)
+        bucket = self._derive_bucket_from_light(tactical_light, is_etf=is_etf)
+        ui_state = self._derive_ui_state_from_final_decision(final_trade_decision, liquidity_status, close_, entry_low, entry_high)
+
         reason = (
             f"{signal}｜{wave_label}｜{trade_type}｜{volume_label}｜"
+            f"{mainstream_reason}/{structure_reason}/{execution_reason}｜"
             f"活性 {float(liquidity.get('liquidity_score',0) or 0):.1f}｜{liquidity_status}｜{elimination_reason or '盤中結構可接受'}｜"
             f"六模組 {model_score:.1f}｜RR {rr:.2f}｜RSI {rsi:.1f}"
         )
@@ -3725,6 +3990,8 @@ class TradingPlanEngine:
             "indicator_score": round(indicator_score, 2),
             "model_score": model_score,
             "wave_trade_score": round(float(wave_trade["wave_trade_score"]), 2),
+            "mainstream_score": mainstream_score,
+            "breakout_score": breakout_score,
             "atr14": round(atr14, 4),
             "atr_pct": atr_pct,
             "sakata_label": sakata_label,
@@ -3847,18 +4114,19 @@ class MasterTradingEngine:
         if not trade_top20.empty:
             trade_top20 = trade_top20.copy()
             trade_top20["pool_role"] = "強勢候選20"
+            cw = SCORE_FORMULA_WEIGHTS["candidate20"]
             trade_top20["candidate20_score"] = (
-                _safe_num_series(trade_top20, "model_score", 0) * 0.22 +
-                _safe_num_series(trade_top20, "wave_trade_score", 0) * 0.12 +
-                _safe_num_series(trade_top20, "liquidity_score", 0) * 0.14 +
-                _safe_num_series(trade_top20, "mainstream_score", 0) * 0.14 +
-                _safe_num_series(trade_top20, "breakout_score", 0) * 0.12 +
-                _safe_num_series(trade_top20, "leader_follow_score", 0) * 0.08 +
-                _safe_num_series(trade_top20, "active_buy_score", 0) * 0.06 +
-                _safe_num_series(trade_top20, "orderflow_aggression_score", 0) * 0.06 +
-                _safe_num_series(trade_top20, "win_rate", 0) * 0.04 +
-                _safe_num_series(trade_top20, "rr", 0).clip(upper=3) * 4 +
-                _safe_num_series(trade_top20, "modules_pass_count", 0) * 2
+                _safe_num_series(trade_top20, "model_score", 0) * cw["model_score"] +
+                _safe_num_series(trade_top20, "wave_trade_score", 0) * cw["wave_trade_score"] +
+                _safe_num_series(trade_top20, "liquidity_score", 0) * cw["liquidity_score"] +
+                _safe_num_series(trade_top20, "mainstream_score", 0) * cw["mainstream_score"] +
+                _safe_num_series(trade_top20, "breakout_score", 0) * cw["breakout_score"] +
+                _safe_num_series(trade_top20, "leader_follow_score", 0) * cw["leader_follow_score"] +
+                _safe_num_series(trade_top20, "active_buy_score", 0) * cw["active_buy_score"] +
+                _safe_num_series(trade_top20, "orderflow_aggression_score", 0) * cw["orderflow_aggression_score"] +
+                _safe_num_series(trade_top20, "win_rate", 0) * cw["win_rate"] +
+                _safe_num_series(trade_top20, "rr", 0).clip(upper=3) * cw["rr_factor"] +
+                _safe_num_series(trade_top20, "modules_pass_count", 0) * cw["modules_pass_count"]
             ).round(2)
             trade_top20 = trade_top20.sort_values(["candidate20_score", "mainstream_score", "breakout_score", "liquidity_score", "model_score"], ascending=False).head(20).copy()
 
@@ -3871,17 +4139,18 @@ class MasterTradingEngine:
             rel_ind_norm = _safe_num_series(tradable_top20, "relative_strength_industry", 0).clip(0, 100)
             tradable_top20["candidate20_score"] = _safe_num_series(tradable_top20, "candidate20_score", 0)
             tradable_top20["source_count"] = _safe_num_series(tradable_top20, "source_count", 1)
+            aw = SCORE_FORMULA_WEIGHTS["core_attack5"]
             tradable_top20["core_attack5_score"] = (
-                tradable_top20["candidate20_score"] * 0.30 +
-                _safe_num_series(tradable_top20, "mainstream_score", 0) * 0.18 +
-                _safe_num_series(tradable_top20, "breakout_score", 0) * 0.14 +
-                _safe_num_series(tradable_top20, "leader_follow_score", 0) * 0.10 +
-                _safe_num_series(tradable_top20, "active_buy_score", 0) * 0.08 +
-                _safe_num_series(tradable_top20, "orderflow_aggression_score", 0) * 0.08 +
-                rel_market_norm * 0.04 +
-                rel_ind_norm * 0.04 +
-                tradable_top20["source_count"] * 4 +
-                tradable_top20["light_rank"] * 3
+                tradable_top20["candidate20_score"] * aw["candidate20_score"] +
+                _safe_num_series(tradable_top20, "mainstream_score", 0) * aw["mainstream_score"] +
+                _safe_num_series(tradable_top20, "breakout_score", 0) * aw["breakout_score"] +
+                _safe_num_series(tradable_top20, "leader_follow_score", 0) * aw["leader_follow_score"] +
+                _safe_num_series(tradable_top20, "active_buy_score", 0) * aw["active_buy_score"] +
+                _safe_num_series(tradable_top20, "orderflow_aggression_score", 0) * aw["orderflow_aggression_score"] +
+                rel_market_norm * aw["rel_market_norm"] +
+                rel_ind_norm * aw["rel_ind_norm"] +
+                tradable_top20["source_count"] * aw["source_count_factor"] +
+                tradable_top20["light_rank"] * aw["light_rank_factor"]
             ).round(2)
             tradable_top20["pool_role"] = "主攻5"
             tradable_top20 = tradable_top20.sort_values(["core_attack5_score", "light_rank", "mainstream_score", "breakout_score", "liquidity_score", "model_score", "win_rate"], ascending=False).head(20).copy()
@@ -3903,46 +4172,90 @@ class MasterTradingEngine:
             defense = defense.sort_values(["model_score", "trade_score", "rr", "win_rate"], ascending=False).head(10)
             defense["pool_role"] = "防守"
 
-        execution_base = tradable[(tradable["liquidity_status"] == "PASS") & (tradable["rsi"] <= 72) & (tradable["atr_pct"] <= 8)].copy() if not tradable.empty else pd.DataFrame()
+        breakout_exec = breakout_top20.copy() if not breakout_top20.empty else pd.DataFrame()
+        core_exec = attack.copy() if not attack.empty else pd.DataFrame()
+        execution_candidates = pd.DataFrame()
+        wait_candidates = pd.DataFrame()
         today_buy = pd.DataFrame()
         wait_pullback = pd.DataFrame()
-        if not execution_base.empty:
-            execution_base = execution_base.copy()
-            execution_base["entry_mid"] = _safe_num_series(execution_base, "entry_mid", 0)
-            execution_base["price_deviation"] = _safe_num_series(execution_base, "price_deviation", 0)
-            execution_base["rr_live"] = _safe_num_series(execution_base, "rr_live", 0)
-            execution_base["candidate20_score"] = _safe_num_series(execution_base, "candidate20_score", 0)
-            execution_base["core_attack5_score"] = (_safe_num_series(execution_base, "core_attack5_score", np.nan).fillna(_safe_num_series(execution_base, "candidate20_score", 0)))
-            execution_base["execution_score"] = (
-                execution_base["core_attack5_score"] * 0.35 +
-                (1 - execution_base["price_deviation"].abs().clip(0, 1)) * 25 +
-                execution_base["rr_live"].clip(upper=3) * 10 +
-                (100 - _safe_num_series(execution_base, "atr_pct", 0).clip(lower=0) * 5) * 0.10 +
-                _safe_num_series(execution_base, "liquidity_score", 0) * 0.10 +
-                _safe_num_series(execution_base, "win_rate", 0) * 0.05 +
-                _safe_num_series(execution_base, "model_score", 0) * 0.05
+        execution_ready = pd.DataFrame()
+        unique_decision = pd.DataFrame()
+        if not core_exec.empty:
+            execution_candidates = normalize_core_analysis_df(core_exec)
+            execution_candidates = execution_candidates.drop_duplicates(subset=["stock_id"], keep="first")
+            execution_candidates["rsi"] = _safe_num_series(execution_candidates, "rsi", 0)
+            execution_candidates["atr_pct"] = _safe_num_series(execution_candidates, "atr_pct", 999)
+            execution_candidates = execution_candidates[
+                (execution_candidates["liquidity_status"].astype(str) == "PASS") &
+                (execution_candidates["rsi"] <= 72) &
+                (execution_candidates["atr_pct"] <= 8)
+            ].copy()
+            execution_candidates["entry_mid"] = _safe_num_series(execution_candidates, "entry_mid", 0)
+            execution_candidates["price_deviation"] = _safe_num_series(execution_candidates, "price_deviation", 0)
+            execution_candidates["rr_live"] = _safe_num_series(execution_candidates, "rr_live", _safe_num_series(execution_candidates, "rr", 0))
+            execution_candidates["candidate20_score"] = _safe_num_series(execution_candidates, "candidate20_score", 0)
+            execution_candidates["core_attack5_score"] = _safe_num_series(execution_candidates, "core_attack5_score", np.nan).fillna(execution_candidates["candidate20_score"])
+            ew = SCORE_FORMULA_WEIGHTS["execution"]
+            execution_candidates["execution_score"] = (
+                execution_candidates["core_attack5_score"] * ew["core_attack5_score"] +
+                (1 - execution_candidates["price_deviation"].abs().clip(0, 1)) * ew["price_fit_factor"] +
+                execution_candidates["rr_live"].clip(upper=3) * ew["rr_live_factor"] +
+                _safe_num_series(execution_candidates, "liquidity_score", 0) * ew["liquidity_score"] +
+                _safe_num_series(execution_candidates, "win_rate", 0) * ew["win_rate"] +
+                _safe_num_series(execution_candidates, "model_score", 0) * ew["model_score"]
             ).round(2)
 
-            today_buy = execution_base[
-                execution_base.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"]) &
-                (execution_base["price_deviation"] <= 0.03) &
-                (execution_base["rr_live"] >= 1.5)
-            ].sort_values(["execution_score", "core_attack5_score", "liquidity_score", "model_score"], ascending=False).copy()
+            today_buy = execution_candidates[
+                execution_candidates.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"]) &
+                (execution_candidates["price_deviation"] <= 0.03) &
+                (execution_candidates["rr_live"] >= 1.5)
+            ].sort_values(["execution_score", "core_attack5_score", "liquidity_score", "model_score"], ascending=False).head(REPORT_DECISION_LIMITS["today_buy"]).copy()
             if not today_buy.empty:
                 today_buy["pool_role"] = "今日可下單"
                 today_buy["ui_state"] = "可下單"
 
-            wait_pullback = execution_base[
-                execution_base.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"]) &
-                (((execution_base["price_deviation"] > 0.03) & (execution_base["price_deviation"] <= 0.08) & (execution_base["rr_live"] >= 1.2)) |
-                 ((execution_base["price_deviation"] <= 0.03) & (execution_base["rr_live"] >= 1.2) & (execution_base["rr_live"] < 1.5)))
-            ].sort_values(["execution_score", "core_attack5_score", "liquidity_score", "model_score"], ascending=False).copy()
-            if not wait_pullback.empty:
-                wait_pullback["pool_role"] = "等待回測"
-                wait_pullback["ui_state"] = "等待回測"
+            wait_pullback = execution_candidates[
+                execution_candidates.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"]) &
+                (((execution_candidates["price_deviation"] > 0.03) & (execution_candidates["price_deviation"] <= 0.08) & (execution_candidates["rr_live"] >= 1.2)) |
+                 ((execution_candidates["price_deviation"] <= 0.03) & (execution_candidates["rr_live"] >= 1.2) & (execution_candidates["rr_live"] < 1.5)))
+            ].sort_values(["execution_score", "core_attack5_score", "liquidity_score", "model_score"], ascending=False).head(REPORT_DECISION_LIMITS["today_buy"]).copy()
+
+        if not breakout_exec.empty:
+            wait_candidates = breakout_exec.copy()
+            wait_candidates["rsi"] = _safe_num_series(wait_candidates, "rsi", 0)
+            wait_candidates["atr_pct"] = _safe_num_series(wait_candidates, "atr_pct", 999)
+            wait_candidates["price_deviation"] = _safe_num_series(wait_candidates, "price_deviation", 0)
+            wait_candidates["rr_live"] = _safe_num_series(wait_candidates, "rr_live", _safe_num_series(wait_candidates, "rr", 0))
+            wait_candidates["core_attack5_score"] = _safe_num_series(wait_candidates, "core_attack5_score", _safe_num_series(wait_candidates, "candidate20_score", 0))
+            ew = SCORE_FORMULA_WEIGHTS["execution"]
+            wait_candidates["execution_score"] = (
+                wait_candidates["core_attack5_score"] * ew["core_attack5_score"] +
+                (1 - wait_candidates["price_deviation"].abs().clip(0, 1)) * ew["price_fit_factor"] +
+                wait_candidates["rr_live"].clip(upper=3) * ew["rr_live_factor"] +
+                _safe_num_series(wait_candidates, "liquidity_score", 0) * ew["liquidity_score"] +
+                _safe_num_series(wait_candidates, "win_rate", 0) * ew["win_rate"] +
+                _safe_num_series(wait_candidates, "model_score", 0) * ew["model_score"]
+            ).round(2)
+            extra_wait = wait_candidates[
+                wait_candidates.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"]) &
+                (wait_candidates["liquidity_status"].astype(str).isin(["PASS", "WATCH"])) &
+                (wait_candidates["rr_live"] >= 1.1)
+            ].sort_values(["execution_score", "breakout_score", "liquidity_score", "model_score"], ascending=False)
+            if not extra_wait.empty:
+                wait_pullback = pd.concat([wait_pullback, extra_wait], ignore_index=True) if not wait_pullback.empty else extra_wait.copy()
+
+        if not wait_pullback.empty:
+            wait_pullback = wait_pullback.drop_duplicates(subset=["stock_id"], keep="first").head(REPORT_DECISION_LIMITS["today_buy"]).copy()
+            wait_pullback["pool_role"] = "等待回測"
+            wait_pullback["ui_state"] = "等待回測"
+
+        execution_ready = today_buy.copy()
+        unique_decision = execution_ready.head(REPORT_DECISION_LIMITS["unique_decision"]).copy()
+        if not unique_decision.empty:
+            unique_decision["pool_role"] = "唯一決策"
 
         dynamic_n = max(1, min(10, market["max_positions"] + 2))
-        return {
+        result = {
             "market": market,
             "trade_top20": trade_top20,
             "tradable_top20": tradable_top20,
@@ -3955,10 +4268,13 @@ class MasterTradingEngine:
             "wait_pullback": wait_pullback.head(dynamic_n),
             "candidate20": trade_top20.head(20),
             "core_attack5": attack.head(5),
-            "execution_ready": today_buy.head(dynamic_n),
+            "execution_ready": execution_ready.head(dynamic_n),
+            "unique_decision": unique_decision.head(5),
             "theme_summary": ThemeStrengthEngine.summarize(base),
             "eliminated": eliminated.head(20),
         }
+        assert_pool_consistency(result)
+        return result
 
 
 
@@ -4790,44 +5106,49 @@ class AppUI:
         x = x[columns].copy()
         return x.fillna("")
 
+    def normalize_core_analysis_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        return normalize_core_analysis_df(df)
+
     def normalize_order_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        x = self._normalize_schema_df(df, ORDER_COLUMNS)
+        x = self._normalize_schema_df(build_display_columns(df), ORDER_COLUMNS)
+        x = assert_schema(x, ORDER_COLUMNS, "ORDER_COLUMNS")
         if not x.empty:
             assert list(x.columns) == ORDER_COLUMNS
         return x
 
     def normalize_institutional_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        x = self._normalize_schema_df(df, INSTITUTIONAL_COLUMNS)
+        x = self._normalize_schema_df(build_display_columns(df), INSTITUTIONAL_COLUMNS)
+        x = assert_schema(x, INSTITUTIONAL_COLUMNS, "INSTITUTIONAL_COLUMNS")
         if not x.empty:
             assert list(x.columns) == INSTITUTIONAL_COLUMNS
         return x
+
+    def _schema_values_from_row(self, row: pd.Series, schema: list[tuple]) -> list:
+        values = []
+        for key, _, _ in schema:
+            label = DISPLAY_COLUMN_MAP.get(key, "")
+            if key == "priority":
+                val = row.get(label, row.get("優先級", 0))
+                try:
+                    val = int(float(val or 0))
+                except Exception:
+                    val = 0
+            else:
+                val = row.get(label, "")
+            values.append(val)
+        return values
 
     def _render_order_tree(self, df: pd.DataFrame):
         self._reconfigure_tree_from_schema(self.order_tree, ORDER_TREE_SCHEMA)
         df = self.normalize_order_df(df)
         for _, r in df.iterrows():
-            self.order_tree.insert("", "end", values=(
-                int(float(r.get("優先級", 0) or 0)), r.get("代號", ""), r.get("名稱", ""), r.get("現價", "-"),
-                r.get("漲跌", "-"), r.get("漲跌幅%", "-"), r.get("分類", ""), r.get("狀態", ""),
-                r.get("盤中狀態", ""), r.get("活性分", ""), r.get("進場區", "-"), r.get("停損", "-"),
-                r.get("目標價", "-"), r.get("1.382", "-"), r.get("1.618", "-"), r.get("RR", ""),
-                r.get("勝率", ""), r.get("ATR%", ""), r.get("Kelly%", ""), r.get("建議張數", ""),
-                r.get("建議金額", ""), r.get("單檔曝險%", ""), r.get("投資組合狀態", ""), r.get("風險備註", "")
-            ))
+            self.order_tree.insert("", "end", values=self._schema_values_from_row(r, ORDER_TREE_SCHEMA))
 
     def _render_institutional_tree(self, df: pd.DataFrame):
         self._reconfigure_tree_from_schema(self.inst_tree, INSTITUTIONAL_TREE_SCHEMA)
         df = self.normalize_institutional_df(df)
         for _, r in df.iterrows():
-            self.inst_tree.insert("", "end", values=(
-                int(float(r.get("優先級", 0) or 0)), r.get("代號", ""), r.get("名稱", ""), r.get("現價", "-"),
-                r.get("漲跌", "-"), r.get("漲跌幅%", "-"), r.get("市場", ""), r.get("產業", ""), r.get("題材", ""),
-                r.get("分類", ""), r.get("狀態", ""), r.get("盤中狀態", ""), r.get("活性分", ""), r.get("淘汰原因", ""),
-                r.get("進場區", "-"), r.get("停損", "-"), r.get("目標價", "-"), r.get("1.382", "-"), r.get("1.618", "-"),
-                r.get("RR", ""), r.get("勝率", ""), r.get("模型分數", ""), r.get("交易分數", ""), r.get("ATR%", ""),
-                r.get("Kelly%", ""), r.get("建議張數", ""), r.get("建議金額", ""), r.get("單檔曝險%", ""), r.get("題材曝險%", ""),
-                r.get("產業曝險%", ""), r.get("投資組合狀態", ""), r.get("風險備註", "")
-            ))
+            self.inst_tree.insert("", "end", values=self._schema_values_from_row(r, INSTITUTIONAL_TREE_SCHEMA))
 
     def clear_right_panel(self, source: str = ""):
         self.right_panel_mode = "產業輪動模式" if source else "個股模式"
@@ -5278,6 +5599,7 @@ class AppUI:
                 x["目標價"] = x["target_1382"]
             elif "target1382" in x.columns:
                 x["目標價"] = x["target1382"]
+        x = build_display_columns(x)
         return x
 
     def build_unique_decision_df(self, *dfs: pd.DataFrame) -> pd.DataFrame:
@@ -5301,13 +5623,17 @@ class AppUI:
         if "decision" in x.columns:
             x["decision_rank"] = x["decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1}).fillna(0)
         elif "final_trade_decision" in x.columns:
-            x["decision_rank"] = x["final_trade_decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1, "WATCH": 1}).fillna(0)
+            x["decision_rank"] = x["final_trade_decision"].map({"STRONG_BUY": 4, "BUY": 3, "DEFENSE": 2, "WEAK BUY": 2, "HOLD": 1, "WAIT_PULLBACK": 1, "WATCH": 1}).fillna(0)
         else:
             x["decision_rank"] = 0
         sort_cols = [c for c in ["decision_rank", "liquidity_score", "model_score", "trade_score", "win_rate", "rr"] if c in x.columns]
-        if sort_cols:
+        if "execution_score" in x.columns:
+            x = x.sort_values([c for c in ["execution_score", "core_attack5_score", "candidate20_score", "liquidity_score", "model_score", "win_rate", "rr"] if c in x.columns], ascending=False)
+        elif sort_cols:
             x = x.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-        x = x.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+        x = x.drop_duplicates(subset=["stock_id"], keep="first").head(5).reset_index(drop=True)
+        if not x.empty:
+            x["pool_role"] = "唯一決策"
         x = self.enrich_price_and_export_fields(x, id_col="stock_id")
         return x
 
@@ -6101,6 +6427,43 @@ class AppUI:
         self._run_in_thread(worker, f"export_{target}")
 
 
+
+    def build_daily_summary_sheet(self) -> pd.DataFrame:
+        market = getattr(self, "last_market_context", {}) or {}
+        top20 = getattr(self, "last_top20_df", pd.DataFrame())
+        today_buy = getattr(self, "last_today_buy_df", pd.DataFrame())
+        wait_df = getattr(self, "last_wait_df", pd.DataFrame())
+        unique_df = getattr(self, "last_unique_decision_df", pd.DataFrame())
+        theme_df = getattr(self, "last_theme_summary_df", pd.DataFrame())
+        theme_text = "、".join(theme_df.head(5)["theme"].astype(str).tolist()) if isinstance(theme_df, pd.DataFrame) and not theme_df.empty and "theme" in theme_df.columns else "-"
+        pick_text = "、".join(unique_df.head(5)["stock_id"].astype(str).tolist()) if isinstance(unique_df, pd.DataFrame) and not unique_df.empty and "stock_id" in unique_df.columns else "-"
+        rows = [
+            {"項目": "市場狀態", "內容": str(market.get("regime", "-"))},
+            {"項目": "市場分數", "內容": str(market.get("score", "-"))},
+            {"項目": "主流族群", "內容": theme_text},
+            {"項目": "TOP20檔數", "內容": int(len(top20) if isinstance(top20, pd.DataFrame) else 0)},
+            {"項目": "今日可下單檔數", "內容": int(len(today_buy) if isinstance(today_buy, pd.DataFrame) else 0)},
+            {"項目": "等待回測檔數", "內容": int(len(wait_df) if isinstance(wait_df, pd.DataFrame) else 0)},
+            {"項目": "唯一決策", "內容": pick_text},
+            {"項目": "風險提示", "內容": str(market.get("memo", "-"))},
+            {"項目": "參數摘要", "內容": f"max_positions={market.get('max_positions','-')}｜min_win_rate={market.get('min_win_rate','-')}｜RSI={market.get('rsi_low','-')}~{market.get('rsi_high','-')}"},
+        ]
+        return pd.DataFrame(rows)
+
+    def build_report_usage_sheet(self) -> pd.DataFrame:
+        rows = [
+            {"報表": "Ranking", "用途": "雷達表，不直接下單。"},
+            {"報表": "Trade_TOP20", "用途": "候選20，進第二層分析。"},
+            {"報表": "Trade_TOP5", "用途": "主力成立 + 主升成立的主攻池。"},
+            {"報表": "Today_Buy", "用途": "只放位置仍正確、可直接執行的主攻股。"},
+            {"報表": "Wait_Pullback", "用途": "主流/突破候選，但位置未到，可等待回測。"},
+            {"報表": "Order_List", "用途": "執行清單，含資金與風控欄位。"},
+            {"報表": "Institutional_Plan", "用途": "組合與曝險配置表。"},
+            {"報表": "Unique_Decision", "用途": "最終 1~5 檔唯一決策。"},
+            {"報表": "Daily_Summary", "用途": "每日總結頁：先看總結，再看細表。"},
+        ]
+        return pd.DataFrame(rows)
+
     def export_analysis_excel(self):
         ranking = self._filtered_ranking()
         if ranking is None or ranking.empty:
@@ -6156,6 +6519,8 @@ class AppUI:
                 unique_df = getattr(self, "last_unique_decision_df", pd.DataFrame())
                 if unique_df is not None and not unique_df.empty:
                     tables["Unique_Decision"] = self.enrich_price_and_export_fields(unique_df, id_col="stock_id")
+                tables["Daily_Summary"] = self.build_daily_summary_sheet()
+                tables["Report_Guide"] = self.build_report_usage_sheet()
                 tables["Detail"] = pd.DataFrame({"detail": [detail_text]})
                 self.ui_call(self.update_task, "匯出分析", 3, 5, item="寫入檔案")
                 base = RUNTIME_DIR / f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -6790,7 +7155,11 @@ class AppUI:
                 self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df, self.last_wait_df))
                 inst_plan_raw = self.portfolio_engine.build_institutional_plan(pd.concat([self.last_today_buy_df.copy(), self.last_wait_df.copy()], ignore_index=True))
                 self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(inst_plan_raw, id_col="代號"))
-                self.last_unique_decision_df = self.build_unique_decision_df(self.last_today_buy_df, self.last_wait_df, self.last_attack_df, self.last_watch_df, self.last_defense_df, self.last_top20_df)
+                unique_raw = trade.get("unique_decision", pd.DataFrame())
+                if unique_raw is not None and not unique_raw.empty:
+                    self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(5)
+                else:
+                    self.last_unique_decision_df = self.build_unique_decision_df(self.last_today_buy_df, self.last_wait_df, self.last_attack_df, self.last_watch_df, self.last_defense_df, self.last_top20_df)
 
                 self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
                 self.ui_call(self.refresh_top20_and_order_views)
