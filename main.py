@@ -149,7 +149,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V16.2 OPERATION"
+APP_NAME = "GTC AI Trading System v9.2 FINAL-RELEASE V16.2-R2 FINAL REINFORCED"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -2846,28 +2846,54 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
     alias_pairs = [
         ("分類", "bucket"), ("狀態", "ui_state"), ("盤中狀態", "liquidity_status"), ("活性分", "liquidity_score"),
         ("1.382", "target_1382"), ("1.618", "target_1618"), ("RR", "rr_live"), ("勝率", "win_rate"),
-        ("ATR%", "atr_pct"), ("Kelly%", "position_pct"), ("建議張數", "建議張數"), ("建議金額", "建議金額"),
-        ("單檔曝險%", "單檔曝險%"), ("題材曝險%", "題材曝險%"), ("產業曝險%", "產業曝險%"),
-        ("投資組合狀態", "投資組合狀態"), ("風險備註", "風險備註"), ("模型分數", "model_score"),
-        ("交易分數", "trade_score"), ("淘汰原因", "elimination_reason"), ("市場", "market"), ("產業", "industry"), ("題材", "theme"),
-        ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "優先級"),
+        ("ATR%", "atr_pct"), ("Kelly%", "position_pct"),
+        ("建議張數", "suggest_qty"), ("建議張數", "qty"), ("建議張數", "shares"),
+        ("建議金額", "suggest_amount"), ("建議金額", "amount"),
+        ("單檔曝險%", "single_position_pct"), ("單檔曝險%", "single_pct"),
+        ("題材曝險%", "theme_exposure_pct"), ("題材曝險%", "theme_pct"),
+        ("產業曝險%", "industry_exposure_pct"), ("產業曝險%", "industry_pct"),
+        ("投資組合狀態", "portfolio_state"), ("風險備註", "risk_note"),
+        ("模型分數", "model_score"), ("交易分數", "trade_score"),
+        ("淘汰原因", "elimination_reason"), ("市場", "market"), ("產業", "industry"), ("題材", "theme"),
+        ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "priority"), ("優先級", "優先級"),
     ]
     for zh, src in alias_pairs:
         if zh not in x.columns and src in x.columns:
             x[zh] = x[src]
 
-    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%"]
+    if "Kelly%" not in x.columns:
+        x["Kelly%"] = pd.to_numeric(x.get("position_pct", x.get("kelly_raw", np.nan)), errors="coerce")
+    if "建議張數" not in x.columns:
+        x["建議張數"] = pd.to_numeric(x.get("suggest_qty", x.get("qty", x.get("shares", 0))), errors="coerce").fillna(0)
+    if "建議金額" not in x.columns:
+        x["建議金額"] = pd.to_numeric(x.get("suggest_amount", x.get("amount", 0)), errors="coerce").fillna(0.0)
+    if "單檔曝險%" not in x.columns:
+        x["單檔曝險%"] = pd.to_numeric(x.get("single_position_pct", x.get("single_pct", 0)), errors="coerce").fillna(0.0)
+    if "題材曝險%" not in x.columns:
+        x["題材曝險%"] = pd.to_numeric(x.get("theme_exposure_pct", x.get("theme_pct", 0)), errors="coerce").fillna(0.0)
+    if "產業曝險%" not in x.columns:
+        x["產業曝險%"] = pd.to_numeric(x.get("industry_exposure_pct", x.get("industry_pct", 0)), errors="coerce").fillna(0.0)
+    if "投資組合狀態" not in x.columns:
+        x["投資組合狀態"] = x.get("portfolio_state", "未配置")
+    if "風險備註" not in x.columns:
+        x["風險備註"] = x.get("risk_note", "")
+    if "優先級" not in x.columns:
+        x["優先級"] = pd.to_numeric(x.get("priority", np.arange(1, len(x) + 1)), errors="coerce").fillna(np.arange(1, len(x) + 1))
+
+    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額"]
     for col in numeric_display:
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
 
     if "建議張數" in x.columns:
         x["建議張數"] = pd.to_numeric(x["建議張數"], errors="coerce").fillna(0).astype(int)
+    if "建議金額" in x.columns:
+        x["建議金額"] = pd.to_numeric(x["建議金額"], errors="coerce").fillna(0.0).round(2)
     for pct_col in ["單檔曝險%", "題材曝險%", "產業曝險%"]:
         if pct_col in x.columns:
             x[pct_col] = pd.to_numeric(x[pct_col], errors="coerce").fillna(0.0).round(2)
 
-    for text_col, default in [("投資組合狀態", "未配置"), ("風險備註", ""), ("盤中狀態", ""), ("淘汰原因", "")]:
+    for text_col, default in [("投資組合狀態", "未配置"), ("風險備註", ""), ("盤中狀態", ""), ("淘汰原因", ""), ("代號", ""), ("名稱", "")]:
         if text_col in x.columns:
             x[text_col] = x[text_col].fillna(default).astype(str)
     return x
@@ -2884,18 +2910,41 @@ def assert_schema(df: pd.DataFrame, expected_columns: list[str], schema_name: st
     return x.fillna("")
 
 
+def _pool_stock_id_series(df: pd.DataFrame) -> pd.Series:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series(dtype="object")
+    if "stock_id" not in df.columns:
+        return pd.Series(dtype="object")
+    return df["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
+
+
+def build_pool_audit(pool_dict: dict) -> dict:
+    candidate20 = set(_pool_stock_id_series(pool_dict.get("candidate20", pd.DataFrame())).tolist())
+    core_attack5 = set(_pool_stock_id_series(pool_dict.get("core_attack5", pd.DataFrame())).tolist())
+    today_buy = set(_pool_stock_id_series(pool_dict.get("today_buy", pd.DataFrame())).tolist())
+    execution_ready = set(_pool_stock_id_series(pool_dict.get("execution_ready", pd.DataFrame())).tolist())
+    unique_decision = set(_pool_stock_id_series(pool_dict.get("unique_decision", pd.DataFrame())).tolist())
+    audit = {
+        "candidate20_count": len(candidate20),
+        "core_attack5_count": len(core_attack5),
+        "today_buy_count": len(today_buy),
+        "execution_ready_count": len(execution_ready),
+        "unique_decision_count": len(unique_decision),
+        "core_minus_candidate20": sorted(core_attack5 - candidate20),
+        "today_minus_core": sorted(today_buy - core_attack5),
+        "unique_minus_execution": sorted(unique_decision - execution_ready),
+    }
+    return audit
+
+
 def assert_pool_consistency(pool_dict: dict):
-    candidate20 = set(pool_dict.get("candidate20", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
-    core_attack5 = set(pool_dict.get("core_attack5", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
-    today_buy = set(pool_dict.get("today_buy", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
-    execution_ready = set(pool_dict.get("execution_ready", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
-    unique_decision = set(pool_dict.get("unique_decision", pd.DataFrame()).get("stock_id", pd.Series(dtype=str)).astype(str))
-    if core_attack5 and not core_attack5.issubset(candidate20):
-        raise ValueError("V16.2 pool error: core_attack5 必須為 candidate20 子集合")
-    if today_buy and not today_buy.issubset(core_attack5):
-        raise ValueError("V16.2 pool error: today_buy 必須為 core_attack5 子集合")
-    if unique_decision and not unique_decision.issubset(execution_ready):
-        raise ValueError("V16.2 pool error: unique_decision 必須為 execution_ready 子集合")
+    audit = build_pool_audit(pool_dict)
+    if audit["core_minus_candidate20"]:
+        raise ValueError(f"V16.2 pool error: core_attack5 必須為 candidate20 子集合｜差集={audit['core_minus_candidate20'][:10]}")
+    if audit["today_minus_core"]:
+        raise ValueError(f"V16.2 pool error: today_buy 必須為 core_attack5 子集合｜差集={audit['today_minus_core'][:10]}")
+    if audit["unique_minus_execution"]:
+        raise ValueError(f"V16.2 pool error: unique_decision 必須為 execution_ready 子集合｜差集={audit['unique_minus_execution'][:10]}")
 
 
 
@@ -4020,6 +4069,7 @@ class MasterTradingEngine:
         self.db = db
         self.market_engine = MarketRegimeEngine(db)
         self.plan_engine = TradingPlanEngine(db)
+        self.last_pool_audit = {}
 
     def get_trade_pool(self, filtered_df: pd.DataFrame, progress_cb=None, log_cb=None, cancel_cb=None) -> dict:
         if filtered_df.empty:
@@ -4131,34 +4181,52 @@ class MasterTradingEngine:
             trade_top20 = trade_top20.sort_values(["candidate20_score", "mainstream_score", "breakout_score", "liquidity_score", "model_score"], ascending=False).head(20).copy()
 
         if tradable_top20.empty:
-            tradable_top20 = tradable[(tradable.get("decision", pd.Series(dtype=str)).isin(["BUY", "WEAK BUY"])) & (~tradable.get("ui_state", pd.Series(dtype=str)).isin(["淘汰", "不可買"]))].copy() if not tradable.empty else pd.DataFrame()
-        if not tradable_top20.empty:
-            tradable_top20 = tradable_top20.copy()
-            tradable_top20["light_rank"] = _safe_text_fill_series(tradable_top20, "tactical_light", "⚪").map({"🔵": 5, "🟢": 4, "🟡": 3, "🟠": 2, "🔴": 1, "⚪": 0}).fillna(0)
-            rel_market_norm = (((_safe_num_series(tradable_top20, "relative_strength_market", 0) + 10) / 20.0) * 100.0).clip(0, 100)
-            rel_ind_norm = _safe_num_series(tradable_top20, "relative_strength_industry", 0).clip(0, 100)
-            tradable_top20["candidate20_score"] = _safe_num_series(tradable_top20, "candidate20_score", 0)
-            tradable_top20["source_count"] = _safe_num_series(tradable_top20, "source_count", 1)
+            tradable_top20 = trade_top20[
+                trade_top20.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])
+            ].copy() if not trade_top20.empty else pd.DataFrame()
+
+        core_source = trade_top20[
+            trade_top20.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])
+        ].copy() if not trade_top20.empty else pd.DataFrame()
+        if not core_source.empty:
+            core_source = core_source.drop_duplicates(subset=["stock_id"], keep="first").copy()
+            core_source["light_rank"] = _safe_text_fill_series(core_source, "tactical_light", "⚪").map({"🔵": 5, "🟢": 4, "🟡": 3, "🟠": 2, "🔴": 1, "⚪": 0}).fillna(0)
+            rel_market_norm = (((_safe_num_series(core_source, "relative_strength_market", 0) + 10) / 20.0) * 100.0).clip(0, 100)
+            rel_ind_norm = _safe_num_series(core_source, "relative_strength_industry", 0).clip(0, 100)
+            core_source["candidate20_score"] = _safe_num_series(core_source, "candidate20_score", 0)
+            core_source["source_count"] = _safe_num_series(core_source, "source_count", 1)
             aw = SCORE_FORMULA_WEIGHTS["core_attack5"]
-            tradable_top20["core_attack5_score"] = (
-                tradable_top20["candidate20_score"] * aw["candidate20_score"] +
-                _safe_num_series(tradable_top20, "mainstream_score", 0) * aw["mainstream_score"] +
-                _safe_num_series(tradable_top20, "breakout_score", 0) * aw["breakout_score"] +
-                _safe_num_series(tradable_top20, "leader_follow_score", 0) * aw["leader_follow_score"] +
-                _safe_num_series(tradable_top20, "active_buy_score", 0) * aw["active_buy_score"] +
-                _safe_num_series(tradable_top20, "orderflow_aggression_score", 0) * aw["orderflow_aggression_score"] +
+            core_source["core_attack5_score"] = (
+                core_source["candidate20_score"] * aw["candidate20_score"] +
+                _safe_num_series(core_source, "mainstream_score", 0) * aw["mainstream_score"] +
+                _safe_num_series(core_source, "breakout_score", 0) * aw["breakout_score"] +
+                _safe_num_series(core_source, "leader_follow_score", 0) * aw["leader_follow_score"] +
+                _safe_num_series(core_source, "active_buy_score", 0) * aw["active_buy_score"] +
+                _safe_num_series(core_source, "orderflow_aggression_score", 0) * aw["orderflow_aggression_score"] +
                 rel_market_norm * aw["rel_market_norm"] +
                 rel_ind_norm * aw["rel_ind_norm"] +
-                tradable_top20["source_count"] * aw["source_count_factor"] +
-                tradable_top20["light_rank"] * aw["light_rank_factor"]
+                core_source["source_count"] * aw["source_count_factor"] +
+                core_source["light_rank"] * aw["light_rank_factor"]
             ).round(2)
-            tradable_top20["pool_role"] = "主攻5"
-            tradable_top20 = tradable_top20.sort_values(["core_attack5_score", "light_rank", "mainstream_score", "breakout_score", "liquidity_score", "model_score", "win_rate"], ascending=False).head(20).copy()
+            core_source["pool_role"] = "主攻5"
+            tradable_top20 = core_source.sort_values(
+                ["core_attack5_score", "light_rank", "mainstream_score", "breakout_score", "liquidity_score", "model_score", "win_rate"],
+                ascending=False
+            ).drop_duplicates(subset=["stock_id"], keep="first").head(20).copy()
 
-        attack = tradable_top20[tradable_top20["final_trade_decision"].astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])].copy() if not tradable_top20.empty else pd.DataFrame()
+        attack = tradable_top20.copy() if not tradable_top20.empty else pd.DataFrame()
         if not attack.empty:
             attack["pool_role"] = "主攻5"
-            attack = attack.sort_values(["core_attack5_score", "light_rank", "liquidity_score", "model_score", "win_rate"], ascending=False).head(5).copy()
+            attack = attack.sort_values(["core_attack5_score", "light_rank", "liquidity_score", "model_score", "win_rate"], ascending=False).drop_duplicates(subset=["stock_id"], keep="first").head(REPORT_DECISION_LIMITS["core_attack5"]).copy()
+
+        if log_cb:
+            candidate20_ids = set(_pool_stock_id_series(trade_top20).tolist())
+            core_ids = set(_pool_stock_id_series(attack).tolist())
+            core_missing = sorted(core_ids - candidate20_ids)
+            log_cb(f"[POOL] candidate20={len(candidate20_ids)}｜core_attack5={len(core_ids)}｜diff={len(core_missing)}")
+            if core_missing:
+                log_cb(f"[POOL-ERROR] core_attack5 - candidate20 差集：{','.join(core_missing[:20])}")
+
         watch = trade_top20[(trade_top20["final_trade_decision"].astype(str).isin(["WAIT_PULLBACK", "AVOID"])) | (trade_top20.get("decision", pd.Series(dtype=str)).isin(["WEAK BUY", "HOLD"]))].copy() if not trade_top20.empty else pd.DataFrame()
         if not watch.empty:
             watch["pool_role"] = "等待回測"
@@ -4261,18 +4329,31 @@ class MasterTradingEngine:
             "tradable_top20": tradable_top20,
             "mainstream_top20": mainstream_top20.head(20) if not mainstream_top20.empty else pd.DataFrame(),
             "breakout_top20": breakout_top20.head(20) if not breakout_top20.empty else pd.DataFrame(),
-            "attack": attack.head(5),
+            "attack": attack.head(REPORT_DECISION_LIMITS["core_attack5"]),
             "watch": watch.head(10),
             "defense": defense.head(10),
             "today_buy": today_buy.head(dynamic_n),
             "wait_pullback": wait_pullback.head(dynamic_n),
             "candidate20": trade_top20.head(20),
-            "core_attack5": attack.head(5),
+            "core_attack5": attack.head(REPORT_DECISION_LIMITS["core_attack5"]),
             "execution_ready": execution_ready.head(dynamic_n),
-            "unique_decision": unique_decision.head(5),
+            "unique_decision": unique_decision.head(REPORT_DECISION_LIMITS["unique_decision"]),
             "theme_summary": ThemeStrengthEngine.summarize(base),
             "eliminated": eliminated.head(20),
         }
+        pool_audit = build_pool_audit(result)
+        self.last_pool_audit = dict(pool_audit)
+        result["pool_audit"] = dict(pool_audit)
+        if log_cb:
+            log_cb(
+                f"[POOL-AUDIT] candidate20={pool_audit['candidate20_count']}｜core_attack5={pool_audit['core_attack5_count']}｜today_buy={pool_audit['today_buy_count']}｜execution_ready={pool_audit['execution_ready_count']}｜unique_decision={pool_audit['unique_decision_count']}"
+            )
+            if pool_audit["core_minus_candidate20"]:
+                log_cb(f"[POOL-AUDIT] core_attack5 - candidate20：{','.join(pool_audit['core_minus_candidate20'][:20])}")
+            if pool_audit["today_minus_core"]:
+                log_cb(f"[POOL-AUDIT] today_buy - core_attack5：{','.join(pool_audit['today_minus_core'][:20])}")
+            if pool_audit["unique_minus_execution"]:
+                log_cb(f"[POOL-AUDIT] unique_decision - execution_ready：{','.join(pool_audit['unique_minus_execution'][:20])}")
         assert_pool_consistency(result)
         return result
 
@@ -4353,9 +4434,9 @@ class SelectionEngine:  # deprecated compatibility helper, not used by v9.2 FINA
             master_top5 = pd.concat([master_top5, extra], ignore_index=True)
 
         return {
-            "master_top5": master_top5.head(5),
-            "attack": attack.head(5),
-            "watch": watch.head(5),
+            "master_top5": master_top5.head(REPORT_DECISION_LIMITS["core_attack5"]),
+            "attack": attack.head(REPORT_DECISION_LIMITS["core_attack5"]),
+            "watch": watch.head(REPORT_DECISION_LIMITS["core_attack5"]),
             "defense": defense.head(3),
         }
 
@@ -5631,7 +5712,7 @@ class AppUI:
             x = x.sort_values([c for c in ["execution_score", "core_attack5_score", "candidate20_score", "liquidity_score", "model_score", "win_rate", "rr"] if c in x.columns], ascending=False)
         elif sort_cols:
             x = x.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-        x = x.drop_duplicates(subset=["stock_id"], keep="first").head(5).reset_index(drop=True)
+        x = x.drop_duplicates(subset=["stock_id"], keep="first").head(REPORT_DECISION_LIMITS["unique_decision"]).reset_index(drop=True)
         if not x.empty:
             x["pool_role"] = "唯一決策"
         x = self.enrich_price_and_export_fields(x, id_col="stock_id")
@@ -6437,6 +6518,7 @@ class AppUI:
         theme_df = getattr(self, "last_theme_summary_df", pd.DataFrame())
         theme_text = "、".join(theme_df.head(5)["theme"].astype(str).tolist()) if isinstance(theme_df, pd.DataFrame) and not theme_df.empty and "theme" in theme_df.columns else "-"
         pick_text = "、".join(unique_df.head(5)["stock_id"].astype(str).tolist()) if isinstance(unique_df, pd.DataFrame) and not unique_df.empty and "stock_id" in unique_df.columns else "-"
+        pool_audit = getattr(self.master_trading_engine, "last_pool_audit", {}) or {}
         rows = [
             {"項目": "市場狀態", "內容": str(market.get("regime", "-"))},
             {"項目": "市場分數", "內容": str(market.get("score", "-"))},
@@ -6445,6 +6527,8 @@ class AppUI:
             {"項目": "今日可下單檔數", "內容": int(len(today_buy) if isinstance(today_buy, pd.DataFrame) else 0)},
             {"項目": "等待回測檔數", "內容": int(len(wait_df) if isinstance(wait_df, pd.DataFrame) else 0)},
             {"項目": "唯一決策", "內容": pick_text},
+            {"項目": "Pool Sizes", "內容": f"candidate20={pool_audit.get('candidate20_count','-')}｜core_attack5={pool_audit.get('core_attack5_count','-')}｜today_buy={pool_audit.get('today_buy_count','-')}｜execution_ready={pool_audit.get('execution_ready_count','-')}｜unique_decision={pool_audit.get('unique_decision_count','-')}"},
+            {"項目": "Pool Audit", "內容": f"core-candidate diff={','.join(pool_audit.get('core_minus_candidate20', [])[:10]) or '-'}｜today-core diff={','.join(pool_audit.get('today_minus_core', [])[:10]) or '-'}｜unique-execution diff={','.join(pool_audit.get('unique_minus_execution', [])[:10]) or '-'}"},
             {"項目": "風險提示", "內容": str(market.get("memo", "-"))},
             {"項目": "參數摘要", "內容": f"max_positions={market.get('max_positions','-')}｜min_win_rate={market.get('min_win_rate','-')}｜RSI={market.get('rsi_low','-')}~{market.get('rsi_high','-')}"},
         ]
@@ -6461,6 +6545,8 @@ class AppUI:
             {"報表": "Institutional_Plan", "用途": "組合與曝險配置表。"},
             {"報表": "Unique_Decision", "用途": "最終 1~5 檔唯一決策。"},
             {"報表": "Daily_Summary", "用途": "每日總結頁：先看總結，再看細表。"},
+            {"報表": "Summary", "用途": "摘要頁，含市場狀態、Pool Sizes 與 Pool Audit 結果。"},
+            {"報表": "用途說明", "用途": "報表用途與檢查規則說明頁。"},
         ]
         return pd.DataFrame(rows)
 
@@ -6520,7 +6606,9 @@ class AppUI:
                 if unique_df is not None and not unique_df.empty:
                     tables["Unique_Decision"] = self.enrich_price_and_export_fields(unique_df, id_col="stock_id")
                 tables["Daily_Summary"] = self.build_daily_summary_sheet()
+                tables["Summary"] = self.build_daily_summary_sheet()
                 tables["Report_Guide"] = self.build_report_usage_sheet()
+                tables["用途說明"] = self.build_report_usage_sheet()
                 tables["Detail"] = pd.DataFrame({"detail": [detail_text]})
                 self.ui_call(self.update_task, "匯出分析", 3, 5, item="寫入檔案")
                 base = RUNTIME_DIR / f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -7063,6 +7151,16 @@ class AppUI:
                 self.ui_call(self.finish_task, "每日增量更新", "作業已中斷")
             except Exception as e:
                 traceback.print_exc()
+                try:
+                    pool_audit = getattr(self.master_trading_engine, "last_pool_audit", {}) or {}
+                    if pool_audit:
+                        self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] candidate20={pool_audit.get('candidate20_count','-')}｜core_attack5={pool_audit.get('core_attack5_count','-')}｜today_buy={pool_audit.get('today_buy_count','-')}｜execution_ready={pool_audit.get('execution_ready_count','-')}｜unique_decision={pool_audit.get('unique_decision_count','-')}")
+                        if pool_audit.get('core_minus_candidate20'):
+                            self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] core_attack5 - candidate20：{','.join(pool_audit.get('core_minus_candidate20', [])[:20])}")
+                        if pool_audit.get('today_minus_core'):
+                            self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] today_buy - core_attack5：{','.join(pool_audit.get('today_minus_core', [])[:20])}")
+                except Exception:
+                    pass
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
 
         self._run_in_thread(worker, "update_daily")
@@ -7157,7 +7255,7 @@ class AppUI:
                 self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(inst_plan_raw, id_col="代號"))
                 unique_raw = trade.get("unique_decision", pd.DataFrame())
                 if unique_raw is not None and not unique_raw.empty:
-                    self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(5)
+                    self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(REPORT_DECISION_LIMITS["unique_decision"])
                 else:
                     self.last_unique_decision_df = self.build_unique_decision_df(self.last_today_buy_df, self.last_wait_df, self.last_attack_df, self.last_watch_df, self.last_defense_df, self.last_top20_df)
 
@@ -7181,7 +7279,7 @@ class AppUI:
                 if trade_top20.empty:
                     lines.append("目前無符合條件標的")
                 else:
-                    for i, (_, r) in enumerate(trade_top20.head(5).iterrows(), start=1):
+                    for i, (_, r) in enumerate(trade_top20.head(REPORT_DECISION_LIMITS["core_attack5"]).iterrows(), start=1):
                         lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
 
                 lines.extend(["", "【今日可下單】"])
