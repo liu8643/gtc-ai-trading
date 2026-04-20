@@ -6958,16 +6958,39 @@ class AppUI:
         self.detail.insert("1.0", "\n".join(lines))
         self.left_notebook.select(self.tab_sop)
 
-    def refresh_filters(self):
+    def refresh_filters(self, reset_active_filters: bool = False):
         master = self.db.get_master()
-        if master.empty:
-            self.market_cb["values"] = ["全部"]
-            self.industry_cb["values"] = ["全部"]
-            self.theme_cb["values"] = ["全部"]
+        market_values = ["全部"]
+        industry_values = ["全部"]
+        theme_values = ["全部"]
+        if not master.empty:
+            market_values += sorted([x for x in master["market"].dropna().unique().tolist() if str(x).strip() != ""])
+            industry_values += sorted([x for x in master["industry"].dropna().unique().tolist() if str(x).strip() != ""])
+            theme_values += sorted([x for x in master["theme"].dropna().unique().tolist() if str(x).strip() != ""])
+
+        self.market_cb["values"] = market_values
+        self.industry_cb["values"] = industry_values
+        self.theme_cb["values"] = theme_values
+
+        if reset_active_filters:
+            try:
+                self.market_var.set("全部")
+                self.industry_var.set("全部")
+                self.theme_var.set("全部")
+                self.search_var.set("")
+            except Exception:
+                pass
             return
-        self.market_cb["values"] = ["全部"] + sorted([x for x in master["market"].dropna().unique().tolist() if str(x).strip() != ""])
-        self.industry_cb["values"] = ["全部"] + sorted([x for x in master["industry"].dropna().unique().tolist() if str(x).strip() != ""])
-        self.theme_cb["values"] = ["全部"] + sorted([x for x in master["theme"].dropna().unique().tolist() if str(x).strip() != ""])
+
+        try:
+            if self.market_var.get() not in market_values:
+                self.market_var.set("全部")
+            if self.industry_var.get() not in industry_values:
+                self.industry_var.set("全部")
+            if self.theme_var.get() not in theme_values:
+                self.theme_var.set("全部")
+        except Exception:
+            pass
 
     def _parse_search_tokens(self, raw_query: str):
         raw = str(raw_query or "").strip()
@@ -6999,23 +7022,45 @@ class AppUI:
 
         return df[mask]
 
-    def _filtered_ranking(self):
+    def _filtered_ranking(self, force_full: bool = False):
         df = self.db.get_latest_ranking()
         if df.empty:
             return df
-        if self.market_var.get() != "全部":
-            df = df[df["market"] == self.market_var.get()]
-        if self.industry_var.get() != "全部":
-            df = df[df["industry"] == self.industry_var.get()]
-        if self.theme_var.get() != "全部":
-            df = df[df["theme"] == self.theme_var.get()]
-        q = self.search_var.get().strip()
-        if q:
-            df = self._apply_search_filter(df, q)
+
+        force_full = bool(force_full or getattr(self, "force_show_full_ranking_once", False))
+        if force_full:
+            try:
+                self.force_show_full_ranking_once = False
+            except Exception:
+                pass
+        else:
+            if self.market_var.get() != "全部":
+                df = df[df["market"] == self.market_var.get()]
+            if self.industry_var.get() != "全部":
+                df = df[df["industry"] == self.industry_var.get()]
+            if self.theme_var.get() != "全部":
+                df = df[df["theme"] == self.theme_var.get()]
+            q = self.search_var.get().strip()
+            if q:
+                df = self._apply_search_filter(df, q)
+
         df = df.sort_values(["rank_all"]).reset_index(drop=True)
         return self.enrich_price_and_export_fields(df, id_col="stock_id")
 
-    def refresh_all_tables(self):
+    def _populate_rank_tree(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+        for i, row in df.iterrows():
+            self.rank_tree.insert("", "end", values=(
+                i + 1, row["stock_id"], row["stock_name"],
+                f"{float(row.get('現價', np.nan)):.2f}" if pd.notna(row.get("現價", np.nan)) else "-",
+                f"{float(row.get('漲跌', np.nan)):.2f}" if pd.notna(row.get("漲跌", np.nan)) else "-",
+                f"{float(row.get('漲跌幅%', np.nan)):.2f}" if pd.notna(row.get("漲跌幅%", np.nan)) else "-",
+                row["industry"], row["theme"],
+                f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
+            ))
+
+    def refresh_all_tables(self, force_full_ranking: bool = False):
         for tree in (self.dashboard_tree, self.sop_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
             for item in tree.get_children():
                 tree.delete(item)
@@ -7029,20 +7074,25 @@ class AppUI:
             self.show_welcome_message()
             return
 
-        df = self._filtered_ranking()
+        used_full_fallback = False
+        df = self._filtered_ranking(force_full=force_full_ranking)
         if df.empty:
-            self.set_status("目前篩選條件下沒有資料。")
-            return
+            full_df = self.db.get_latest_ranking()
+            if full_df is not None and not full_df.empty:
+                df = full_df.sort_values(["rank_all"]).reset_index(drop=True)
+                df = self.enrich_price_and_export_fields(df, id_col="stock_id")
+                used_full_fallback = True
+                try:
+                    self.force_show_full_ranking_once = False
+                except Exception:
+                    pass
+            else:
+                self.set_status("目前篩選條件下沒有資料。")
+                return
 
-        for i, row in df.iterrows():
-            self.rank_tree.insert("", "end", values=(
-                i + 1, row["stock_id"], row["stock_name"],
-                f"{float(row.get('現價', np.nan)):.2f}" if pd.notna(row.get("現價", np.nan)) else "-",
-                f"{float(row.get('漲跌', np.nan)):.2f}" if pd.notna(row.get("漲跌", np.nan)) else "-",
-                f"{float(row.get('漲跌幅%', np.nan)):.2f}" if pd.notna(row.get("漲跌幅%", np.nan)) else "-",
-                row["industry"], row["theme"],
-                f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
-            ))
+        self._populate_rank_tree(df)
+        if used_full_fallback:
+            self.set_status("目前篩選條件無資料，已改顯示完整排行。")
 
         sector = (
             df.groupby("industry", as_index=False)
@@ -7127,8 +7177,9 @@ class AppUI:
                     rank_skip["skip"] = skip_count
                     self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
                 rank_count = self.rank_engine.rebuild(progress_cb=rank_progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
-                self.ui_call(self.refresh_filters)
-                self.ui_call(self.refresh_all_tables)
+                self.force_show_full_ranking_once = True
+                self.ui_call(self.refresh_filters, True)
+                self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.show_welcome_message)
                 self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。")
                 self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n排行 {rank_count} 檔\n（TWSE/TPEX 官方優先，只更新今日）")
@@ -7161,8 +7212,9 @@ class AppUI:
                 def progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
                     self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
                 count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
-                self.ui_call(self.refresh_filters)
-                self.ui_call(self.refresh_all_tables)
+                self.force_show_full_ranking_once = True
+                self.ui_call(self.refresh_filters, True)
+                self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.refresh_classification_summary_ui)
                 self.ui_call(self.finish_task, "重建排行", f"排行已完成，共 {count} 檔")
                 if count <= 0:
