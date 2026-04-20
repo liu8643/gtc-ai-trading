@@ -4312,7 +4312,7 @@ class MasterTradingEngine:
         result = {
             "market": market,
             "trade_top20": trade_top20,
-            "tradable_top20": core_attack5.copy(),
+            "tradable_top20": trade_top20.copy(),
             "mainstream_top20": mainstream_top20.head(20) if not mainstream_top20.empty else pd.DataFrame(),
             "breakout_top20": breakout_top20.head(20) if not breakout_top20.empty else pd.DataFrame(),
             "attack": core_attack5.head(REPORT_DECISION_LIMITS["core_attack5"]),
@@ -4341,6 +4341,8 @@ class MasterTradingEngine:
             if pool_audit["unique_minus_execution"]:
                 log_cb(f"[POOL-AUDIT] unique_decision - execution_ready：{','.join(pool_audit['unique_minus_execution'][:20])}")
         assert_pool_consistency(result)
+        if log_cb:
+            log_cb(f"[POOL-FINAL] trade_top20={len(result.get('trade_top20', pd.DataFrame()))}｜attack={len(result.get('attack', pd.DataFrame()))}｜today_buy={len(result.get('today_buy', pd.DataFrame()))}｜wait_pullback={len(result.get('wait_pullback', pd.DataFrame()))}")
         return result
 
 
@@ -5417,7 +5419,19 @@ class AppUI:
         func()
 
     def ui_call(self, func, *args, **kwargs):
-        self.root.after(0, lambda: func(*args, **kwargs))
+        def _wrapped():
+            try:
+                func(*args, **kwargs)
+            except Exception as exc:
+                try:
+                    log_exception(f"UI callback failed: {getattr(func, '__name__', str(func))}", exc)
+                except Exception:
+                    pass
+                try:
+                    self.append_log(f"UI callback failed: {getattr(func, '__name__', str(func))}｜{exc}", "ERROR")
+                except Exception:
+                    pass
+        self.root.after(0, _wrapped)
 
     def _run_in_thread(self, target, name="worker"):
         if self.worker is not None and self.worker.is_alive():
@@ -7060,6 +7074,53 @@ class AppUI:
                 f"{row['total_score']:.2f}", f"{row['ai_score']:.2f}", row["signal"], row["action"]
             ))
 
+    def _reload_rank_tree_after_rebuild(self, force_full: bool = True):
+        """重建排行後專用：直接重建排行榜畫面，避免 refresh_all_tables() 途中例外時整片空白。"""
+        try:
+            self.refresh_filters(True)
+        except Exception:
+            pass
+
+        try:
+            for item in self.rank_tree.get_children():
+                self.rank_tree.delete(item)
+        except Exception:
+            pass
+
+        df = pd.DataFrame()
+        try:
+            df = self._filtered_ranking(force_full=force_full)
+        except Exception as exc:
+            log_exception("_reload_rank_tree_after_rebuild::_filtered_ranking failed", exc)
+            try:
+                self.append_log(f"重建排行後讀取排行失敗：{exc}", "ERROR")
+            except Exception:
+                pass
+            df = pd.DataFrame()
+
+        if df is None or df.empty:
+            try:
+                full_df = self.db.get_latest_ranking()
+                if full_df is not None and not full_df.empty:
+                    df = self.enrich_price_and_export_fields(full_df.sort_values(["rank_all"]).reset_index(drop=True), id_col="stock_id")
+            except Exception as exc:
+                log_exception("_reload_rank_tree_after_rebuild::fallback latest ranking failed", exc)
+
+        if df is None or df.empty:
+            self.set_status("重建排行已完成，但排行榜仍無資料可顯示。")
+            return
+
+        self._populate_rank_tree(df)
+        count = len(self.rank_tree.get_children())
+        self.set_status(f"排行已完成，共 {len(df)} 檔｜UI已載入 {count} 筆")
+        try:
+            if count <= 0:
+                self.append_log("重建排行後 UI 載入完成，但 rank_tree 仍為 0 筆。", "ERROR")
+            else:
+                self.append_log(f"重建排行後已載入排行榜 {count} 筆。")
+        except Exception:
+            pass
+
     def refresh_all_tables(self, force_full_ranking: bool = False):
         for tree in (self.dashboard_tree, self.sop_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
             for item in tree.get_children():
@@ -7213,7 +7274,7 @@ class AppUI:
                     self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
                 count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
                 self.force_show_full_ranking_once = True
-                self.ui_call(self.refresh_filters, True)
+                self.ui_call(self._reload_rank_tree_after_rebuild, True)
                 self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.refresh_classification_summary_ui)
                 self.ui_call(self.finish_task, "重建排行", f"排行已完成，共 {count} 檔")
@@ -7234,7 +7295,15 @@ class AppUI:
             return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
         df = self._filtered_ranking()
         if df.empty:
-            return messagebox.showwarning("提醒", "目前篩選條件下沒有可用資料")
+            try:
+                full_df = self.db.get_latest_ranking()
+                if full_df is not None and not full_df.empty:
+                    df = self.enrich_price_and_export_fields(full_df.sort_values(["rank_all"]).reset_index(drop=True), id_col="stock_id")
+                    self.set_status("目前篩選條件無資料，AI選股TOP20 已改用完整排行執行。")
+                else:
+                    return messagebox.showwarning("提醒", "目前沒有可用排行資料")
+            except Exception:
+                return messagebox.showwarning("提醒", "目前篩選條件下沒有可用資料")
 
         def worker():
             try:
@@ -7263,10 +7332,10 @@ class AppUI:
                 theme_summary = trade["theme_summary"]
                 eliminated = trade.get("eliminated", pd.DataFrame())
 
-                ui_top20_source = tradable_top20 if tradable_top20 is not None and not tradable_top20.empty else trade_top20
-                self.last_top20_df = self.enrich_price_and_export_fields(ui_top20_source.copy(), id_col="stock_id")
+                ui_top20_source = trade_top20 if trade_top20 is not None and not trade_top20.empty else tradable_top20
+                self.last_top20_df = self.enrich_price_and_export_fields(ui_top20_source.copy(), id_col="stock_id") if ui_top20_source is not None and not ui_top20_source.empty else pd.DataFrame()
                 self.cache_trade_dataframe(self.last_top20_df)
-                top5 = (tradable_top20 if tradable_top20 is not None and not tradable_top20.empty else trade_top20).head(5).copy()
+                top5 = attack.head(5).copy() if attack is not None and not attack.empty else (trade_top20.head(5).copy() if trade_top20 is not None and not trade_top20.empty else pd.DataFrame())
                 if not top5.empty:
                     bt_rows = []
                     for _, rr in top5.iterrows():
