@@ -2808,40 +2808,85 @@ def normalize_core_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
 def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+
     x = df.copy()
+
+    def _log_missing_columns(*cols: str):
+        missing = [c for c in cols if c not in x.columns]
+        if missing:
+            try:
+                log_warning(f"build_display_columns 缺少欄位，已套用安全預設值：{', '.join(missing)}")
+            except Exception:
+                pass
+
+    def _safe_series(col: str, default=0, numeric: bool = False):
+        if col in x.columns:
+            s = pd.Series(x[col], index=x.index, copy=True)
+        else:
+            _log_missing_columns(col)
+            s = pd.Series(default, index=x.index)
+        if numeric:
+            return pd.to_numeric(s, errors="coerce")
+        return s.fillna(default)
+
+    def _safe_first_series(candidates, default=0, numeric: bool = False):
+        for col in candidates:
+            if col in x.columns:
+                return _safe_series(col, default=default, numeric=numeric)
+        _log_missing_columns(*candidates)
+        s = pd.Series(default, index=x.index)
+        if numeric:
+            return pd.to_numeric(s, errors="coerce")
+        return s.fillna(default)
+
     if "close" not in x.columns:
         x["close"] = np.nan
     x["close"] = pd.to_numeric(x["close"], errors="coerce")
+
     if "prev_close" not in x.columns:
         x["prev_close"] = x["close"]
     x["prev_close"] = pd.to_numeric(x["prev_close"], errors="coerce").replace(0, np.nan)
-    x["現價"] = pd.to_numeric(x.get("現價", x["close"]), errors="coerce").fillna(x["close"])
+
+    x["現價"] = pd.to_numeric(_safe_first_series(["現價", "close"], default=np.nan, numeric=True), errors="coerce").fillna(x["close"])
     chg = (x["close"] - x["prev_close"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     chg_pct = ((x["close"] / x["prev_close"] - 1.0) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    x["漲跌"] = pd.to_numeric(x.get("漲跌", chg), errors="coerce").fillna(chg).round(2)
-    x["漲跌幅%"] = pd.to_numeric(x.get("漲跌幅%", chg_pct), errors="coerce").fillna(chg_pct).round(2)
+    x["漲跌"] = pd.to_numeric(_safe_first_series(["漲跌"], default=np.nan, numeric=True), errors="coerce").fillna(chg).round(2)
+    x["漲跌幅%"] = pd.to_numeric(_safe_first_series(["漲跌幅%"], default=np.nan, numeric=True), errors="coerce").fillna(chg_pct).round(2)
 
     if "進場區" not in x.columns:
         if "entry_zone" in x.columns:
-            x["進場區"] = x["entry_zone"]
+            x["進場區"] = _safe_series("entry_zone", default="", numeric=False).astype(str)
         elif {"entry_low", "entry_high"}.issubset(x.columns):
-            x["進場區"] = x.apply(lambda r: f"{float(r.get('entry_low', 0) or 0):.2f} ~ {float(r.get('entry_high', 0) or 0):.2f}", axis=1)
+            entry_low = _safe_series("entry_low", default=0, numeric=True).fillna(0.0)
+            entry_high = _safe_series("entry_high", default=0, numeric=True).fillna(0.0)
+            x["進場區"] = [f"{float(lo):.2f} ~ {float(hi):.2f}" for lo, hi in zip(entry_low, entry_high)]
         elif "entry" in x.columns:
-            x["進場區"] = x["entry"]
+            x["進場區"] = _safe_series("entry", default="", numeric=False).astype(str)
+        else:
+            _log_missing_columns("entry_zone", "entry_low", "entry_high", "entry")
+            x["進場區"] = pd.Series("", index=x.index, dtype="object")
+
     if "停損" not in x.columns:
         if "stop_loss" in x.columns:
-            x["停損"] = x["stop_loss"]
+            x["停損"] = _safe_series("stop_loss", default="", numeric=False)
         elif "stop" in x.columns:
-            x["停損"] = x["stop"]
+            x["停損"] = _safe_series("stop", default="", numeric=False)
+        else:
+            _log_missing_columns("stop_loss", "stop")
+            x["停損"] = pd.Series("", index=x.index, dtype="object")
+
     if "目標價" not in x.columns:
         if "target_price" in x.columns:
-            x["目標價"] = x["target_price"]
+            x["目標價"] = _safe_series("target_price", default="", numeric=False)
         elif "1.382" in x.columns:
-            x["目標價"] = x["1.382"]
+            x["目標價"] = _safe_series("1.382", default="", numeric=False)
         elif "target_1382" in x.columns:
-            x["目標價"] = x["target_1382"]
+            x["目標價"] = _safe_series("target_1382", default="", numeric=False)
         elif "target1382" in x.columns:
-            x["目標價"] = x["target1382"]
+            x["目標價"] = _safe_series("target1382", default="", numeric=False)
+        else:
+            _log_missing_columns("target_price", "1.382", "target_1382", "target1382")
+            x["目標價"] = pd.Series("", index=x.index, dtype="object")
 
     alias_pairs = [
         ("分類", "bucket"), ("狀態", "ui_state"), ("盤中狀態", "liquidity_status"), ("活性分", "liquidity_score"),
@@ -2862,23 +2907,24 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
             x[zh] = x[src]
 
     if "Kelly%" not in x.columns:
-        x["Kelly%"] = pd.to_numeric(x.get("position_pct", x.get("kelly_raw", np.nan)), errors="coerce")
+        x["Kelly%"] = pd.to_numeric(_safe_first_series(["position_pct", "kelly_raw"], default=np.nan, numeric=True), errors="coerce")
     if "建議張數" not in x.columns:
-        x["建議張數"] = pd.to_numeric(x.get("suggest_qty", x.get("qty", x.get("shares", 0))), errors="coerce").fillna(0)
+        x["建議張數"] = pd.to_numeric(_safe_first_series(["suggest_qty", "qty", "shares"], default=0, numeric=True), errors="coerce").fillna(0)
     if "建議金額" not in x.columns:
-        x["建議金額"] = pd.to_numeric(x.get("suggest_amount", x.get("amount", 0)), errors="coerce").fillna(0.0)
+        x["建議金額"] = pd.to_numeric(_safe_first_series(["suggest_amount", "amount"], default=0.0, numeric=True), errors="coerce").fillna(0.0)
     if "單檔曝險%" not in x.columns:
-        x["單檔曝險%"] = pd.to_numeric(x.get("single_position_pct", x.get("single_pct", 0)), errors="coerce").fillna(0.0)
+        x["單檔曝險%"] = pd.to_numeric(_safe_first_series(["single_position_pct", "single_pct"], default=0.0, numeric=True), errors="coerce").fillna(0.0)
     if "題材曝險%" not in x.columns:
-        x["題材曝險%"] = pd.to_numeric(x.get("theme_exposure_pct", x.get("theme_pct", 0)), errors="coerce").fillna(0.0)
+        x["題材曝險%"] = pd.to_numeric(_safe_first_series(["theme_exposure_pct", "theme_pct"], default=0.0, numeric=True), errors="coerce").fillna(0.0)
     if "產業曝險%" not in x.columns:
-        x["產業曝險%"] = pd.to_numeric(x.get("industry_exposure_pct", x.get("industry_pct", 0)), errors="coerce").fillna(0.0)
+        x["產業曝險%"] = pd.to_numeric(_safe_first_series(["industry_exposure_pct", "industry_pct"], default=0.0, numeric=True), errors="coerce").fillna(0.0)
     if "投資組合狀態" not in x.columns:
-        x["投資組合狀態"] = x.get("portfolio_state", "未配置")
+        x["投資組合狀態"] = _safe_first_series(["portfolio_state"], default="未配置", numeric=False).astype(str)
     if "風險備註" not in x.columns:
-        x["風險備註"] = x.get("risk_note", "")
+        x["風險備註"] = _safe_first_series(["risk_note"], default="", numeric=False).astype(str)
     if "優先級" not in x.columns:
-        x["優先級"] = pd.to_numeric(x.get("priority", np.arange(1, len(x) + 1)), errors="coerce").fillna(np.arange(1, len(x) + 1))
+        x["優先級"] = pd.to_numeric(_safe_first_series(["priority", "優先級"], default=np.nan, numeric=True), errors="coerce")
+        x["優先級"] = x["優先級"].fillna(pd.Series(np.arange(1, len(x) + 1), index=x.index))
 
     numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額"]
     for col in numeric_display:
@@ -2895,9 +2941,8 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     for text_col, default in [("投資組合狀態", "未配置"), ("風險備註", ""), ("盤中狀態", ""), ("淘汰原因", ""), ("代號", ""), ("名稱", "")]:
         if text_col in x.columns:
-            x[text_col] = x[text_col].fillna(default).astype(str)
+            x[text_col] = pd.Series(x[text_col], index=x.index, copy=True).fillna(default).astype(str)
     return x
-
 
 def assert_schema(df: pd.DataFrame, expected_columns: list[str], schema_name: str) -> pd.DataFrame:
     if df is None:
