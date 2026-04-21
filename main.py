@@ -129,6 +129,7 @@ def safe_plot_text(value, fallback: str = "-") -> str:
     return s or fallback
 
 SELECTED_PLOT_FONT = None
+BUILD_DISPLAY_WARNING_CACHE: set[tuple[str, ...]] = set()
 
 
 class OperationCancelled(Exception):
@@ -2812,12 +2813,15 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
 
     def _log_missing_columns(*cols: str):
-        missing = [c for c in cols if c not in x.columns]
+        missing = sorted({c for c in cols if c not in x.columns})
         if missing:
-            try:
-                log_warning(f"build_display_columns 缺少欄位，已套用安全預設值：{', '.join(missing)}")
-            except Exception:
-                pass
+            key = tuple(missing)
+            if key not in BUILD_DISPLAY_WARNING_CACHE:
+                BUILD_DISPLAY_WARNING_CACHE.add(key)
+                try:
+                    log_warning(f"build_display_columns 缺少欄位，已套用安全預設值：{', '.join(missing)}")
+                except Exception:
+                    pass
 
     def _safe_series(col: str, default=0, numeric: bool = False):
         if col in x.columns:
@@ -2977,7 +2981,7 @@ def build_pool_audit(pool_dict: dict) -> dict:
         "unique_decision_count": len(unique_decision),
         "core_minus_candidate20": sorted(core_attack5 - candidate20),
         "today_minus_core": sorted(today_buy - core_attack5),
-        "unique_minus_execution": sorted(unique_decision - execution_ready),
+        "unique_minus_core": sorted(unique_decision - core_attack5),
     }
     return audit
 
@@ -2988,8 +2992,8 @@ def assert_pool_consistency(pool_dict: dict):
         raise ValueError(f"V16.2 pool error: core_attack5 必須為 candidate20 子集合｜差集={audit['core_minus_candidate20'][:10]}")
     if audit["today_minus_core"]:
         raise ValueError(f"V16.2 pool error: today_buy 必須為 core_attack5 子集合｜差集={audit['today_minus_core'][:10]}")
-    if audit["unique_minus_execution"]:
-        raise ValueError(f"V16.2 pool error: unique_decision 必須為 execution_ready 子集合｜差集={audit['unique_minus_execution'][:10]}")
+    if audit["unique_minus_core"]:
+        raise ValueError(f"V16.2 pool error: unique_decision 必須為 core_attack5 子集合｜差集={audit['unique_minus_core'][:10]}")
 
 
 
@@ -4311,23 +4315,26 @@ class MasterTradingEngine:
                      ((execution_candidates["price_deviation"] <= 0.03) & (execution_candidates["rr_live"] >= 1.2) & (execution_candidates["rr_live"] < 1.5)))
                 ].sort_values(["execution_score", "core_attack5_score", "liquidity_score", "model_score"], ascending=False).head(REPORT_DECISION_LIMITS["today_buy"]).copy()
 
-            if wait_pullback.empty and not trade_top20.empty:
-                wait_pullback = trade_top20[
-                    trade_top20.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"])
-                ].copy()
-                if not wait_pullback.empty and not today_buy.empty:
-                    wait_pullback = wait_pullback[~wait_pullback["stock_id"].isin(today_buy["stock_id"].astype(str).tolist())].copy()
-                if not wait_pullback.empty:
-                    wait_pullback["core_attack5_score"] = _safe_num_series(wait_pullback, "core_attack5_score", _safe_num_series(wait_pullback, "candidate20_score", 0))
-                    wait_pullback["price_deviation"] = _safe_num_series(wait_pullback, "price_deviation", 0)
-                    wait_pullback["rr_live"] = _safe_num_series(wait_pullback, "rr_live", _safe_num_series(wait_pullback, "rr", 0))
-                    wait_pullback = wait_pullback.sort_values(["core_attack5_score", "candidate20_score", "liquidity_score", "model_score"], ascending=False).drop_duplicates(subset=["stock_id"], keep="first").head(REPORT_DECISION_LIMITS["today_buy"]).copy()
+            if not wait_pullback.empty and not today_buy.empty:
+                wait_pullback = wait_pullback[~wait_pullback["stock_id"].isin(today_buy["stock_id"].astype(str).tolist())].copy()
             if not wait_pullback.empty:
+                wait_pullback["core_attack5_score"] = _safe_num_series(wait_pullback, "core_attack5_score", _safe_num_series(wait_pullback, "candidate20_score", 0))
+                wait_pullback["price_deviation"] = _safe_num_series(wait_pullback, "price_deviation", 0)
+                wait_pullback["rr_live"] = _safe_num_series(wait_pullback, "rr_live", _safe_num_series(wait_pullback, "rr", 0))
+                wait_pullback = wait_pullback.sort_values(["execution_score", "core_attack5_score", "candidate20_score", "liquidity_score", "model_score"], ascending=False).drop_duplicates(subset=["stock_id"], keep="first").head(REPORT_DECISION_LIMITS["today_buy"]).copy()
                 wait_pullback["pool_role"] = "等待回測"
                 wait_pullback["ui_state"] = "等待回測"
 
             execution_ready = today_buy.copy()
-            unique_decision = execution_ready.head(REPORT_DECISION_LIMITS["unique_decision"]).copy()
+            unique_base = core_attack5.copy() if core_attack5 is not None else pd.DataFrame()
+            if unique_base is None or unique_base.empty:
+                unique_base = execution_ready.copy()
+            if unique_base is not None and not unique_base.empty:
+                if "final_trade_decision" in unique_base.columns:
+                    unique_base = unique_base[unique_base["final_trade_decision"].astype(str).isin(["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"])].copy()
+                unique_decision = unique_base.sort_values([c for c in ["core_attack5_score", "candidate20_score", "liquidity_score", "model_score", "win_rate", "rr"] if c in unique_base.columns], ascending=False).drop_duplicates(subset=["stock_id"], keep="first").head(REPORT_DECISION_LIMITS["unique_decision"]).copy()
+            else:
+                unique_decision = pd.DataFrame()
             if not unique_decision.empty:
                 unique_decision["pool_role"] = "唯一決策"
 
@@ -4810,6 +4817,8 @@ class AppUI:
         self.history_batch_size = 25
         self.history_sleep_sec = 0.6
         self.last_job_summary = {}
+        self.startup_initialized = False
+        self.startup_in_progress = False
 
         self.root.title(APP_NAME)
         self._configure_startup_window()
@@ -4840,10 +4849,43 @@ class AppUI:
         set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
         self.refresh_filters()
         self.show_welcome_message()
-        self.refresh_all_tables()
+        self.root.after(120, self.start_background_init)
         self.root.after(180, self._apply_initial_layout)
         self.root.after(600, self._apply_initial_layout)
         self.set_status(f"PACKED={PACKED_DATA_DIR} | EXTERNAL={EXTERNAL_DATA_DIR} | CSV={MASTER_CSV}")
+
+    def start_background_init(self):
+        if getattr(self, "startup_initialized", False) or getattr(self, "startup_in_progress", False):
+            return
+
+        def worker():
+            done = threading.Event()
+            self.startup_in_progress = True
+            try:
+                self.ui_call(self.start_task, "啟動初始化", 4)
+                self.ui_call(self.update_task, "啟動初始化", 1, 4, item="載入歡迎頁與篩選條件")
+                self.ui_call(self.show_welcome_message)
+                self.ui_call(self.update_task, "啟動初始化", 2, 4, item="建立儀表板與排行檢視")
+
+                def _refresh_and_mark():
+                    try:
+                        self.refresh_all_tables()
+                    finally:
+                        done.set()
+
+                self.ui_call(_refresh_and_mark)
+                done.wait()
+                self.ui_call(self.update_task, "啟動初始化", 3, 4, success=1, item="首輪畫面刷新完成")
+                self.startup_initialized = True
+                self.ui_call(self.update_task, "啟動初始化", 4, 4, success=1, item="系統可操作")
+                self.ui_call(self.finish_task, "啟動初始化", "系統初始化完成，可開始操作。")
+            finally:
+                self.startup_in_progress = False
+
+        self._run_in_thread(worker, "startup_init")
+
+    def update_status(self, msg: str):
+        self.ui_call(self.set_status, msg)
 
     def _configure_startup_window(self):
         """啟動時自動貼齊可視區域，避免主視窗超出螢幕範圍。"""
@@ -6694,9 +6736,7 @@ class AppUI:
 
     def build_order_list(self, today_buy_df: pd.DataFrame, wait_df: pd.DataFrame | None = None) -> pd.DataFrame:
         x1 = today_buy_df.copy() if today_buy_df is not None else pd.DataFrame()
-        x2 = wait_df.copy() if wait_df is not None else pd.DataFrame()
-        pool = pd.concat([x1, x2], ignore_index=True) if (not x1.empty or not x2.empty) else pd.DataFrame()
-        plan = self.portfolio_engine.build_institutional_plan(pool)
+        plan = self.portfolio_engine.build_institutional_plan(x1)
         if plan.empty:
             return pd.DataFrame(columns=["優先級","代號","名稱","現價","漲跌","漲跌幅%","分類","狀態","盤中狀態","活性分","進場區","停損","目標價","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
         order_df = pd.DataFrame({
@@ -7402,8 +7442,8 @@ class AppUI:
                 self.cache_trade_dataframe(self.last_today_buy_df)
                 self.last_wait_df = self.enrich_price_and_export_fields(wait_pullback.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_wait_df)
-                self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df, self.last_wait_df))
-                inst_plan_raw = self.portfolio_engine.build_institutional_plan(pd.concat([self.last_today_buy_df.copy(), self.last_wait_df.copy()], ignore_index=True))
+                self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df))
+                inst_plan_raw = self.portfolio_engine.build_institutional_plan(self.last_today_buy_df.copy())
                 self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(inst_plan_raw, id_col="代號"))
                 unique_raw = trade.get("unique_decision", pd.DataFrame())
                 if unique_raw is not None and not unique_raw.empty:
