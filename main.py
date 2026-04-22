@@ -2973,15 +2973,23 @@ def build_pool_audit(pool_dict: dict) -> dict:
     today_buy = set(_pool_stock_id_series(pool_dict.get("today_buy", pd.DataFrame())).tolist())
     execution_ready = set(_pool_stock_id_series(pool_dict.get("execution_ready", pd.DataFrame())).tolist())
     unique_decision = set(_pool_stock_id_series(pool_dict.get("unique_decision", pd.DataFrame())).tolist())
+    wait_pullback = set(_pool_stock_id_series(pool_dict.get("wait_pullback", pd.DataFrame())).tolist())
+    watch = set(_pool_stock_id_series(pool_dict.get("watch", pd.DataFrame())).tolist())
     audit = {
         "candidate20_count": len(candidate20),
         "core_attack5_count": len(core_attack5),
         "today_buy_count": len(today_buy),
         "execution_ready_count": len(execution_ready),
         "unique_decision_count": len(unique_decision),
+        "wait_pullback_count": len(wait_pullback),
+        "watch_count": len(watch),
         "core_minus_candidate20": sorted(core_attack5 - candidate20),
         "today_minus_core": sorted(today_buy - core_attack5),
         "unique_minus_core": sorted(unique_decision - core_attack5),
+        "wait_minus_core": sorted(wait_pullback - core_attack5),
+        "watch_minus_candidate20": sorted(watch - candidate20),
+        "watch_core_overlap": sorted(watch & core_attack5),
+        "wait_watch_overlap": sorted(wait_pullback & watch),
     }
     return audit
 
@@ -2994,6 +3002,57 @@ def assert_pool_consistency(pool_dict: dict):
         raise ValueError(f"V16.2 pool error: today_buy 必須為 core_attack5 子集合｜差集={audit['today_minus_core'][:10]}")
     if audit["unique_minus_core"]:
         raise ValueError(f"V16.2 pool error: unique_decision 必須為 core_attack5 子集合｜差集={audit['unique_minus_core'][:10]}")
+    if audit["wait_minus_core"]:
+        raise ValueError(f"V16.2 pool error: wait_pullback 必須為 core_attack5 子集合｜差集={audit['wait_minus_core'][:10]}")
+    if audit["watch_minus_candidate20"]:
+        raise ValueError(f"V16.2 pool error: watch 必須為 candidate20 子集合｜差集={audit['watch_minus_candidate20'][:10]}")
+    if audit["watch_core_overlap"]:
+        raise ValueError(f"V16.2 pool error: watch 不可與 core_attack5 重疊｜差集={audit['watch_core_overlap'][:10]}")
+    if audit["wait_watch_overlap"]:
+        raise ValueError(f"V16.2 pool error: wait_pullback 不可與 watch 重疊｜差集={audit['wait_watch_overlap'][:10]}")
+
+
+def _pool_ids_from_any_df(df: pd.DataFrame, id_col: str = "stock_id") -> set[str]:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return set()
+    if id_col not in df.columns:
+        return set()
+    return set(pd.Series(df[id_col]).astype(str).map(normalize_stock_id).astype(str).str.strip().tolist())
+
+
+def assert_phase1_report_consistency(
+    candidate20_df: pd.DataFrame,
+    core_attack5_df: pd.DataFrame,
+    today_buy_df: pd.DataFrame,
+    wait_pullback_df: pd.DataFrame,
+    watch_df: pd.DataFrame,
+    unique_decision_df: pd.DataFrame,
+    order_list_df: pd.DataFrame,
+    institutional_plan_df: pd.DataFrame,
+):
+    candidate20_ids = _pool_ids_from_any_df(candidate20_df, "stock_id")
+    core_ids = _pool_ids_from_any_df(core_attack5_df, "stock_id")
+    today_ids = _pool_ids_from_any_df(today_buy_df, "stock_id")
+    wait_ids = _pool_ids_from_any_df(wait_pullback_df, "stock_id")
+    watch_ids = _pool_ids_from_any_df(watch_df, "stock_id")
+    unique_ids = _pool_ids_from_any_df(unique_decision_df, "stock_id")
+    order_ids = _pool_ids_from_any_df(order_list_df, "代號")
+    inst_ids = _pool_ids_from_any_df(institutional_plan_df, "代號")
+
+    if not order_ids.issubset(today_ids):
+        raise ValueError(f"V16.2 report error: Order_List 必須只來自 today_buy｜差集={sorted(order_ids - today_ids)[:10]}")
+    if not inst_ids.issubset(today_ids):
+        raise ValueError(f"V16.2 report error: Institutional_Plan 必須只來自 today_buy｜差集={sorted(inst_ids - today_ids)[:10]}")
+    if not unique_ids.issubset(core_ids):
+        raise ValueError(f"V16.2 report error: Unique_Decision 必須只來自 core_attack5｜差集={sorted(unique_ids - core_ids)[:10]}")
+    if not watch_ids.issubset(candidate20_ids):
+        raise ValueError(f"V16.2 report error: Watch 必須只來自 candidate20｜差集={sorted(watch_ids - candidate20_ids)[:10]}")
+    if watch_ids & core_ids:
+        raise ValueError(f"V16.2 report error: Watch 不可與 core_attack5 重疊｜差集={sorted(watch_ids & core_ids)[:10]}")
+    if not wait_ids.issubset(core_ids):
+        raise ValueError(f"V16.2 report error: Wait_Pullback 必須只來自 core_attack5｜差集={sorted(wait_ids - core_ids)[:10]}")
+    if wait_ids & watch_ids:
+        raise ValueError(f"V16.2 report error: Wait_Pullback 不可與 Watch 重疊｜差集={sorted(wait_ids & watch_ids)[:10]}")
 
 
 
@@ -4270,9 +4329,14 @@ class MasterTradingEngine:
                 core_attack5 = core_attack5[core_attack5["stock_id"].isin(trade_top20["stock_id"].tolist())].copy()
                 core_attack5["pool_role"] = "主攻5"
 
-            watch = trade_top20[(trade_top20["final_trade_decision"].astype(str).isin(["WAIT_PULLBACK", "AVOID"])) | (trade_top20.get("decision", pd.Series(dtype=str)).isin(["WEAK BUY", "HOLD"]))].copy() if not trade_top20.empty else pd.DataFrame()
-            if not watch.empty:
-                watch["pool_role"] = "等待回測"
+            watch = pd.DataFrame()
+            if not trade_top20.empty:
+                core_ids_for_watch = set(_pool_stock_id_series(core_attack5).tolist()) if not core_attack5.empty else set()
+                watch = trade_top20[~trade_top20["stock_id"].astype(str).isin(list(core_ids_for_watch))].copy()
+                watch = watch.drop_duplicates(subset=["stock_id"], keep="first").copy()
+                if not watch.empty:
+                    watch["pool_role"] = "觀察"
+                    watch["ui_state"] = "觀察"
 
             execution_candidates = core_attack5.copy() if not core_attack5.empty else pd.DataFrame()
             if not execution_candidates.empty:
@@ -4327,8 +4391,6 @@ class MasterTradingEngine:
 
             execution_ready = today_buy.copy()
             unique_base = core_attack5.copy() if core_attack5 is not None else pd.DataFrame()
-            if unique_base is None or unique_base.empty:
-                unique_base = execution_ready.copy()
             if unique_base is not None and not unique_base.empty:
                 if "final_trade_decision" in unique_base.columns:
                     unique_base = unique_base[unique_base["final_trade_decision"].astype(str).isin(["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"])].copy()
@@ -4392,6 +4454,14 @@ class MasterTradingEngine:
                 log_cb(f"[POOL-AUDIT] today_buy - core_attack5：{','.join(pool_audit['today_minus_core'][:20])}")
             if pool_audit["unique_minus_core"]:
                 log_cb(f"[POOL-AUDIT] unique_decision - core_attack5：{','.join(pool_audit['unique_minus_core'][:20])}")
+            if pool_audit["wait_minus_core"]:
+                log_cb(f"[POOL-AUDIT] wait_pullback - core_attack5：{','.join(pool_audit['wait_minus_core'][:20])}")
+            if pool_audit["watch_minus_candidate20"]:
+                log_cb(f"[POOL-AUDIT] watch - candidate20：{','.join(pool_audit['watch_minus_candidate20'][:20])}")
+            if pool_audit["watch_core_overlap"]:
+                log_cb(f"[POOL-AUDIT] watch ∩ core_attack5：{','.join(pool_audit['watch_core_overlap'][:20])}")
+            if pool_audit["wait_watch_overlap"]:
+                log_cb(f"[POOL-AUDIT] wait_pullback ∩ watch：{','.join(pool_audit['wait_watch_overlap'][:20])}")
         assert_pool_consistency(result)
         if log_cb:
             log_cb(f"[POOL-FINAL] trade_top20={len(result.get('trade_top20', pd.DataFrame()))}｜attack={len(result.get('attack', pd.DataFrame()))}｜today_buy={len(result.get('today_buy', pd.DataFrame()))}｜wait_pullback={len(result.get('wait_pullback', pd.DataFrame()))}")
@@ -7451,7 +7521,18 @@ class AppUI:
                 if unique_raw is not None and not unique_raw.empty:
                     self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(REPORT_DECISION_LIMITS["unique_decision"])
                 else:
-                    self.last_unique_decision_df = self.build_unique_decision_df(self.last_today_buy_df, self.last_wait_df, self.last_attack_df, self.last_watch_df, self.last_defense_df, self.last_top20_df)
+                    self.last_unique_decision_df = self.last_attack_df.head(REPORT_DECISION_LIMITS["unique_decision"]).copy()
+
+                assert_phase1_report_consistency(
+                    self.last_top20_df,
+                    self.last_attack_df,
+                    self.last_today_buy_df,
+                    self.last_wait_df,
+                    self.last_watch_df,
+                    self.last_unique_decision_df,
+                    self.last_order_list_df,
+                    self.last_institutional_plan_df,
+                )
 
                 self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
                 self.ui_call(self.refresh_top20_and_order_views)
