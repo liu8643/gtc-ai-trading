@@ -4390,8 +4390,8 @@ class MasterTradingEngine:
                 log_cb(f"[POOL-AUDIT] core_attack5 - candidate20：{','.join(pool_audit['core_minus_candidate20'][:20])}")
             if pool_audit["today_minus_core"]:
                 log_cb(f"[POOL-AUDIT] today_buy - core_attack5：{','.join(pool_audit['today_minus_core'][:20])}")
-            if pool_audit["unique_minus_execution"]:
-                log_cb(f"[POOL-AUDIT] unique_decision - execution_ready：{','.join(pool_audit['unique_minus_execution'][:20])}")
+            if pool_audit["unique_minus_core"]:
+                log_cb(f"[POOL-AUDIT] unique_decision - core_attack5：{','.join(pool_audit['unique_minus_core'][:20])}")
         assert_pool_consistency(result)
         if log_cb:
             log_cb(f"[POOL-FINAL] trade_top20={len(result.get('trade_top20', pd.DataFrame()))}｜attack={len(result.get('attack', pd.DataFrame()))}｜today_buy={len(result.get('today_buy', pd.DataFrame()))}｜wait_pullback={len(result.get('wait_pullback', pd.DataFrame()))}")
@@ -6615,7 +6615,7 @@ class AppUI:
             {"項目": "等待回測檔數", "內容": int(len(wait_df) if isinstance(wait_df, pd.DataFrame) else 0)},
             {"項目": "唯一決策", "內容": pick_text},
             {"項目": "Pool Sizes", "內容": f"candidate20={pool_audit.get('candidate20_count','-')}｜core_attack5={pool_audit.get('core_attack5_count','-')}｜today_buy={pool_audit.get('today_buy_count','-')}｜execution_ready={pool_audit.get('execution_ready_count','-')}｜unique_decision={pool_audit.get('unique_decision_count','-')}"},
-            {"項目": "Pool Audit", "內容": f"core-candidate diff={','.join(pool_audit.get('core_minus_candidate20', [])[:10]) or '-'}｜today-core diff={','.join(pool_audit.get('today_minus_core', [])[:10]) or '-'}｜unique-execution diff={','.join(pool_audit.get('unique_minus_execution', [])[:10]) or '-'}"},
+            {"項目": "Pool Audit", "內容": f"core-candidate diff={','.join(pool_audit.get('core_minus_candidate20', [])[:10]) or '-'}｜today-core diff={','.join(pool_audit.get('today_minus_core', [])[:10]) or '-'}｜unique-core diff={','.join(pool_audit.get('unique_minus_core', [])[:10]) or '-'}"},
             {"項目": "風險提示", "內容": str(market.get("memo", "-"))},
             {"項目": "參數摘要", "內容": f"max_positions={market.get('max_positions','-')}｜min_win_rate={market.get('min_win_rate','-')}｜RSI={market.get('rsi_low','-')}~{market.get('rsi_high','-')}"},
         ]
@@ -7342,6 +7342,8 @@ class AppUI:
                             self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] core_attack5 - candidate20：{','.join(pool_audit.get('core_minus_candidate20', [])[:20])}")
                         if pool_audit.get('today_minus_core'):
                             self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] today_buy - core_attack5：{','.join(pool_audit.get('today_minus_core', [])[:20])}")
+                        if pool_audit.get('unique_minus_core'):
+                            self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] unique_decision - core_attack5：{','.join(pool_audit.get('unique_minus_core', [])[:20])}")
                 except Exception:
                     pass
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
