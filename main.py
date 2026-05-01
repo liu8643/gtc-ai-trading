@@ -150,7 +150,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.5 EXTERNAL DECISION INTEGRATED V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.5.1 EXTERNAL DECISION AUTO-SYNC V16.2-R4"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -2329,7 +2329,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.5_external_decision_integrated_v16.2_r4",
+                "program_version": "v9.5.1_external_decision_auto_sync_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -8911,14 +8911,82 @@ class AppUI:
 
         self._run_in_thread(worker, "rebuild_rank")
 
+    def _ensure_external_data_ready_auto_sync(self, context: str = "AI選股TOP20") -> tuple[int, str]:
+        """V9.5.1：TOP20前置條件自動補救。
+        使用者按 AI選股TOP20 時，不再要求手動先按「同步外部資料」；
+        若 mandatory external data 尚未 ready，系統會先執行一次真實外部資料同步，
+        同步後再重新檢查 Gate。
+        """
+        readiness = ExternalDataReadiness(self.db)
+        ready, reason = readiness.mandatory_ready()
+        if int(ready) == 1:
+            try:
+                self.ui_call(self.append_log, f"[V9.5.1-AUTO-SYNC-SKIP] 外部資料已就緒，直接執行 {context}")
+            except Exception:
+                pass
+            return 1, ""
+
+        start_reason = str(reason or "外部資料未就緒")
+        auto_run_id = self.db.log_system_run(
+            event="external_auto_sync_before_top20",
+            status="start",
+            message=f"{context} preflight not ready; auto sync triggered: {start_reason}",
+            step="preflight_auto_sync",
+            module="external_data",
+        )
+        self.ui_call(self.append_log, f"[V9.5.1-AUTO-SYNC-START] {context} 偵測外部資料未就緒，系統自動同步外部資料｜run_id={auto_run_id}｜原因：{start_reason}", "WARNING")
+        self.ui_call(self.set_status, f"{context}：外部資料未就緒，正在自動同步...")
+
+        try:
+            sync_result = ExternalDataFetcher(self.db).refresh_external_data_pipeline(run_id=auto_run_id)
+            status_df = self.db.read_table("external_source_status", limit=500)
+            self.ui_call(self._populate_external_tree, status_df)
+            blocking = sync_result.get("blocking", []) if isinstance(sync_result, dict) else []
+            if blocking:
+                self.ui_call(self.append_log, f"[V9.5.1-AUTO-SYNC-WARN] 外部資料自動同步完成但仍有阻擋項｜run_id={auto_run_id}｜{'; '.join(blocking)}", "WARNING")
+            else:
+                self.ui_call(self.append_log, f"[V9.5.1-AUTO-SYNC-OK] 外部資料自動同步完成｜run_id={auto_run_id}")
+        except Exception as exc:
+            msg = f"外部資料自動同步失敗：{exc}"
+            self.db.log_system_run(
+                event="external_auto_sync_before_top20",
+                status="fail",
+                message=msg,
+                run_id=auto_run_id,
+                step="preflight_auto_sync",
+                module="external_data",
+            )
+            self.ui_call(self.append_log, f"[V9.5.1-AUTO-SYNC-FAIL] {msg}", "ERROR")
+            return 0, msg
+
+        ready2, reason2 = readiness.mandatory_ready()
+        if int(ready2) == 1:
+            self.db.log_system_run(
+                event="external_auto_sync_before_top20",
+                status="ok",
+                message=f"{context} external preflight passed after auto sync",
+                run_id=auto_run_id,
+                step="preflight_auto_sync",
+                module="external_data",
+            )
+            self.ui_call(self.append_log, f"[V9.5.1-PREFLIGHT-GO] 外部資料已就緒，繼續執行 {context}")
+            return 1, ""
+
+        final_reason = str(reason2 or "外部資料自動同步後仍未就緒")
+        self.db.log_system_run(
+            event="external_auto_sync_before_top20",
+            status="blocked",
+            message=f"{context} external preflight still blocked after auto sync: {final_reason}",
+            run_id=auto_run_id,
+            step="preflight_auto_sync",
+            module="external_data",
+        )
+        self.ui_call(self.append_log, f"[V9.5.1-PREFLIGHT-NO-GO] 自動同步後外部資料仍未就緒，停止 {context}：{final_reason}", "ERROR")
+        return 0, final_reason
+
     def show_top20(self):
         if not self.ensure_ranking_ready(auto_rebuild=True):
             return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
-        ready, reason = ExternalDataReadiness(self.db).mandatory_ready()
-        if int(ready) != 1:
-            self.append_log(f"[V9.5-PREFLIGHT-NO-GO] 外部資料未就緒，AI選股停止：{reason}")
-            self.refresh_external_data_status()
-            return messagebox.showwarning("外部資料未就緒", "外部資料尚未完成同步或已失敗，系統不允許直接產生可下單名單。\n\n請先執行「同步外部資料」。\n\n阻擋原因：\n" + str(reason))
         df = self._filtered_ranking()
         if df.empty:
             try:
@@ -8936,6 +9004,12 @@ class AppUI:
                 total = len(df)
                 self.ui_call(self.clear_log)
                 self.ui_call(self.start_task, "AI選股TOP20", total)
+
+                auto_ready, auto_reason = self._ensure_external_data_ready_auto_sync("AI選股TOP20")
+                if int(auto_ready) != 1:
+                    self.ui_call(self.finish_task, "AI選股TOP20", "AI選股停止：外部資料自動同步後仍未就緒")
+                    self.ui_call(messagebox.showwarning, "外部資料未就緒", "系統已自動執行「同步外部資料」，但必要外部資料仍未就緒，因此停止產生可下單名單。\n\n阻擋原因：\n" + str(auto_reason))
+                    return
 
                 def progress(idx, total_count, sid):
                     self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
