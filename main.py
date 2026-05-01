@@ -150,7 +150,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.5.1 EXTERNAL DECISION AUTO-SYNC V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.5.2 EXTERNAL DECISION NE-GATE V16.2-R4"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -2289,6 +2289,9 @@ class DBManager:
             ("market_source_level", "market_source_level TEXT DEFAULT ''"),
             ("source_trace_json", "source_trace_json TEXT DEFAULT ''"),
             ("decision_reason_short", "decision_reason_short TEXT DEFAULT ''"),
+            ("global_external_ready", "global_external_ready INTEGER DEFAULT 0"),
+            ("stock_external_coverage_state", "stock_external_coverage_state TEXT DEFAULT ''"),
+            ("gate_policy_note", "gate_policy_note TEXT DEFAULT ''"),
         ]:
             _add("trade_plan", col, ddl)
 
@@ -2329,7 +2332,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.5.1_external_decision_auto_sync_v16.2_r4",
+                "program_version": "v9.5.2_external_decision_ne_gate_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -2410,6 +2413,7 @@ class DBManager:
             "market_gate_state": "BLOCK", "flow_gate_state": "BLOCK", "fundamental_gate_state": "BLOCK",
             "event_gate_state": "NE", "risk_gate_state": "BLOCK",
             "latest_external_date": "", "market_source_level": "", "source_trace_json": "", "decision_reason_short": "",
+            "global_external_ready": 0, "stock_external_coverage_state": "", "gate_policy_note": "NE=Not Evaluated：資料未覆蓋不阻擋交易，只降權/標示",
         }
         for c, d in defaults.items():
             if c not in x.columns:
@@ -2421,7 +2425,7 @@ class DBManager:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed"]:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "update_time"]
+        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "update_time"]
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -3571,6 +3575,9 @@ def attach_external_display_columns(x: pd.DataFrame) -> pd.DataFrame:
         "外部資料日": "latest_external_date",
         "資料來源層級": "market_source_level",
         "決策摘要": "decision_reason_short",
+        "全域外部Ready": "global_external_ready",
+        "個股覆蓋狀態": "stock_external_coverage_state",
+        "Gate說明": "gate_policy_note",
     }
     for zh, src in mapping.items():
         if zh not in out.columns:
@@ -3589,13 +3596,34 @@ class CapitalFlowEngine:
             return {"pass": 0, "score": 0.0, "reason": f"法人資料未就緒，阻擋Gate：{st.get('reason')}", "data_ready": 0}
         df = self.db.read_table("external_institutional", limit=None)
         if df.empty or "stock_id" not in df.columns:
-            return {"pass": 0, "score": 0.0, "reason": "法人資料表為空，阻擋Gate", "data_ready": 0}
+            return {
+                "pass": 1,
+                "score": 50.0,
+                "reason": "法人資料表無個股覆蓋資料，Flow Gate=NE，不阻擋交易",
+                "data_ready": 0,
+                "not_evaluated": 1,
+                "coverage_state": "NE_NO_FLOW_TABLE",
+            }
         x = df[df["stock_id"].astype(str) == str(stock_id)].copy()
         if x.empty:
-            return {"pass": 0, "score": 0.0, "reason": "無該股法人資料，阻擋Flow Gate", "data_ready": 0}
+            return {
+                "pass": 1,
+                "score": 50.0,
+                "reason": "該股無法人覆蓋資料，Flow Gate=NE，不阻擋交易",
+                "data_ready": 0,
+                "not_evaluated": 1,
+                "coverage_state": "NE_NO_FLOW_COVERAGE",
+            }
         x = x.tail(5)
         score = float(pd.to_numeric(x.get("institutional_score", 50), errors="coerce").fillna(50).mean())
-        return {"pass": int(score >= 45), "score": round(score, 2), "reason": f"法人分數 {score:.1f}", "data_ready": 1}
+        return {
+            "pass": int(score >= 45),
+            "score": round(score, 2),
+            "reason": f"法人分數 {score:.1f}",
+            "data_ready": 1,
+            "not_evaluated": 0,
+            "coverage_state": "COVERED",
+        }
 
 
 class FundamentalEngine:
@@ -3624,9 +3652,23 @@ class FundamentalEngine:
                 score += 10 if eps > 0 else -8
                 reasons.append(f"EPS {eps:.2f}")
         if not reasons:
-            return {"pass": 0, "score": 0.0, "reason": "該股無營收/估值資料，阻擋Fundamental Gate", "data_ready": 0}
+            return {
+                "pass": 1,
+                "score": 50.0,
+                "reason": "該股無基本面覆蓋資料，Fundamental Gate=NE，不阻擋交易",
+                "data_ready": 0,
+                "not_evaluated": 1,
+                "coverage_state": "NE_NO_FUNDAMENTAL_COVERAGE",
+            }
         score = max(0, min(100, score))
-        return {"pass": int(score >= 45), "score": round(score, 2), "reason": "；".join(reasons), "data_ready": 1}
+        return {
+            "pass": int(score >= 45),
+            "score": round(score, 2),
+            "reason": "；".join(reasons),
+            "data_ready": 1,
+            "not_evaluated": 0,
+            "coverage_state": "COVERED",
+        }
 
 
 class EventEngine:
@@ -3697,27 +3739,47 @@ class DecisionLayerEngine:
         event = self.event_engine.evaluate(stock_id)
 
         technical_gate = int(str(plan.get("final_trade_decision", "")).upper() in ["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"] and float(plan.get("rr_live", plan.get("rr", 0)) or 0) >= 1.0)
-        external_ready = int(mandatory_ready == 1 and int(flow.get("data_ready", 0)) == 1 and (is_etf == 1 or int(fundamental.get("data_ready", 0)) == 1))
+
+        # V9.5.2：拆開「全域外部資料Ready」與「個股外部資料覆蓋」。
+        # mandatory_ready 只代表 market_snapshot / institutional / revenue 三個全域資料源已完成同步。
+        # 個股法人/基本面若無覆蓋，改為 NE（Not Evaluated），只標示、不阻擋交易。
+        external_ready = int(mandatory_ready == 1)
+        global_external_ready = external_ready
 
         risk = RiskGateEngine.evaluate(plan, market_mode=market_mode, external_data_ready=external_ready)
         fundamental_applicable = 0 if is_etf == 1 else 1
+        flow_ne = int(flow.get("not_evaluated", 0) or 0)
+        fund_ne = int(fundamental.get("not_evaluated", 0) or 0)
         event_ne = int(event.get("not_evaluated", 0) or 0)
 
         gate_states = {
             "market_gate_state": gate_state(market_gate, data_ready=int(market_status.get("ready", 0))),
-            "flow_gate_state": gate_state(flow.get("pass", 0), data_ready=flow.get("data_ready", 0)),
-            "fundamental_gate_state": gate_state(fundamental.get("pass", 0), data_ready=fundamental.get("data_ready", 0), applicable=fundamental_applicable),
+            "flow_gate_state": gate_state(flow.get("pass", 0), data_ready=flow.get("data_ready", 0), not_evaluated=flow_ne),
+            "fundamental_gate_state": gate_state(fundamental.get("pass", 0), data_ready=fundamental.get("data_ready", 0), not_evaluated=fund_ne, applicable=fundamental_applicable),
             "event_gate_state": gate_state(event.get("pass", 0), data_ready=event.get("data_ready", 0), not_evaluated=event_ne),
             "risk_gate_state": gate_state(risk.get("pass", 0), data_ready=1),
         }
+        flow_gate_ok = gate_states["flow_gate_state"] in ("PASS", "NA", "NE")
+        fundamental_gate_ok = gate_states["fundamental_gate_state"] in ("PASS", "NA", "NE")
         gates = {
             "market_gate": int(market_gate),
-            "flow_gate": int(flow["pass"]),
-            "fundamental_gate": 1 if fundamental_applicable == 0 else int(fundamental["pass"]),
+            "flow_gate": int(flow_gate_ok),
+            "fundamental_gate": int(fundamental_gate_ok),
             "event_gate": 1 if gate_states["event_gate_state"] in ("PASS", "NA", "NE") else 0,
             "technical_gate": int(technical_gate),
             "risk_gate": int(risk["pass"]),
         }
+
+        coverage_states = [gate_states["flow_gate_state"]]
+        if fundamental_applicable == 1:
+            coverage_states.append(gate_states["fundamental_gate_state"])
+        if any(s == "BLOCK" for s in coverage_states):
+            stock_external_coverage_state = "BLOCK"
+        elif any(s == "NE" for s in coverage_states):
+            stock_external_coverage_state = "PARTIAL_NE"
+        else:
+            stock_external_coverage_state = "FULL"
+        gate_policy_note = "NE=Not Evaluated：資料未覆蓋不阻擋交易，只降權/標示；BLOCK才會阻擋。"
 
         blocking_parts = []
         for k, state in gate_states.items():
@@ -3726,10 +3788,10 @@ class DecisionLayerEngine:
         if int(technical_gate) != 1:
             blocking_parts.append("technical_gate")
         if external_ready != 1:
-            blocking_parts.append(mandatory_reason or "external mandatory data not ready")
+            blocking_parts.append(mandatory_reason or "global external mandatory data not ready")
         trade_allowed = int(not blocking_parts and all(v == 1 for v in gates.values()) and external_ready == 1)
 
-        gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Event={event['score']}; Risk={risk['score']}; ExternalReady={external_ready}; States={gate_states}"
+        gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Event={event['score']}; Risk={risk['score']}; GlobalExternalReady={global_external_ready}; StockCoverage={stock_external_coverage_state}; States={gate_states}"
         blocking_reason = "；".join([str(x) for x in blocking_parts if str(x).strip()])
         decision_reason = "｜".join([market_memo, market_status.get("reason",""), flow["reason"], fundamental["reason"], event["reason"], risk["reason"], blocking_reason])
 
@@ -3742,6 +3804,9 @@ class DecisionLayerEngine:
             "decision_reason": decision_reason,
             "decision_reason_short": short_reason(decision_reason, 140),
             "external_data_ready": external_ready,
+            "global_external_ready": global_external_ready,
+            "stock_external_coverage_state": stock_external_coverage_state,
+            "gate_policy_note": gate_policy_note,
             "external_blocking_reason": blocking_reason,
             "pipeline_run_id": str(plan.get("pipeline_run_id", "")),
             "external_run_id": str(plan.get("pipeline_run_id", "")),
@@ -3752,6 +3817,8 @@ class DecisionLayerEngine:
         })
         if not trade_allowed:
             out["ui_state"] = "外部阻擋" if external_ready == 1 else "外部資料不足"
+        elif stock_external_coverage_state == "PARTIAL_NE":
+            out["ui_state"] = "可交易-部分外部資料NE"
         return out
 
     def evaluate_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -3910,7 +3977,7 @@ V80_WEIGHTS = {
 ORDER_COLUMNS = [
     "優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "盤中狀態", "活性分",
     "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%",
-    "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註", "外部允許", "外部Ready", "Market Gate", "Flow Gate", "Fundamental Gate", "Event Gate", "Risk Gate", "外部阻擋原因", "外部資料日", "資料來源層級", "決策摘要"
+    "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註", "外部允許", "外部Ready", "全域外部Ready", "個股覆蓋狀態", "Market Gate", "Flow Gate", "Fundamental Gate", "Event Gate", "Risk Gate", "外部阻擋原因", "外部資料日", "資料來源層級", "決策摘要", "Gate說明"
 ]
 
 INSTITUTIONAL_COLUMNS = [
@@ -3927,7 +3994,8 @@ ORDER_TREE_SCHEMA = [
     ("target", "目標價", 100), ("target1382", "1.382", 90), ("target1618", "1.618", 90), ("rr", "RR", 80),
     ("win_rate", "勝率%", 85), ("atr_pct", "ATR%", 85), ("kelly_pct", "Kelly%", 85), ("qty", "建議張數", 90),
     ("amount", "建議金額", 100), ("single_pct", "單檔曝險%", 95), ("portfolio_state", "組合狀態", 105), ("risk_note", "風險備註", 220),
-    ("trade_allowed", "外部允許", 85), ("market_gate", "Market", 90), ("flow_gate", "Flow", 90), ("fund_gate", "Fund", 105),
+    ("trade_allowed", "外部允許", 85), ("global_ready", "全域Ready", 90), ("coverage_state", "覆蓋狀態", 110),
+    ("market_gate", "Market", 90), ("flow_gate", "Flow", 90), ("fund_gate", "Fund", 105),
     ("event_gate", "Event", 90), ("risk_gate", "Risk", 90), ("block_reason", "外部阻擋", 220),
 ]
 
@@ -3940,7 +4008,8 @@ INSTITUTIONAL_TREE_SCHEMA = [
     ("win_rate", "勝率%", 85), ("model_score", "模型分數", 95), ("trade_score", "交易分數", 95), ("atr_pct", "ATR%", 85),
     ("kelly_pct", "Kelly%", 85), ("qty", "建議張數", 90), ("amount", "建議金額", 100), ("single_pct", "單檔曝險%", 95),
     ("theme_pct", "題材曝險%", 95), ("industry_pct", "產業曝險%", 95), ("portfolio_state", "投資組合狀態", 110), ("risk_note", "風險備註", 220),
-    ("trade_allowed", "外部允許", 85), ("market_gate", "Market", 90), ("flow_gate", "Flow", 90), ("fund_gate", "Fund", 105),
+    ("trade_allowed", "外部允許", 85), ("global_ready", "全域Ready", 90), ("coverage_state", "覆蓋狀態", 110),
+    ("market_gate", "Market", 90), ("flow_gate", "Flow", 90), ("fund_gate", "Fund", 105),
     ("event_gate", "Event", 90), ("risk_gate", "Risk", 90), ("block_reason", "外部阻擋", 220),
 ]
 
@@ -3987,6 +4056,8 @@ DISPLAY_COLUMN_MAP = {
     "portfolio_state": "投資組合狀態",
     "risk_note": "風險備註",
     "trade_allowed": "外部允許",
+    "global_ready": "全域外部Ready",
+    "coverage_state": "個股覆蓋狀態",
     "market_gate": "Market Gate",
     "flow_gate": "Flow Gate",
     "fund_gate": "Fundamental Gate",
@@ -4144,6 +4215,8 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("Fundamental Gate", "fundamental_gate_state"), ("Event Gate", "event_gate_state"), ("Risk Gate", "risk_gate_state"),
         ("外部阻擋原因", "external_blocking_reason"), ("外部資料日", "latest_external_date"),
         ("資料來源層級", "market_source_level"), ("決策摘要", "decision_reason_short"),
+        ("全域外部Ready", "global_external_ready"), ("個股覆蓋狀態", "stock_external_coverage_state"),
+        ("Gate說明", "gate_policy_note"),
         ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "priority"), ("優先級", "優先級"),
     ]
     for zh, src in alias_pairs:
