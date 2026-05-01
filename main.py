@@ -150,7 +150,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.3 EXTERNAL DECISION LAYER V16.2-R3"
+APP_NAME = "GTC AI Trading System v9.4 TRUE EXTERNAL DATA PIPELINE V16.2-R4"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -1978,10 +1978,18 @@ class DBManager:
 
 
     def _init_external_decision_schema(self, cur):
+        cur.execute("PRAGMA table_info(system_run_log)")
+        _run_cols = cur.fetchall()
+        if _run_cols and any(str(c[1]) == "run_id" and int(c[5] or 0) == 1 for c in _run_cols):
+            legacy_name = "system_run_log_legacy_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+            cur.execute(f"ALTER TABLE system_run_log RENAME TO {legacy_name}")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS system_run_log (
-            run_id TEXT PRIMARY KEY,
+            log_id TEXT PRIMARY KEY,
+            run_id TEXT,
+            event_seq INTEGER DEFAULT 0,
             run_time TEXT,
+            event_time TEXT,
             program_name TEXT,
             program_version TEXT,
             program_path TEXT,
@@ -1989,7 +1997,10 @@ class DBManager:
             db_path TEXT,
             db_hash TEXT,
             event TEXT,
+            step TEXT,
+            module TEXT,
             status TEXT,
+            duration_ms REAL DEFAULT 0,
             message TEXT
         )
         """)
@@ -2178,14 +2189,69 @@ class DBManager:
             PRIMARY KEY(run_id, stock_id, source_rank)
         )
         """)
+        self._ensure_external_schema_columns(cur)
         for sql in [
+            "CREATE INDEX IF NOT EXISTS idx_system_run_log_run_id ON system_run_log(run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_system_run_log_event ON system_run_log(event, status)",
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_date ON trade_plan(plan_date)",
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_allowed ON trade_plan(trade_allowed)",
             "CREATE INDEX IF NOT EXISTS idx_external_log_module ON external_data_log(module, source_date)",
+            "CREATE INDEX IF NOT EXISTS idx_external_status_ready ON external_source_status(data_ready, status)",
             "CREATE INDEX IF NOT EXISTS idx_inst_stock_date ON external_institutional(stock_id, trade_date)",
             "CREATE INDEX IF NOT EXISTS idx_revenue_stock_month ON external_revenue(stock_id, revenue_month)",
         ]:
             cur.execute(sql)
+
+    def _ensure_external_schema_columns(self, cur):
+        def _cols(table):
+            try:
+                return {str(r[1]) for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+            except Exception:
+                return set()
+
+        def _add(table, col, ddl):
+            cols = _cols(table)
+            if col not in cols:
+                try:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+                except Exception as exc:
+                    log_warning(f"Schema欄位補強失敗：{table}.{col}｜{exc}")
+
+        for col, ddl in [
+            ("step", "step TEXT"),
+            ("validator_status", "validator_status TEXT"),
+            ("writer_status", "writer_status TEXT"),
+            ("duration_ms", "duration_ms REAL DEFAULT 0"),
+            ("data_ready", "data_ready INTEGER DEFAULT 0"),
+            ("blocking_reason", "blocking_reason TEXT"),
+            ("target_table", "target_table TEXT"),
+        ]:
+            _add("external_data_log", col, ddl)
+
+        for col, ddl in [
+            ("target_table", "target_table TEXT"),
+            ("last_success_time", "last_success_time TEXT"),
+            ("data_ready", "data_ready INTEGER DEFAULT 0"),
+            ("blocking_reason", "blocking_reason TEXT"),
+            ("last_rows_count", "last_rows_count INTEGER DEFAULT 0"),
+            ("source_level", "source_level TEXT"),
+        ]:
+            _add("external_source_status", col, ddl)
+
+        for col, ddl in [
+            ("source_type", "source_type TEXT"),
+            ("source_url", "source_url TEXT"),
+            ("source_level", "source_level TEXT"),
+            ("proxy_reason", "proxy_reason TEXT"),
+        ]:
+            _add("market_snapshot", col, ddl)
+
+        for col, ddl in [
+            ("external_data_ready", "external_data_ready INTEGER DEFAULT 0"),
+            ("external_blocking_reason", "external_blocking_reason TEXT"),
+            ("pipeline_run_id", "pipeline_run_id TEXT"),
+        ]:
+            _add("trade_plan", col, ddl)
 
     def _safe_sha256(self, path) -> str:
         try:
@@ -2203,21 +2269,37 @@ class DBManager:
     def make_run_id(self) -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
-    def log_system_run(self, event: str, status: str = "ok", message: str = "", run_id: str | None = None) -> str:
+    def _next_event_seq(self, run_id: str) -> int:
+        try:
+            with self.lock:
+                row = self.conn.cursor().execute("SELECT COALESCE(MAX(event_seq),0)+1 FROM system_run_log WHERE run_id=?", (run_id,)).fetchone()
+            return int(row[0] or 1)
+        except Exception:
+            return int(time.time() * 1000) % 1000000
+
+    def log_system_run(self, event: str, status: str = "ok", message: str = "", run_id: str | None = None, step: str = "", module: str = "", duration_ms: float = 0.0) -> str:
         run_id = run_id or self.make_run_id()
         try:
             program_path = str(Path(__file__).resolve()) if "__file__" in globals() else ""
+            event_seq = self._next_event_seq(run_id)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             row = {
+                "log_id": f"{run_id}_{event_seq:04d}_{int(time.time()*1000)}",
                 "run_id": run_id,
-                "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "event_seq": event_seq,
+                "run_time": now,
+                "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.3_external_decision_layer_v16.2_r3",
+                "program_version": "v9.4_true_external_data_pipeline_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
                 "db_hash": self._safe_sha256(self.db_path),
                 "event": event,
+                "step": step or event,
+                "module": module or "",
                 "status": status,
+                "duration_ms": float(duration_ms or 0.0),
                 "message": message,
             }
             with self.lock:
@@ -2227,31 +2309,43 @@ class DBManager:
             log_warning(f"system_run_log 寫入失敗：{exc}")
         return run_id
 
-    def log_external_data(self, module: str, source_name: str, official_url: str = "", request_url: str = "", source_date: str = "", status: str = "pending", http_status: str = "", fallback_count: int = 0, rows_count: int = 0, error_message: str = "", run_id: str | None = None):
+    def log_external_data(self, module: str, source_name: str, official_url: str = "", request_url: str = "", source_date: str = "", status: str = "pending", http_status: str = "", fallback_count: int = 0, rows_count: int = 0, error_message: str = "", run_id: str | None = None, step: str = "fetch", validator_status: str = "", writer_status: str = "", duration_ms: float = 0.0, target_table: str = "", data_ready: int | None = None, blocking_reason: str = "", source_level: str = ""):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_id = f"{module}_{source_date or datetime.now().strftime('%Y%m%d')}_{int(time.time()*1000)}"
+        safe_module = re.sub(r"[^A-Za-z0-9_]", "_", str(module or "module"))
+        log_id = f"{safe_module}_{source_date or datetime.now().strftime('%Y%m%d')}_{step}_{int(time.time()*1000)}"
+        ready = int(data_ready if data_ready is not None else (1 if str(status).lower() in ("success", "fallback", "ok") and int(rows_count or 0) > 0 else 0))
+        block = str(blocking_reason or ("" if ready else (error_message or "資料未就緒")))
         row = {
             "log_id": log_id, "run_id": run_id or "", "module": module, "source_name": source_name,
             "official_url": official_url, "request_url": request_url, "source_date": source_date,
             "fetch_time": now, "http_status": str(http_status or ""), "status": status,
             "fallback_count": int(fallback_count or 0), "rows_count": int(rows_count or 0), "error_message": str(error_message or ""),
+            "step": step, "validator_status": validator_status, "writer_status": writer_status,
+            "duration_ms": float(duration_ms or 0.0), "data_ready": ready, "blocking_reason": block,
+            "target_table": target_table,
         }
         status_row = {
             "module": module, "source_name": source_name, "official_url": official_url, "request_url": request_url,
             "source_date": source_date, "last_fetch_time": now, "status": status, "fallback_count": int(fallback_count or 0),
-            "rows_count": int(rows_count or 0), "error_message": str(error_message or ""),
+            "rows_count": int(rows_count or 0), "error_message": str(error_message or ""), "target_table": target_table,
+            "last_success_time": now if ready else "", "data_ready": ready, "blocking_reason": block,
+            "last_rows_count": int(rows_count or 0), "source_level": source_level or ("official" if ready else "failed"),
         }
         try:
             with self.lock:
                 pd.DataFrame([row]).to_sql("external_data_log", self.conn, if_exists="append", index=False)
                 cur = self.conn.cursor()
                 cur.execute("""
-                    INSERT INTO external_source_status(module, source_name, official_url, request_url, source_date, last_fetch_time, status, fallback_count, rows_count, error_message)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO external_source_status(module, source_name, official_url, request_url, source_date, last_fetch_time, status, fallback_count, rows_count, error_message, target_table, last_success_time, data_ready, blocking_reason, last_rows_count, source_level)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(module) DO UPDATE SET
                         source_name=excluded.source_name, official_url=excluded.official_url, request_url=excluded.request_url,
                         source_date=excluded.source_date, last_fetch_time=excluded.last_fetch_time, status=excluded.status,
-                        fallback_count=excluded.fallback_count, rows_count=excluded.rows_count, error_message=excluded.error_message
+                        fallback_count=excluded.fallback_count, rows_count=excluded.rows_count, error_message=excluded.error_message,
+                        target_table=excluded.target_table,
+                        last_success_time=CASE WHEN excluded.data_ready=1 THEN excluded.last_success_time ELSE external_source_status.last_success_time END,
+                        data_ready=excluded.data_ready, blocking_reason=excluded.blocking_reason, last_rows_count=excluded.last_rows_count,
+                        source_level=excluded.source_level
                 """, tuple(status_row.values()))
                 self.conn.commit()
         except Exception as exc:
@@ -2272,6 +2366,7 @@ class DBManager:
             "rr": 0.0, "rr_live": 0.0, "win_rate": 0.0, "market_gate": 0, "flow_gate": 0, "fundamental_gate": 0,
             "event_gate": 0, "technical_gate": 0, "risk_gate": 0, "trade_allowed": 0, "gate_summary": "", "decision_reason": "",
             "final_trade_decision": "", "ui_state": "", "pool_role": "", "source_rank": "",
+            "external_data_ready": 0, "external_blocking_reason": "", "pipeline_run_id": run_id,
         }
         for c, d in defaults.items():
             if c not in x.columns:
@@ -2283,7 +2378,7 @@ class DBManager:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed"]:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "update_time"]
+        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "update_time"]
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -2881,15 +2976,70 @@ class RankingEngine:
 
 
 
+
 class ExternalSourceConfig:
+    """V9.4：外部資料來源設定。每個module必須有target_table、parser、official_url與fallback_days。"""
     SOURCES = {
-        "market_snapshot": {"source_name": "TWSE/Yahoo/FRED proxy", "official_url": "https://www.twse.com.tw", "fallback_days": 5},
-        "institutional": {"source_name": "TWSE 三大法人", "official_url": "https://www.twse.com.tw/zh/trading/foreign/bfi82u", "fallback_days": 5},
-        "margin": {"source_name": "TWSE 融資融券", "official_url": "https://www.twse.com.tw/zh/trading/margin", "fallback_days": 5},
-        "revenue": {"source_name": "MOPS 月營收", "official_url": "https://mops.twse.com.tw", "fallback_days": 45},
-        "valuation": {"source_name": "MOPS 財報/估值", "official_url": "https://mops.twse.com.tw", "fallback_days": 120},
-        "dividend": {"source_name": "MOPS 股利", "official_url": "https://mops.twse.com.tw", "fallback_days": 365},
-        "event": {"source_name": "MOPS 重大訊息/法說", "official_url": "https://mops.twse.com.tw", "fallback_days": 30},
+        "market_snapshot": {
+            "source_name": "TWSE/Yahoo 市場快照",
+            "official_url": "https://www.twse.com.tw",
+            "request_template": "internal_market_regime_proxy",
+            "target_table": "market_snapshot",
+            "required_columns": ["snapshot_date", "market_score", "market_mode"],
+            "fallback_days": 5,
+            "mandatory": True,
+            "parser": "fetch_market_snapshot",
+        },
+        "institutional": {
+            "source_name": "TWSE 三大法人買賣超",
+            "official_url": "https://www.twse.com.tw/zh/trading/foreign/t86",
+            "request_template": "https://www.twse.com.tw/rwd/zh/fund/T86?date={date}&selectType=ALLBUT0999&response=json",
+            "target_table": "external_institutional",
+            "required_columns": ["stock_id", "trade_date", "foreign_buy_sell", "trust_buy_sell", "dealer_buy_sell"],
+            "fallback_days": 5,
+            "mandatory": True,
+            "parser": "fetch_institutional",
+        },
+        "margin": {
+            "source_name": "TWSE 融資融券",
+            "official_url": "https://www.twse.com.tw/zh/trading/margin/mi-margn",
+            "request_template": "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date}&selectType=ALL&response=json",
+            "target_table": "external_margin",
+            "required_columns": ["stock_id", "trade_date"],
+            "fallback_days": 5,
+            "mandatory": False,
+            "parser": "fetch_margin",
+        },
+        "revenue": {
+            "source_name": "MOPS 月營收",
+            "official_url": "https://mops.twse.com.tw",
+            "request_template": "https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv",
+            "target_table": "external_revenue",
+            "required_columns": ["stock_id", "revenue_month", "revenue", "yoy"],
+            "fallback_days": 45,
+            "mandatory": True,
+            "parser": "fetch_revenue",
+        },
+        "valuation": {
+            "source_name": "MOPS 財報/估值",
+            "official_url": "https://mops.twse.com.tw",
+            "request_template": "manual_parser_required",
+            "target_table": "external_valuation",
+            "required_columns": ["stock_id", "data_date"],
+            "fallback_days": 120,
+            "mandatory": False,
+            "parser": "fetch_valuation",
+        },
+        "event": {
+            "source_name": "MOPS 重大訊息/事件",
+            "official_url": "https://mops.twse.com.tw",
+            "request_template": "manual_parser_required",
+            "target_table": "external_event",
+            "required_columns": ["event_id", "event_date", "event_type"],
+            "fallback_days": 30,
+            "mandatory": False,
+            "parser": "fetch_event",
+        },
     }
 
     @classmethod
@@ -2899,7 +3049,35 @@ class ExternalSourceConfig:
             row = dict(cfg)
             row["module"] = module
             rows.append(row)
-        return pd.DataFrame(rows)[["module", "source_name", "official_url", "fallback_days"]]
+        return pd.DataFrame(rows)
+
+
+class ExternalPipelineResult:
+    """統一外部資料Pipeline結果，避免UI只有pending卻宣告完成。"""
+    def __init__(self, module: str, status: str, df: pd.DataFrame | None = None, source_name: str = "", official_url: str = "", request_url: str = "", source_date: str = "", http_status: str = "", fallback_count: int = 0, error_message: str = "", target_table: str = "", data_ready: int = 0, source_level: str = "official"):
+        self.module = module
+        self.status = status
+        self.df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        self.source_name = source_name
+        self.official_url = official_url
+        self.request_url = request_url
+        self.source_date = source_date
+        self.http_status = str(http_status or "")
+        self.fallback_count = int(fallback_count or 0)
+        self.error_message = str(error_message or "")
+        self.target_table = target_table
+        self.rows_count = int(len(self.df)) if isinstance(self.df, pd.DataFrame) else 0
+        self.data_ready = int(data_ready)
+        self.source_level = source_level
+
+    def to_dict(self) -> dict:
+        return {
+            "module": self.module, "status": self.status, "source_name": self.source_name,
+            "official_url": self.official_url, "request_url": self.request_url, "source_date": self.source_date,
+            "http_status": self.http_status, "fallback_count": self.fallback_count, "rows_count": self.rows_count,
+            "error_message": self.error_message, "target_table": self.target_table, "data_ready": self.data_ready,
+            "source_level": self.source_level,
+        }
 
 
 class DataValidator:
@@ -2917,13 +3095,34 @@ class ExternalDataWriter:
     def __init__(self, db: DBManager):
         self.db = db
 
-    def log_pending_sources(self, run_id: str | None = None):
-        for _, r in ExternalSourceConfig.to_dataframe().iterrows():
-            self.db.log_external_data(
-                module=str(r["module"]), source_name=str(r["source_name"]), official_url=str(r["official_url"]),
-                request_url="", source_date=datetime.now().strftime("%Y-%m-%d"), status="pending_implementation",
-                rows_count=0, error_message="已建立正式資料來源追蹤；實際Fetcher需依官方API逐步接入", run_id=run_id,
-            )
+    def write_result(self, result: ExternalPipelineResult) -> ExternalPipelineResult:
+        if result is None:
+            return ExternalPipelineResult("unknown", "fail", error_message="result is None")
+        df = result.df.copy() if isinstance(result.df, pd.DataFrame) else pd.DataFrame()
+        if result.status not in ("success", "fallback") or df.empty:
+            result.data_ready = 0
+            return result
+        try:
+            with self.db.lock:
+                if result.target_table == "market_snapshot":
+                    self.db.conn.execute("DELETE FROM market_snapshot WHERE snapshot_date=?", (datetime.now().strftime("%Y-%m-%d"),))
+                    df.to_sql("market_snapshot", self.db.conn, if_exists="append", index=False)
+                elif result.target_table in {
+                    "external_institutional", "external_margin", "external_revenue",
+                    "external_valuation", "external_event"
+                }:
+                    df.to_sql(result.target_table, self.db.conn, if_exists="append", index=False)
+                else:
+                    raise ValueError(f"未知target_table：{result.target_table}")
+                self.db.conn.commit()
+            result.rows_count = int(len(df))
+            result.data_ready = 1 if len(df) > 0 else 0
+            return result
+        except Exception as exc:
+            result.status = "fail"
+            result.data_ready = 0
+            result.error_message = f"DB寫入失敗：{exc}"
+            return result
 
 
 class ExternalDataFetcher:
@@ -2931,47 +3130,328 @@ class ExternalDataFetcher:
         self.db = db
         self.writer = ExternalDataWriter(db)
 
-    def refresh_all(self, run_id: str | None = None) -> dict:
-        run_id = run_id or self.db.log_system_run(event="external_refresh", status="start", message="start external data refresh")
-        self.writer.log_pending_sources(run_id=run_id)
+    def _request_json(self, url: str, timeout: int = 30) -> tuple[object, str]:
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"})
+        return resp.json(), str(resp.status_code)
+
+    def _date_candidates(self, fallback_days: int) -> list[tuple[str, str, int]]:
+        base_date = datetime.now()
+        out = []
+        for offset in range(int(fallback_days or 0) + 1):
+            d = base_date - pd.Timedelta(days=offset)
+            out.append((d.strftime("%Y%m%d"), d.strftime("%Y-%m-%d"), offset))
+        return out
+
+    def _num(self, v, default: float = 0.0) -> float:
+        try:
+            s = str(v).replace(",", "").replace("--", "").strip()
+            if s in ("", "-", "None", "nan"):
+                return float(default)
+            return float(s)
+        except Exception:
+            return float(default)
+
+    def _normalize_twse_dataset(self, payload) -> tuple[list, list]:
+        if isinstance(payload, dict):
+            fields = payload.get("fields") or payload.get("stat") or []
+            data = payload.get("data") or payload.get("tables", [{}])[0].get("data", []) if payload.get("tables") else payload.get("data", [])
+            if isinstance(data, dict):
+                data = data.get("data", [])
+            return fields, data or []
+        if isinstance(payload, list):
+            return [], payload
+        return [], []
+
+    def fetch_market_snapshot(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        source_date = datetime.now().strftime("%Y-%m-%d")
         market = MarketRegimeEngine(self.db).get_market_regime()
-        snapshot = pd.DataFrame([{
-            "snapshot_date": datetime.now().strftime("%Y-%m-%d"),
-            "market_score": float(market.get("score", 50) or 50),
-            "market_mode": "Risk_ON" if float(market.get("score", 50) or 50) >= 68 else "Risk_OFF" if float(market.get("score", 50) or 50) <= 42 else "Neutral",
-            "taiex_close": 0.0, "taiex_trend": str(market.get("regime", "")), "sp500_close": 0.0, "nasdaq_close": 0.0,
-            "vix": 0.0, "us10y": 0.0, "dxy": 0.0, "breadth": float(market.get("breadth", 0) or 0),
-            "source_status": "proxy_from_internal_price_history", "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        market_score = float(market.get("score", 50) or 50)
+        mode = "Risk_ON" if market_score >= 68 else "Risk_OFF" if market_score <= 42 else "Neutral"
+        # V9.4明確標示：此為內部price_history proxy，不可假稱官方外部資料。
+        df = pd.DataFrame([{
+            "snapshot_date": source_date,
+            "market_score": market_score,
+            "market_mode": mode,
+            "taiex_close": 0.0,
+            "taiex_trend": str(market.get("regime", "")),
+            "sp500_close": 0.0,
+            "nasdaq_close": 0.0,
+            "vix": 0.0,
+            "us10y": 0.0,
+            "dxy": 0.0,
+            "breadth": float(market.get("breadth", 0) or 0),
+            "source_status": "fallback_proxy_from_internal_price_history",
+            "source_type": "proxy",
+            "source_url": "internal:price_history",
+            "source_level": "proxy",
+            "proxy_reason": "外部市場即時資料未完整接入時，以內部2330/0050/廣度代理；Decision Layer需降權標示。",
+            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }])
-        with self.db.lock:
-            self.db.conn.execute("DELETE FROM market_snapshot WHERE snapshot_date=?", (datetime.now().strftime("%Y-%m-%d"),))
-            snapshot.to_sql("market_snapshot", self.db.conn, if_exists="append", index=False)
-            self.db.conn.commit()
-        self.db.log_system_run(event="external_refresh", status="ok", message="source status initialized; market snapshot proxy written", run_id=run_id)
-        return {"run_id": run_id, "market": market}
+        return ExternalPipelineResult(module, "fallback", df=df, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url="internal:price_history", source_date=source_date, target_table=cfg.get("target_table",""), data_ready=1, source_level="proxy")
+
+    def fetch_institutional(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        last_error = ""
+        for date_ymd, date_iso, offset in self._date_candidates(cfg.get("fallback_days", 5)):
+            url = cfg.get("request_template", "").format(date=date_ymd)
+            try:
+                payload, http_status = self._request_json(url)
+                fields, data = self._normalize_twse_dataset(payload)
+                rows = []
+                for rec in data:
+                    vals = list(rec) if isinstance(rec, (list, tuple)) else []
+                    if len(vals) < 8:
+                        continue
+                    sid = normalize_stock_id(vals[0])
+                    if not sid:
+                        continue
+                    # TWSE T86常見欄位：外資買賣超、投信買賣超、自營商買賣超等；若欄位排序異動，仍保留可追溯URL與失敗原因。
+                    foreign = self._num(vals[4] if len(vals) > 4 else 0)
+                    trust = self._num(vals[10] if len(vals) > 10 else 0)
+                    dealer = self._num(vals[11] if len(vals) > 11 else 0)
+                    total = foreign + trust + dealer
+                    score = max(0, min(100, 50 + total / 1000.0))
+                    rows.append({
+                        "stock_id": sid, "trade_date": date_iso,
+                        "foreign_buy_sell": foreign, "trust_buy_sell": trust, "dealer_buy_sell": dealer,
+                        "eight_bank_buy_sell": 0.0, "institutional_score": round(score, 2),
+                        "main_force_flag": "BUY" if total > 0 else "SELL" if total < 0 else "NEUTRAL",
+                        "source_date": date_iso, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "trade_date"], keep="last") if rows else pd.DataFrame()
+                if not df.empty:
+                    return ExternalPipelineResult(module, "success" if offset == 0 else "fallback", df=df, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=url, source_date=date_iso, http_status=http_status, fallback_count=offset, target_table=cfg.get("target_table",""), data_ready=1, source_level="official")
+                last_error = "TWSE T86回傳無可解析資料"
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=last_error or "TWSE三大法人資料抓取失敗", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+
+    def fetch_margin(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        last_error = ""
+        for date_ymd, date_iso, offset in self._date_candidates(cfg.get("fallback_days", 5)):
+            url = cfg.get("request_template", "").format(date=date_ymd)
+            try:
+                payload, http_status = self._request_json(url)
+                fields, data = self._normalize_twse_dataset(payload)
+                rows = []
+                for rec in data:
+                    vals = list(rec) if isinstance(rec, (list, tuple)) else []
+                    if len(vals) < 8:
+                        continue
+                    sid = normalize_stock_id(vals[0])
+                    if not sid:
+                        continue
+                    margin_balance = self._num(vals[6] if len(vals) > 6 else 0)
+                    short_balance = self._num(vals[12] if len(vals) > 12 else 0)
+                    margin_change = self._num(vals[5] if len(vals) > 5 else 0)
+                    short_change = self._num(vals[11] if len(vals) > 11 else 0)
+                    retail_heat = max(0, min(100, 50 + margin_change / 500.0 - short_change / 500.0))
+                    rows.append({
+                        "stock_id": sid, "trade_date": date_iso,
+                        "margin_balance": margin_balance, "short_balance": short_balance,
+                        "margin_change": margin_change, "short_change": short_change,
+                        "margin_utilization": 0.0, "retail_heat_score": round(retail_heat, 2),
+                        "source_date": date_iso, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "trade_date"], keep="last") if rows else pd.DataFrame()
+                if not df.empty:
+                    return ExternalPipelineResult(module, "success" if offset == 0 else "fallback", df=df, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=url, source_date=date_iso, http_status=http_status, fallback_count=offset, target_table=cfg.get("target_table",""), data_ready=1, source_level="official")
+                last_error = "TWSE融資融券回傳無可解析資料"
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=last_error or "TWSE融資融券資料抓取失敗", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+
+    def _read_remote_csv(self, url: str) -> tuple[pd.DataFrame, str]:
+        resp = requests.get(url, timeout=45, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mopsfin.twse.com.tw/"})
+        resp.raise_for_status()
+        content = resp.content
+        last_error = None
+        for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+            try:
+                return pd.read_csv(io.BytesIO(content), encoding=enc, dtype=str).fillna(""), str(resp.status_code)
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"CSV解析失敗：{last_error}")
+
+    def fetch_revenue(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        urls = [cfg.get("request_template",""), "https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv"]
+        all_rows = []
+        last_error = ""
+        used_url = ""
+        http_status = ""
+        for url in urls:
+            try:
+                raw, http_status = self._read_remote_csv(url)
+                used_url = url
+                col_map = {}
+                for c in raw.columns:
+                    cs = str(c).strip()
+                    if cs in ("公司代號", "公司代碼", "股票代號"):
+                        col_map["stock_id"] = c
+                    elif cs in ("出表年月", "資料年月", "年月", "營收年月"):
+                        col_map["revenue_month"] = c
+                    elif "當月營收" in cs:
+                        col_map["revenue"] = c
+                    elif "上月" in cs and "增減" in cs:
+                        col_map["mom"] = c
+                    elif ("去年" in cs or "同期" in cs) and "增減" in cs:
+                        col_map["yoy"] = c
+                    elif "累計營收" in cs and "當月" not in cs:
+                        col_map["cumulative_revenue"] = c
+                    elif "累計" in cs and "增減" in cs:
+                        col_map["cumulative_yoy"] = c
+                if "stock_id" not in col_map or "revenue" not in col_map:
+                    last_error = f"MOPS月營收欄位無法辨識：{list(raw.columns)[:12]}"
+                    continue
+                for _, r in raw.iterrows():
+                    sid = normalize_stock_id(r.get(col_map.get("stock_id"), ""))
+                    if not sid:
+                        continue
+                    month = str(r.get(col_map.get("revenue_month"), datetime.now().strftime("%Y%m"))).strip()
+                    rev = self._num(r.get(col_map.get("revenue"), 0))
+                    yoy = self._num(r.get(col_map.get("yoy"), 0))
+                    mom = self._num(r.get(col_map.get("mom"), 0))
+                    all_rows.append({
+                        "stock_id": sid, "revenue_month": month, "revenue": rev, "mom": mom, "yoy": yoy,
+                        "cumulative_revenue": self._num(r.get(col_map.get("cumulative_revenue"), 0)),
+                        "cumulative_yoy": self._num(r.get(col_map.get("cumulative_yoy"), 0)),
+                        "source_date": datetime.now().strftime("%Y-%m-%d"),
+                        "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+        df = pd.DataFrame(all_rows).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if all_rows else pd.DataFrame()
+        if not df.empty:
+            return ExternalPipelineResult(module, "success", df=df, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=used_url, source_date=datetime.now().strftime("%Y-%m-%d"), http_status=http_status, target_table=cfg.get("target_table",""), data_ready=1, source_level="official")
+        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=" | ".join(urls), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=last_error or "MOPS月營收資料抓取失敗", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+
+    def fetch_valuation(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message="V9.4已取消pending假完成：估值/財報官方parser尚未指定穩定API，列為明確fail而非pending。", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+
+    def fetch_event(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message="V9.4已取消pending假完成：重大訊息/事件官方parser尚未指定穩定API，列為Not Evaluated/fail。", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+
+    def _execute_module(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        t0 = time.time()
+        self.db.log_system_run(event="external_pipeline", status="start", message=f"module={module}", run_id=run_id, step="fetch", module=module)
+        func = getattr(self, str(cfg.get("parser", "")), None)
+        if not callable(func):
+            result = ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=f"找不到parser：{cfg.get('parser')}", target_table=cfg.get("target_table",""), data_ready=0)
+        else:
+            try:
+                result = func(module, cfg, run_id)
+            except Exception as exc:
+                result = ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=str(exc), target_table=cfg.get("target_table",""), data_ready=0)
+
+        ok, msg = DataValidator.validate_df(result.df, cfg.get("required_columns", []), module) if result.status in ("success", "fallback") else (False, result.error_message)
+        self.db.log_external_data(
+            module=module, source_name=result.source_name, official_url=result.official_url, request_url=result.request_url,
+            source_date=result.source_date, status=result.status if ok else "fail", http_status=result.http_status,
+            fallback_count=result.fallback_count, rows_count=result.rows_count, error_message="" if ok else msg,
+            run_id=run_id, step="validate", validator_status="ok" if ok else "fail", duration_ms=(time.time()-t0)*1000,
+            target_table=result.target_table, data_ready=1 if ok else 0, blocking_reason="" if ok else msg, source_level=result.source_level,
+        )
+        if ok:
+            result = self.writer.write_result(result)
+        else:
+            result.status = "fail"
+            result.data_ready = 0
+            result.error_message = msg
+
+        self.db.log_external_data(
+            module=module, source_name=result.source_name, official_url=result.official_url, request_url=result.request_url,
+            source_date=result.source_date, status=result.status, http_status=result.http_status, fallback_count=result.fallback_count,
+            rows_count=result.rows_count, error_message=result.error_message, run_id=run_id, step="write",
+            validator_status="ok" if ok else "fail", writer_status="ok" if result.data_ready else "fail",
+            duration_ms=(time.time()-t0)*1000, target_table=result.target_table, data_ready=result.data_ready,
+            blocking_reason="" if result.data_ready else (result.error_message or msg), source_level=result.source_level,
+        )
+        self.db.log_system_run(event="external_pipeline", status=result.status, message=f"module={module}; rows={result.rows_count}; ready={result.data_ready}; error={result.error_message}", run_id=run_id, step="write", module=module, duration_ms=(time.time()-t0)*1000)
+        return result
+
+    def refresh_external_data_pipeline(self, run_id: str | None = None) -> dict:
+        run_id = run_id or self.db.log_system_run(event="external_refresh", status="start", message="V9.4 true external data pipeline start", step="start")
+        results = []
+        for module, cfg in ExternalSourceConfig.SOURCES.items():
+            results.append(self._execute_module(module, cfg, run_id))
+        ready_map = {r.module: int(r.data_ready) for r in results}
+        blocking = [f"{r.module}:{r.error_message or r.status}" for r in results if int(r.data_ready) == 0 and ExternalSourceConfig.SOURCES.get(r.module, {}).get("mandatory", False)]
+        status = "ok" if not blocking else "blocked"
+        self.db.log_system_run(event="external_refresh", status=status, message="; ".join(blocking) if blocking else "external pipeline completed", run_id=run_id, step="finish")
+        return {"run_id": run_id, "results": [r.to_dict() for r in results], "ready_map": ready_map, "blocking": blocking, "status": status}
+
+    def refresh_all(self, run_id: str | None = None) -> dict:
+        # backward compatibility：舊UI呼叫仍導向V9.4真實Pipeline，不再只寫pending。
+        return self.refresh_external_data_pipeline(run_id=run_id)
+
+
+
+class ExternalDataReadiness:
+    """V9.4：外部資料Ready檢查，讓Gate可阻擋假通過。"""
+    MANDATORY_MODULES = ["market_snapshot", "institutional", "revenue"]
+
+    def __init__(self, db: DBManager):
+        self.db = db
+
+    def status_df(self) -> pd.DataFrame:
+        return self.db.read_table("external_source_status", limit=None)
+
+    def get_status(self, module: str) -> dict:
+        df = self.status_df()
+        if df is None or df.empty or "module" not in df.columns:
+            return {"ready": 0, "reason": f"{module} 未執行同步", "rows": 0, "status": "missing"}
+        x = df[df["module"].astype(str) == str(module)].tail(1)
+        if x.empty:
+            return {"ready": 0, "reason": f"{module} 無狀態紀錄", "rows": 0, "status": "missing"}
+        r = x.iloc[-1]
+        ready = int(pd.to_numeric(pd.Series([r.get("data_ready", 0)]), errors="coerce").fillna(0).iloc[0])
+        rows = int(pd.to_numeric(pd.Series([r.get("rows_count", 0)]), errors="coerce").fillna(0).iloc[0])
+        status = str(r.get("status", "") or "")
+        reason = str(r.get("blocking_reason", "") or r.get("error_message", "") or "")
+        if not ready:
+            reason = reason or f"{module} data_ready=0/status={status}/rows={rows}"
+        return {"ready": ready, "reason": reason, "rows": rows, "status": status}
+
+    def mandatory_ready(self) -> tuple[int, str]:
+        missing = []
+        for module in self.MANDATORY_MODULES:
+            st = self.get_status(module)
+            if int(st.get("ready", 0)) != 1:
+                missing.append(f"{module}:{st.get('reason','not ready')}")
+        return (0 if missing else 1, "；".join(missing))
 
 
 class CapitalFlowEngine:
     def __init__(self, db: DBManager):
         self.db = db
+        self.readiness = ExternalDataReadiness(db)
 
     def evaluate(self, stock_id: str) -> dict:
+        st = self.readiness.get_status("institutional")
+        if int(st.get("ready", 0)) != 1:
+            return {"pass": 0, "score": 0.0, "reason": f"法人資料未就緒，阻擋Gate：{st.get('reason')}", "data_ready": 0}
         df = self.db.read_table("external_institutional", limit=None)
         if df.empty or "stock_id" not in df.columns:
-            return {"pass": 1, "score": 50.0, "reason": "法人資料未接入，採中性Gate"}
+            return {"pass": 0, "score": 0.0, "reason": "法人資料表為空，阻擋Gate", "data_ready": 0}
         x = df[df["stock_id"].astype(str) == str(stock_id)].copy()
         if x.empty:
-            return {"pass": 1, "score": 50.0, "reason": "無該股法人資料，採中性Gate"}
+            return {"pass": 0, "score": 0.0, "reason": "無該股法人資料，阻擋Flow Gate", "data_ready": 0}
         x = x.tail(5)
         score = float(pd.to_numeric(x.get("institutional_score", 50), errors="coerce").fillna(50).mean())
-        return {"pass": int(score >= 45), "score": round(score, 2), "reason": f"法人分數 {score:.1f}"}
+        return {"pass": int(score >= 45), "score": round(score, 2), "reason": f"法人分數 {score:.1f}", "data_ready": 1}
 
 
 class FundamentalEngine:
     def __init__(self, db: DBManager):
         self.db = db
+        self.readiness = ExternalDataReadiness(db)
 
     def evaluate(self, stock_id: str) -> dict:
+        rev_st = self.readiness.get_status("revenue")
+        if int(rev_st.get("ready", 0)) != 1:
+            return {"pass": 0, "score": 0.0, "reason": f"營收資料未就緒，阻擋Gate：{rev_st.get('reason')}", "data_ready": 0}
         rev = self.db.read_table("external_revenue", limit=None)
         val = self.db.read_table("external_valuation", limit=None)
         score = 50.0
@@ -2989,40 +3469,47 @@ class FundamentalEngine:
                 score += 10 if eps > 0 else -8
                 reasons.append(f"EPS {eps:.2f}")
         if not reasons:
-            reasons.append("基本面資料未接入，採中性Gate")
+            return {"pass": 0, "score": 0.0, "reason": "該股無營收/估值資料，阻擋Fundamental Gate", "data_ready": 0}
         score = max(0, min(100, score))
-        return {"pass": int(score >= 45), "score": round(score, 2), "reason": "；".join(reasons)}
+        return {"pass": int(score >= 45), "score": round(score, 2), "reason": "；".join(reasons), "data_ready": 1}
 
 
 class EventEngine:
     def __init__(self, db: DBManager):
         self.db = db
+        self.readiness = ExternalDataReadiness(db)
 
     def evaluate(self, stock_id: str) -> dict:
+        st = self.readiness.get_status("event")
+        if int(st.get("ready", 0)) != 1:
+            return {"pass": 1, "score": 50.0, "reason": f"事件資料Not Evaluated：{st.get('reason')}", "data_ready": 0, "not_evaluated": 1}
         ev = self.db.read_table("external_event", limit=None)
         if ev.empty or "stock_id" not in ev.columns:
-            return {"pass": 1, "score": 50.0, "reason": "事件資料未接入，採中性Gate"}
+            return {"pass": 1, "score": 50.0, "reason": "事件資料表空白，Not Evaluated，不宣告事件Gate成功", "data_ready": 0, "not_evaluated": 1}
         x = ev[(ev["stock_id"].astype(str) == str(stock_id)) | (ev["stock_id"].astype(str) == "")].tail(5)
         score = float(pd.to_numeric(x.get("event_score", 50), errors="coerce").fillna(50).max()) if not x.empty else 50.0
-        return {"pass": int(score >= 40), "score": round(score, 2), "reason": f"事件分數 {score:.1f}"}
+        return {"pass": int(score >= 40), "score": round(score, 2), "reason": f"事件分數 {score:.1f}", "data_ready": 1, "not_evaluated": 0}
 
 
 class RiskGateEngine:
     @staticmethod
-    def evaluate(plan: dict, market_mode: str = "Neutral") -> dict:
+    def evaluate(plan: dict, market_mode: str = "Neutral", external_data_ready: int = 1) -> dict:
         rr_live = float(plan.get("rr_live", plan.get("rr", 0)) or 0)
         atr_pct = float(plan.get("atr_pct", 0) or 0)
         win_rate = float(plan.get("win_rate", 0) or 0)
         allowed = rr_live >= 1.2 and atr_pct <= 8 and win_rate >= 45
         if market_mode == "Risk_OFF" and int(plan.get("is_etf", 0) or 0) != 1:
             allowed = False
-        return {"pass": int(allowed), "score": round(min(100, rr_live * 25 + win_rate * 0.5 - atr_pct * 2), 2), "reason": f"RR={rr_live:.2f}; ATR={atr_pct:.1f}%; 勝率={win_rate:.1f}%; Market={market_mode}"}
+        if int(external_data_ready or 0) != 1:
+            allowed = False
+        return {"pass": int(allowed), "score": round(min(100, rr_live * 25 + win_rate * 0.5 - atr_pct * 2), 2), "reason": f"RR={rr_live:.2f}; ATR={atr_pct:.1f}%; 勝率={win_rate:.1f}%; Market={market_mode}; ExternalReady={external_data_ready}"}
 
 
 class DecisionLayerEngine:
     def __init__(self, db: DBManager):
         self.db = db
         self.market_engine = MarketRegimeEngine(db)
+        self.readiness = ExternalDataReadiness(db)
         self.flow_engine = CapitalFlowEngine(db)
         self.fundamental_engine = FundamentalEngine(db)
         self.event_engine = EventEngine(db)
@@ -3030,14 +3517,17 @@ class DecisionLayerEngine:
     def evaluate_plan(self, plan: dict) -> dict:
         stock_id = str(plan.get("stock_id", ""))
         market = self.market_engine.get_market_regime()
+        market_status = self.readiness.get_status("market_snapshot")
+        mandatory_ready, mandatory_reason = self.readiness.mandatory_ready()
         market_score = float(market.get("score", 50) or 50)
         market_mode = "Risk_ON" if market_score >= 68 else "Risk_OFF" if market_score <= 42 else "Neutral"
-        market_gate = 1 if market_mode != "Risk_OFF" or int(plan.get("is_etf", 0) or 0) == 1 else 0
+        market_gate = 1 if int(market_status.get("ready", 0)) == 1 and (market_mode != "Risk_OFF" or int(plan.get("is_etf", 0) or 0) == 1) else 0
         flow = self.flow_engine.evaluate(stock_id)
         fundamental = self.fundamental_engine.evaluate(stock_id)
         event = self.event_engine.evaluate(stock_id)
         technical_gate = int(str(plan.get("final_trade_decision", "")).upper() in ["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"] and float(plan.get("rr_live", plan.get("rr", 0)) or 0) >= 1.0)
-        risk = RiskGateEngine.evaluate(plan, market_mode=market_mode)
+        external_ready = int(mandatory_ready == 1 and int(flow.get("data_ready", 0)) == 1 and int(fundamental.get("data_ready", 0)) == 1)
+        risk = RiskGateEngine.evaluate(plan, market_mode=market_mode, external_data_ready=external_ready)
         gates = {
             "market_gate": int(market_gate),
             "flow_gate": int(flow["pass"]),
@@ -3046,14 +3536,22 @@ class DecisionLayerEngine:
             "technical_gate": int(technical_gate),
             "risk_gate": int(risk["pass"]),
         }
-        trade_allowed = int(all(v == 1 for v in gates.values()))
-        gate_summary = f"Market={market_mode}/{market_score:.1f}; Flow={flow['score']}; Fundamental={fundamental['score']}; Event={event['score']}; Risk={risk['score']}"
-        decision_reason = "｜".join([market.get("memo", ""), flow["reason"], fundamental["reason"], event["reason"], risk["reason"]])
+        trade_allowed = int(all(v == 1 for v in gates.values()) and external_ready == 1)
+        gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Event={event['score']}; Risk={risk['score']}; ExternalReady={external_ready}"
+        blocking_reason = mandatory_reason if external_ready != 1 else ""
+        decision_reason = "｜".join([market.get("memo", ""), market_status.get("reason",""), flow["reason"], fundamental["reason"], event["reason"], risk["reason"], blocking_reason])
         out = dict(plan)
         out.update(gates)
-        out.update({"trade_allowed": trade_allowed, "gate_summary": gate_summary, "decision_reason": decision_reason})
+        out.update({
+            "trade_allowed": trade_allowed,
+            "gate_summary": gate_summary,
+            "decision_reason": decision_reason,
+            "external_data_ready": external_ready,
+            "external_blocking_reason": blocking_reason,
+            "pipeline_run_id": str(plan.get("pipeline_run_id", "")),
+        })
         if not trade_allowed and out.get("ui_state") == "可下單":
-            out["ui_state"] = "Gate未通過"
+            out["ui_state"] = "External Data Missing" if external_ready != 1 else "Gate未通過"
         return out
 
     def evaluate_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -5671,8 +6169,10 @@ class AppUI:
             "每日增量更新",
             "重建排行",
             "更新分類檔",
-            "外部資料中心",
-            "重新整理外部資料狀態",
+            "外部資料監控中心",
+            "同步外部資料",
+            "重整外部資料狀態顯示",
+            "查看外部原始資料",
             "中斷作業",
             "匯出分析Excel",
             "開啟圖表",
@@ -5786,8 +6286,9 @@ class AppUI:
         })
         self.inst_tree.bind("<<TreeviewSelect>>", self.on_select_institutional)
 
-        self.external_tree = self._make_tree(self.tab_external, ("module", "source", "source_date", "status", "rows", "fallback", "error"), {
-            "module": "模組", "source": "資料來源", "source_date": "資料日", "status": "狀態", "rows": "筆數", "fallback": "回退", "error": "錯誤/說明"
+        self.external_tree = self._make_tree(self.tab_external, ("module", "source", "source_date", "status", "rows", "ready", "last_success", "url", "blocking", "error"), {
+            "module": "模組", "source": "資料來源", "source_date": "資料日", "status": "狀態", "rows": "筆數", "ready": "DataReady",
+            "last_success": "最後成功", "url": "Request URL", "blocking": "阻擋原因", "error": "錯誤/說明"
         })
 
         self.backtest_tree = self._make_tree(self.tab_backtest, ("rank", "id", "name", "win", "avg_ret", "cagr", "mdd", "sharpe", "samples"), {
@@ -6120,8 +6621,10 @@ class AppUI:
             "每日增量更新": self.update_data,
             "重建排行": self.rebuild_ranking,
             "更新分類檔": self.update_classification_book,
-            "外部資料中心": self.show_external_data_center,
-            "重新整理外部資料狀態": self.refresh_external_data_status,
+            "外部資料監控中心": self.show_external_data_center,
+            "同步外部資料": self.sync_external_data,
+            "重整外部資料狀態顯示": self.refresh_external_data_status,
+            "查看外部原始資料": self.export_external_raw_sample,
             "AI選股TOP20": self.show_top20,
             "主攻5": self.show_top5,
             "V3.5操作說明": self.show_operation_guide,
@@ -6136,6 +6639,46 @@ class AppUI:
         func()
 
 
+    def export_external_raw_sample(self):
+        """V9.4：依外部資料監控中心選取module匯出原始落表資料，讓使用者可查核是否真寫DB。"""
+        try:
+            item = None
+            try:
+                sels = self.external_tree.selection()
+                item = sels[0] if sels else None
+            except Exception:
+                item = None
+            module = ""
+            if item:
+                vals = self.external_tree.item(item, "values")
+                module = str(vals[0]) if vals else ""
+            status_df = self.db.read_table("external_source_status", limit=None)
+            if status_df is None or status_df.empty:
+                return messagebox.showwarning("外部資料", "尚無外部資料狀態，請先執行「同步外部資料」。")
+            if module:
+                row = status_df[status_df["module"].astype(str) == module].tail(1)
+            else:
+                row = status_df.head(1)
+            if row.empty:
+                return messagebox.showwarning("外部資料", f"找不到module：{module}")
+            target_table = str(row.iloc[-1].get("target_table", "") or "")
+            if not target_table:
+                return messagebox.showwarning("外部資料", f"{module or '所選模組'}未設定target_table")
+            raw = self.db.read_table(target_table, limit=500)
+            log_df = self.db.read_table("external_data_log", limit=1000)
+            if log_df is not None and not log_df.empty and "module" in log_df.columns and module:
+                log_df = log_df[log_df["module"].astype(str) == module].copy()
+            out_base = CHART_DIR / f"External_Raw_Sample_{module or target_table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            out_path, kind = write_table_bundle(out_base, {
+                "Raw_Data": raw if raw is not None else pd.DataFrame(),
+                "Source_Status": row,
+                "External_Data_Log": log_df if log_df is not None else pd.DataFrame(),
+            }, preferred="excel")
+            self.append_log(f"外部原始資料已匯出：{out_path}")
+            open_path(out_path)
+        except Exception as exc:
+            self.append_log(f"外部原始資料匯出失敗：{exc}", "ERROR")
+
     def show_external_data_center(self):
         try:
             self.left_notebook.select(self.tab_external)
@@ -6143,30 +6686,54 @@ class AppUI:
             pass
         self.refresh_external_data_status()
 
-    def refresh_external_data_status(self):
+    def sync_external_data(self):
+        """V9.4：真正同步外部資料。會執行fetch→validate→write_db→status→log，不再只刷新狀態。"""
         def worker():
             try:
-                run_id = self.db.log_system_run(event="external_data_center_refresh", status="start", message="UI refresh external source status")
-                ExternalDataFetcher(self.db).refresh_all(run_id=run_id)
-                status = self.db.read_table("external_source_status", limit=200)
+                run_id = self.db.log_system_run(event="external_sync_ui", status="start", message="UI triggered true external data pipeline", step="start")
+                result = ExternalDataFetcher(self.db).refresh_external_data_pipeline(run_id=run_id)
+                status = self.db.read_table("external_source_status", limit=500)
                 self.ui_call(self._populate_external_tree, status)
-                self.ui_call(self.append_log, f"外部資料中心已更新｜run_id={run_id}")
+                blocking = result.get("blocking", []) if isinstance(result, dict) else []
+                if blocking:
+                    self.ui_call(self.append_log, f"外部資料同步完成但有阻擋項｜run_id={run_id}｜{'; '.join(blocking)}", "WARNING")
+                else:
+                    self.ui_call(self.append_log, f"外部資料同步完成｜run_id={run_id}")
             except Exception as exc:
-                self.ui_call(self.append_log, f"外部資料中心更新失敗：{exc}", "ERROR")
-        self._run_in_thread(worker, "external_data_center")
+                self.ui_call(self.append_log, f"外部資料同步失敗：{exc}", "ERROR")
+        self._run_in_thread(worker, "external_data_sync")
+
+    def refresh_external_data_status(self):
+        """V9.4：只刷新監控中心畫面，不執行fetch，避免功能語義錯誤。"""
+        def worker():
+            try:
+                run_id = self.db.log_system_run(event="external_status_refresh", status="start", message="UI refresh external source status only", step="status")
+                status = self.db.read_table("external_source_status", limit=500)
+                self.ui_call(self._populate_external_tree, status)
+                self.ui_call(self.append_log, f"外部資料狀態顯示已重整｜run_id={run_id}")
+            except Exception as exc:
+                self.ui_call(self.append_log, f"外部資料狀態顯示重整失敗：{exc}", "ERROR")
+        self._run_in_thread(worker, "external_status_refresh")
 
     def _populate_external_tree(self, df: pd.DataFrame):
         try:
             self.external_tree.delete(*self.external_tree.get_children())
             if df is None or df.empty:
+                self.external_tree.insert("", "end", values=("NO_DATA", "", "", "FAIL", 0, 0, "", "", "尚未執行外部資料同步", ""))
                 return
             for _, r in df.iterrows():
+                ready = int(pd.to_numeric(pd.Series([r.get("data_ready", 0)]), errors="coerce").fillna(0).iloc[0])
+                status = str(r.get("status", "") or "")
+                rows = int(pd.to_numeric(pd.Series([r.get("rows_count", 0)]), errors="coerce").fillna(0).iloc[0])
+                if status == "pending_implementation" or rows == 0 and ready == 0:
+                    status = "FAIL/NOT_READY"
                 self.external_tree.insert("", "end", values=(
-                    r.get("module", ""), r.get("source_name", ""), r.get("source_date", ""), r.get("status", ""),
-                    r.get("rows_count", ""), r.get("fallback_count", ""), r.get("error_message", ""),
+                    r.get("module", ""), r.get("source_name", ""), r.get("source_date", ""), status,
+                    rows, ready, r.get("last_success_time", ""), r.get("request_url", ""),
+                    r.get("blocking_reason", ""), r.get("error_message", ""),
                 ))
         except Exception as exc:
-            log_warning(f"外部資料中心填表失敗：{exc}")
+            log_warning(f"外部資料監控中心填表失敗：{exc}")
 
     def ui_call(self, func, *args, **kwargs):
         def _wrapped():
@@ -7349,6 +7916,31 @@ class AppUI:
                     tables["Trade_Plan_DB"] = self.db.read_table("trade_plan", limit=1000)
                     tables["Market_Snapshot"] = self.db.read_table("market_snapshot", limit=200)
                     tables["External_Source_Config"] = ExternalSourceConfig.to_dataframe()
+                    _status_df = tables.get("External_Source_Status", pd.DataFrame())
+                    _blocking_rows = []
+                    if _status_df is not None and not _status_df.empty:
+                        for _, _r in _status_df.iterrows():
+                            _ready = int(pd.to_numeric(pd.Series([_r.get("data_ready", 0)]), errors="coerce").fillna(0).iloc[0])
+                            _rows = int(pd.to_numeric(pd.Series([_r.get("rows_count", 0)]), errors="coerce").fillna(0).iloc[0])
+                            _module = str(_r.get("module", ""))
+                            _mandatory = bool(ExternalSourceConfig.SOURCES.get(_module, {}).get("mandatory", False))
+                            if _ready != 1 and _mandatory:
+                                _blocking_rows.append({
+                                    "severity": "P0", "module": _module, "status": _r.get("status", ""),
+                                    "rows_count": _rows, "blocking_reason": _r.get("blocking_reason", "") or _r.get("error_message", ""),
+                                    "go_no_go": "NO-GO"
+                                })
+                    else:
+                        _blocking_rows.append({"severity": "P0", "module": "ALL", "status": "missing", "rows_count": 0, "blocking_reason": "尚未執行外部資料同步或external_source_status空白", "go_no_go": "NO-GO"})
+                    tables["Blocking_Issues"] = pd.DataFrame(_blocking_rows) if _blocking_rows else pd.DataFrame([{"severity": "OK", "module": "ALL", "status": "ok", "rows_count": "", "blocking_reason": "", "go_no_go": "GO"}])
+                    tables["Go_NoGo_Summary"] = pd.DataFrame([{
+                        "go_no_go": "NO-GO" if _blocking_rows else "GO",
+                        "blocking_count": len(_blocking_rows),
+                        "rule": "P0未過不得標示完成；mandatory external modules must be data_ready=1",
+                        "db_path": str(self.db.db_path),
+                        "db_hash": self.db._safe_sha256(self.db.db_path),
+                        "program_name": APP_NAME,
+                    }])
                 except Exception as exc:
                     tables["DB_Export_Error"] = pd.DataFrame([{"error": str(exc)}])
                 try:
