@@ -150,7 +150,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.4 TRUE EXTERNAL DATA PIPELINE V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.5 EXTERNAL DECISION INTEGRATED V16.2-R4"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -2154,6 +2154,32 @@ class DBManager:
         )
         """)
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS external_source_status_detail (
+            run_id TEXT,
+            module TEXT,
+            source_key TEXT,
+            source_name TEXT,
+            official_url TEXT,
+            request_url TEXT,
+            source_date TEXT,
+            fetch_time TEXT,
+            http_status TEXT,
+            status TEXT,
+            attempt_no INTEGER DEFAULT 1,
+            fallback_count INTEGER DEFAULT 0,
+            rows_count INTEGER DEFAULT 0,
+            coverage_total INTEGER DEFAULT 0,
+            coverage_hit INTEGER DEFAULT 0,
+            freshness_days INTEGER DEFAULT 9999,
+            data_ready INTEGER DEFAULT 0,
+            blocking_reason TEXT,
+            error_message TEXT,
+            source_level TEXT,
+            target_table TEXT,
+            PRIMARY KEY (run_id, module, source_key, attempt_no)
+        )
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_plan (
             run_id TEXT,
             plan_date TEXT,
@@ -2199,6 +2225,8 @@ class DBManager:
             "CREATE INDEX IF NOT EXISTS idx_external_status_ready ON external_source_status(data_ready, status)",
             "CREATE INDEX IF NOT EXISTS idx_inst_stock_date ON external_institutional(stock_id, trade_date)",
             "CREATE INDEX IF NOT EXISTS idx_revenue_stock_month ON external_revenue(stock_id, revenue_month)",
+            "CREATE INDEX IF NOT EXISTS idx_external_detail_module ON external_source_status_detail(module, source_key, source_date)",
+            "CREATE INDEX IF NOT EXISTS idx_trade_plan_gate_state ON trade_plan(trade_allowed, market_gate_state, flow_gate_state, fundamental_gate_state)",
         ]:
             cur.execute(sql)
 
@@ -2250,6 +2278,17 @@ class DBManager:
             ("external_data_ready", "external_data_ready INTEGER DEFAULT 0"),
             ("external_blocking_reason", "external_blocking_reason TEXT"),
             ("pipeline_run_id", "pipeline_run_id TEXT"),
+            ("external_run_id", "external_run_id TEXT"),
+            ("decision_run_id", "decision_run_id TEXT"),
+            ("market_gate_state", "market_gate_state TEXT DEFAULT 'BLOCK'"),
+            ("flow_gate_state", "flow_gate_state TEXT DEFAULT 'BLOCK'"),
+            ("fundamental_gate_state", "fundamental_gate_state TEXT DEFAULT 'BLOCK'"),
+            ("event_gate_state", "event_gate_state TEXT DEFAULT 'NE'"),
+            ("risk_gate_state", "risk_gate_state TEXT DEFAULT 'BLOCK'"),
+            ("latest_external_date", "latest_external_date TEXT DEFAULT ''"),
+            ("market_source_level", "market_source_level TEXT DEFAULT ''"),
+            ("source_trace_json", "source_trace_json TEXT DEFAULT ''"),
+            ("decision_reason_short", "decision_reason_short TEXT DEFAULT ''"),
         ]:
             _add("trade_plan", col, ddl)
 
@@ -2290,7 +2329,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.4_true_external_data_pipeline_v16.2_r4",
+                "program_version": "v9.5_external_decision_integrated_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -2367,6 +2406,10 @@ class DBManager:
             "event_gate": 0, "technical_gate": 0, "risk_gate": 0, "trade_allowed": 0, "gate_summary": "", "decision_reason": "",
             "final_trade_decision": "", "ui_state": "", "pool_role": "", "source_rank": "",
             "external_data_ready": 0, "external_blocking_reason": "", "pipeline_run_id": run_id,
+            "external_run_id": run_id, "decision_run_id": "",
+            "market_gate_state": "BLOCK", "flow_gate_state": "BLOCK", "fundamental_gate_state": "BLOCK",
+            "event_gate_state": "NE", "risk_gate_state": "BLOCK",
+            "latest_external_date": "", "market_source_level": "", "source_trace_json": "", "decision_reason_short": "",
         }
         for c, d in defaults.items():
             if c not in x.columns:
@@ -2378,7 +2421,7 @@ class DBManager:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed"]:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "update_time"]
+        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "update_time"]
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -3095,6 +3138,22 @@ class ExternalDataWriter:
     def __init__(self, db: DBManager):
         self.db = db
 
+    def _delete_existing_rows(self, table: str, df: pd.DataFrame):
+        cur = self.db.conn.cursor()
+        if table == "market_snapshot" and "snapshot_date" in df.columns:
+            for v in df["snapshot_date"].dropna().astype(str).unique().tolist():
+                cur.execute("DELETE FROM market_snapshot WHERE snapshot_date=?", (v,))
+        elif table == "external_institutional" and {"stock_id", "trade_date"}.issubset(df.columns):
+            cur.executemany("DELETE FROM external_institutional WHERE stock_id=? AND trade_date=?", df[["stock_id", "trade_date"]].astype(str).drop_duplicates().itertuples(index=False, name=None))
+        elif table == "external_margin" and {"stock_id", "trade_date"}.issubset(df.columns):
+            cur.executemany("DELETE FROM external_margin WHERE stock_id=? AND trade_date=?", df[["stock_id", "trade_date"]].astype(str).drop_duplicates().itertuples(index=False, name=None))
+        elif table == "external_revenue" and {"stock_id", "revenue_month"}.issubset(df.columns):
+            cur.executemany("DELETE FROM external_revenue WHERE stock_id=? AND revenue_month=?", df[["stock_id", "revenue_month"]].astype(str).drop_duplicates().itertuples(index=False, name=None))
+        elif table == "external_valuation" and {"stock_id", "data_date"}.issubset(df.columns):
+            cur.executemany("DELETE FROM external_valuation WHERE stock_id=? AND data_date=?", df[["stock_id", "data_date"]].astype(str).drop_duplicates().itertuples(index=False, name=None))
+        elif table == "external_event" and "event_id" in df.columns:
+            cur.executemany("DELETE FROM external_event WHERE event_id=?", [(str(v),) for v in df["event_id"].dropna().astype(str).unique().tolist()])
+
     def write_result(self, result: ExternalPipelineResult) -> ExternalPipelineResult:
         if result is None:
             return ExternalPipelineResult("unknown", "fail", error_message="result is None")
@@ -3105,12 +3164,13 @@ class ExternalDataWriter:
         try:
             with self.db.lock:
                 if result.target_table == "market_snapshot":
-                    self.db.conn.execute("DELETE FROM market_snapshot WHERE snapshot_date=?", (datetime.now().strftime("%Y-%m-%d"),))
+                    self._delete_existing_rows("market_snapshot", df)
                     df.to_sql("market_snapshot", self.db.conn, if_exists="append", index=False)
                 elif result.target_table in {
                     "external_institutional", "external_margin", "external_revenue",
                     "external_valuation", "external_event"
                 }:
+                    self._delete_existing_rows(result.target_table, df)
                     df.to_sql(result.target_table, self.db.conn, if_exists="append", index=False)
                 else:
                     raise ValueError(f"未知target_table：{result.target_table}")
@@ -3423,6 +3483,101 @@ class ExternalDataReadiness:
         return (0 if missing else 1, "；".join(missing))
 
 
+
+def gate_state(pass_value, data_ready: int = 1, not_evaluated: int = 0, applicable: int = 1) -> str:
+    if int(applicable or 0) == 0:
+        return "NA"
+    if int(not_evaluated or 0) == 1:
+        return "NE"
+    if int(data_ready or 0) != 1:
+        return "BLOCK"
+    return "PASS" if int(pass_value or 0) == 1 else "BLOCK"
+
+
+def short_reason(text: str, max_len: int = 120) -> str:
+    s = str(text or "").replace("\n", " ").replace("\r", " ").strip()
+    return s[:max_len] + ("..." if len(s) > max_len else "")
+
+
+def latest_source_trace(db: DBManager) -> dict:
+    try:
+        status = db.read_table("external_source_status", limit=None)
+        if status is None or status.empty:
+            return {"ready": 0, "latest_external_date": "", "market_source_level": "", "modules": {}, "blocking": "external_source_status empty"}
+        modules = {}
+        blocking = []
+        latest_dates = []
+        market_source_level = ""
+        for _, r in status.iterrows():
+            module = str(r.get("module", ""))
+            ready = int(pd.to_numeric(pd.Series([r.get("data_ready", 0)]), errors="coerce").fillna(0).iloc[0])
+            source_date = str(r.get("source_date", "") or "")
+            if source_date:
+                latest_dates.append(source_date)
+            if module == "market_snapshot":
+                market_source_level = str(r.get("source_level", "") or "")
+            modules[module] = {
+                "ready": ready,
+                "status": str(r.get("status", "") or ""),
+                "rows": int(pd.to_numeric(pd.Series([r.get("rows_count", 0)]), errors="coerce").fillna(0).iloc[0]),
+                "source_date": source_date,
+                "source_level": str(r.get("source_level", "") or ""),
+                "reason": str(r.get("blocking_reason", "") or r.get("error_message", "") or ""),
+                "url": str(r.get("request_url", "") or ""),
+            }
+            if not ready:
+                blocking.append(f"{module}:{modules[module]['reason'] or modules[module]['status']}")
+        return {
+            "ready": 0 if blocking else 1,
+            "latest_external_date": max(latest_dates) if latest_dates else "",
+            "market_source_level": market_source_level,
+            "modules": modules,
+            "blocking": "；".join(blocking),
+        }
+    except Exception as exc:
+        return {"ready": 0, "latest_external_date": "", "market_source_level": "", "modules": {}, "blocking": str(exc)}
+
+
+def apply_external_decision_filter(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    if "trade_allowed" not in x.columns:
+        x["trade_allowed"] = 0
+        x["external_blocking_reason"] = (x.get("external_blocking_reason", "") if "external_blocking_reason" in x.columns else "")
+    allowed = pd.to_numeric(x["trade_allowed"], errors="coerce").fillna(0).astype(int).eq(1)
+    blocked = x.loc[~allowed].copy()
+    if not blocked.empty:
+        try:
+            log_warning(f"V9.5 external decision blocked {len(blocked)} rows from {label}: " + ",".join(blocked.get("stock_id", pd.Series(dtype=str)).astype(str).head(20).tolist()))
+        except Exception:
+            pass
+    return x.loc[allowed].copy()
+
+
+def attach_external_display_columns(x: pd.DataFrame) -> pd.DataFrame:
+    if x is None or x.empty:
+        return x
+    out = x.copy()
+    mapping = {
+        "外部允許": "trade_allowed",
+        "外部Ready": "external_data_ready",
+        "Market Gate": "market_gate_state",
+        "Flow Gate": "flow_gate_state",
+        "Fundamental Gate": "fundamental_gate_state",
+        "Event Gate": "event_gate_state",
+        "Risk Gate": "risk_gate_state",
+        "外部阻擋原因": "external_blocking_reason",
+        "外部資料日": "latest_external_date",
+        "資料來源層級": "market_source_level",
+        "決策摘要": "decision_reason_short",
+    }
+    for zh, src in mapping.items():
+        if zh not in out.columns:
+            out[zh] = out[src] if src in out.columns else ""
+    return out
+
+
 class CapitalFlowEngine:
     def __init__(self, db: DBManager):
         self.db = db
@@ -3516,42 +3671,87 @@ class DecisionLayerEngine:
 
     def evaluate_plan(self, plan: dict) -> dict:
         stock_id = str(plan.get("stock_id", ""))
-        market = self.market_engine.get_market_regime()
+        trace = latest_source_trace(self.db)
         market_status = self.readiness.get_status("market_snapshot")
         mandatory_ready, mandatory_reason = self.readiness.mandatory_ready()
-        market_score = float(market.get("score", 50) or 50)
-        market_mode = "Risk_ON" if market_score >= 68 else "Risk_OFF" if market_score <= 42 else "Neutral"
-        market_gate = 1 if int(market_status.get("ready", 0)) == 1 and (market_mode != "Risk_OFF" or int(plan.get("is_etf", 0) or 0) == 1) else 0
+
+        # V9.5：Market Gate 優先讀取 market_snapshot DB，避免 fetch→write_db→decision 斷鏈。
+        market_snapshot = self.db.read_table("market_snapshot", limit=None)
+        if market_snapshot is not None and not market_snapshot.empty and "market_score" in market_snapshot.columns:
+            ms = market_snapshot.tail(1).iloc[-1]
+            market_score = float(pd.to_numeric(pd.Series([ms.get("market_score", 50)]), errors="coerce").fillna(50).iloc[0])
+            market_mode = str(ms.get("market_mode", "") or "")
+            if not market_mode:
+                market_mode = "Risk_ON" if market_score >= 68 else "Risk_OFF" if market_score <= 42 else "Neutral"
+            market_memo = f"market_snapshot DB｜score={market_score:.1f}｜mode={market_mode}｜source={ms.get('source_level','')}"
+        else:
+            market = self.market_engine.get_market_regime()
+            market_score = float(market.get("score", 50) or 50)
+            market_mode = "Risk_ON" if market_score >= 68 else "Risk_OFF" if market_score <= 42 else "Neutral"
+            market_memo = f"market proxy fallback｜{market.get('memo','')}"
+
+        is_etf = int(plan.get("is_etf", 0) or 0)
+        market_gate = 1 if int(market_status.get("ready", 0)) == 1 and (market_mode != "Risk_OFF" or is_etf == 1) else 0
         flow = self.flow_engine.evaluate(stock_id)
         fundamental = self.fundamental_engine.evaluate(stock_id)
         event = self.event_engine.evaluate(stock_id)
+
         technical_gate = int(str(plan.get("final_trade_decision", "")).upper() in ["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"] and float(plan.get("rr_live", plan.get("rr", 0)) or 0) >= 1.0)
-        external_ready = int(mandatory_ready == 1 and int(flow.get("data_ready", 0)) == 1 and int(fundamental.get("data_ready", 0)) == 1)
+        external_ready = int(mandatory_ready == 1 and int(flow.get("data_ready", 0)) == 1 and (is_etf == 1 or int(fundamental.get("data_ready", 0)) == 1))
+
         risk = RiskGateEngine.evaluate(plan, market_mode=market_mode, external_data_ready=external_ready)
+        fundamental_applicable = 0 if is_etf == 1 else 1
+        event_ne = int(event.get("not_evaluated", 0) or 0)
+
+        gate_states = {
+            "market_gate_state": gate_state(market_gate, data_ready=int(market_status.get("ready", 0))),
+            "flow_gate_state": gate_state(flow.get("pass", 0), data_ready=flow.get("data_ready", 0)),
+            "fundamental_gate_state": gate_state(fundamental.get("pass", 0), data_ready=fundamental.get("data_ready", 0), applicable=fundamental_applicable),
+            "event_gate_state": gate_state(event.get("pass", 0), data_ready=event.get("data_ready", 0), not_evaluated=event_ne),
+            "risk_gate_state": gate_state(risk.get("pass", 0), data_ready=1),
+        }
         gates = {
             "market_gate": int(market_gate),
             "flow_gate": int(flow["pass"]),
-            "fundamental_gate": int(fundamental["pass"]),
-            "event_gate": int(event["pass"]),
+            "fundamental_gate": 1 if fundamental_applicable == 0 else int(fundamental["pass"]),
+            "event_gate": 1 if gate_states["event_gate_state"] in ("PASS", "NA", "NE") else 0,
             "technical_gate": int(technical_gate),
             "risk_gate": int(risk["pass"]),
         }
-        trade_allowed = int(all(v == 1 for v in gates.values()) and external_ready == 1)
-        gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Event={event['score']}; Risk={risk['score']}; ExternalReady={external_ready}"
-        blocking_reason = mandatory_reason if external_ready != 1 else ""
-        decision_reason = "｜".join([market.get("memo", ""), market_status.get("reason",""), flow["reason"], fundamental["reason"], event["reason"], risk["reason"], blocking_reason])
+
+        blocking_parts = []
+        for k, state in gate_states.items():
+            if state == "BLOCK":
+                blocking_parts.append(k.replace("_state", ""))
+        if int(technical_gate) != 1:
+            blocking_parts.append("technical_gate")
+        if external_ready != 1:
+            blocking_parts.append(mandatory_reason or "external mandatory data not ready")
+        trade_allowed = int(not blocking_parts and all(v == 1 for v in gates.values()) and external_ready == 1)
+
+        gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Event={event['score']}; Risk={risk['score']}; ExternalReady={external_ready}; States={gate_states}"
+        blocking_reason = "；".join([str(x) for x in blocking_parts if str(x).strip()])
+        decision_reason = "｜".join([market_memo, market_status.get("reason",""), flow["reason"], fundamental["reason"], event["reason"], risk["reason"], blocking_reason])
+
         out = dict(plan)
         out.update(gates)
+        out.update(gate_states)
         out.update({
             "trade_allowed": trade_allowed,
             "gate_summary": gate_summary,
             "decision_reason": decision_reason,
+            "decision_reason_short": short_reason(decision_reason, 140),
             "external_data_ready": external_ready,
             "external_blocking_reason": blocking_reason,
             "pipeline_run_id": str(plan.get("pipeline_run_id", "")),
+            "external_run_id": str(plan.get("pipeline_run_id", "")),
+            "decision_run_id": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "latest_external_date": trace.get("latest_external_date", ""),
+            "market_source_level": trace.get("market_source_level", ""),
+            "source_trace_json": json.dumps(trace, ensure_ascii=False)[:3000],
         })
-        if not trade_allowed and out.get("ui_state") == "可下單":
-            out["ui_state"] = "External Data Missing" if external_ready != 1 else "Gate未通過"
+        if not trade_allowed:
+            out["ui_state"] = "外部阻擋" if external_ready == 1 else "外部資料不足"
         return out
 
     def evaluate_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -3710,7 +3910,7 @@ V80_WEIGHTS = {
 ORDER_COLUMNS = [
     "優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "盤中狀態", "活性分",
     "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%",
-    "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"
+    "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註", "外部允許", "外部Ready", "Market Gate", "Flow Gate", "Fundamental Gate", "Event Gate", "Risk Gate", "外部阻擋原因", "外部資料日", "資料來源層級", "決策摘要"
 ]
 
 INSTITUTIONAL_COLUMNS = [
@@ -3727,6 +3927,8 @@ ORDER_TREE_SCHEMA = [
     ("target", "目標價", 100), ("target1382", "1.382", 90), ("target1618", "1.618", 90), ("rr", "RR", 80),
     ("win_rate", "勝率%", 85), ("atr_pct", "ATR%", 85), ("kelly_pct", "Kelly%", 85), ("qty", "建議張數", 90),
     ("amount", "建議金額", 100), ("single_pct", "單檔曝險%", 95), ("portfolio_state", "組合狀態", 105), ("risk_note", "風險備註", 220),
+    ("trade_allowed", "外部允許", 85), ("market_gate", "Market", 90), ("flow_gate", "Flow", 90), ("fund_gate", "Fund", 105),
+    ("event_gate", "Event", 90), ("risk_gate", "Risk", 90), ("block_reason", "外部阻擋", 220),
 ]
 
 INSTITUTIONAL_TREE_SCHEMA = [
@@ -3738,6 +3940,8 @@ INSTITUTIONAL_TREE_SCHEMA = [
     ("win_rate", "勝率%", 85), ("model_score", "模型分數", 95), ("trade_score", "交易分數", 95), ("atr_pct", "ATR%", 85),
     ("kelly_pct", "Kelly%", 85), ("qty", "建議張數", 90), ("amount", "建議金額", 100), ("single_pct", "單檔曝險%", 95),
     ("theme_pct", "題材曝險%", 95), ("industry_pct", "產業曝險%", 95), ("portfolio_state", "投資組合狀態", 110), ("risk_note", "風險備註", 220),
+    ("trade_allowed", "外部允許", 85), ("market_gate", "Market", 90), ("flow_gate", "Flow", 90), ("fund_gate", "Fund", 105),
+    ("event_gate", "Event", 90), ("risk_gate", "Risk", 90), ("block_reason", "外部阻擋", 220),
 ]
 
 
@@ -3782,6 +3986,13 @@ DISPLAY_COLUMN_MAP = {
     "industry_pct": "產業曝險%",
     "portfolio_state": "投資組合狀態",
     "risk_note": "風險備註",
+    "trade_allowed": "外部允許",
+    "market_gate": "Market Gate",
+    "flow_gate": "Flow Gate",
+    "fund_gate": "Fundamental Gate",
+    "event_gate": "Event Gate",
+    "risk_gate": "Risk Gate",
+    "block_reason": "外部阻擋原因",
 }
 
 
@@ -3928,6 +4139,11 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("投資組合狀態", "portfolio_state"), ("風險備註", "risk_note"),
         ("模型分數", "model_score"), ("交易分數", "trade_score"),
         ("淘汰原因", "elimination_reason"), ("市場", "market"), ("產業", "industry"), ("題材", "theme"),
+        ("外部允許", "trade_allowed"), ("外部Ready", "external_data_ready"),
+        ("Market Gate", "market_gate_state"), ("Flow Gate", "flow_gate_state"),
+        ("Fundamental Gate", "fundamental_gate_state"), ("Event Gate", "event_gate_state"), ("Risk Gate", "risk_gate_state"),
+        ("外部阻擋原因", "external_blocking_reason"), ("外部資料日", "latest_external_date"),
+        ("資料來源層級", "market_source_level"), ("決策摘要", "decision_reason_short"),
         ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "priority"), ("優先級", "優先級"),
     ]
     for zh, src in alias_pairs:
@@ -5233,7 +5449,10 @@ class MasterTradingEngine:
             try:
                 plans_df = self.decision_layer.evaluate_dataframe(plans_df)
             except Exception as exc:
-                log_warning(f"DecisionLayer evaluate_dataframe 失敗，維持原技術決策：{exc}")
+                log_warning(f"DecisionLayer evaluate_dataframe 失敗，外部決策保守阻擋：{exc}")
+                plans_df["trade_allowed"] = 0
+                plans_df["external_blocking_reason"] = f"DecisionLayer失敗：{exc}"
+                plans_df["ui_state"] = "外部決策錯誤"
 
         market = self.market_engine.get_market_regime()
         if plans_df.empty:
@@ -5328,9 +5547,11 @@ class MasterTradingEngine:
                 trade_top20 = trade_top20.sort_values(["candidate20_score", "mainstream_score", "breakout_score", "liquidity_score", "model_score"], ascending=False).head(REPORT_DECISION_LIMITS["candidate20"]).copy()
 
             # 鎖死來源：core_attack5 只能由 candidate20 產生
-            core_source = trade_top20[
-                trade_top20.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])
-            ].copy() if not trade_top20.empty else pd.DataFrame()
+            trade_top20 = attach_external_display_columns(trade_top20)
+            core_source_base = apply_external_decision_filter(trade_top20, "core_attack5")
+            core_source = core_source_base[
+                core_source_base.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])
+            ].copy() if not core_source_base.empty else pd.DataFrame()
             if not core_source.empty:
                 core_source["stock_id"] = core_source["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
                 core_source = core_source.drop_duplicates(subset=["stock_id"], keep="first").copy()
@@ -5453,6 +5674,12 @@ class MasterTradingEngine:
             if today_missing:
                 log_cb(f"[POOL-STAGE2-ERROR] today_buy - core_attack5 差集：{','.join(today_missing[:20])}")
 
+        # V9.5 硬性保證：任何 trade_allowed=0 不得進入主攻、今日下單、等待回測、唯一決策、執行清單。
+        core_attack5 = apply_external_decision_filter(core_attack5, "core_attack5")
+        today_buy = apply_external_decision_filter(today_buy, "today_buy")
+        wait_pullback = apply_external_decision_filter(wait_pullback, "wait_pullback")
+        execution_ready = apply_external_decision_filter(execution_ready, "execution_ready")
+        unique_decision = apply_external_decision_filter(unique_decision, "unique_decision")
         dynamic_n = max(1, min(10, market["max_positions"] + 2))
         result = {
             "market": market,
@@ -6222,6 +6449,7 @@ class AppUI:
         self.tab_theme = ttk.Frame(self.left_notebook)
         self.tab_top20 = ttk.Frame(self.left_notebook)
         self.tab_top5 = ttk.Frame(self.left_notebook)
+        self.tab_unique = ttk.Frame(self.left_notebook)
         self.tab_order = ttk.Frame(self.left_notebook)
         self.tab_inst = ttk.Frame(self.left_notebook)
         self.tab_external = ttk.Frame(self.left_notebook)
@@ -6234,6 +6462,7 @@ class AppUI:
         self.left_notebook.add(self.tab_theme, text="題材輪動")
         self.left_notebook.add(self.tab_top20, text="強勢候選20")
         self.left_notebook.add(self.tab_top5, text="主攻5")
+        self.left_notebook.add(self.tab_unique, text="唯一決策")
         self.left_notebook.add(self.tab_order, text="執行下單清單")
         self.left_notebook.add(self.tab_inst, text="組合交易計畫")
         self.left_notebook.add(self.tab_external, text="外部資料中心")
@@ -6276,8 +6505,13 @@ class AppUI:
         })
         self.top5_tree.bind("<<TreeviewSelect>>", self.on_select_top5)
 
-        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "chg", "chg_pct", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note"), {
-            "priority": "優先級", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註"
+        self.unique_tree = self._make_tree(self.tab_unique, ("rank", "id", "name", "trade_allowed", "market_gate", "flow_gate", "fund_gate", "event_gate", "risk_gate", "external_ready", "source_date", "source_level", "block_reason", "decision"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "trade_allowed": "可下單", "market_gate": "Market", "flow_gate": "Flow", "fund_gate": "Fundamental", "event_gate": "Event", "risk_gate": "Risk", "external_ready": "ExternalReady", "source_date": "外部資料日", "source_level": "來源層級", "block_reason": "阻擋原因", "decision": "決策摘要"
+        })
+        self.unique_tree.bind("<<TreeviewSelect>>", self.on_select_unique)
+
+        self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "chg", "chg_pct", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note", "trade_allowed", "market_gate", "flow_gate", "fund_gate", "event_gate", "risk_gate", "block_reason"), {
+            "priority": "優先級", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註", "trade_allowed": "外部允許", "market_gate": "Market", "flow_gate": "Flow", "fund_gate": "Fundamental", "event_gate": "Event", "risk_gate": "Risk", "block_reason": "外部阻擋"
         })
         self.order_tree.bind("<<TreeviewSelect>>", self.on_select_order)
 
@@ -7042,6 +7276,13 @@ class AppUI:
         plan = self.plan_cache.get(sid)
         if plan:
             return plan
+        latest_tp = self.db.read_table("trade_plan", limit=None)
+        if latest_tp is not None and not latest_tp.empty and "stock_id" in latest_tp.columns:
+            latest_tp = latest_tp[latest_tp["stock_id"].astype(str) == sid].tail(1)
+            if not latest_tp.empty:
+                payload = latest_tp.iloc[-1].to_dict()
+                self.plan_cache[sid] = payload
+                return payload
         for df in [getattr(self, "last_top20_df", pd.DataFrame()), getattr(self, "last_top5_df", pd.DataFrame()),
                    getattr(self, "last_today_buy_df", pd.DataFrame()), getattr(self, "last_wait_df", pd.DataFrame()),
                    getattr(self, "last_attack_df", pd.DataFrame()), getattr(self, "last_watch_df", pd.DataFrame()),
@@ -8001,6 +8242,7 @@ class AppUI:
 
     def build_order_list(self, today_buy_df: pd.DataFrame, wait_df: pd.DataFrame | None = None) -> pd.DataFrame:
         x1 = today_buy_df.copy() if today_buy_df is not None else pd.DataFrame()
+        x1 = apply_external_decision_filter(x1, "order_list")
         plan = self.portfolio_engine.build_institutional_plan(x1)
         if plan.empty:
             return pd.DataFrame(columns=["優先級","代號","名稱","現價","漲跌","漲跌幅%","分類","狀態","盤中狀態","活性分","進場區","停損","目標價","1.382","1.618","RR","勝率","ATR%","Kelly%","建議張數","建議金額","單檔曝險%","投資組合狀態","風險備註"])
@@ -8030,8 +8272,11 @@ class AppUI:
             "投資組合狀態": plan["投資組合狀態"],
             "風險備註": plan["風險備註"],
         })
-        self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(plan.copy(), id_col="代號"))
-        order_df = self.normalize_order_df(self.enrich_price_and_export_fields(order_df, id_col="代號"))
+        for zh in ["外部允許", "外部Ready", "Market Gate", "Flow Gate", "Fundamental Gate", "Event Gate", "Risk Gate", "外部阻擋原因", "外部資料日", "資料來源層級", "決策摘要"]:
+            if zh in plan.columns:
+                order_df[zh] = plan[zh]
+        self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(attach_external_display_columns(plan.copy()), id_col="代號"))
+        order_df = self.normalize_order_df(self.enrich_price_and_export_fields(attach_external_display_columns(order_df), id_col="代號"))
         return order_df
 
 
@@ -8074,6 +8319,20 @@ class AppUI:
                     f"{float(r.get('cagr', 0) or 0):.2f}",
                     f"{float(r.get('mdd', 0) or 0):.2f}"
                 ))
+        if hasattr(self, "unique_tree"):
+            for item in self.unique_tree.get_children():
+                self.unique_tree.delete(item)
+            unique_df = getattr(self, "last_unique_decision_df", pd.DataFrame())
+            if unique_df is not None and not unique_df.empty:
+                unique_df = attach_external_display_columns(unique_df)
+                for i, (_, r) in enumerate(unique_df.iterrows(), start=1):
+                    self.unique_tree.insert("", "end", values=(
+                        i, r.get("stock_id", ""), r.get("stock_name", ""),
+                        r.get("trade_allowed", ""), r.get("market_gate_state", ""), r.get("flow_gate_state", ""),
+                        r.get("fundamental_gate_state", ""), r.get("event_gate_state", ""), r.get("risk_gate_state", ""),
+                        r.get("external_data_ready", ""), r.get("latest_external_date", ""), r.get("market_source_level", ""),
+                        r.get("external_blocking_reason", ""), r.get("decision_reason_short", "")
+                    ))
         if self.last_institutional_plan_df is not None and not self.last_institutional_plan_df.empty:
             self._render_institutional_tree(self.last_institutional_plan_df)
         if self.last_order_list_df is not None and not self.last_order_list_df.empty:
@@ -8092,6 +8351,16 @@ class AppUI:
         if self._should_ignore_select_event(stock_id, "強勢候選20"):
             return
         self.sync_all_views(stock_id, source="強勢候選20")
+    def on_select_unique(self, event=None):
+        sel = self.unique_tree.selection() if hasattr(self, "unique_tree") else []
+        if not sel:
+            return
+        vals = self.unique_tree.item(sel[0], "values")
+        stock_id = str(vals[1])
+        if self._should_ignore_select_event(stock_id, "唯一決策"):
+            return
+        self.sync_all_views(stock_id, source="唯一決策")
+
     def on_select_order(self, event=None):
         sel = self.order_tree.selection()
         if not sel:
@@ -8645,6 +8914,11 @@ class AppUI:
     def show_top20(self):
         if not self.ensure_ranking_ready(auto_rebuild=True):
             return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
+        ready, reason = ExternalDataReadiness(self.db).mandatory_ready()
+        if int(ready) != 1:
+            self.append_log(f"[V9.5-PREFLIGHT-NO-GO] 外部資料未就緒，AI選股停止：{reason}")
+            self.refresh_external_data_status()
+            return messagebox.showwarning("外部資料未就緒", "外部資料尚未完成同步或已失敗，系統不允許直接產生可下單名單。\n\n請先執行「同步外部資料」。\n\n阻擋原因：\n" + str(reason))
         df = self._filtered_ranking()
         if df.empty:
             try:
@@ -8716,7 +8990,7 @@ class AppUI:
                 if unique_raw is not None and not unique_raw.empty:
                     self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(REPORT_DECISION_LIMITS["unique_decision"])
                 else:
-                    self.last_unique_decision_df = self.last_attack_df.head(REPORT_DECISION_LIMITS["unique_decision"]).copy()
+                    self.last_unique_decision_df = pd.DataFrame()
 
                 assert_phase1_report_consistency(
                     self.last_top20_df,
@@ -8737,7 +9011,7 @@ class AppUI:
                 defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
                 eliminated_cnt = len(eliminated) if eliminated is not None else 0
                 lines = [
-                    "《v9.2 FINAL-RELEASE V3.5 操作版》",
+                    "《v9.5 EXTERNAL DECISION INTEGRATED 操作版》",
                     f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
                     f"市場說明：{market['memo']}",
                     f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可下單：{len(today_buy)}｜條件預掛：{len(wait_pullback)}｜防守：{defend_cnt}｜淘汰：{eliminated_cnt}",
