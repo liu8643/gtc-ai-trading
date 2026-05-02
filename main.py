@@ -1,13 +1,14 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v9.2 FINAL-RELEASE / v9.5.6 MARGIN_INTEGRATED
+GTC AI Trading System v9.2 FINAL-RELEASE / v9.5.8 DATA_INTEGRITY_PATCH
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材 / 子題材）
 - 本地 SQLite 歷史資料庫
 - TWSE/TPEX 官方資料 + Yahoo Finance 備援更新
 - V9.5.6：融資融券（個股 + 市場情緒）整合進 Decision Layer / UI / Excel / Debug Log
+- V9.5.8：Data Integrity Patch：market_snapshot 禁止 internal proxy 假通過；必須 TWSE 官方市場資料成功才 data_ready=1
 - 核心 StrategyEngineV91（訊號 → 評分 → 倉位 → 交易計畫）
 - 波浪 + 費波交易模型化
 - Kelly + ATR 資金管理
@@ -151,7 +152,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.5.7 EPS_MATRIX_PATCH V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.5.8 DATA_INTEGRITY_PATCH V16.2-R4"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -174,6 +175,12 @@ TWSE_MARGIN_DATASET_ID = "11680"
 TWSE_MARGIN_OPEN_DATA_ENDPOINT = "https://www.twse.com.tw/exchangeReport/MI_MARGN?response=open_data&selectType=ALL"
 TWSE_MARGIN_API_TEMPLATE = TWSE_MARGIN_OPEN_DATA_ENDPOINT
 TWSE_MARGIN_COMPARE_PAGE = "https://www.twse.com.tw/IIH2/zh/compare/margin.html"
+
+# V9.5.8 DATA_INTEGRITY_PATCH：market_snapshot 不可再使用 internal:price_history 當 success。
+# 只有 TWSE 官方市場指數資料成功解析，market_snapshot 才允許 data_ready=1。
+TWSE_MARKET_SNAPSHOT_ENDPOINT_TEMPLATE = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date}&type=MS"
+MARKET_PROXY_DECISION_POLICY = "internal:price_history proxy 僅可作偵錯，不可寫入 Ready，不可進入今日可下單。"
+
 MARGIN_DATA_SOURCE_POLICY = [
     "TWSE 官方 MI_MARGN open_data endpoint（dataset 11680）：上市個股融資融券，寫入 external_margin",
     "TPEx 官方 OpenAPI / 官方頁面：上櫃個股融資融券，寫入 external_margin",
@@ -2506,7 +2513,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.5.7_eps_matrix_patch_v16.2_r4",
+                "program_version": "v9.5.8_data_integrity_patch_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3310,14 +3317,16 @@ class ExternalSourceConfig:
     """V9.4：外部資料來源設定。每個module必須有target_table、parser、official_url與fallback_days。"""
     SOURCES = {
         "market_snapshot": {
-            "source_name": "TWSE/Yahoo 市場快照",
-            "official_url": "https://www.twse.com.tw",
-            "request_template": "internal_market_regime_proxy",
+            "source_name": "TWSE 官方市場指數快照",
+            "official_url": "https://www.twse.com.tw/zh/trading/historical/mi-index.html",
+            "request_template": TWSE_MARKET_SNAPSHOT_ENDPOINT_TEMPLATE,
             "target_table": "market_snapshot",
             "required_columns": ["snapshot_date", "market_score", "market_mode"],
-            "fallback_days": 5,
+            "fallback_days": 7,
             "mandatory": True,
             "parser": "fetch_market_snapshot",
+            "source_priority": "1.TWSE MI_INDEX 官方市場指數 → 2.日期 fallback 找最近交易日；禁止 internal:price_history proxy 當 Ready",
+            "data_integrity_policy": MARKET_PROXY_DECISION_POLICY,
         },
         "institutional": {
             "source_name": "TWSE 三大法人買賣超",
@@ -3537,32 +3546,131 @@ class ExternalDataFetcher:
             return [], payload
         return [], []
 
-    def fetch_market_snapshot(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
-        source_date = datetime.now().strftime("%Y-%m-%d")
-        market = MarketRegimeEngine(self.db).get_market_regime()
-        market_score = float(market.get("score", 50) or 50)
-        mode = "Risk_ON" if market_score >= 68 else "Risk_OFF" if market_score <= 42 else "Neutral"
-        # V9.4明確標示：此為內部price_history proxy，不可假稱官方外部資料。
-        df = pd.DataFrame([{
-            "snapshot_date": source_date,
+    def _clean_market_number(self, v, default: float = np.nan) -> float:
+        """V9.5.8：清理 TWSE 指數數字，支援逗號、百分比與特殊符號。"""
+        try:
+            s = str(v).replace(",", "").replace("%", "").replace("+", "").strip()
+            s = re.sub(r"<[^>]+>", "", s)
+            s = s.replace("--", "").replace("-", "-")
+            if s in ("", "-", "None", "nan", "NaN"):
+                return float(default)
+            return float(s)
+        except Exception:
+            return float(default)
+
+    def _purge_proxy_market_snapshot_rows(self):
+        """V9.5.8：避免舊版 proxy market_snapshot 繼續留在 DB 誤導 UI/Decision。"""
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.execute("DELETE FROM market_snapshot WHERE COALESCE(source_level,'')='proxy' OR COALESCE(source_url,'')='internal:price_history' OR COALESCE(source_status,'') LIKE 'fallback_proxy%'")
+                self.db.conn.commit()
+        except Exception as exc:
+            log_warning(f"[DATA_INTEGRITY][MARKET] 清除 proxy market_snapshot 失敗：{exc}")
+
+    def _parse_twse_market_index_snapshot(self, payload, date_iso: str, request_url: str) -> pd.DataFrame:
+        """V9.5.8：解析 TWSE MI_INDEX type=MS，取得加權指數作 market_snapshot。"""
+        fields, data = self._normalize_twse_dataset(payload)
+        rows = data if isinstance(data, list) else []
+        target = None
+        for rec in rows:
+            vals = list(rec.values()) if isinstance(rec, dict) else (list(rec) if isinstance(rec, (list, tuple)) else [])
+            if not vals:
+                continue
+            joined = " ".join(str(v) for v in vals)
+            if "發行量加權股價指數" in joined or "TAIEX" in joined:
+                target = vals
+                break
+        if target is None:
+            return pd.DataFrame()
+
+        # 常見欄位：指數、收盤指數、漲跌(+/-)、漲跌點數、漲跌百分比(%)。
+        taiex_close = self._clean_market_number(target[1] if len(target) > 1 else np.nan)
+        change_points = self._clean_market_number(target[3] if len(target) > 3 else (target[2] if len(target) > 2 else np.nan), default=0.0)
+        change_pct = self._clean_market_number(target[4] if len(target) > 4 else np.nan, default=np.nan)
+        if not np.isfinite(change_pct) and np.isfinite(taiex_close) and taiex_close != 0:
+            change_pct = change_points / max(abs(taiex_close - change_points), 1.0) * 100.0
+        if not np.isfinite(taiex_close) or taiex_close <= 0:
+            return pd.DataFrame()
+
+        market_score = 50.0 + max(-20.0, min(20.0, float(change_pct if np.isfinite(change_pct) else 0.0) * 10.0))
+        market_score = round(max(0.0, min(100.0, market_score)), 2)
+        market_mode = "Risk_ON" if market_score >= 60 else "Risk_OFF" if market_score <= 40 else "Neutral"
+        taiex_trend = "多頭" if change_points > 0 else "空頭" if change_points < 0 else "中性"
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return pd.DataFrame([{
+            "snapshot_date": date_iso,
             "market_score": market_score,
-            "market_mode": mode,
-            "taiex_close": 0.0,
-            "taiex_trend": str(market.get("regime", "")),
-            "sp500_close": 0.0,
-            "nasdaq_close": 0.0,
-            "vix": 0.0,
-            "us10y": 0.0,
-            "dxy": 0.0,
-            "breadth": float(market.get("breadth", 0) or 0),
-            "source_status": "fallback_proxy_from_internal_price_history",
-            "source_type": "proxy",
-            "source_url": "internal:price_history",
-            "source_level": "proxy",
-            "proxy_reason": "外部市場即時資料未完整接入時，以內部2330/0050/廣度代理；Decision Layer需降權標示。",
-            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "market_mode": market_mode,
+            "taiex_close": float(taiex_close),
+            "taiex_trend": taiex_trend,
+            "sp500_close": np.nan,
+            "nasdaq_close": np.nan,
+            "vix": np.nan,
+            "us10y": np.nan,
+            "dxy": np.nan,
+            "breadth": np.nan,
+            "source_status": "success_twse_official_mi_index",
+            "source_type": "official",
+            "source_url": request_url,
+            "source_level": "official_twse_mi_index",
+            "proxy_reason": "V9.5.8 DATA_INTEGRITY_PATCH：未使用 internal:price_history proxy；全球市場欄位未接官方來源時保持空值，不用0假資料。",
+            "update_time": now,
         }])
-        return ExternalPipelineResult(module, "fallback", df=df, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url="internal:price_history", source_date=source_date, target_table=cfg.get("target_table",""), data_ready=1, source_level="proxy")
+
+    def fetch_market_snapshot(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        """V9.5.8 DATA_INTEGRITY_PATCH：
+        market_snapshot 必須來自 TWSE 官方 MI_INDEX。internal:price_history proxy 不可再被視為 success/fallback/data_ready。
+        若 TWSE 官方資料未取到，回傳 fail/data_ready=0，讓 mandatory_ready 阻擋今日可下單。
+        """
+        self._purge_proxy_market_snapshot_rows()
+        last_error = ""
+        last_url = cfg.get("request_template", "")
+        for date_ymd, date_iso, offset in self._date_candidates(cfg.get("fallback_days", 7)):
+            url = str(cfg.get("request_template", TWSE_MARKET_SNAPSHOT_ENDPOINT_TEMPLATE)).format(date=date_ymd)
+            last_url = url
+            try:
+                payload, http_status = self._request_json(url)
+                df = self._parse_twse_market_index_snapshot(payload, date_iso, url)
+                if df is not None and not df.empty:
+                    log_info(f"[DATA_INTEGRITY][MARKET] official success rows={len(df)} date={date_iso} url={url}")
+                    return ExternalPipelineResult(
+                        module,
+                        "success" if offset == 0 else "fallback",
+                        df=df,
+                        source_name=cfg.get("source_name", ""),
+                        official_url=cfg.get("official_url", ""),
+                        request_url=url,
+                        source_date=date_iso,
+                        http_status=http_status,
+                        fallback_count=offset,
+                        target_table=cfg.get("target_table", ""),
+                        data_ready=1,
+                        source_level="official_twse_mi_index",
+                    )
+                last_error = f"TWSE MI_INDEX 無可解析加權指數資料 date={date_ymd}"
+            except Exception as exc:
+                last_error = f"{url} | {exc}"
+                log_warning(f"[DATA_INTEGRITY][MARKET] official fetch failed: {last_error}")
+                continue
+
+        # 不再建立 fallback_proxy_from_internal_price_history 的 market_snapshot row。
+        # 原因：proxy 只能診斷，不可讓 Decision Layer 誤判 global_external_ready=1。
+        return ExternalPipelineResult(
+            module,
+            "fail",
+            df=pd.DataFrame(),
+            source_name=cfg.get("source_name", ""),
+            official_url=cfg.get("official_url", ""),
+            request_url=last_url,
+            source_date=datetime.now().strftime("%Y-%m-%d"),
+            http_status="",
+            fallback_count=int(cfg.get("fallback_days", 7) or 0),
+            error_message=(last_error or "TWSE 官方 market_snapshot 未取得；internal proxy 已禁止作為 Ready"),
+            target_table=cfg.get("target_table", ""),
+            data_ready=0,
+            source_level="official_failed_proxy_blocked",
+        )
 
     def fetch_institutional(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
         last_error = ""
@@ -5042,20 +5150,26 @@ class DecisionLayerEngine:
         market_status = self.readiness.get_status("market_snapshot")
         mandatory_ready, mandatory_reason = self.readiness.mandatory_ready()
 
-        # V9.5：Market Gate 優先讀取 market_snapshot DB，避免 fetch→write_db→decision 斷鏈。
+        # V9.5.8 DATA_INTEGRITY_PATCH：Decision Layer 只接受 data_ready=1 且非 proxy 的 market_snapshot。
+        # 若 market_snapshot 未通過官方資料 Ready，不再使用 MarketRegimeEngine internal proxy 當判斷依據。
         market_snapshot = self.db.read_table("market_snapshot", limit=None)
-        if market_snapshot is not None and not market_snapshot.empty and "market_score" in market_snapshot.columns:
+        market_status_ready = int(market_status.get("ready", 0) or 0)
+        valid_market_snapshot = False
+        if market_snapshot is not None and not market_snapshot.empty and "market_score" in market_snapshot.columns and market_status_ready == 1:
             ms = market_snapshot.tail(1).iloc[-1]
+            source_level = str(ms.get("source_level", "") or "")
+            source_url = str(ms.get("source_url", "") or "")
+            valid_market_snapshot = ("proxy" not in source_level.lower()) and (source_url != "internal:price_history")
+        if valid_market_snapshot:
             market_score = float(pd.to_numeric(pd.Series([ms.get("market_score", 50)]), errors="coerce").fillna(50).iloc[0])
             market_mode = str(ms.get("market_mode", "") or "")
             if not market_mode:
                 market_mode = "Risk_ON" if market_score >= 68 else "Risk_OFF" if market_score <= 42 else "Neutral"
             market_memo = f"market_snapshot DB｜score={market_score:.1f}｜mode={market_mode}｜source={ms.get('source_level','')}"
         else:
-            market = self.market_engine.get_market_regime()
-            market_score = float(market.get("score", 50) or 50)
-            market_mode = "Risk_ON" if market_score >= 68 else "Risk_OFF" if market_score <= 42 else "Neutral"
-            market_memo = f"market proxy fallback｜{market.get('memo','')}"
+            market_score = 50.0
+            market_mode = "NOT_READY"
+            market_memo = f"market_snapshot NOT_READY｜{market_status.get('reason','official market data not ready')}｜proxy blocked"
 
         is_etf = int(plan.get("is_etf", 0) or 0)
         market_gate = 1 if int(market_status.get("ready", 0)) == 1 and (market_mode != "Risk_OFF" or is_etf == 1) else 0
@@ -5109,6 +5223,7 @@ class DecisionLayerEngine:
             stock_external_coverage_state = "PARTIAL_NE"
         else:
             stock_external_coverage_state = "FULL"
+        gate_policy_note = "NE=Not Evaluated：資料未覆蓋不阻擋交易，只降權/標示；V9.5.8：market_snapshot proxy 不可作 Ready。"
         eps_category = str(fundamental.get("eps_category", plan.get("eps_category", "U0")) or "U0")
         matrix_cell = str(fundamental.get("matrix_cell", plan.get("matrix_cell", "")) or "")
         revenue_eps_score = float(pd.to_numeric(pd.Series([fundamental.get("revenue_eps_score", plan.get("revenue_eps_score", 50))]), errors="coerce").fillna(50).iloc[0])
@@ -10867,3 +10982,4 @@ if __name__ == "__main__":
 
 
 # V9.5.6 MARGIN_INTEGRATED PATCH MARKER: external_margin + macro_margin_sentiment + DecisionLayer margin_score completed.
+# V9.5.8 DATA_INTEGRITY_PATCH MARKER: market_snapshot proxy blocked; only TWSE MI_INDEX official data can set data_ready=1.
