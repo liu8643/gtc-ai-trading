@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v9.2 FINAL-RELEASE
+GTC AI Trading System v9.2 FINAL-RELEASE / v9.5.4 VALUATION-PE-EPS_TTM
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材 / 子題材）
@@ -150,7 +150,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.5.2 EXTERNAL DECISION NE-GATE V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.5.4 VALUATION-PE-EPS_TTM V16.2-R4"
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -1050,6 +1050,25 @@ def _safe_num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Ser
     if isinstance(df, pd.DataFrame):
         return pd.Series(default, index=df.index, dtype="float64")
     return pd.Series(dtype="float64")
+
+
+def calculate_eps_ttm(price, pe, max_abs_eps: float = 100.0):
+    """V9.5.4：以 TWSE BWIBBU_d 的收盤價 / 本益比反推 EPS_TTM。
+
+    定位：EPS_TTM 是估值近似值（Trailing EPS proxy），保留追溯與評分用途；
+    不等同 MOPS 原始季 EPS，也不可作為硬性 Gate。
+    """
+    try:
+        price_v = float(price)
+        pe_v = float(pe)
+        if not np.isfinite(price_v) or not np.isfinite(pe_v) or pe_v <= 0:
+            return None
+        eps = price_v / pe_v
+        if not np.isfinite(eps) or abs(eps) > float(max_abs_eps):
+            return None
+        return round(float(eps), 4)
+    except Exception:
+        return None
 
 def _safe_text_fill_series(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
     if isinstance(df, pd.DataFrame) and col in df.columns:
@@ -2070,13 +2089,18 @@ class DBManager:
         CREATE TABLE IF NOT EXISTS external_valuation (
             stock_id TEXT,
             data_date TEXT,
-            eps REAL,
+            close_price REAL,
             pe REAL,
             pb REAL,
+            dividend_yield REAL,
+            eps REAL,
+            eps_ttm REAL,
             roe REAL,
             gross_margin REAL,
             operating_margin REAL,
+            fiscal_year_quarter TEXT,
             source_date TEXT,
+            source_url TEXT,
             update_time TEXT,
             PRIMARY KEY(stock_id, data_date)
         )
@@ -2275,6 +2299,15 @@ class DBManager:
             _add("market_snapshot", col, ddl)
 
         for col, ddl in [
+            ("close_price", "close_price REAL"),
+            ("dividend_yield", "dividend_yield REAL"),
+            ("eps_ttm", "eps_ttm REAL"),
+            ("fiscal_year_quarter", "fiscal_year_quarter TEXT"),
+            ("source_url", "source_url TEXT"),
+        ]:
+            _add("external_valuation", col, ddl)
+
+        for col, ddl in [
             ("external_data_ready", "external_data_ready INTEGER DEFAULT 0"),
             ("external_blocking_reason", "external_blocking_reason TEXT"),
             ("pipeline_run_id", "pipeline_run_id TEXT"),
@@ -2292,6 +2325,11 @@ class DBManager:
             ("global_external_ready", "global_external_ready INTEGER DEFAULT 0"),
             ("stock_external_coverage_state", "stock_external_coverage_state TEXT DEFAULT ''"),
             ("gate_policy_note", "gate_policy_note TEXT DEFAULT ''"),
+            ("pe", "pe REAL"),
+            ("pb", "pb REAL"),
+            ("dividend_yield", "dividend_yield REAL"),
+            ("eps_ttm", "eps_ttm REAL"),
+            ("valuation_score", "valuation_score REAL DEFAULT 0"),
         ]:
             _add("trade_plan", col, ddl)
 
@@ -2332,7 +2370,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.5.2_external_decision_ne_gate_v16.2_r4",
+                "program_version": "v9.5.4_valuation_pe_eps_ttm_ne_gate_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -2414,6 +2452,7 @@ class DBManager:
             "event_gate_state": "NE", "risk_gate_state": "BLOCK",
             "latest_external_date": "", "market_source_level": "", "source_trace_json": "", "decision_reason_short": "",
             "global_external_ready": 0, "stock_external_coverage_state": "", "gate_policy_note": "NE=Not Evaluated：資料未覆蓋不阻擋交易，只降權/標示",
+            "pe": 0.0, "pb": 0.0, "dividend_yield": 0.0, "eps_ttm": 0.0, "valuation_score": 0.0,
         }
         for c, d in defaults.items():
             if c not in x.columns:
@@ -2421,11 +2460,11 @@ class DBManager:
         if "entry_mid" in x.columns:
             close_series = pd.to_numeric(x["close"], errors="coerce").fillna(0)
             x.loc[close_series.eq(0), "close"] = pd.to_numeric(x.loc[close_series.eq(0), "entry_mid"], errors="coerce").fillna(0)
-        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate"]:
+        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "valuation_score"]:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed"]:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "update_time"]
+        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "valuation_score", "update_time"]
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -3068,12 +3107,12 @@ class ExternalSourceConfig:
             "parser": "fetch_revenue",
         },
         "valuation": {
-            "source_name": "MOPS 財報/估值",
-            "official_url": "https://mops.twse.com.tw",
-            "request_template": "manual_parser_required",
+            "source_name": "TWSE 個股日本益比/淨值比/殖利率",
+            "official_url": "https://www.twse.com.tw/zh/trading/historical/bwibbu-day.html",
+            "request_template": "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date={date}&selectType=ALL&response=json",
             "target_table": "external_valuation",
-            "required_columns": ["stock_id", "data_date"],
-            "fallback_days": 120,
+            "required_columns": ["stock_id", "data_date", "pe", "pb", "dividend_yield", "eps_ttm"],
+            "fallback_days": 10,
             "mandatory": False,
             "parser": "fetch_valuation",
         },
@@ -3392,7 +3431,94 @@ class ExternalDataFetcher:
         return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=" | ".join(urls), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=last_error or "MOPS月營收資料抓取失敗", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
 
     def fetch_valuation(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
-        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message="V9.4已取消pending假完成：估值/財報官方parser尚未指定穩定API，列為明確fail而非pending。", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+        """V9.5.3：正式接入 TWSE BWIBBU_d 日本益比/股價淨值比/殖利率。
+        定位：PE/PB/殖利率作為 Fundamental scoring，不作為硬 Gate；資料缺漏仍由 NE 邏輯處理。
+        官方頁面：https://www.twse.com.tw/zh/trading/historical/bwibbu-day.html
+        程式端點：https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date={date}&selectType=ALL&response=json
+        """
+        last_error = ""
+        request_templates = [
+            cfg.get("request_template", ""),
+            "https://www.twse.com.tw/exchangeReport/BWIBBU_d?date={date}&selectType=ALL&response=json",
+            "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date={date}&response=json",
+        ]
+        for date_ymd, date_iso, offset in self._date_candidates(cfg.get("fallback_days", 10)):
+            for tpl in request_templates:
+                if not tpl:
+                    continue
+                url = tpl.format(date=date_ymd)
+                try:
+                    payload, http_status = self._request_json(url)
+                    fields, data = self._normalize_twse_dataset(payload)
+                    if not fields or not data:
+                        last_error = "TWSE BWIBBU_d 回傳無 fields/data"
+                        continue
+                    rows = []
+                    for rec in data:
+                        vals = list(rec) if isinstance(rec, (list, tuple)) else []
+                        if len(vals) < 4:
+                            continue
+                        row_map = {str(fields[i]).strip(): vals[i] for i in range(min(len(fields), len(vals)))}
+                        sid = normalize_stock_id(row_map.get("證券代號", vals[0] if vals else ""))
+                        if not sid:
+                            continue
+                        close_price = self._num(row_map.get("收盤價", row_map.get("收盤價(元)", 0)), default=np.nan)
+                        pe = self._num(row_map.get("本益比", 0), default=np.nan)
+                        pb = self._num(row_map.get("股價淨值比", 0), default=np.nan)
+                        dividend_yield = self._num(row_map.get("殖利率(%)", row_map.get("殖利率", 0)), default=np.nan)
+                        # TWSE PE = price / trailing EPS；EPS_TTM為估值近似值，不當原始財報EPS。
+                        eps_ttm = calculate_eps_ttm(close_price, pe)
+                        eps_proxy = eps_ttm  # backward compatibility：保留既有 eps 欄位，不刪除資料流。
+                        fyq = str(row_map.get("財報年/季", "") or "").strip()
+                        rows.append({
+                            "stock_id": sid,
+                            "data_date": date_iso,
+                            "close_price": None if pd.isna(close_price) else float(close_price),
+                            "pe": None if pd.isna(pe) else float(pe),
+                            "pb": None if pd.isna(pb) else float(pb),
+                            "dividend_yield": None if pd.isna(dividend_yield) else float(dividend_yield),
+                            "eps": eps_proxy,
+                            "eps_ttm": eps_ttm,
+                            "roe": None,
+                            "gross_margin": None,
+                            "operating_margin": None,
+                            "fiscal_year_quarter": fyq,
+                            "source_date": date_iso,
+                            "source_url": url,
+                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                    df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "data_date"], keep="last") if rows else pd.DataFrame()
+                    if df is not None and not df.empty:
+                        return ExternalPipelineResult(
+                            module,
+                            "success" if offset == 0 else "fallback",
+                            df=df,
+                            source_name=cfg.get("source_name", ""),
+                            official_url=cfg.get("official_url", ""),
+                            request_url=url,
+                            source_date=date_iso,
+                            http_status=http_status,
+                            fallback_count=offset,
+                            target_table=cfg.get("target_table", ""),
+                            data_ready=1,
+                            source_level="official",
+                        )
+                    last_error = "TWSE BWIBBU_d 回傳無可解析個股資料"
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+        return ExternalPipelineResult(
+            module,
+            "fail",
+            source_name=cfg.get("source_name", ""),
+            official_url=cfg.get("official_url", ""),
+            request_url=cfg.get("request_template", ""),
+            source_date=datetime.now().strftime("%Y-%m-%d"),
+            error_message=last_error or "TWSE BWIBBU_d 估值資料抓取失敗",
+            target_table=cfg.get("target_table", ""),
+            data_ready=0,
+            source_level="official",
+        )
 
     def fetch_event(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
         return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message="V9.4已取消pending假完成：重大訊息/事件官方parser尚未指定穩定API，列為Not Evaluated/fail。", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
@@ -3578,6 +3704,11 @@ def attach_external_display_columns(x: pd.DataFrame) -> pd.DataFrame:
         "全域外部Ready": "global_external_ready",
         "個股覆蓋狀態": "stock_external_coverage_state",
         "Gate說明": "gate_policy_note",
+        "PE": "pe",
+        "PB": "pb",
+        "殖利率%": "dividend_yield",
+        "EPS_TTM": "eps_ttm",
+        "估值分": "valuation_score",
     }
     for zh, src in mapping.items():
         if zh not in out.columns:
@@ -3648,9 +3779,34 @@ class FundamentalEngine:
         if not val.empty and "stock_id" in val.columns:
             v = val[val["stock_id"].astype(str) == str(stock_id)].tail(1)
             if not v.empty:
-                eps = float(pd.to_numeric(v.get("eps", 0), errors="coerce").fillna(0).iloc[-1])
-                score += 10 if eps > 0 else -8
-                reasons.append(f"EPS {eps:.2f}")
+                pe = float(pd.to_numeric(v.get("pe", np.nan), errors="coerce").iloc[-1]) if "pe" in v.columns else np.nan
+                pb = float(pd.to_numeric(v.get("pb", np.nan), errors="coerce").iloc[-1]) if "pb" in v.columns else np.nan
+                dividend_yield = float(pd.to_numeric(v.get("dividend_yield", np.nan), errors="coerce").iloc[-1]) if "dividend_yield" in v.columns else np.nan
+                eps_ttm = float(pd.to_numeric(v.get("eps_ttm", v.get("eps", np.nan)), errors="coerce").iloc[-1]) if ("eps_ttm" in v.columns or "eps" in v.columns) else np.nan
+                valuation_score = 0.0
+                valuation_notes = []
+                if pd.notna(pe) and pe > 0:
+                    pe_score = 8 if pe < 10 else 5 if pe < 20 else 0 if pe < 35 else -5
+                    valuation_score += pe_score
+                    score += pe_score
+                    valuation_notes.append(f"PE {pe:.2f}")
+                if pd.notna(pb) and pb > 0:
+                    pb_score = 3 if pb < 1.5 else 1 if pb < 3 else 0 if pb < 5 else -3
+                    valuation_score += pb_score
+                    score += pb_score
+                    valuation_notes.append(f"PB {pb:.2f}")
+                if pd.notna(dividend_yield) and dividend_yield > 0:
+                    dy_score = 3 if dividend_yield >= 3 else 1
+                    valuation_score += dy_score
+                    score += dy_score
+                    valuation_notes.append(f"殖利率 {dividend_yield:.2f}%")
+                if pd.notna(eps_ttm):
+                    eps_score = 2 if eps_ttm > 10 else 1 if eps_ttm > 5 else 0
+                    valuation_score += eps_score
+                    score += eps_score
+                    valuation_notes.append(f"EPS_TTM {eps_ttm:.2f}")
+                if valuation_notes:
+                    reasons.append("估值：" + "/".join(valuation_notes))
         if not reasons:
             return {
                 "pass": 1,
@@ -3668,6 +3824,11 @@ class FundamentalEngine:
             "data_ready": 1,
             "not_evaluated": 0,
             "coverage_state": "COVERED",
+            "pe": locals().get("pe", np.nan),
+            "pb": locals().get("pb", np.nan),
+            "dividend_yield": locals().get("dividend_yield", np.nan),
+            "eps_ttm": locals().get("eps_ttm", np.nan),
+            "valuation_score": round(locals().get("valuation_score", 0.0), 2),
         }
 
 
@@ -3807,6 +3968,11 @@ class DecisionLayerEngine:
             "global_external_ready": global_external_ready,
             "stock_external_coverage_state": stock_external_coverage_state,
             "gate_policy_note": gate_policy_note,
+            "pe": fundamental.get("pe", np.nan),
+            "pb": fundamental.get("pb", np.nan),
+            "dividend_yield": fundamental.get("dividend_yield", np.nan),
+            "eps_ttm": fundamental.get("eps_ttm", np.nan),
+            "valuation_score": fundamental.get("valuation_score", 0.0),
             "external_blocking_reason": blocking_reason,
             "pipeline_run_id": str(plan.get("pipeline_run_id", "")),
             "external_run_id": str(plan.get("pipeline_run_id", "")),
@@ -3975,13 +4141,13 @@ V80_WEIGHTS = {
 }
 
 ORDER_COLUMNS = [
-    "優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "盤中狀態", "活性分",
+    "優先級", "代號", "名稱", "現價", "PE", "PB", "殖利率%", "EPS_TTM", "估值分", "漲跌", "漲跌幅%", "分類", "狀態", "盤中狀態", "活性分",
     "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%",
     "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註", "外部允許", "外部Ready", "全域外部Ready", "個股覆蓋狀態", "Market Gate", "Flow Gate", "Fundamental Gate", "Event Gate", "Risk Gate", "外部阻擋原因", "外部資料日", "資料來源層級", "決策摘要", "Gate說明"
 ]
 
 INSTITUTIONAL_COLUMNS = [
-    "優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態",
+    "優先級", "代號", "名稱", "現價", "PE", "PB", "殖利率%", "EPS_TTM", "估值分", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態",
     "盤中狀態", "活性分", "淘汰原因", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率",
     "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%",
     "產業曝險%", "投資組合狀態", "風險備註"
@@ -3989,6 +4155,7 @@ INSTITUTIONAL_COLUMNS = [
 
 ORDER_TREE_SCHEMA = [
     ("priority", "優先級", 80), ("id", "代號", 90), ("name", "名稱", 120), ("price", "現價", 90),
+    ("pe", "PE", 70), ("pb", "PB", 70), ("dividend_yield", "殖利率%", 80), ("eps_ttm", "EPS_TTM", 90), ("valuation_score", "估值分", 80),
     ("chg", "漲跌", 90), ("chg_pct", "漲跌幅%", 95), ("bucket", "分類", 95), ("action", "狀態", 95),
     ("liquidity", "盤中狀態", 100), ("liq_score", "活性分", 90), ("entry", "進場區", 130), ("stop", "停損", 100),
     ("target", "目標價", 100), ("target1382", "1.382", 90), ("target1618", "1.618", 90), ("rr", "RR", 80),
@@ -4001,6 +4168,7 @@ ORDER_TREE_SCHEMA = [
 
 INSTITUTIONAL_TREE_SCHEMA = [
     ("priority", "優先級", 80), ("id", "代號", 90), ("name", "名稱", 120), ("price", "現價", 90),
+    ("pe", "PE", 70), ("pb", "PB", 70), ("dividend_yield", "殖利率%", 80), ("eps_ttm", "EPS_TTM", 90), ("valuation_score", "估值分", 80),
     ("chg", "漲跌", 90), ("chg_pct", "漲跌幅%", 95), ("market", "市場", 85), ("industry", "產業", 110),
     ("theme", "題材", 110), ("bucket", "分類", 95), ("action", "狀態", 95), ("liquidity", "盤中狀態", 100),
     ("liq_score", "活性分", 90), ("elim_reason", "淘汰原因", 160), ("entry", "進場區", 130), ("stop", "停損", 100),
@@ -4030,6 +4198,11 @@ DISPLAY_COLUMN_MAP = {
     "id": "代號",
     "name": "名稱",
     "price": "現價",
+    "pe": "PE",
+    "pb": "PB",
+    "dividend_yield": "殖利率%",
+    "eps_ttm": "EPS_TTM",
+    "valuation_score": "估值分",
     "chg": "漲跌",
     "chg_pct": "漲跌幅%",
     "bucket": "分類",
@@ -4210,6 +4383,7 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("投資組合狀態", "portfolio_state"), ("風險備註", "risk_note"),
         ("模型分數", "model_score"), ("交易分數", "trade_score"),
         ("淘汰原因", "elimination_reason"), ("市場", "market"), ("產業", "industry"), ("題材", "theme"),
+        ("PE", "pe"), ("PB", "pb"), ("殖利率%", "dividend_yield"), ("EPS_TTM", "eps_ttm"), ("估值分", "valuation_score"),
         ("外部允許", "trade_allowed"), ("外部Ready", "external_data_ready"),
         ("Market Gate", "market_gate_state"), ("Flow Gate", "flow_gate_state"),
         ("Fundamental Gate", "fundamental_gate_state"), ("Event Gate", "event_gate_state"), ("Risk Gate", "risk_gate_state"),
@@ -4243,7 +4417,7 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         x["優先級"] = pd.to_numeric(_safe_first_series(["priority", "優先級"], default=np.nan, numeric=True), errors="coerce")
         x["優先級"] = x["優先級"].fillna(pd.Series(np.arange(1, len(x) + 1), index=x.index))
 
-    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額"]
+    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額", "PE", "PB", "殖利率%", "EPS_TTM", "估值分"]
     for col in numeric_display:
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
@@ -8229,6 +8403,7 @@ class AppUI:
                     tables["System_Run_Log"] = self.db.read_table("system_run_log", limit=500)
                     tables["Trade_Plan_DB"] = self.db.read_table("trade_plan", limit=1000)
                     tables["Market_Snapshot"] = self.db.read_table("market_snapshot", limit=200)
+                    tables["External_Valuation"] = self.db.read_table("external_valuation", limit=3000)
                     tables["External_Source_Config"] = ExternalSourceConfig.to_dataframe()
                     _status_df = tables.get("External_Source_Status", pd.DataFrame())
                     _blocking_rows = []
