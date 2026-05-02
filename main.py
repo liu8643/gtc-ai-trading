@@ -1,12 +1,13 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v9.2 FINAL-RELEASE / v9.5.5 EPS_OFFICIAL_SOURCE
+GTC AI Trading System v9.2 FINAL-RELEASE / v9.5.6 MARGIN_INTEGRATED
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材 / 子題材）
 - 本地 SQLite 歷史資料庫
 - TWSE/TPEX 官方資料 + Yahoo Finance 備援更新
+- V9.5.6：融資融券（個股 + 市場情緒）整合進 Decision Layer / UI / Excel / Debug Log
 - 核心 StrategyEngineV91（訊號 → 評分 → 倉位 → 交易計畫）
 - 波浪 + 費波交易模型化
 - Kelly + ATR 資金管理
@@ -150,7 +151,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.5.5 EPS_OFFICIAL_SOURCE V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.5.7 EPS_MATRIX_PATCH V16.2-R4"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -163,6 +164,22 @@ EXTERNAL_DATA_SOURCE_PRIORITY = [
     "Goodinfo fallback only（不可作為主資料源）",
 ]
 GOODINFO_FALLBACK_ENABLED = os.getenv("GTC_ENABLE_GOODINFO_FALLBACK", "0").strip() == "1"
+
+# V9.5.6 MARGIN_INTEGRATED：融資融券資料源正式規範
+# 原則：不使用 Mitake / 券商 SDK / 未授權商業資料；只使用官方可追溯來源。
+TPEX_OPENAPI_PORTAL_URL = "https://www.tpex.org.tw/openapi/"
+TPEX_OPENAPI_SWAGGER_URL = "https://www.tpex.org.tw/openapi/swagger.json"
+TWSE_MARGIN_OFFICIAL_PAGE = "https://wwwc.twse.com.tw/zh/trading/margin/mi-margn.html"
+TWSE_MARGIN_DATASET_ID = "11680"
+TWSE_MARGIN_OPEN_DATA_ENDPOINT = "https://www.twse.com.tw/exchangeReport/MI_MARGN?response=open_data&selectType=ALL"
+TWSE_MARGIN_API_TEMPLATE = TWSE_MARGIN_OPEN_DATA_ENDPOINT
+TWSE_MARGIN_COMPARE_PAGE = "https://www.twse.com.tw/IIH2/zh/compare/margin.html"
+MARGIN_DATA_SOURCE_POLICY = [
+    "TWSE 官方 MI_MARGN open_data endpoint（dataset 11680）：上市個股融資融券，寫入 external_margin",
+    "TPEx 官方 OpenAPI / 官方頁面：上櫃個股融資融券，寫入 external_margin",
+    "TWSE compare/margin：市場層融資融券情緒，寫入 macro_margin_sentiment",
+    "禁止 Mitake / 券商 SDK / 未授權商業資料",
+]
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -175,11 +192,15 @@ def configure_app_logger() -> logging.Logger:
         return logger
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
-    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    file_handler.setFormatter(formatter)
+    try:
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception:
+        # V9.5.7：若執行目錄/手機下載環境無法寫 log 檔，不阻斷主程式啟動；仍保留 console log。
+        pass
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
     logger.propagate = False
     return logger
@@ -2117,6 +2138,29 @@ class DBManager:
             PRIMARY KEY(stock_id, data_date)
         )
         """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS financial_feature_daily (
+            stock_id TEXT,
+            feature_date TEXT,
+            eps_ttm REAL,
+            eps_yoy REAL,
+            revenue_yoy REAL,
+            eps_bucket TEXT,
+            rev_bucket TEXT,
+            matrix_cell TEXT,
+            eps_category TEXT,
+            matrix_base_score REAL,
+            modifier REAL,
+            revenue_eps_score REAL,
+            data_quality_flag TEXT,
+            source_trace_json TEXT,
+            source_date TEXT,
+            run_id TEXT,
+            update_time TEXT,
+            PRIMARY KEY(stock_id, feature_date)
+        )
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS external_dividend (
             stock_id TEXT,
@@ -2158,6 +2202,23 @@ class DBManager:
             source_date TEXT,
             update_time TEXT,
             PRIMARY KEY(stock_id, trade_date)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS macro_margin_sentiment (
+            data_date TEXT PRIMARY KEY,
+            total_margin_balance REAL,
+            total_short_balance REAL,
+            total_margin_change REAL,
+            total_short_change REAL,
+            market_margin_utilization REAL,
+            macro_margin_score REAL,
+            macro_margin_state TEXT,
+            sentiment_reason TEXT,
+            source_name TEXT,
+            source_url TEXT,
+            source_date TEXT,
+            update_time TEXT
         )
         """)
         cur.execute("""
@@ -2260,7 +2321,10 @@ class DBManager:
             "CREATE INDEX IF NOT EXISTS idx_external_log_module ON external_data_log(module, source_date)",
             "CREATE INDEX IF NOT EXISTS idx_external_status_ready ON external_source_status(data_ready, status)",
             "CREATE INDEX IF NOT EXISTS idx_inst_stock_date ON external_institutional(stock_id, trade_date)",
+            "CREATE INDEX IF NOT EXISTS idx_margin_stock_date ON external_margin(stock_id, trade_date)",
+            "CREATE INDEX IF NOT EXISTS idx_macro_margin_date ON macro_margin_sentiment(data_date)",
             "CREATE INDEX IF NOT EXISTS idx_revenue_stock_month ON external_revenue(stock_id, revenue_month)",
+            "CREATE INDEX IF NOT EXISTS idx_financial_feature_stock_date ON financial_feature_daily(stock_id, feature_date)",
             "CREATE INDEX IF NOT EXISTS idx_external_detail_module ON external_source_status_detail(module, source_key, source_date)",
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_gate_state ON trade_plan(trade_allowed, market_gate_state, flow_gate_state, fundamental_gate_state)",
         ]:
@@ -2320,6 +2384,43 @@ class DBManager:
             _add("external_valuation", col, ddl)
 
         for col, ddl in [
+            ("eps_ttm", "eps_ttm REAL"),
+            ("eps_yoy", "eps_yoy REAL"),
+            ("revenue_yoy", "revenue_yoy REAL"),
+            ("eps_bucket", "eps_bucket TEXT"),
+            ("rev_bucket", "rev_bucket TEXT"),
+            ("matrix_cell", "matrix_cell TEXT"),
+            ("eps_category", "eps_category TEXT"),
+            ("matrix_base_score", "matrix_base_score REAL"),
+            ("modifier", "modifier REAL"),
+            ("revenue_eps_score", "revenue_eps_score REAL"),
+            ("data_quality_flag", "data_quality_flag TEXT"),
+            ("source_trace_json", "source_trace_json TEXT"),
+            ("source_date", "source_date TEXT"),
+            ("run_id", "run_id TEXT"),
+            ("update_time", "update_time TEXT"),
+        ]:
+            _add("financial_feature_daily", col, ddl)
+
+        for col, ddl in [
+            ("technical_total_score", "technical_total_score REAL DEFAULT 0"),
+            ("financial_score", "financial_score REAL DEFAULT 50"),
+            ("eps_ttm", "eps_ttm REAL"),
+            ("eps_yoy", "eps_yoy REAL"),
+            ("revenue_yoy", "revenue_yoy REAL"),
+            ("eps_bucket", "eps_bucket TEXT"),
+            ("rev_bucket", "rev_bucket TEXT"),
+            ("matrix_cell", "matrix_cell TEXT"),
+            ("eps_category", "eps_category TEXT"),
+            ("matrix_base_score", "matrix_base_score REAL"),
+            ("modifier", "modifier REAL"),
+            ("revenue_eps_score", "revenue_eps_score REAL DEFAULT 50"),
+            ("data_quality_flag", "data_quality_flag TEXT"),
+            ("source_trace_json", "source_trace_json TEXT"),
+        ]:
+            _add("ranking_result", col, ddl)
+
+        for col, ddl in [
             ("external_data_ready", "external_data_ready INTEGER DEFAULT 0"),
             ("external_blocking_reason", "external_blocking_reason TEXT"),
             ("pipeline_run_id", "pipeline_run_id TEXT"),
@@ -2342,6 +2443,29 @@ class DBManager:
             ("dividend_yield", "dividend_yield REAL"),
             ("eps_ttm", "eps_ttm REAL"),
             ("valuation_score", "valuation_score REAL DEFAULT 0"),
+            ("eps_yoy", "eps_yoy REAL"),
+            ("revenue_yoy", "revenue_yoy REAL"),
+            ("eps_bucket", "eps_bucket TEXT"),
+            ("rev_bucket", "rev_bucket TEXT"),
+            ("matrix_cell", "matrix_cell TEXT"),
+            ("eps_category", "eps_category TEXT"),
+            ("matrix_base_score", "matrix_base_score REAL"),
+            ("modifier", "modifier REAL"),
+            ("revenue_eps_score", "revenue_eps_score REAL DEFAULT 50"),
+            ("data_quality_flag", "data_quality_flag TEXT"),
+            ("financial_score", "financial_score REAL DEFAULT 50"),
+            ("eps_matrix_decision_note", "eps_matrix_decision_note TEXT DEFAULT ''"),
+            ("margin_balance", "margin_balance REAL"),
+            ("short_balance", "short_balance REAL"),
+            ("margin_change", "margin_change REAL"),
+            ("short_change", "short_change REAL"),
+            ("margin_utilization", "margin_utilization REAL"),
+            ("retail_heat_score", "retail_heat_score REAL DEFAULT 50"),
+            ("margin_score", "margin_score REAL DEFAULT 50"),
+            ("margin_state", "margin_state TEXT DEFAULT 'NE'"),
+            ("macro_margin_score", "macro_margin_score REAL DEFAULT 50"),
+            ("macro_margin_state", "macro_margin_state TEXT DEFAULT 'NE'"),
+            ("margin_decision_note", "margin_decision_note TEXT DEFAULT ''"),
         ]:
             _add("trade_plan", col, ddl)
 
@@ -2382,7 +2506,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.5.5_eps_official_source_v16.2_r4",
+                "program_version": "v9.5.7_eps_matrix_patch_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -2465,6 +2589,11 @@ class DBManager:
             "latest_external_date": "", "market_source_level": "", "source_trace_json": "", "decision_reason_short": "",
             "global_external_ready": 0, "stock_external_coverage_state": "", "gate_policy_note": "NE=Not Evaluated：資料未覆蓋不阻擋交易，只降權/標示",
             "pe": 0.0, "pb": 0.0, "dividend_yield": 0.0, "eps_ttm": 0.0, "valuation_score": 0.0,
+            "eps_yoy": 0.0, "revenue_yoy": 0.0, "eps_bucket": "", "rev_bucket": "", "matrix_cell": "",
+            "eps_category": "U0", "matrix_base_score": 0.0, "modifier": 0.0, "revenue_eps_score": 50.0,
+            "data_quality_flag": "NE", "financial_score": 50.0, "eps_matrix_decision_note": "",
+            "margin_balance": 0.0, "short_balance": 0.0, "margin_change": 0.0, "short_change": 0.0, "margin_utilization": 0.0,
+            "retail_heat_score": 50.0, "margin_score": 50.0, "margin_state": "NE", "macro_margin_score": 50.0, "macro_margin_state": "NE", "margin_decision_note": "",
         }
         for c, d in defaults.items():
             if c not in x.columns:
@@ -2472,11 +2601,11 @@ class DBManager:
         if "entry_mid" in x.columns:
             close_series = pd.to_numeric(x["close"], errors="coerce").fillna(0)
             x.loc[close_series.eq(0), "close"] = pd.to_numeric(x.loc[close_series.eq(0), "entry_mid"], errors="coerce").fillna(0)
-        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "valuation_score"]:
+        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score"]:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed"]:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "valuation_score", "update_time"]
+        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "update_time"]
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -2484,6 +2613,70 @@ class DBManager:
             self.conn.commit()
         self.log_system_run(event="trade_plan_batch", status="ok", message=f"trade_plan rows={len(x)}", run_id=run_id)
         return run_id
+
+
+    def replace_financial_feature_batch(self, df: pd.DataFrame, run_id: str | None = None):
+        """V9.5.7 EPS_MATRIX_PATCH：寫入 financial_feature_daily。"""
+        if df is None or df.empty:
+            return ""
+        run_id = run_id or self.log_system_run(event="financial_feature_batch", status="start", message=f"rows={len(df)}", module="eps_matrix")
+        x = df.copy()
+        if "feature_date" not in x.columns:
+            x["feature_date"] = datetime.now().strftime("%Y-%m-%d")
+        if "run_id" not in x.columns:
+            x["run_id"] = run_id
+        x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        defaults = {
+            "stock_id": "", "feature_date": "", "eps_ttm": np.nan, "eps_yoy": np.nan, "revenue_yoy": np.nan,
+            "eps_bucket": "E_NA", "rev_bucket": "R_NA", "matrix_cell": "E_NA-R_NA", "eps_category": "U0",
+            "matrix_base_score": 40.0, "modifier": 0.0, "revenue_eps_score": 40.0,
+            "data_quality_flag": "NE", "source_trace_json": "{}", "source_date": "", "run_id": run_id,
+            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for c, d in defaults.items():
+            if c not in x.columns:
+                x[c] = d
+        for c in ["eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score"]:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+        text_cols = ["stock_id", "feature_date", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "data_quality_flag", "source_trace_json", "source_date", "run_id", "update_time"]
+        for c in text_cols:
+            x[c] = x[c].fillna("").astype(str)
+        keep = ["stock_id", "feature_date", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "source_trace_json", "source_date", "run_id", "update_time"]
+        x = x[keep].drop_duplicates(subset=["stock_id", "feature_date"], keep="last")
+        with self.lock:
+            cur = self.conn.cursor()
+            for fd in x["feature_date"].dropna().astype(str).unique().tolist():
+                cur.execute("DELETE FROM financial_feature_daily WHERE feature_date=?", (fd,))
+            x.to_sql("financial_feature_daily", self.conn, if_exists="append", index=False)
+            self.conn.commit()
+        self.log_system_run(event="financial_feature_batch", status="ok", message=f"financial_feature_daily rows={len(x)}", run_id=run_id, module="eps_matrix")
+        return run_id
+
+    def get_latest_financial_features(self) -> pd.DataFrame:
+        q = """
+        SELECT f.*
+        FROM financial_feature_daily f
+        JOIN (
+            SELECT stock_id, MAX(feature_date) AS feature_date
+            FROM financial_feature_daily
+            GROUP BY stock_id
+        ) m
+        ON f.stock_id=m.stock_id AND f.feature_date=m.feature_date
+        """
+        with self.lock:
+            try:
+                return pd.read_sql_query(q, self.conn)
+            except Exception:
+                return pd.DataFrame()
+
+    def get_latest_financial_feature_row(self, stock_id: str) -> dict:
+        df = self.get_latest_financial_features()
+        if df is None or df.empty or "stock_id" not in df.columns:
+            return {}
+        x = df[df["stock_id"].astype(str) == str(stock_id)].tail(1)
+        if x.empty:
+            return {}
+        return dict(x.iloc[-1])
 
     def read_table(self, table_name: str, limit: int | None = 500) -> pd.DataFrame:
         safe = re.sub(r"[^A-Za-z0-9_]", "", str(table_name or ""))
@@ -2499,7 +2692,7 @@ class DBManager:
                 return pd.DataFrame()
 
     def schema_check_df(self) -> pd.DataFrame:
-        required = ["stocks_master", "price_history", "ranking_result", "system_run_log", "external_data_log", "external_source_status", "market_snapshot", "external_revenue", "external_valuation", "external_dividend", "external_institutional", "external_margin", "external_event", "macro_module_score", "trade_plan"]
+        required = ["stocks_master", "price_history", "ranking_result", "system_run_log", "external_data_log", "external_source_status", "market_snapshot", "external_revenue", "external_valuation", "financial_feature_daily", "external_dividend", "external_institutional", "external_margin", "external_event", "macro_module_score", "trade_plan"]
         rows = []
         with self.lock:
             existing = {r[0] for r in self.conn.cursor().execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -3034,6 +3227,23 @@ class RankingEngine:
         success = 0
         skipped = 0
 
+        # V9.5.7：先建立/更新 EPS Matrix feature，再合併進 Ranking；不在 Excel/UI 重算。
+        run_id = self.db.log_system_run(event="ranking_rebuild", status="start", message="Ranking rebuild with EPS_MATRIX_PATCH", module="ranking")
+        feature_engine = FinancialFeatureEngine(self.db)
+        feature_df = feature_engine.build_feature_batch(run_id=run_id, write_db=True)
+        if feature_df is None or feature_df.empty:
+            feature_df = self.db.get_latest_financial_features()
+        feature_map = {}
+        if feature_df is not None and not feature_df.empty and "stock_id" in feature_df.columns:
+            feature_map = {str(r.get("stock_id")): dict(r) for _, r in feature_df.iterrows()}
+            if log_cb:
+                log_cb(f"[EPS MATRIX][MERGE] financial_feature_daily 可合併 {len(feature_map)} 檔")
+            log_info(f"[EPS MATRIX][MERGE] run_id={run_id} features={len(feature_map)}")
+        else:
+            if log_cb:
+                log_cb("[EPS MATRIX][MERGE] 無 financial_feature_daily，Ranking 使用中性財務分數")
+            log_warning(f"[EPS MATRIX][MERGE] run_id={run_id} features=0")
+
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷重建排行")
@@ -3046,6 +3256,25 @@ class RankingEngine:
                 continue
             hist = DataEngine.attach(hist)
             score = StrategyEngineV91.score(hist)
+            technical_total = float(score.get("total_score", 0) or 0)
+            feat = feature_map.get(stock_id, {})
+            revenue_eps_score = float(pd.to_numeric(pd.Series([feat.get("revenue_eps_score", 50)]), errors="coerce").fillna(50).iloc[0])
+            valuation_score = float(pd.to_numeric(pd.Series([feat.get("revenue_eps_score", 50)]), errors="coerce").fillna(50).iloc[0])
+            liquidity_score = float(score.get("volume_score", 0) or 0)
+            theme_score = float(score.get("ai_score", 0) or 0)
+            final_total = round(
+                technical_total * 0.50 +
+                revenue_eps_score * 0.20 +
+                valuation_score * 0.10 +
+                liquidity_score * 0.10 +
+                theme_score * 0.10,
+                2
+            )
+            score["technical_total_score"] = round(technical_total, 2)
+            score["financial_score"] = round(revenue_eps_score, 2)
+            score["total_score"] = final_total
+            for c in ["eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "source_trace_json"]:
+                score[c] = feat.get(c, np.nan if c in ["eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score"] else "")
             rows.append({
                 "date": today,
                 "stock_id": stock_id,
@@ -3057,8 +3286,7 @@ class RankingEngine:
             if progress_cb:
                 progress_cb(idx, total, stock_id, success, 0, skipped, "ok")
             if log_cb and (idx % 100 == 0 or idx == total):
-                log_cb(f"重排行進度 {idx}/{total}｜已納入 {success} 檔｜跳過 {skipped} 檔")
-
+                log_cb(f"重排行進度 {idx}/{total}｜已納入 {success} 檔｜跳過 {skipped} 檔｜EPS矩陣合併")
         if not rows:
             return 0
 
@@ -3067,7 +3295,10 @@ class RankingEngine:
         merged = df.merge(master[["stock_id", "industry"]], on="stock_id", how="left")
         df["rank_industry"] = merged.groupby("industry")["total_score"].rank(method="dense", ascending=False).astype(int)
         self.db.replace_ranking(df)
+        self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with EPS_MATRIX_PATCH", run_id=run_id, module="ranking")
         return len(df)
+
+
 
 
 
@@ -3099,14 +3330,30 @@ class ExternalSourceConfig:
             "parser": "fetch_institutional",
         },
         "margin": {
-            "source_name": "TWSE 融資融券",
-            "official_url": "https://www.twse.com.tw/zh/trading/margin/mi-margn",
-            "request_template": "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date}&selectType=ALL&response=json",
+            "source_name": "TWSE+TPEx 官方融資融券（個股）",
+            "official_url": TWSE_MARGIN_OFFICIAL_PAGE + " | " + TPEX_OPENAPI_PORTAL_URL,
+            "request_template": TWSE_MARGIN_API_TEMPLATE,
             "target_table": "external_margin",
-            "required_columns": ["stock_id", "trade_date"],
-            "fallback_days": 5,
+            "required_columns": ["stock_id", "trade_date", "margin_balance", "short_balance", "margin_change", "short_change", "retail_heat_score"],
+            "fallback_days": 7,
             "mandatory": False,
             "parser": "fetch_margin",
+            "source_priority": "1.TWSE MI_MARGN open_data 上市個股（dataset 11680）→ 2.TPEx 官方/OpenAPI 上櫃個股 → 3.官方HTML/CSV fallback；禁止Mitake/券商SDK",
+            "license_url": TWSE_OPENAPI_LICENSE_URL,
+            "oas_swagger_url": TWSE_OPENAPI_SWAGGER_URL + " | " + TPEX_OPENAPI_SWAGGER_URL,
+        },
+        "macro_margin_sentiment": {
+            "source_name": "TWSE 市場融資融券情緒（整體市場）",
+            "official_url": TWSE_MARGIN_COMPARE_PAGE,
+            "request_template": TWSE_MARGIN_COMPARE_PAGE,
+            "target_table": "macro_margin_sentiment",
+            "required_columns": ["data_date", "macro_margin_score", "macro_margin_state"],
+            "fallback_days": 7,
+            "mandatory": False,
+            "parser": "fetch_macro_margin_sentiment",
+            "source_priority": "TWSE compare/margin 僅作市場情緒層，不寫 external_margin 個股表",
+            "license_url": TWSE_OPENAPI_LICENSE_URL,
+            "oas_swagger_url": TWSE_OPENAPI_SWAGGER_URL,
         },
         "revenue": {
             "source_name": "MOPS 月營收",
@@ -3151,8 +3398,8 @@ class ExternalSourceConfig:
             row = dict(cfg)
             row["module"] = module
             row.setdefault("source_priority", "1.TWSE OpenAPI/官方API → 2.TPEx官方頁面/CSV → 3.MOPS OpenData → 4.Goodinfo fallback only")
-            row.setdefault("license_url", TWSE_OPENAPI_LICENSE_URL if module in ("valuation", "market_snapshot", "institutional", "margin") else "")
-            row.setdefault("oas_swagger_url", TWSE_OPENAPI_SWAGGER_URL if module in ("valuation", "market_snapshot", "institutional", "margin") else "")
+            row.setdefault("license_url", TWSE_OPENAPI_LICENSE_URL if module in ("valuation", "market_snapshot", "institutional", "margin", "macro_margin_sentiment") else "")
+            row.setdefault("oas_swagger_url", (TWSE_OPENAPI_SWAGGER_URL + " | " + TPEX_OPENAPI_SWAGGER_URL) if module == "margin" else (TWSE_OPENAPI_SWAGGER_URL if module in ("valuation", "market_snapshot", "institutional", "macro_margin_sentiment") else ""))
             row.setdefault("goodinfo_policy", "Goodinfo不可作主資料源；僅允許官方來源失敗後fallback，且預設停用。")
             rows.append(row)
         return pd.DataFrame(rows)
@@ -3217,7 +3464,7 @@ class ExternalDataWriter:
         elif table == "external_event" and "event_id" in df.columns:
             cur.executemany("DELETE FROM external_event WHERE event_id=?", [(str(v),) for v in df["event_id"].dropna().astype(str).unique().tolist()])
 
-    def write_result(self, result: ExternalPipelineResult) -> ExternalPipelineResult:
+    def write_result(self, result: ExternalPipelineResult, run_id: str | None = None) -> ExternalPipelineResult:
         if result is None:
             return ExternalPipelineResult("unknown", "fail", error_message="result is None")
         df = result.df.copy() if isinstance(result.df, pd.DataFrame) else pd.DataFrame()
@@ -3229,6 +3476,11 @@ class ExternalDataWriter:
                 if result.target_table == "market_snapshot":
                     self._delete_existing_rows("market_snapshot", df)
                     df.to_sql("market_snapshot", self.db.conn, if_exists="append", index=False)
+                elif result.target_table == "macro_margin_sentiment":
+                    if "data_date" in df.columns:
+                        cur = self.db.conn.cursor()
+                        cur.executemany("DELETE FROM macro_margin_sentiment WHERE data_date=?", df[["data_date"]].astype(str).drop_duplicates().itertuples(index=False, name=None))
+                    df.to_sql("macro_margin_sentiment", self.db.conn, if_exists="append", index=False)
                 elif result.target_table in {
                     "external_institutional", "external_margin", "external_revenue",
                     "external_valuation", "external_event"
@@ -3349,41 +3601,243 @@ class ExternalDataFetcher:
                 continue
         return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=last_error or "TWSE三大法人資料抓取失敗", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
 
-    def fetch_margin(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
-        last_error = ""
-        for date_ymd, date_iso, offset in self._date_candidates(cfg.get("fallback_days", 5)):
-            url = cfg.get("request_template", "").format(date=date_ymd)
+    def _roc_date(self, date_ymd: str) -> str:
+        """YYYYMMDD -> ROC date YYY/MM/DD for TPEx legacy endpoints."""
+        try:
+            d = datetime.strptime(str(date_ymd), "%Y%m%d")
+            return f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
+        except Exception:
+            return str(date_ymd)
+
+    def _request_text(self, url: str, timeout: int = 30, referer: str = "https://www.twse.com.tw/") -> tuple[str, str]:
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
+        resp.raise_for_status()
+        try:
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        except Exception:
+            pass
+        return resp.text, str(resp.status_code)
+
+    def _parse_margin_twse_rows(self, payload, date_iso: str, source_url: str) -> pd.DataFrame:
+        rows = []
+        if isinstance(payload, str):
             try:
-                payload, http_status = self._request_json(url)
-                fields, data = self._normalize_twse_dataset(payload)
-                rows = []
-                for rec in data:
-                    vals = list(rec) if isinstance(rec, (list, tuple)) else []
-                    if len(vals) < 8:
-                        continue
-                    sid = normalize_stock_id(vals[0])
+                raw = pd.read_csv(io.StringIO(payload), dtype=str).fillna("")
+            except Exception:
+                raw = pd.DataFrame()
+            if raw is not None and not raw.empty:
+                for _, r in raw.iterrows():
+                    sid = normalize_stock_id(r.get("股票代號", ""))
                     if not sid:
                         continue
-                    margin_balance = self._num(vals[6] if len(vals) > 6 else 0)
-                    short_balance = self._num(vals[12] if len(vals) > 12 else 0)
-                    margin_change = self._num(vals[5] if len(vals) > 5 else 0)
-                    short_change = self._num(vals[11] if len(vals) > 11 else 0)
-                    retail_heat = max(0, min(100, 50 + margin_change / 500.0 - short_change / 500.0))
+                    prev_margin = self._num(r.get("融資前日餘額", 0))
+                    margin_balance = self._num(r.get("融資今日餘額", 0))
+                    prev_short = self._num(r.get("融券前日餘額", 0))
+                    short_balance = self._num(r.get("融券今日餘額", 0))
+                    margin_change = margin_balance - prev_margin
+                    short_change = short_balance - prev_short
+                    margin_utilization = (short_balance / margin_balance * 100.0) if margin_balance > 0 else 0.0
+                    retail_heat = max(0, min(100, 50 + margin_change / 500.0 - short_change / 500.0 + min(margin_utilization, 100) * 0.05))
                     rows.append({
                         "stock_id": sid, "trade_date": date_iso,
                         "margin_balance": margin_balance, "short_balance": short_balance,
                         "margin_change": margin_change, "short_change": short_change,
-                        "margin_utilization": 0.0, "retail_heat_score": round(retail_heat, 2),
+                        "margin_utilization": round(margin_utilization, 2), "retail_heat_score": round(retail_heat, 2),
+                        "source_date": date_iso, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                return pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "trade_date"], keep="last") if rows else pd.DataFrame()
+        fields, data = self._normalize_twse_dataset(payload)
+        # TWSE MI_MARGN 常見資料列：代號、名稱、融資買進/賣出/現償/前餘額/今日餘額、融券買進/賣出/現償/前餘額/今日餘額等。
+        for rec in data:
+            vals = list(rec.values()) if isinstance(rec, dict) else (list(rec) if isinstance(rec, (list, tuple)) else [])
+            if len(vals) < 8:
+                continue
+            sid = normalize_stock_id(vals[0])
+            if not sid:
+                continue
+            # 儘量以 TWSE 固定欄位順序取值，若欄位改版，下面的資料品質 log 會顯示 rows=0。
+            prev_margin = self._num(vals[5] if len(vals) > 5 else 0)
+            margin_balance = self._num(vals[6] if len(vals) > 6 else 0)
+            prev_short = self._num(vals[11] if len(vals) > 11 else 0)
+            short_balance = self._num(vals[12] if len(vals) > 12 else 0)
+            margin_change = margin_balance - prev_margin if prev_margin or margin_balance else self._num(vals[5] if len(vals) > 5 else 0)
+            short_change = short_balance - prev_short if prev_short or short_balance else self._num(vals[11] if len(vals) > 11 else 0)
+            margin_utilization = (short_balance / margin_balance * 100.0) if margin_balance > 0 else 0.0
+            retail_heat = max(0, min(100, 50 + margin_change / 500.0 - short_change / 500.0 + min(margin_utilization, 100) * 0.05))
+            rows.append({
+                "stock_id": sid, "trade_date": date_iso,
+                "margin_balance": margin_balance, "short_balance": short_balance,
+                "margin_change": margin_change, "short_change": short_change,
+                "margin_utilization": round(margin_utilization, 2), "retail_heat_score": round(retail_heat, 2),
+                "source_date": date_iso, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        return pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "trade_date"], keep="last") if rows else pd.DataFrame()
+
+    def _fetch_twse_margin_one_day(self, date_ymd: str, date_iso: str) -> tuple[pd.DataFrame, str, str]:
+        urls = [
+            TWSE_MARGIN_OPEN_DATA_ENDPOINT,
+            f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_ymd}&selectType=ALL",
+            f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date_ymd}&selectType=ALL&response=json",
+        ]
+        last_error = ""
+        for url in urls:
+            try:
+                if "response=open_data" in url:
+                    text, http_status = self._request_text(url, referer="https://www.twse.com.tw/")
+                    df = self._parse_margin_twse_rows(text, date_iso, url)
+                else:
+                    payload, http_status = self._request_json(url)
+                    df = self._parse_margin_twse_rows(payload, date_iso, url)
+                if not df.empty:
+                    log_info(f"[MARGIN][TWSE] success rows={len(df)} date={date_iso} url={url}")
+                    return df, url, http_status
+                last_error = f"TWSE MI_MARGN rows=0 url={url}"
+            except Exception as exc:
+                last_error = f"{url} | {exc}"
+        raise RuntimeError(last_error or "TWSE MI_MARGN 無可解析資料")
+
+    def _fetch_tpex_margin_candidates(self, date_ymd: str, date_iso: str) -> tuple[pd.DataFrame, str, str]:
+        roc = self._roc_date(date_ymd)
+        urls = [
+            # TPEx OpenAPI 名稱可能隨官方版本調整；保留多候選並全部寫 log，避免 silent fail。
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_trading",
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_purchase_short_sale",
+            f"https://www.tpex.org.tw/www/zh-tw/margin/balance?response=json&date={date_ymd}",
+            f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={roc}",
+        ]
+        last_error = ""
+        for url in urls:
+            try:
+                payload, http_status = self._request_json(url)
+                data = payload.get("data") if isinstance(payload, dict) else payload
+                rows = []
+                for rec in data if isinstance(data, list) else []:
+                    if isinstance(rec, dict):
+                        keys = {str(k): v for k, v in rec.items()}
+                        sid = normalize_stock_id(keys.get("代號") or keys.get("股票代號") or keys.get("證券代號") or keys.get("SecuritiesCompanyCode") or keys.get("Code") or keys.get("stock_id"))
+                        if not sid:
+                            continue
+                        margin_balance = self._num(keys.get("融資餘額") or keys.get("融資今日餘額") or keys.get("MarginBalance") or keys.get("MarginPurchaseBalance") or 0)
+                        short_balance = self._num(keys.get("融券餘額") or keys.get("融券今日餘額") or keys.get("ShortBalance") or keys.get("ShortSaleBalance") or 0)
+                        margin_change = self._num(keys.get("融資增減") or keys.get("MarginChange") or 0)
+                        short_change = self._num(keys.get("融券增減") or keys.get("ShortChange") or 0)
+                    else:
+                        vals = list(rec) if isinstance(rec, (list, tuple)) else []
+                        if len(vals) < 6:
+                            continue
+                        sid = normalize_stock_id(vals[0])
+                        if not sid:
+                            continue
+                        margin_balance = self._num(vals[5] if len(vals) > 5 else 0)
+                        short_balance = self._num(vals[11] if len(vals) > 11 else 0)
+                        margin_change = self._num(vals[4] if len(vals) > 4 else 0)
+                        short_change = self._num(vals[10] if len(vals) > 10 else 0)
+                    util = (short_balance / margin_balance * 100.0) if margin_balance > 0 else 0.0
+                    heat = max(0, min(100, 50 + margin_change / 500.0 - short_change / 500.0 + min(util, 100) * 0.05))
+                    rows.append({
+                        "stock_id": sid, "trade_date": date_iso,
+                        "margin_balance": margin_balance, "short_balance": short_balance,
+                        "margin_change": margin_change, "short_change": short_change,
+                        "margin_utilization": round(util, 2), "retail_heat_score": round(heat, 2),
                         "source_date": date_iso, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     })
                 df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "trade_date"], keep="last") if rows else pd.DataFrame()
                 if not df.empty:
-                    return ExternalPipelineResult(module, "success" if offset == 0 else "fallback", df=df, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=url, source_date=date_iso, http_status=http_status, fallback_count=offset, target_table=cfg.get("target_table",""), data_ready=1, source_level="official")
-                last_error = "TWSE融資融券回傳無可解析資料"
+                    log_info(f"[MARGIN][TPEx] success rows={len(df)} date={date_iso} url={url}")
+                    return df, url, http_status
+                last_error = f"TPEx margin rows=0 url={url}"
+            except Exception as exc:
+                last_error = f"{url} | {exc}"
+                continue
+        raise RuntimeError(last_error or "TPEx margin 無可解析資料")
+
+    def _build_macro_margin_from_external_margin(self, df: pd.DataFrame, date_iso: str, source_url: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        total_margin = float(pd.to_numeric(df.get("margin_balance", 0), errors="coerce").fillna(0).sum())
+        total_short = float(pd.to_numeric(df.get("short_balance", 0), errors="coerce").fillna(0).sum())
+        total_margin_chg = float(pd.to_numeric(df.get("margin_change", 0), errors="coerce").fillna(0).sum())
+        total_short_chg = float(pd.to_numeric(df.get("short_change", 0), errors="coerce").fillna(0).sum())
+        util = (total_short / total_margin * 100.0) if total_margin > 0 else 0.0
+        score = 50.0
+        reason = []
+        if total_margin_chg > 0:
+            score -= min(20, abs(total_margin_chg) / max(total_margin, 1) * 1000)
+            reason.append("融資總額增加：散戶熱度升溫")
+        elif total_margin_chg < 0:
+            score += min(15, abs(total_margin_chg) / max(total_margin, 1) * 1000)
+            reason.append("融資總額下降：籌碼冷卻")
+        if total_short_chg > 0:
+            score += min(10, abs(total_short_chg) / max(total_short, 1) * 500)
+            reason.append("融券增加：軋空潛力上升")
+        if util > 30:
+            score -= 10
+            reason.append("券資比偏高：風險升高")
+        score = round(max(0, min(100, score)), 2)
+        state = "過熱" if score < 40 else "冷卻偏多" if score >= 60 else "中性"
+        return pd.DataFrame([{
+            "data_date": date_iso,
+            "total_margin_balance": total_margin,
+            "total_short_balance": total_short,
+            "total_margin_change": total_margin_chg,
+            "total_short_change": total_short_chg,
+            "market_margin_utilization": round(util, 2),
+            "macro_margin_score": score,
+            "macro_margin_state": state,
+            "sentiment_reason": "；".join(reason) if reason else "市場融資融券中性",
+            "source_name": "TWSE/TPEx external_margin aggregate",
+            "source_url": source_url,
+            "source_date": date_iso,
+            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }])
+
+    def fetch_margin(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        last_error = ""
+        for date_ymd, date_iso, offset in self._date_candidates(cfg.get("fallback_days", 7)):
+            parts = []
+            urls = []
+            http_statuses = []
+            try:
+                try:
+                    twse_df, twse_url, twse_status = self._fetch_twse_margin_one_day(date_ymd, date_iso)
+                    if not twse_df.empty:
+                        parts.append(twse_df)
+                        urls.append(twse_url)
+                        http_statuses.append(f"TWSE:{twse_status}")
+                except Exception as exc:
+                    last_error = f"TWSE margin fail: {exc}"
+                    log_warning(f"[MARGIN][TWSE] {last_error}")
+                try:
+                    tpex_df, tpex_url, tpex_status = self._fetch_tpex_margin_candidates(date_ymd, date_iso)
+                    if not tpex_df.empty:
+                        parts.append(tpex_df)
+                        urls.append(tpex_url)
+                        http_statuses.append(f"TPEx:{tpex_status}")
+                except Exception as exc:
+                    last_error = (last_error + " | " if last_error else "") + f"TPEx margin fail: {exc}"
+                    log_warning(f"[MARGIN][TPEx] {exc}")
+                df = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id", "trade_date"], keep="last") if parts else pd.DataFrame()
+                if not df.empty:
+                    macro_df = self._build_macro_margin_from_external_margin(df, date_iso, " | ".join(urls))
+                    if not macro_df.empty:
+                        macro_result = ExternalPipelineResult("macro_margin_sentiment", "success" if offset == 0 else "fallback", df=macro_df, source_name="TWSE/TPEx 市場融資情緒", official_url=TWSE_MARGIN_COMPARE_PAGE, request_url=" | ".join(urls), source_date=date_iso, http_status=";".join(http_statuses), fallback_count=offset, target_table="macro_margin_sentiment", data_ready=1, source_level="official")
+                        self.writer.write_result(macro_result, run_id)
+                    log_info(f"[MARGIN] merged rows={len(df)} date={date_iso} macro_rows={len(macro_df)}")
+                    return ExternalPipelineResult(module, "success" if offset == 0 else "fallback", df=df, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=" | ".join(urls), source_date=date_iso, http_status=";".join(http_statuses), fallback_count=offset, target_table=cfg.get("target_table",""), data_ready=1, source_level="official")
             except Exception as exc:
                 last_error = str(exc)
                 continue
-        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=last_error or "TWSE融資融券資料抓取失敗", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=last_error or "TWSE/TPEx融資融券資料抓取失敗", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+
+    def fetch_macro_margin_sentiment(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        # 優先由 external_margin 已成功寫入的個股資料彙總，確保市場層與個股層口徑一致。
+        df = self.db.read_table("external_margin", limit=None)
+        if df is not None and not df.empty:
+            date_iso = str(df.get("trade_date", pd.Series([datetime.now().strftime("%Y-%m-%d")])).dropna().astype(str).max())
+            macro = self._build_macro_margin_from_external_margin(df[df["trade_date"].astype(str) == date_iso].copy(), date_iso, "internal:external_margin aggregate")
+            if not macro.empty:
+                return ExternalPipelineResult(module, "success", df=macro, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url="internal:external_margin aggregate", source_date=date_iso, http_status="internal", fallback_count=0, target_table=cfg.get("target_table",""), data_ready=1, source_level="official_aggregate")
+        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message="external_margin尚無資料，無法彙總市場融資情緒；請先同步margin", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
 
     def _read_remote_csv(self, url: str) -> tuple[pd.DataFrame, str]:
         resp = requests.get(url, timeout=45, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mopsfin.twse.com.tw/"})
@@ -3890,6 +4344,43 @@ class ExternalDataFetcher:
         for module, cfg in ExternalSourceConfig.SOURCES.items():
             results.append(self._execute_module(module, cfg, run_id))
         ready_map = {r.module: int(r.data_ready) for r in results}
+        try:
+            ff = FinancialFeatureEngine(self.db).build_feature_batch(run_id=run_id, write_db=True)
+            self.db.log_external_data(
+                module="financial_feature_daily",
+                source_name="EPS Matrix Feature Engine",
+                official_url="external_valuation + external_revenue",
+                request_url="internal:financial_feature_daily",
+                source_date=datetime.now().strftime("%Y-%m-%d"),
+                status="success" if ff is not None and not ff.empty else "fail",
+                http_status="internal",
+                rows_count=0 if ff is None else len(ff),
+                run_id=run_id,
+                step="feature",
+                target_table="financial_feature_daily",
+                data_ready=1 if ff is not None and not ff.empty else 0,
+                blocking_reason="" if ff is not None and not ff.empty else "financial_feature_daily rows=0",
+                source_level="derived_feature",
+            )
+        except Exception as exc:
+            log_warning(f"[EPS MATRIX][BUILD][ERROR] {exc}")
+            self.db.log_external_data(
+                module="financial_feature_daily",
+                source_name="EPS Matrix Feature Engine",
+                official_url="external_valuation + external_revenue",
+                request_url="internal:financial_feature_daily",
+                source_date=datetime.now().strftime("%Y-%m-%d"),
+                status="fail",
+                http_status="internal",
+                rows_count=0,
+                error_message=str(exc),
+                run_id=run_id,
+                step="feature",
+                target_table="financial_feature_daily",
+                data_ready=0,
+                blocking_reason=str(exc),
+                source_level="derived_feature",
+            )
         blocking = [f"{r.module}:{r.error_message or r.status}" for r in results if int(r.data_ready) == 0 and ExternalSourceConfig.SOURCES.get(r.module, {}).get("mandatory", False)]
         status = "ok" if not blocking else "blocked"
         self.db.log_system_run(event="external_refresh", status=status, message="; ".join(blocking) if blocking else "external pipeline completed", run_id=run_id, step="finish")
@@ -4031,7 +4522,24 @@ def attach_external_display_columns(x: pd.DataFrame) -> pd.DataFrame:
         "PB": "pb",
         "殖利率%": "dividend_yield",
         "EPS_TTM": "eps_ttm",
+        "EPS YoY": "eps_yoy",
+        "營收YoY": "revenue_yoy",
+        "EPS分類": "eps_category",
+        "Matrix": "matrix_cell",
+        "財務分數": "revenue_eps_score",
+        "資料狀態": "data_quality_flag",
         "估值分": "valuation_score",
+        "融資餘額": "margin_balance",
+        "融資增減": "margin_change",
+        "融券餘額": "short_balance",
+        "融券增減": "short_change",
+        "券資比%": "margin_utilization",
+        "散戶熱度": "retail_heat_score",
+        "融資分": "margin_score",
+        "融資狀態": "margin_state",
+        "市場融資分": "macro_margin_score",
+        "市場融資狀態": "macro_margin_state",
+        "融資決策說明": "margin_decision_note",
     }
     for zh, src in mapping.items():
         if zh not in out.columns:
@@ -4080,15 +4588,354 @@ class CapitalFlowEngine:
         }
 
 
+class MarginDecisionEngine:
+    """V9.5.6：個股融資 + 市場融資情緒。資料未覆蓋時為 NE，不阻擋；有資料時作為籌碼風險/加分。"""
+    def __init__(self, db: DBManager):
+        self.db = db
+        self.readiness = ExternalDataReadiness(db)
+
+    @staticmethod
+    def score_margin_row(row: pd.Series) -> tuple[float, str, str]:
+        margin_change = float(pd.to_numeric(pd.Series([row.get("margin_change", 0)]), errors="coerce").fillna(0).iloc[0])
+        short_change = float(pd.to_numeric(pd.Series([row.get("short_change", 0)]), errors="coerce").fillna(0).iloc[0])
+        util = float(pd.to_numeric(pd.Series([row.get("margin_utilization", 0)]), errors="coerce").fillna(0).iloc[0])
+        score = 50.0
+        reasons = []
+        if margin_change > 0:
+            score -= min(25, margin_change / 500.0)
+            reasons.append("融資增加：散戶追價風險")
+        elif margin_change < 0:
+            score += min(20, abs(margin_change) / 500.0)
+            reasons.append("融資下降：籌碼冷卻")
+        if short_change > 0:
+            score += min(12, short_change / 500.0)
+            reasons.append("融券增加：軋空潛力")
+        elif short_change < 0:
+            score -= min(8, abs(short_change) / 500.0)
+            reasons.append("融券下降：空方回補")
+        if util > 30:
+            score -= 10
+            reasons.append("券資比偏高")
+        score = float(max(0, min(100, score)))
+        state = "冷卻偏多" if score >= 60 else "散戶過熱" if score < 40 else "中性"
+        return round(score, 2), state, "；".join(reasons) if reasons else "融資融券中性"
+
+    def evaluate(self, stock_id: str) -> dict:
+        st = self.readiness.get_status("margin")
+        df = self.db.read_table("external_margin", limit=None)
+        macro_df = self.db.read_table("macro_margin_sentiment", limit=None)
+        macro_score = 50.0
+        macro_state = "NE"
+        macro_reason = "市場融資情緒NE"
+        if macro_df is not None and not macro_df.empty:
+            m = macro_df.tail(1).iloc[-1]
+            macro_score = float(pd.to_numeric(pd.Series([m.get("macro_margin_score", 50)]), errors="coerce").fillna(50).iloc[0])
+            macro_state = str(m.get("macro_margin_state", "中性") or "中性")
+            macro_reason = str(m.get("sentiment_reason", "") or "")
+        if int(st.get("ready", 0)) != 1 or df is None or df.empty or "stock_id" not in df.columns:
+            return {"pass": 1, "score": 50.0, "reason": f"融資資料NE：{st.get('reason','尚無個股融資資料')}｜{macro_state}:{macro_score}", "data_ready": 0, "not_evaluated": 1, "coverage_state": "NE_NO_MARGIN", "margin_score": 50.0, "margin_state": "NE", "macro_margin_score": macro_score, "macro_margin_state": macro_state, "margin_decision_note": macro_reason}
+        x = df[df["stock_id"].astype(str) == str(stock_id)].tail(1)
+        if x.empty:
+            return {"pass": 1, "score": 50.0, "reason": f"該股無融資覆蓋資料，Margin=NE｜{macro_state}:{macro_score}", "data_ready": 0, "not_evaluated": 1, "coverage_state": "NE_NO_MARGIN_COVERAGE", "margin_score": 50.0, "margin_state": "NE", "macro_margin_score": macro_score, "macro_margin_state": macro_state, "margin_decision_note": macro_reason}
+        row = x.iloc[-1]
+        score, state, reason = self.score_margin_row(row)
+        # 市場情緒做小幅修正：過熱扣分、冷卻加分，不直接阻擋。
+        adjusted = score + (macro_score - 50.0) * 0.15
+        adjusted = round(max(0, min(100, adjusted)), 2)
+        return {
+            "pass": int(adjusted >= 35),
+            "score": adjusted,
+            "reason": f"個股融資={state} score={score}｜市場={macro_state} {macro_score}｜{reason}｜{macro_reason}",
+            "data_ready": 1,
+            "not_evaluated": 0,
+            "coverage_state": "COVERED",
+            "margin_balance": row.get("margin_balance", np.nan),
+            "short_balance": row.get("short_balance", np.nan),
+            "margin_change": row.get("margin_change", np.nan),
+            "short_change": row.get("short_change", np.nan),
+            "margin_utilization": row.get("margin_utilization", np.nan),
+            "retail_heat_score": row.get("retail_heat_score", np.nan),
+            "margin_score": adjusted,
+            "margin_state": state,
+            "macro_margin_score": macro_score,
+            "macro_margin_state": macro_state,
+            "margin_decision_note": reason + ("｜" + macro_reason if macro_reason else ""),
+        }
+
+
+
+class FinancialFeatureEngine:
+    """V9.5.7 EPS_MATRIX_PATCH：把 external_valuation / external_revenue 轉成可進 Ranking / Decision / UI / Excel 的 EPS 矩陣特徵。"""
+    MATRIX_SCORE = {
+        ("E3", "R3"): 100, ("E3", "R2"): 88, ("E3", "R1"): 48, ("E3", "R0"): 25,
+        ("E2", "R3"): 92,  ("E2", "R2"): 75, ("E2", "R1"): 45, ("E2", "R0"): 22,
+        ("E1", "R3"): 82,  ("E1", "R2"): 62, ("E1", "R1"): 35, ("E1", "R0"): 15,
+        ("E0", "R3"): 70,  ("E0", "R2"): 45, ("E0", "R1"): 20, ("E0", "R0"): 5,
+        ("E_NA", "R3"): 55, ("E_NA", "R2"): 45, ("E_NA", "R1"): 30, ("E_NA", "R0"): 15,
+        ("E3", "R_NA"): 60, ("E2", "R_NA"): 50, ("E1", "R_NA"): 40, ("E0", "R_NA"): 25,
+        ("E_NA", "R_NA"): 40,
+    }
+
+    def __init__(self, db: DBManager):
+        self.db = db
+
+    @staticmethod
+    def _num(v, default=np.nan):
+        try:
+            if v is None:
+                return default
+            s = str(v).replace(",", "").replace("%", "").strip()
+            if s in ("", "-", "--", "nan", "None", "NULL", "null"):
+                return default
+            out = float(s)
+            if not np.isfinite(out):
+                return default
+            return out
+        except Exception:
+            return default
+
+    @staticmethod
+    def _clamp(v, lo=0.0, hi=100.0):
+        try:
+            return max(lo, min(hi, float(v)))
+        except Exception:
+            return lo
+
+    def _latest_by_stock(self, table: str, date_col: str) -> pd.DataFrame:
+        df = self.db.read_table(table, limit=None)
+        if df is None or df.empty or "stock_id" not in df.columns:
+            return pd.DataFrame()
+        if date_col in df.columns:
+            df = df.sort_values(["stock_id", date_col])
+        return df.drop_duplicates(subset=["stock_id"], keep="last").copy()
+
+    def build_eps_ttm(self, row: pd.Series) -> tuple[float, str]:
+        eps_ttm = self._num(row.get("eps_ttm"), np.nan)
+        if np.isfinite(eps_ttm):
+            return eps_ttm, "OK"
+        eps = self._num(row.get("eps"), np.nan)
+        if np.isfinite(eps):
+            return eps, "EPS_RAW"
+        price = self._num(row.get("close_price"), np.nan)
+        pe = self._num(row.get("pe"), np.nan)
+        calc = calculate_eps_ttm(price, pe)
+        if calc is not None:
+            return float(calc), "PE_PROXY"
+        return np.nan, "EPS_NE"
+
+    @staticmethod
+    def classify_eps_bucket(eps_ttm) -> str:
+        try:
+            eps = float(eps_ttm)
+            if not np.isfinite(eps):
+                return "E_NA"
+        except Exception:
+            return "E_NA"
+        if eps < 0:
+            return "E0"
+        if eps < 2:
+            return "E1"
+        if eps < 8:
+            return "E2"
+        return "E3"
+
+    @staticmethod
+    def classify_revenue_bucket(revenue_yoy) -> str:
+        try:
+            rev = float(revenue_yoy)
+            if not np.isfinite(rev):
+                return "R_NA"
+        except Exception:
+            return "R_NA"
+        if rev < -10:
+            return "R0"
+        if rev < 0:
+            return "R1"
+        if rev < 15:
+            return "R2"
+        return "R3"
+
+    @staticmethod
+    def classify_eps_category(eps_bucket: str, rev_bucket: str, eps_yoy=np.nan) -> str:
+        try:
+            ey = float(eps_yoy)
+        except Exception:
+            ey = np.nan
+        if eps_bucket == "E3" and rev_bucket == "R3" and (not np.isfinite(ey) or ey >= 10):
+            return "U1"  # 高 EPS + 高成長
+        if eps_bucket == "E2" and rev_bucket == "R3" and (not np.isfinite(ey) or ey >= 0):
+            return "U1"
+        if eps_bucket == "E3" and rev_bucket == "R2":
+            return "U2"  # 成熟穩健
+        if eps_bucket in ("E0", "E1") and rev_bucket == "R3":
+            return "U3"  # 轉機/低基期
+        if eps_bucket == "E3" and rev_bucket in ("R0", "R1"):
+            return "U4"  # 高EPS但業務衰退
+        if eps_bucket == "E_NA" or rev_bucket == "R_NA":
+            return "U0"
+        return "U0"
+
+    def calc_modifier(self, eps_yoy, roe, gross_margin, pe) -> float:
+        mod = 0.0
+        ey = self._num(eps_yoy, np.nan)
+        if np.isfinite(ey):
+            mod += 12 if ey >= 50 else 8 if ey >= 30 else 4 if ey >= 10 else 0 if ey >= 0 else -8 if ey >= -20 else -15
+        roe_v = self._num(roe, np.nan)
+        if np.isfinite(roe_v):
+            mod += 6 if roe_v >= 20 else 3 if roe_v >= 10 else -8 if roe_v < 0 else 0
+        gm = self._num(gross_margin, np.nan)
+        if np.isfinite(gm):
+            mod += 4 if gm >= 35 else -5 if gm < 10 else 0
+        pe_v = self._num(pe, np.nan)
+        if np.isfinite(pe_v) and pe_v > 0:
+            mod += -8 if pe_v > 60 else 2 if pe_v < 15 else 0
+        return round(mod, 2)
+
+    def calc_data_quality_flag(self, eps_flag: str, revenue_yoy, eps_yoy, source_trace: dict) -> str:
+        flags = []
+        if eps_flag and eps_flag != "OK":
+            flags.append(eps_flag)
+        if not np.isfinite(self._num(revenue_yoy, np.nan)):
+            flags.append("REV_NE")
+        if not np.isfinite(self._num(eps_yoy, np.nan)):
+            flags.append("EPS_YOY_NE")
+        if not source_trace:
+            flags.append("SOURCE_NE")
+        return "OK" if not flags else "|".join(flags)
+
+    def calc_revenue_eps_score(self, matrix_score, eps_ttm, revenue_yoy, modifier) -> float:
+        # 避免只用一張矩陣，保留 EPS 與營收連續分數。
+        eps = self._num(eps_ttm, np.nan)
+        rev = self._num(revenue_yoy, np.nan)
+        eps_score = 40.0
+        if np.isfinite(eps):
+            eps_score = 20 if eps < 0 else 45 if eps < 2 else 70 if eps < 8 else 88
+        rev_score = 40.0
+        if np.isfinite(rev):
+            rev_score = 20 if rev < -10 else 40 if rev < 0 else 65 if rev < 15 else 90
+        score = 0.5 * float(matrix_score) + 0.3 * eps_score + 0.2 * rev_score + float(modifier)
+        return round(self._clamp(score), 2)
+
+    def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 10) -> pd.DataFrame:
+        run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        feature_date = datetime.now().strftime("%Y-%m-%d")
+        master = self.db.get_master()
+        valuation = self._latest_by_stock("external_valuation", "data_date")
+        revenue = self._latest_by_stock("external_revenue", "revenue_month")
+        if master is None or master.empty:
+            return pd.DataFrame()
+        base = master[["stock_id"]].copy()
+        if valuation is not None and not valuation.empty:
+            keep_val = [c for c in ["stock_id", "data_date", "close_price", "pe", "pb", "dividend_yield", "eps", "eps_ttm", "roe", "gross_margin", "operating_margin", "fiscal_year_quarter", "source_date", "source_url"] if c in valuation.columns]
+            base = base.merge(valuation[keep_val], on="stock_id", how="left")
+        if revenue is not None and not revenue.empty:
+            keep_rev = [c for c in ["stock_id", "revenue_month", "yoy", "cumulative_yoy", "source_date"] if c in revenue.columns]
+            base = base.merge(revenue[keep_rev], on="stock_id", how="left", suffixes=("", "_revenue"))
+        rows = []
+        for _, r in base.iterrows():
+            sid = str(r.get("stock_id", "")).strip()
+            eps_ttm, eps_flag = self.build_eps_ttm(r)
+            revenue_yoy = self._num(r.get("yoy", r.get("cumulative_yoy", np.nan)), np.nan)
+            eps_yoy = self._num(r.get("eps_yoy", np.nan), np.nan)
+            eps_b = self.classify_eps_bucket(eps_ttm)
+            rev_b = self.classify_revenue_bucket(revenue_yoy)
+            matrix_cell = f"{eps_b}-{rev_b}"
+            matrix_base = float(self.MATRIX_SCORE.get((eps_b, rev_b), 40.0))
+            eps_cat = self.classify_eps_category(eps_b, rev_b, eps_yoy)
+            modifier = self.calc_modifier(eps_yoy, r.get("roe", np.nan), r.get("gross_margin", np.nan), r.get("pe", np.nan))
+            score = self.calc_revenue_eps_score(matrix_base, eps_ttm, revenue_yoy, modifier)
+            source_trace = {
+                "valuation_date": str(r.get("data_date", "") or ""),
+                "valuation_source": str(r.get("source_url", "") or ""),
+                "revenue_month": str(r.get("revenue_month", "") or ""),
+                "eps_source_flag": eps_flag,
+            }
+            dq = self.calc_data_quality_flag(eps_flag, revenue_yoy, eps_yoy, source_trace)
+            rows.append({
+                "stock_id": sid, "feature_date": feature_date, "eps_ttm": eps_ttm, "eps_yoy": eps_yoy,
+                "revenue_yoy": revenue_yoy, "eps_bucket": eps_b, "rev_bucket": rev_b,
+                "matrix_cell": matrix_cell, "eps_category": eps_cat, "matrix_base_score": matrix_base,
+                "modifier": modifier, "revenue_eps_score": score, "data_quality_flag": dq,
+                "source_trace_json": json.dumps(source_trace, ensure_ascii=False),
+                "source_date": str(r.get("source_date_revenue", r.get("source_date", "")) or ""),
+                "run_id": run_id, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        out = pd.DataFrame(rows)
+        if write_db and out is not None and not out.empty:
+            self.db.replace_financial_feature_batch(out, run_id=run_id)
+            sample = out.head(log_limit)
+            for _, rr in sample.iterrows():
+                log_info(f"[EPS MATRIX][BUILD] run_id={run_id} stock={rr.get('stock_id')} eps_ttm={rr.get('eps_ttm')} rev_yoy={rr.get('revenue_yoy')} cell={rr.get('matrix_cell')} cat={rr.get('eps_category')} score={rr.get('revenue_eps_score')} flag={rr.get('data_quality_flag')}")
+            log_info(f"[EPS MATRIX][BUILD] run_id={run_id} rows={len(out)}")
+        return out
+
+    def get_latest_feature(self, stock_id: str) -> dict:
+        return self.db.get_latest_financial_feature_row(stock_id)
+
 class FundamentalEngine:
     def __init__(self, db: DBManager):
         self.db = db
         self.readiness = ExternalDataReadiness(db)
 
     def evaluate(self, stock_id: str) -> dict:
+        feature = FinancialFeatureEngine(self.db).get_latest_feature(stock_id)
+        if feature:
+            score = float(pd.to_numeric(pd.Series([feature.get("revenue_eps_score", 50)]), errors="coerce").fillna(50).iloc[0])
+            eps_category = str(feature.get("eps_category", "U0") or "U0")
+            matrix_cell = str(feature.get("matrix_cell", "") or "")
+            flag = str(feature.get("data_quality_flag", "") or "")
+            # U4 是高EPS但業務/成長衰退：不直接亂砍所有技術股，但 Fundamental Gate 要明確 BLOCK，Decision reason 可追溯。
+            if eps_category == "U4":
+                passed = 0
+                reason = f"EPS矩陣 U4 高EPS衰退風險｜{matrix_cell}｜score={score:.1f}｜flag={flag}"
+            elif eps_category == "U3":
+                passed = 1
+                reason = f"EPS矩陣 U3 轉機觀察｜{matrix_cell}｜score={score:.1f}｜flag={flag}"
+            elif eps_category in ("U1", "U2"):
+                passed = int(score >= 45)
+                reason = f"EPS矩陣 {eps_category}｜{matrix_cell}｜score={score:.1f}｜flag={flag}"
+            else:
+                passed = int(score >= 35)
+                reason = f"EPS矩陣 {eps_category}｜{matrix_cell}｜score={score:.1f}｜flag={flag}"
+            return {
+                "pass": passed,
+                "score": round(score, 2),
+                "reason": reason,
+                "data_ready": 1,
+                "not_evaluated": 0,
+                "coverage_state": "COVERED_EPS_MATRIX",
+                "eps_ttm": feature.get("eps_ttm", np.nan),
+                "eps_yoy": feature.get("eps_yoy", np.nan),
+                "revenue_yoy": feature.get("revenue_yoy", np.nan),
+                "eps_bucket": feature.get("eps_bucket", ""),
+                "rev_bucket": feature.get("rev_bucket", ""),
+                "matrix_cell": matrix_cell,
+                "eps_category": eps_category,
+                "matrix_base_score": feature.get("matrix_base_score", np.nan),
+                "modifier": feature.get("modifier", np.nan),
+                "revenue_eps_score": score,
+                "data_quality_flag": flag,
+                "financial_score": score,
+                "eps_matrix_decision_note": reason,
+                "source_trace_json": feature.get("source_trace_json", ""),
+                "pe": np.nan, "pb": np.nan, "dividend_yield": np.nan, "valuation_score": round(score, 2),
+            }
+
+        # 若尚未建立 feature，維持原本 NE 原則：資料未覆蓋不硬擋，但明確標示。
         rev_st = self.readiness.get_status("revenue")
         if int(rev_st.get("ready", 0)) != 1:
-            return {"pass": 0, "score": 0.0, "reason": f"營收資料未就緒，阻擋Gate：{rev_st.get('reason')}", "data_ready": 0}
+            return {
+                "pass": 1,
+                "score": 50.0,
+                "reason": f"EPS矩陣尚未建立，營收資料未就緒，Fundamental Gate=NE：{rev_st.get('reason')}",
+                "data_ready": 0,
+                "not_evaluated": 1,
+                "coverage_state": "NE_NO_EPS_MATRIX",
+                "eps_category": "U0", "matrix_cell": "E_NA-R_NA", "revenue_eps_score": 50.0,
+                "data_quality_flag": "EPS_MATRIX_NE",
+            }
+
+        # fallback：沿用 valuation/revenue 的簡化評分，並標示為 legacy fundamental。
         rev = self.db.read_table("external_revenue", limit=None)
         val = self.db.read_table("external_valuation", limit=None)
         score = 50.0
@@ -4099,6 +4946,8 @@ class FundamentalEngine:
                 yoy = float(pd.to_numeric(r.get("yoy", 0), errors="coerce").fillna(0).iloc[-1])
                 score += 15 if yoy > 20 else 8 if yoy > 0 else -10
                 reasons.append(f"營收YoY {yoy:.1f}%")
+        pe = pb = dividend_yield = eps_ttm = np.nan
+        valuation_score = 0.0
         if not val.empty and "stock_id" in val.columns:
             v = val[val["stock_id"].astype(str) == str(stock_id)].tail(1)
             if not v.empty:
@@ -4106,30 +4955,16 @@ class FundamentalEngine:
                 pb = float(pd.to_numeric(v.get("pb", np.nan), errors="coerce").iloc[-1]) if "pb" in v.columns else np.nan
                 dividend_yield = float(pd.to_numeric(v.get("dividend_yield", np.nan), errors="coerce").iloc[-1]) if "dividend_yield" in v.columns else np.nan
                 eps_ttm = float(pd.to_numeric(v.get("eps_ttm", v.get("eps", np.nan)), errors="coerce").iloc[-1]) if ("eps_ttm" in v.columns or "eps" in v.columns) else np.nan
-                valuation_score = 0.0
-                valuation_notes = []
                 if pd.notna(pe) and pe > 0:
                     pe_score = 8 if pe < 10 else 5 if pe < 20 else 0 if pe < 35 else -5
                     valuation_score += pe_score
                     score += pe_score
-                    valuation_notes.append(f"PE {pe:.2f}")
-                if pd.notna(pb) and pb > 0:
-                    pb_score = 3 if pb < 1.5 else 1 if pb < 3 else 0 if pb < 5 else -3
-                    valuation_score += pb_score
-                    score += pb_score
-                    valuation_notes.append(f"PB {pb:.2f}")
-                if pd.notna(dividend_yield) and dividend_yield > 0:
-                    dy_score = 3 if dividend_yield >= 3 else 1
-                    valuation_score += dy_score
-                    score += dy_score
-                    valuation_notes.append(f"殖利率 {dividend_yield:.2f}%")
+                    reasons.append(f"PE {pe:.2f}")
                 if pd.notna(eps_ttm):
                     eps_score = 2 if eps_ttm > 10 else 1 if eps_ttm > 5 else 0
                     valuation_score += eps_score
                     score += eps_score
-                    valuation_notes.append(f"EPS_TTM {eps_ttm:.2f}")
-                if valuation_notes:
-                    reasons.append("估值：" + "/".join(valuation_notes))
+                    reasons.append(f"EPS_TTM {eps_ttm:.2f}")
         if not reasons:
             return {
                 "pass": 1,
@@ -4138,20 +4973,25 @@ class FundamentalEngine:
                 "data_ready": 0,
                 "not_evaluated": 1,
                 "coverage_state": "NE_NO_FUNDAMENTAL_COVERAGE",
+                "eps_category": "U0", "matrix_cell": "E_NA-R_NA", "revenue_eps_score": 50.0,
+                "data_quality_flag": "FUNDAMENTAL_NE",
             }
         score = max(0, min(100, score))
         return {
             "pass": int(score >= 45),
             "score": round(score, 2),
-            "reason": "；".join(reasons),
+            "reason": "legacy fundamental｜" + "；".join(reasons),
             "data_ready": 1,
             "not_evaluated": 0,
-            "coverage_state": "COVERED",
-            "pe": locals().get("pe", np.nan),
-            "pb": locals().get("pb", np.nan),
-            "dividend_yield": locals().get("dividend_yield", np.nan),
-            "eps_ttm": locals().get("eps_ttm", np.nan),
-            "valuation_score": round(locals().get("valuation_score", 0.0), 2),
+            "coverage_state": "COVERED_LEGACY",
+            "pe": pe,
+            "pb": pb,
+            "dividend_yield": dividend_yield,
+            "eps_ttm": eps_ttm,
+            "valuation_score": round(valuation_score, 2),
+            "eps_category": "U0", "matrix_cell": "E_NA-R_NA", "revenue_eps_score": round(score, 2),
+            "data_quality_flag": "LEGACY_FUNDAMENTAL",
+            "financial_score": round(score, 2),
         }
 
 
@@ -4193,6 +5033,7 @@ class DecisionLayerEngine:
         self.readiness = ExternalDataReadiness(db)
         self.flow_engine = CapitalFlowEngine(db)
         self.fundamental_engine = FundamentalEngine(db)
+        self.margin_engine = MarginDecisionEngine(db)
         self.event_engine = EventEngine(db)
 
     def evaluate_plan(self, plan: dict) -> dict:
@@ -4220,6 +5061,7 @@ class DecisionLayerEngine:
         market_gate = 1 if int(market_status.get("ready", 0)) == 1 and (market_mode != "Risk_OFF" or is_etf == 1) else 0
         flow = self.flow_engine.evaluate(stock_id)
         fundamental = self.fundamental_engine.evaluate(stock_id)
+        margin = self.margin_engine.evaluate(stock_id)
         event = self.event_engine.evaluate(stock_id)
 
         technical_gate = int(str(plan.get("final_trade_decision", "")).upper() in ["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"] and float(plan.get("rr_live", plan.get("rr", 0)) or 0) >= 1.0)
@@ -4234,27 +5076,31 @@ class DecisionLayerEngine:
         fundamental_applicable = 0 if is_etf == 1 else 1
         flow_ne = int(flow.get("not_evaluated", 0) or 0)
         fund_ne = int(fundamental.get("not_evaluated", 0) or 0)
+        margin_ne = int(margin.get("not_evaluated", 0) or 0)
         event_ne = int(event.get("not_evaluated", 0) or 0)
 
         gate_states = {
             "market_gate_state": gate_state(market_gate, data_ready=int(market_status.get("ready", 0))),
             "flow_gate_state": gate_state(flow.get("pass", 0), data_ready=flow.get("data_ready", 0), not_evaluated=flow_ne),
             "fundamental_gate_state": gate_state(fundamental.get("pass", 0), data_ready=fundamental.get("data_ready", 0), not_evaluated=fund_ne, applicable=fundamental_applicable),
+            "margin_gate_state": gate_state(margin.get("pass", 0), data_ready=margin.get("data_ready", 0), not_evaluated=margin_ne),
             "event_gate_state": gate_state(event.get("pass", 0), data_ready=event.get("data_ready", 0), not_evaluated=event_ne),
             "risk_gate_state": gate_state(risk.get("pass", 0), data_ready=1),
         }
         flow_gate_ok = gate_states["flow_gate_state"] in ("PASS", "NA", "NE")
         fundamental_gate_ok = gate_states["fundamental_gate_state"] in ("PASS", "NA", "NE")
+        margin_gate_ok = gate_states["margin_gate_state"] in ("PASS", "NA", "NE")
         gates = {
             "market_gate": int(market_gate),
             "flow_gate": int(flow_gate_ok),
             "fundamental_gate": int(fundamental_gate_ok),
+            "margin_gate": int(margin_gate_ok),
             "event_gate": 1 if gate_states["event_gate_state"] in ("PASS", "NA", "NE") else 0,
             "technical_gate": int(technical_gate),
             "risk_gate": int(risk["pass"]),
         }
 
-        coverage_states = [gate_states["flow_gate_state"]]
+        coverage_states = [gate_states["flow_gate_state"], gate_states["margin_gate_state"]]
         if fundamental_applicable == 1:
             coverage_states.append(gate_states["fundamental_gate_state"])
         if any(s == "BLOCK" for s in coverage_states):
@@ -4263,7 +5109,18 @@ class DecisionLayerEngine:
             stock_external_coverage_state = "PARTIAL_NE"
         else:
             stock_external_coverage_state = "FULL"
-        gate_policy_note = "NE=Not Evaluated：資料未覆蓋不阻擋交易，只降權/標示；BLOCK才會阻擋。"
+        eps_category = str(fundamental.get("eps_category", plan.get("eps_category", "U0")) or "U0")
+        matrix_cell = str(fundamental.get("matrix_cell", plan.get("matrix_cell", "")) or "")
+        revenue_eps_score = float(pd.to_numeric(pd.Series([fundamental.get("revenue_eps_score", plan.get("revenue_eps_score", 50))]), errors="coerce").fillna(50).iloc[0])
+        eps_matrix_decision_note = str(fundamental.get("eps_matrix_decision_note", "") or fundamental.get("reason", ""))
+        eps_category_block = int(eps_category == "U4")
+        eps_turnaround_watch = int(eps_category == "U3")
+        if eps_category == "U1":
+            gate_policy_note += "；EPS矩陣U1=高成長主升，允許加權。"
+        elif eps_category == "U3":
+            gate_policy_note += "；EPS矩陣U3=轉機觀察，不直接下重手。"
+        elif eps_category == "U4":
+            gate_policy_note += "；EPS矩陣U4=高EPS衰退風險，禁止BUY。"
 
         blocking_parts = []
         for k, state in gate_states.items():
@@ -4271,13 +5128,15 @@ class DecisionLayerEngine:
                 blocking_parts.append(k.replace("_state", ""))
         if int(technical_gate) != 1:
             blocking_parts.append("technical_gate")
+        if eps_category_block:
+            blocking_parts.append("eps_matrix_u4_high_eps_decline")
         if external_ready != 1:
             blocking_parts.append(mandatory_reason or "global external mandatory data not ready")
         trade_allowed = int(not blocking_parts and all(v == 1 for v in gates.values()) and external_ready == 1)
 
-        gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Event={event['score']}; Risk={risk['score']}; GlobalExternalReady={global_external_ready}; StockCoverage={stock_external_coverage_state}; States={gate_states}"
+        gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Margin={margin['score']}; Event={event['score']}; Risk={risk['score']}; GlobalExternalReady={global_external_ready}; StockCoverage={stock_external_coverage_state}; States={gate_states}"
         blocking_reason = "；".join([str(x) for x in blocking_parts if str(x).strip()])
-        decision_reason = "｜".join([market_memo, market_status.get("reason",""), flow["reason"], fundamental["reason"], event["reason"], risk["reason"], blocking_reason])
+        decision_reason = "｜".join([market_memo, market_status.get("reason",""), flow["reason"], fundamental["reason"], margin["reason"], event["reason"], risk["reason"], blocking_reason])
 
         out = dict(plan)
         out.update(gates)
@@ -4294,8 +5153,30 @@ class DecisionLayerEngine:
             "pe": fundamental.get("pe", np.nan),
             "pb": fundamental.get("pb", np.nan),
             "dividend_yield": fundamental.get("dividend_yield", np.nan),
-            "eps_ttm": fundamental.get("eps_ttm", np.nan),
+            "eps_yoy": fundamental.get("eps_yoy", np.nan),
+            "revenue_yoy": fundamental.get("revenue_yoy", np.nan),
+            "eps_bucket": fundamental.get("eps_bucket", ""),
+            "rev_bucket": fundamental.get("rev_bucket", ""),
+            "matrix_cell": matrix_cell,
+            "eps_category": eps_category,
+            "matrix_base_score": fundamental.get("matrix_base_score", np.nan),
+            "modifier": fundamental.get("modifier", np.nan),
+            "revenue_eps_score": revenue_eps_score,
+            "data_quality_flag": fundamental.get("data_quality_flag", ""),
+            "financial_score": revenue_eps_score,
+            "eps_matrix_decision_note": eps_matrix_decision_note,
             "valuation_score": fundamental.get("valuation_score", 0.0),
+            "margin_balance": margin.get("margin_balance", np.nan),
+            "short_balance": margin.get("short_balance", np.nan),
+            "margin_change": margin.get("margin_change", np.nan),
+            "short_change": margin.get("short_change", np.nan),
+            "margin_utilization": margin.get("margin_utilization", np.nan),
+            "retail_heat_score": margin.get("retail_heat_score", np.nan),
+            "margin_score": margin.get("margin_score", 50.0),
+            "margin_state": margin.get("margin_state", "NE"),
+            "macro_margin_score": margin.get("macro_margin_score", 50.0),
+            "macro_margin_state": margin.get("macro_margin_state", "NE"),
+            "margin_decision_note": margin.get("margin_decision_note", ""),
             "external_blocking_reason": blocking_reason,
             "pipeline_run_id": str(plan.get("pipeline_run_id", "")),
             "external_run_id": str(plan.get("pipeline_run_id", "")),
@@ -4306,8 +5187,13 @@ class DecisionLayerEngine:
         })
         if not trade_allowed:
             out["ui_state"] = "外部阻擋" if external_ready == 1 else "外部資料不足"
+        elif eps_turnaround_watch:
+            out["ui_state"] = "轉機觀察-EPS矩陣U3"
         elif stock_external_coverage_state == "PARTIAL_NE":
             out["ui_state"] = "可交易-部分外部資料NE"
+        if eps_matrix_decision_note:
+            out["decision_reason_short"] = short_reason(str(out.get("decision_reason_short", "")) + "｜" + eps_matrix_decision_note, 160)
+        log_info(f"[EPS MATRIX][DECISION] stock={stock_id} cat={eps_category} cell={matrix_cell} score={revenue_eps_score} trade_allowed={trade_allowed}")
         return out
 
     def evaluate_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -4464,13 +5350,13 @@ V80_WEIGHTS = {
 }
 
 ORDER_COLUMNS = [
-    "優先級", "代號", "名稱", "現價", "PE", "PB", "殖利率%", "EPS_TTM", "估值分", "漲跌", "漲跌幅%", "分類", "狀態", "盤中狀態", "活性分",
+    "優先級", "代號", "名稱", "現價", "PE", "PB", "殖利率%", "EPS_TTM", "估值分", "融資餘額", "融資增減", "融券餘額", "融券增減", "券資比%", "散戶熱度", "融資分", "融資狀態", "市場融資分", "市場融資狀態", "漲跌", "漲跌幅%", "分類", "狀態", "盤中狀態", "活性分",
     "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%",
     "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註", "外部允許", "外部Ready", "全域外部Ready", "個股覆蓋狀態", "Market Gate", "Flow Gate", "Fundamental Gate", "Event Gate", "Risk Gate", "外部阻擋原因", "外部資料日", "資料來源層級", "決策摘要", "Gate說明"
 ]
 
 INSTITUTIONAL_COLUMNS = [
-    "優先級", "代號", "名稱", "現價", "PE", "PB", "殖利率%", "EPS_TTM", "估值分", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態",
+    "優先級", "代號", "名稱", "現價", "PE", "PB", "殖利率%", "EPS_TTM", "估值分", "融資餘額", "融資增減", "融券餘額", "融券增減", "券資比%", "散戶熱度", "融資分", "融資狀態", "市場融資分", "市場融資狀態", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態",
     "盤中狀態", "活性分", "淘汰原因", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率",
     "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%",
     "產業曝險%", "投資組合狀態", "風險備註"
@@ -4479,6 +5365,7 @@ INSTITUTIONAL_COLUMNS = [
 ORDER_TREE_SCHEMA = [
     ("priority", "優先級", 80), ("id", "代號", 90), ("name", "名稱", 120), ("price", "現價", 90),
     ("pe", "PE", 70), ("pb", "PB", 70), ("dividend_yield", "殖利率%", 80), ("eps_ttm", "EPS_TTM", 90), ("valuation_score", "估值分", 80),
+    ("margin_score", "融資分", 80), ("margin_state", "融資狀態", 90), ("macro_margin_state", "市場融資", 90),
     ("chg", "漲跌", 90), ("chg_pct", "漲跌幅%", 95), ("bucket", "分類", 95), ("action", "狀態", 95),
     ("liquidity", "盤中狀態", 100), ("liq_score", "活性分", 90), ("entry", "進場區", 130), ("stop", "停損", 100),
     ("target", "目標價", 100), ("target1382", "1.382", 90), ("target1618", "1.618", 90), ("rr", "RR", 80),
@@ -4492,6 +5379,7 @@ ORDER_TREE_SCHEMA = [
 INSTITUTIONAL_TREE_SCHEMA = [
     ("priority", "優先級", 80), ("id", "代號", 90), ("name", "名稱", 120), ("price", "現價", 90),
     ("pe", "PE", 70), ("pb", "PB", 70), ("dividend_yield", "殖利率%", 80), ("eps_ttm", "EPS_TTM", 90), ("valuation_score", "估值分", 80),
+    ("margin_score", "融資分", 80), ("margin_state", "融資狀態", 90), ("macro_margin_state", "市場融資", 90),
     ("chg", "漲跌", 90), ("chg_pct", "漲跌幅%", 95), ("market", "市場", 85), ("industry", "產業", 110),
     ("theme", "題材", 110), ("bucket", "分類", 95), ("action", "狀態", 95), ("liquidity", "盤中狀態", 100),
     ("liq_score", "活性分", 90), ("elim_reason", "淘汰原因", 160), ("entry", "進場區", 130), ("stop", "停損", 100),
@@ -4526,6 +5414,10 @@ DISPLAY_COLUMN_MAP = {
     "dividend_yield": "殖利率%",
     "eps_ttm": "EPS_TTM",
     "valuation_score": "估值分",
+    "margin_score": "融資分",
+    "margin_state": "融資狀態",
+    "macro_margin_score": "市場融資分",
+    "macro_margin_state": "市場融資狀態",
     "chg": "漲跌",
     "chg_pct": "漲跌幅%",
     "bucket": "分類",
@@ -4706,7 +5598,9 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("投資組合狀態", "portfolio_state"), ("風險備註", "risk_note"),
         ("模型分數", "model_score"), ("交易分數", "trade_score"),
         ("淘汰原因", "elimination_reason"), ("市場", "market"), ("產業", "industry"), ("題材", "theme"),
-        ("PE", "pe"), ("PB", "pb"), ("殖利率%", "dividend_yield"), ("EPS_TTM", "eps_ttm"), ("估值分", "valuation_score"),
+        ("PE", "pe"), ("PB", "pb"), ("殖利率%", "dividend_yield"), ("EPS_TTM", "eps_ttm"), ("EPS YoY", "eps_yoy"), ("營收YoY", "revenue_yoy"),
+        ("EPS Bucket", "eps_bucket"), ("Revenue Bucket", "rev_bucket"), ("EPS分類", "eps_category"), ("Matrix", "matrix_cell"),
+        ("財務分數", "revenue_eps_score"), ("資料狀態", "data_quality_flag"), ("EPS矩陣說明", "eps_matrix_decision_note"), ("估值分", "valuation_score"),
         ("外部允許", "trade_allowed"), ("外部Ready", "external_data_ready"),
         ("Market Gate", "market_gate_state"), ("Flow Gate", "flow_gate_state"),
         ("Fundamental Gate", "fundamental_gate_state"), ("Event Gate", "event_gate_state"), ("Risk Gate", "risk_gate_state"),
@@ -4740,7 +5634,7 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         x["優先級"] = pd.to_numeric(_safe_first_series(["priority", "優先級"], default=np.nan, numeric=True), errors="coerce")
         x["優先級"] = x["優先級"].fillna(pd.Series(np.arange(1, len(x) + 1), index=x.index))
 
-    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額", "PE", "PB", "殖利率%", "EPS_TTM", "估值分"]
+    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額", "PE", "PB", "殖利率%", "EPS_TTM", "EPS YoY", "營收YoY", "財務分數", "估值分"]
     for col in numeric_display:
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
@@ -4753,7 +5647,7 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         if pct_col in x.columns:
             x[pct_col] = pd.to_numeric(x[pct_col], errors="coerce").fillna(0.0).round(2)
 
-    for text_col, default in [("投資組合狀態", "未配置"), ("風險備註", ""), ("盤中狀態", ""), ("淘汰原因", ""), ("代號", ""), ("名稱", "")]:
+    for text_col, default in [("投資組合狀態", "未配置"), ("風險備註", ""), ("盤中狀態", ""), ("淘汰原因", ""), ("EPS Bucket", ""), ("Revenue Bucket", ""), ("EPS分類", "U0"), ("Matrix", ""), ("資料狀態", ""), ("EPS矩陣說明", ""), ("代號", ""), ("名稱", "")]:
         if text_col in x.columns:
             x[text_col] = pd.Series(x[text_col], index=x.index, copy=True).fillna(default).astype(str)
     return x
@@ -5476,6 +6370,7 @@ class TradingPlanEngine:
         self.db = db
         self.market_engine = MarketRegimeEngine(db)
         self.intraday_engine = IntradayLiquidityEngine(db)
+        self.financial_feature_engine = FinancialFeatureEngine(db)
 
     @staticmethod
     def _is_etf(stock: pd.Series) -> bool:
@@ -5909,6 +6804,16 @@ class TradingPlanEngine:
             f"六模組 {model_score:.1f}｜RR {rr:.2f}｜RSI {rsi:.1f}"
         )
 
+        feature = self.financial_feature_engine.get_latest_feature(stock_id)
+        if not feature:
+            feature = {
+                "eps_ttm": np.nan, "eps_yoy": np.nan, "revenue_yoy": np.nan,
+                "eps_bucket": "", "rev_bucket": "", "matrix_cell": "",
+                "eps_category": "U0", "matrix_base_score": np.nan, "modifier": np.nan,
+                "revenue_eps_score": 50.0, "data_quality_flag": "EPS_MATRIX_NE",
+                "financial_score": 50.0, "eps_matrix_decision_note": "EPS矩陣尚未建立"
+            }
+
         return {
             "stock_id": stock_id,
             "stock_name": stock["stock_name"],
@@ -5978,6 +6883,19 @@ class TradingPlanEngine:
             "liquidity_score": round(float(liquidity.get("liquidity_score", 0) or 0), 2),
             "elimination_reason": elimination_reason,
             "is_mainstream_funding": int(liquidity.get("is_mainstream_funding", 0) or 0),
+            "eps_ttm": feature.get("eps_ttm", np.nan),
+            "eps_yoy": feature.get("eps_yoy", np.nan),
+            "revenue_yoy": feature.get("revenue_yoy", np.nan),
+            "eps_bucket": feature.get("eps_bucket", ""),
+            "rev_bucket": feature.get("rev_bucket", ""),
+            "matrix_cell": feature.get("matrix_cell", ""),
+            "eps_category": feature.get("eps_category", "U0"),
+            "matrix_base_score": feature.get("matrix_base_score", np.nan),
+            "modifier": feature.get("modifier", np.nan),
+            "revenue_eps_score": feature.get("revenue_eps_score", 50.0),
+            "financial_score": feature.get("revenue_eps_score", 50.0),
+            "data_quality_flag": feature.get("data_quality_flag", ""),
+            "eps_matrix_decision_note": f"EPS矩陣 {feature.get('eps_category', 'U0')}｜{feature.get('matrix_cell','')}｜score={feature.get('revenue_eps_score',50)}｜flag={feature.get('data_quality_flag','')}",
             "final_trade_decision": final_trade_decision,
         }
 
@@ -6002,6 +6920,14 @@ class MasterTradingEngine:
 
         base = filtered_df.copy()
         hot_themes = ThemeStrengthEngine.get_hot_themes(base)
+        try:
+            feature_rows = FinancialFeatureEngine(self.db).build_feature_batch(write_db=True)
+            if log_cb:
+                log_cb(f"[EPS MATRIX][BUILD] AI選股前已更新 financial_feature_daily：{0 if feature_rows is None else len(feature_rows)} 筆")
+        except Exception as exc:
+            log_warning(f"[EPS MATRIX][BUILD][WARN] AI選股前 feature 建立失敗：{exc}")
+            if log_cb:
+                log_cb(f"[EPS MATRIX][BUILD][WARN] {exc}")
 
         plans = []
         sids = base["stock_id"].astype(str).tolist()
@@ -8725,8 +9651,31 @@ class AppUI:
                     tables["External_Data_Log"] = self.db.read_table("external_data_log", limit=1000)
                     tables["System_Run_Log"] = self.db.read_table("system_run_log", limit=500)
                     tables["Trade_Plan_DB"] = self.db.read_table("trade_plan", limit=1000)
+                    _tp = tables.get("Trade_Plan_DB", pd.DataFrame())
+                    if _tp is not None and not _tp.empty:
+                        eps_view_cols = [c for c in ["stock_id", "stock_name", "final_trade_decision", "trade_allowed", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_category", "matrix_cell", "revenue_eps_score", "data_quality_flag", "decision_reason_short"] if c in _tp.columns]
+                        tables["TradePlan_EPS_View"] = _tp[eps_view_cols].copy()
+                    _val_rows = []
+                    _ffv = self.db.read_table("financial_feature_daily", limit=None)
+                    if _ffv is not None and not _ffv.empty:
+                        _val_rows.append({"test_id": "TC02", "test": "EPS<0但營收高成長", "result": "PASS" if ((_ffv.get("eps_bucket", "") == "E0") & (_ffv.get("rev_bucket", "") == "R3") & (_ffv.get("eps_category", "") == "U3")).any() else "NO_SAMPLE"})
+                        _val_rows.append({"test_id": "TC03", "test": "高EPS但營收衰退", "result": "PASS" if ((_ffv.get("eps_bucket", "") == "E3") & (_ffv.get("rev_bucket", "").isin(["R0", "R1"])) & (_ffv.get("eps_category", "") == "U4")).any() else "NO_SAMPLE"})
+                        _val_rows.append({"test_id": "TC04", "test": "資料缺失NE", "result": "PASS" if _ffv.get("data_quality_flag", pd.Series(dtype=str)).astype(str).str.contains("NE", na=False).any() else "NO_SAMPLE"})
+                        _val_rows.append({"test_id": "TC05", "test": "Ranking/TradePlan欄位", "result": "PASS" if "revenue_eps_score" in _ffv.columns else "FAIL"})
+                    else:
+                        _val_rows.append({"test_id": "TC01", "test": "financial_feature_daily", "result": "NO_DATA"})
+                    tables["Validation_Result"] = pd.DataFrame(_val_rows)
                     tables["Market_Snapshot"] = self.db.read_table("market_snapshot", limit=200)
                     tables["External_Valuation"] = self.db.read_table("external_valuation", limit=3000)
+                    tables["Financial_Feature"] = self.db.read_table("financial_feature_daily", limit=5000)
+                    _ff = tables.get("Financial_Feature", pd.DataFrame())
+                    if _ff is not None and not _ff.empty:
+                        eps_cols = [c for c in ["stock_id", "feature_date", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "source_trace_json"] if c in _ff.columns]
+                        tables["EPS_Matrix_Check"] = _ff[eps_cols].head(200).copy()
+                    else:
+                        tables["EPS_Matrix_Check"] = pd.DataFrame([{"status": "NO_DATA", "message": "financial_feature_daily 尚無資料，請先同步外部資料或重建排行"}])
+                    tables["External_Margin"] = self.db.read_table("external_margin", limit=3000)
+                    tables["Macro_Margin_Sentiment"] = self.db.read_table("macro_margin_sentiment", limit=300)
                     tables["External_Source_Config"] = ExternalSourceConfig.to_dataframe()
                     _status_df = tables.get("External_Source_Status", pd.DataFrame())
                     _blocking_rows = []
@@ -9915,3 +10864,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# V9.5.6 MARGIN_INTEGRATED PATCH MARKER: external_margin + macro_margin_sentiment + DecisionLayer margin_score completed.
