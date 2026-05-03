@@ -152,7 +152,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.5.8 DATA_INTEGRITY_PATCH V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.5.9 EXTERNAL_INFO_ONLY_PATCH V16.2-R4"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -179,7 +179,11 @@ TWSE_MARGIN_COMPARE_PAGE = "https://www.twse.com.tw/IIH2/zh/compare/margin.html"
 # V9.5.8 DATA_INTEGRITY_PATCH：market_snapshot 不可再使用 internal:price_history 當 success。
 # 只有 TWSE 官方市場指數資料成功解析，market_snapshot 才允許 data_ready=1。
 TWSE_MARKET_SNAPSHOT_ENDPOINT_TEMPLATE = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date}&type=MS"
-MARKET_PROXY_DECISION_POLICY = "internal:price_history proxy 僅可作偵錯，不可寫入 Ready，不可進入今日可下單。"
+MARKET_PROXY_DECISION_POLICY = "internal:price_history proxy 僅可作偵錯，不可寫入 Ready。外部資料不得直接控制 trade_allowed。"
+ANALYSIS_EXECUTION_SPLIT_POLICY = (
+    "V9.5.9：外部資料不作交易控制開關；analysis_ready 永遠允許技術分析；"
+    "execution_ready 僅作資訊/提示/Excel/Log 欄位；trade_allowed 只由技術面、RR、風控條件決定。"
+)
 
 MARGIN_DATA_SOURCE_POLICY = [
     "TWSE 官方 MI_MARGN open_data endpoint（dataset 11680）：上市個股融資融券，寫入 external_margin",
@@ -2370,6 +2374,11 @@ class DBManager:
             ("blocking_reason", "blocking_reason TEXT"),
             ("last_rows_count", "last_rows_count INTEGER DEFAULT 0"),
             ("source_level", "source_level TEXT"),
+            ("analysis_ready", "analysis_ready INTEGER DEFAULT 1"),
+            ("execution_ready", "execution_ready INTEGER DEFAULT 0"),
+            ("soft_block", "soft_block INTEGER DEFAULT 0"),
+            ("block_reason", "block_reason TEXT"),
+            ("execution_block_reason", "execution_block_reason TEXT"),
         ]:
             _add("external_source_status", col, ddl)
 
@@ -2430,6 +2439,11 @@ class DBManager:
         for col, ddl in [
             ("external_data_ready", "external_data_ready INTEGER DEFAULT 0"),
             ("external_blocking_reason", "external_blocking_reason TEXT"),
+            ("analysis_ready", "analysis_ready INTEGER DEFAULT 1"),
+            ("execution_ready", "execution_ready INTEGER DEFAULT 0"),
+            ("soft_block", "soft_block INTEGER DEFAULT 0"),
+            ("block_reason", "block_reason TEXT DEFAULT ''"),
+            ("execution_block_reason", "execution_block_reason TEXT DEFAULT ''"),
             ("pipeline_run_id", "pipeline_run_id TEXT"),
             ("external_run_id", "external_run_id TEXT"),
             ("decision_run_id", "decision_run_id TEXT"),
@@ -2513,7 +2527,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.5.8_data_integrity_patch_v16.2_r4",
+                "program_version": "v9.5.9_external_info_only_patch_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -2589,7 +2603,9 @@ class DBManager:
             "rr": 0.0, "rr_live": 0.0, "win_rate": 0.0, "market_gate": 0, "flow_gate": 0, "fundamental_gate": 0,
             "event_gate": 0, "technical_gate": 0, "risk_gate": 0, "trade_allowed": 0, "gate_summary": "", "decision_reason": "",
             "final_trade_decision": "", "ui_state": "", "pool_role": "", "source_rank": "",
-            "external_data_ready": 0, "external_blocking_reason": "", "pipeline_run_id": run_id,
+            "external_data_ready": 0, "external_blocking_reason": "",
+            "analysis_ready": 1, "execution_ready": 0, "soft_block": 0, "block_reason": "", "execution_block_reason": "",
+            "pipeline_run_id": run_id,
             "external_run_id": run_id, "decision_run_id": "",
             "market_gate_state": "BLOCK", "flow_gate_state": "BLOCK", "fundamental_gate_state": "BLOCK",
             "event_gate_state": "NE", "risk_gate_state": "BLOCK",
@@ -2610,9 +2626,11 @@ class DBManager:
             x.loc[close_series.eq(0), "close"] = pd.to_numeric(x.loc[close_series.eq(0), "entry_mid"], errors="coerce").fillna(0)
         for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score"]:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
-        for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed"]:
+        for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "analysis_ready", "execution_ready", "soft_block"]:
+            if c not in x.columns:
+                x[c] = 0
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "update_time"]
+        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "analysis_ready", "execution_ready", "soft_block", "block_reason", "execution_block_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "update_time"]
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -3409,6 +3427,10 @@ class ExternalSourceConfig:
             row.setdefault("source_priority", "1.TWSE OpenAPI/官方API → 2.TPEx官方頁面/CSV → 3.MOPS OpenData → 4.Goodinfo fallback only")
             row.setdefault("license_url", TWSE_OPENAPI_LICENSE_URL if module in ("valuation", "market_snapshot", "institutional", "margin", "macro_margin_sentiment") else "")
             row.setdefault("oas_swagger_url", (TWSE_OPENAPI_SWAGGER_URL + " | " + TPEX_OPENAPI_SWAGGER_URL) if module == "margin" else (TWSE_OPENAPI_SWAGGER_URL if module in ("valuation", "market_snapshot", "institutional", "macro_margin_sentiment") else ""))
+            row.setdefault("mandatory_for_analysis", False)
+            row.setdefault("mandatory_for_execution", bool(row.get("mandatory", False)))
+            row.setdefault("soft_block_allowed", True)
+            row.setdefault("v959_policy", ANALYSIS_EXECUTION_SPLIT_POLICY)
             row.setdefault("goodinfo_policy", "Goodinfo不可作主資料源；僅允許官方來源失敗後fallback，且預設停用。")
             rows.append(row)
         return pd.DataFrame(rows)
@@ -4489,10 +4511,12 @@ class ExternalDataFetcher:
                 blocking_reason=str(exc),
                 source_level="derived_feature",
             )
-        blocking = [f"{r.module}:{r.error_message or r.status}" for r in results if int(r.data_ready) == 0 and ExternalSourceConfig.SOURCES.get(r.module, {}).get("mandatory", False)]
-        status = "ok" if not blocking else "blocked"
-        self.db.log_system_run(event="external_refresh", status=status, message="; ".join(blocking) if blocking else "external pipeline completed", run_id=run_id, step="finish")
-        return {"run_id": run_id, "results": [r.to_dict() for r in results], "ready_map": ready_map, "blocking": blocking, "status": status}
+        # V9.5.9：外部資料缺口只形成資訊型 soft_block，不可停止分析或直接控制交易。
+        execution_blocking = [f"{r.module}:{r.error_message or r.status}" for r in results if int(r.data_ready) == 0 and ExternalSourceConfig.SOURCES.get(r.module, {}).get("mandatory", False)]
+        blocking = list(execution_blocking)  # 舊欄位相容：代表外部資料未完整，不代表停止交易引擎。
+        status = "soft_block" if execution_blocking else "ok"
+        self.db.log_system_run(event="external_refresh", status=status, message="; ".join(execution_blocking) if execution_blocking else "external pipeline completed", run_id=run_id, step="finish")
+        return {"run_id": run_id, "results": [r.to_dict() for r in results], "ready_map": ready_map, "blocking": blocking, "execution_blocking": execution_blocking, "analysis_allowed": 1, "status": status}
 
     def refresh_all(self, run_id: str | None = None) -> dict:
         # backward compatibility：舊UI呼叫仍導向V9.4真實Pipeline，不再只寫pending。
@@ -4501,8 +4525,16 @@ class ExternalDataFetcher:
 
 
 class ExternalDataReadiness:
-    """V9.4：外部資料Ready檢查，讓Gate可阻擋假通過。"""
-    MANDATORY_MODULES = ["market_snapshot", "institutional", "revenue"]
+    """V9.5.9：外部資料Ready分層。
+
+    重點：
+    - analysis_ready：技術分析 / TOP20 / 觀察池永遠允許，外部缺口只提示。
+    - execution_ready：僅為資訊欄位，用於 UI / Excel / Log 顯示外部資料是否完整。
+    - mandatory_ready：保留舊介面相容，回傳 execution_ready 狀態，但不得再被 trade_allowed 當硬開關。
+    """
+    EXECUTION_MANDATORY_MODULES = ["market_snapshot", "institutional", "revenue"]
+    ANALYSIS_MANDATORY_MODULES = []
+    MANDATORY_MODULES = EXECUTION_MANDATORY_MODULES
 
     def __init__(self, db: DBManager):
         self.db = db
@@ -4526,15 +4558,21 @@ class ExternalDataReadiness:
             reason = reason or f"{module} data_ready=0/status={status}/rows={rows}"
         return {"ready": ready, "reason": reason, "rows": rows, "status": status}
 
-    def mandatory_ready(self) -> tuple[int, str]:
+    def analysis_ready(self) -> tuple[int, str]:
+        # V9.5.9 最終整合版：外部資料缺口不得阻擋 AI 分析 / TOP20 / 觀察池。
+        return 1, "analysis_ready=1：外部資料僅作風險提示，不阻擋分析"
+
+    def execution_ready(self) -> tuple[int, str]:
         missing = []
-        for module in self.MANDATORY_MODULES:
+        for module in self.EXECUTION_MANDATORY_MODULES:
             st = self.get_status(module)
             if int(st.get("ready", 0)) != 1:
                 missing.append(f"{module}:{st.get('reason','not ready')}")
         return (0 if missing else 1, "；".join(missing))
 
-
+    def mandatory_ready(self) -> tuple[int, str]:
+        # 舊函式相容：只代表外部資料完整狀態，不代表 trade_allowed。
+        return self.execution_ready()
 
 def gate_state(pass_value, data_ready: int = 1, not_evaluated: int = 0, applicable: int = 1) -> str:
     if int(applicable or 0) == 0:
@@ -4555,11 +4593,12 @@ def latest_source_trace(db: DBManager) -> dict:
     try:
         status = db.read_table("external_source_status", limit=None)
         if status is None or status.empty:
-            return {"ready": 0, "latest_external_date": "", "market_source_level": "", "modules": {}, "blocking": "external_source_status empty"}
+            return {"ready": 0, "analysis_ready": 1, "execution_ready": 0, "soft_block": 1, "latest_external_date": "", "market_source_level": "", "modules": {}, "blocking": "external_source_status empty"}
         modules = {}
         blocking = []
         latest_dates = []
         market_source_level = ""
+        execution_mandatory = set(getattr(ExternalDataReadiness, "EXECUTION_MANDATORY_MODULES", []))
         for _, r in status.iterrows():
             module = str(r.get("module", ""))
             ready = int(pd.to_numeric(pd.Series([r.get("data_ready", 0)]), errors="coerce").fillna(0).iloc[0])
@@ -4577,35 +4616,45 @@ def latest_source_trace(db: DBManager) -> dict:
                 "reason": str(r.get("blocking_reason", "") or r.get("error_message", "") or ""),
                 "url": str(r.get("request_url", "") or ""),
             }
-            if not ready:
+            if module in execution_mandatory and not ready:
                 blocking.append(f"{module}:{modules[module]['reason'] or modules[module]['status']}")
+        execution_ready = 0 if blocking else 1
         return {
-            "ready": 0 if blocking else 1,
+            "ready": execution_ready,  # 舊欄位相容：代表外部資料完整，不代表交易開關。
+            "analysis_ready": 1,
+            "execution_ready": execution_ready,
+            "soft_block": int(execution_ready != 1),
             "latest_external_date": max(latest_dates) if latest_dates else "",
             "market_source_level": market_source_level,
             "modules": modules,
             "blocking": "；".join(blocking),
         }
     except Exception as exc:
-        return {"ready": 0, "latest_external_date": "", "market_source_level": "", "modules": {}, "blocking": str(exc)}
-
+        return {"ready": 0, "analysis_ready": 1, "execution_ready": 0, "soft_block": 1, "latest_external_date": "", "market_source_level": "", "modules": {}, "blocking": str(exc)}
 
 def apply_external_decision_filter(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    """V9.5.9：外部資料不得直接濾掉交易候選。
+
+    trade_allowed 是唯一交易控制欄位；execution_ready/soft_block 只作資訊提示。
+    此函式保留名稱是為了相容舊流程，但不再因外部資料缺口移除資料列。
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     x = df.copy()
-    if "trade_allowed" not in x.columns:
-        x["trade_allowed"] = 0
-        x["external_blocking_reason"] = (x.get("external_blocking_reason", "") if "external_blocking_reason" in x.columns else "")
-    allowed = pd.to_numeric(x["trade_allowed"], errors="coerce").fillna(0).astype(int).eq(1)
-    blocked = x.loc[~allowed].copy()
-    if not blocked.empty:
+    for col, default in [("trade_allowed", 0), ("analysis_ready", 1), ("execution_ready", 0), ("soft_block", 0)]:
+        if col not in x.columns:
+            x[col] = default
+    if "external_blocking_reason" not in x.columns:
+        x["external_blocking_reason"] = ""
+    if "block_reason" not in x.columns:
+        x["block_reason"] = x.get("external_blocking_reason", "")
+    soft_cnt = int(pd.to_numeric(x.get("soft_block", 0), errors="coerce").fillna(0).astype(int).sum()) if "soft_block" in x.columns else 0
+    if soft_cnt:
         try:
-            log_warning(f"V9.5 external decision blocked {len(blocked)} rows from {label}: " + ",".join(blocked.get("stock_id", pd.Series(dtype=str)).astype(str).head(20).tolist()))
+            log_warning(f"V9.5.9 external soft_block only {soft_cnt} rows from {label}; rows are kept, not filtered")
         except Exception:
             pass
-    return x.loc[allowed].copy()
-
+    return x.copy()
 
 def attach_external_display_columns(x: pd.DataFrame) -> pd.DataFrame:
     if x is None or x.empty:
@@ -4614,6 +4663,10 @@ def attach_external_display_columns(x: pd.DataFrame) -> pd.DataFrame:
     mapping = {
         "外部允許": "trade_allowed",
         "外部Ready": "external_data_ready",
+        "分析Ready": "analysis_ready",
+        "ExecutionReady": "execution_ready",
+        "SoftBlock": "soft_block",
+        "BlockReason": "block_reason",
         "Market Gate": "market_gate_state",
         "Flow Gate": "flow_gate_state",
         "Fundamental Gate": "fundamental_gate_state",
@@ -4663,7 +4716,14 @@ class CapitalFlowEngine:
     def evaluate(self, stock_id: str) -> dict:
         st = self.readiness.get_status("institutional")
         if int(st.get("ready", 0)) != 1:
-            return {"pass": 0, "score": 0.0, "reason": f"法人資料未就緒，阻擋Gate：{st.get('reason')}", "data_ready": 0}
+            return {
+                "pass": 1,
+                "score": 50.0,
+                "reason": f"法人資料未就緒，Flow Gate=NE，不阻擋交易：{st.get('reason')}",
+                "data_ready": 0,
+                "not_evaluated": 1,
+                "coverage_state": "NE_FLOW_SOURCE_NOT_READY",
+            }
         df = self.db.read_table("external_institutional", limit=None)
         if df.empty or "stock_id" not in df.columns:
             return {
@@ -5129,9 +5189,8 @@ class RiskGateEngine:
         allowed = rr_live >= 1.2 and atr_pct <= 8 and win_rate >= 45
         if market_mode == "Risk_OFF" and int(plan.get("is_etf", 0) or 0) != 1:
             allowed = False
-        if int(external_data_ready or 0) != 1:
-            allowed = False
-        return {"pass": int(allowed), "score": round(min(100, rr_live * 25 + win_rate * 0.5 - atr_pct * 2), 2), "reason": f"RR={rr_live:.2f}; ATR={atr_pct:.1f}%; 勝率={win_rate:.1f}%; Market={market_mode}; ExternalReady={external_data_ready}"}
+        # V9.5.9：external_data_ready 僅作資訊，不可直接控制 RiskGate / trade_allowed。
+        return {"pass": int(allowed), "score": round(min(100, rr_live * 25 + win_rate * 0.5 - atr_pct * 2), 2), "reason": f"RR={rr_live:.2f}; ATR={atr_pct:.1f}%; 勝率={win_rate:.1f}%; Market={market_mode}; ExternalReadyInfo={external_data_ready}"}
 
 
 class DecisionLayerEngine:
@@ -5148,7 +5207,9 @@ class DecisionLayerEngine:
         stock_id = str(plan.get("stock_id", ""))
         trace = latest_source_trace(self.db)
         market_status = self.readiness.get_status("market_snapshot")
-        mandatory_ready, mandatory_reason = self.readiness.mandatory_ready()
+        analysis_ready, analysis_reason = self.readiness.analysis_ready()
+        execution_ready, execution_reason = self.readiness.execution_ready()
+        mandatory_ready, mandatory_reason = execution_ready, execution_reason
 
         # V9.5.8 DATA_INTEGRITY_PATCH：Decision Layer 只接受 data_ready=1 且非 proxy 的 market_snapshot。
         # 若 market_snapshot 未通過官方資料 Ready，不再使用 MarketRegimeEngine internal proxy 當判斷依據。
@@ -5172,7 +5233,8 @@ class DecisionLayerEngine:
             market_memo = f"market_snapshot NOT_READY｜{market_status.get('reason','official market data not ready')}｜proxy blocked"
 
         is_etf = int(plan.get("is_etf", 0) or 0)
-        market_gate = 1 if int(market_status.get("ready", 0)) == 1 and (market_mode != "Risk_OFF" or is_etf == 1) else 0
+        # V9.5.9：market_snapshot 未ready不可讓交易引擎全停；僅當官方市場明確 Risk_OFF 時才由市場風控擋非ETF。
+        market_gate = 1 if (market_mode != "Risk_OFF" or is_etf == 1) else 0
         flow = self.flow_engine.evaluate(stock_id)
         fundamental = self.fundamental_engine.evaluate(stock_id)
         margin = self.margin_engine.evaluate(stock_id)
@@ -5183,8 +5245,10 @@ class DecisionLayerEngine:
         # V9.5.2：拆開「全域外部資料Ready」與「個股外部資料覆蓋」。
         # mandatory_ready 只代表 market_snapshot / institutional / revenue 三個全域資料源已完成同步。
         # 個股法人/基本面若無覆蓋，改為 NE（Not Evaluated），只標示、不阻擋交易。
-        external_ready = int(mandatory_ready == 1)
+        # V9.5.9：external_ready/execution_ready 僅為資訊欄位，不可控制 trade_allowed。
+        external_ready = int(execution_ready == 1)
         global_external_ready = external_ready
+        soft_block = int(analysis_ready == 1 and execution_ready != 1)
 
         risk = RiskGateEngine.evaluate(plan, market_mode=market_mode, external_data_ready=external_ready)
         fundamental_applicable = 0 if is_etf == 1 else 1
@@ -5194,7 +5258,7 @@ class DecisionLayerEngine:
         event_ne = int(event.get("not_evaluated", 0) or 0)
 
         gate_states = {
-            "market_gate_state": gate_state(market_gate, data_ready=int(market_status.get("ready", 0))),
+            "market_gate_state": gate_state(market_gate, data_ready=1),
             "flow_gate_state": gate_state(flow.get("pass", 0), data_ready=flow.get("data_ready", 0), not_evaluated=flow_ne),
             "fundamental_gate_state": gate_state(fundamental.get("pass", 0), data_ready=fundamental.get("data_ready", 0), not_evaluated=fund_ne, applicable=fundamental_applicable),
             "margin_gate_state": gate_state(margin.get("pass", 0), data_ready=margin.get("data_ready", 0), not_evaluated=margin_ne),
@@ -5223,7 +5287,7 @@ class DecisionLayerEngine:
             stock_external_coverage_state = "PARTIAL_NE"
         else:
             stock_external_coverage_state = "FULL"
-        gate_policy_note = "NE=Not Evaluated：資料未覆蓋不阻擋交易，只降權/標示；V9.5.8：market_snapshot proxy 不可作 Ready。"
+        gate_policy_note = "V9.5.9：外部資料不得直接控制 trade_allowed；execution_ready/soft_block 只作 UI/Excel/Log 資訊。NE=Not Evaluated：資料未覆蓋不阻擋交易，只降權/標示；market_snapshot proxy 不可作 Ready。"
         eps_category = str(fundamental.get("eps_category", plan.get("eps_category", "U0")) or "U0")
         matrix_cell = str(fundamental.get("matrix_cell", plan.get("matrix_cell", "")) or "")
         revenue_eps_score = float(pd.to_numeric(pd.Series([fundamental.get("revenue_eps_score", plan.get("revenue_eps_score", 50))]), errors="coerce").fillna(50).iloc[0])
@@ -5245,9 +5309,10 @@ class DecisionLayerEngine:
             blocking_parts.append("technical_gate")
         if eps_category_block:
             blocking_parts.append("eps_matrix_u4_high_eps_decline")
-        if external_ready != 1:
-            blocking_parts.append(mandatory_reason or "global external mandatory data not ready")
-        trade_allowed = int(not blocking_parts and all(v == 1 for v in gates.values()) and external_ready == 1)
+        # V9.5.9 核心修正：外部資料缺口不加入 blocking_parts；trade_allowed 不看 execution_ready/external_ready。
+        if soft_block:
+            gate_policy_note += "；外部資料未完整形成SOFT_BLOCK提示，但不作交易開關。"
+        trade_allowed = int(not blocking_parts and all(v == 1 for v in gates.values()))
 
         gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Margin={margin['score']}; Event={event['score']}; Risk={risk['score']}; GlobalExternalReady={global_external_ready}; StockCoverage={stock_external_coverage_state}; States={gate_states}"
         blocking_reason = "；".join([str(x) for x in blocking_parts if str(x).strip()])
@@ -5262,6 +5327,11 @@ class DecisionLayerEngine:
             "decision_reason": decision_reason,
             "decision_reason_short": short_reason(decision_reason, 140),
             "external_data_ready": external_ready,
+            "analysis_ready": int(analysis_ready),
+            "execution_ready": int(execution_ready),
+            "soft_block": int(soft_block),
+            "block_reason": execution_reason,
+            "execution_block_reason": execution_reason,
             "global_external_ready": global_external_ready,
             "stock_external_coverage_state": stock_external_coverage_state,
             "gate_policy_note": gate_policy_note,
@@ -5301,7 +5371,9 @@ class DecisionLayerEngine:
             "source_trace_json": json.dumps(trace, ensure_ascii=False)[:3000],
         })
         if not trade_allowed:
-            out["ui_state"] = "外部阻擋" if external_ready == 1 else "外部資料不足"
+            out["ui_state"] = "交易條件未通過"
+        elif soft_block:
+            out["ui_state"] = "可交易-外部資料SOFT_BLOCK提示"
         elif eps_turnaround_watch:
             out["ui_state"] = "轉機觀察-EPS矩陣U3"
         elif stock_external_coverage_state == "PARTIAL_NE":
@@ -5558,8 +5630,11 @@ DISPLAY_COLUMN_MAP = {
     "industry_pct": "產業曝險%",
     "portfolio_state": "投資組合狀態",
     "risk_note": "風險備註",
-    "trade_allowed": "外部允許",
-    "global_ready": "全域外部Ready",
+    "trade_allowed": "可交易",
+    "analysis_ready": "分析Ready",
+    "execution_ready": "ExecutionReady資訊",
+    "soft_block": "SoftBlock提示",
+    "global_ready": "全域外部Ready資訊",
     "coverage_state": "個股覆蓋狀態",
     "market_gate": "Market Gate",
     "flow_gate": "Flow Gate",
@@ -5620,6 +5695,11 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     x = df.copy()
+    # V9.5.9：補齊外部資訊欄位，避免 UI/Excel 因缺欄位或純量 fillna 崩潰。
+    for col, default in [("analysis_ready", 1), ("execution_ready", 0), ("soft_block", 0), ("block_reason", ""), ("execution_block_reason", "")]:
+        if col not in x.columns:
+            x[col] = default
+
 
     def _log_missing_columns(*cols: str):
         missing = sorted({c for c in cols if c not in x.columns})
@@ -7285,7 +7365,7 @@ class MasterTradingEngine:
             if today_missing:
                 log_cb(f"[POOL-STAGE2-ERROR] today_buy - core_attack5 差集：{','.join(today_missing[:20])}")
 
-        # V9.5 硬性保證：任何 trade_allowed=0 不得進入主攻、今日下單、等待回測、唯一決策、執行清單。
+        # V9.5.9：此處保留相容函式呼叫，但 apply_external_decision_filter 不再因外部資料缺口移除資料列；trade_allowed由技術/RR/風控決定。
         core_attack5 = apply_external_decision_filter(core_attack5, "core_attack5")
         today_buy = apply_external_decision_filter(today_buy, "today_buy")
         wait_pullback = apply_external_decision_filter(wait_pullback, "wait_pullback")
@@ -9768,8 +9848,17 @@ class AppUI:
                     tables["Trade_Plan_DB"] = self.db.read_table("trade_plan", limit=1000)
                     _tp = tables.get("Trade_Plan_DB", pd.DataFrame())
                     if _tp is not None and not _tp.empty:
-                        eps_view_cols = [c for c in ["stock_id", "stock_name", "final_trade_decision", "trade_allowed", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_category", "matrix_cell", "revenue_eps_score", "data_quality_flag", "decision_reason_short"] if c in _tp.columns]
+                        eps_view_cols = [c for c in ["stock_id", "stock_name", "final_trade_decision", "trade_allowed", "analysis_ready", "execution_ready", "soft_block", "block_reason", "execution_block_reason", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_category", "matrix_cell", "revenue_eps_score", "data_quality_flag", "decision_reason_short"] if c in _tp.columns]
                         tables["TradePlan_EPS_View"] = _tp[eps_view_cols].copy()
+                        ext_cols = [c for c in ["stock_id", "stock_name", "final_trade_decision", "trade_allowed", "analysis_ready", "execution_ready", "soft_block", "block_reason", "external_blocking_reason", "decision_reason_short", "source_trace_json"] if c in _tp.columns]
+                        if ext_cols:
+                            tables["External_Selection"] = _tp[ext_cols].copy()
+                            if "soft_block" in _tp.columns:
+                                _soft = _tp[pd.to_numeric(_tp["soft_block"], errors="coerce").fillna(0).astype(int).eq(1)].copy()
+                                tables["SoftBlock_Candidates"] = _soft[ext_cols].copy() if not _soft.empty else pd.DataFrame(columns=ext_cols)
+                            if "trade_allowed" in _tp.columns:
+                                _ready = _tp[pd.to_numeric(_tp["trade_allowed"], errors="coerce").fillna(0).astype(int).eq(1)].copy()
+                                tables["Execution_Ready"] = _ready[ext_cols].copy() if not _ready.empty else pd.DataFrame(columns=ext_cols)
                     _val_rows = []
                     _ffv = self.db.read_table("financial_feature_daily", limit=None)
                     if _ffv is not None and not _ffv.empty:
@@ -9804,15 +9893,15 @@ class AppUI:
                                 _blocking_rows.append({
                                     "severity": "P0", "module": _module, "status": _r.get("status", ""),
                                     "rows_count": _rows, "blocking_reason": _r.get("blocking_reason", "") or _r.get("error_message", ""),
-                                    "go_no_go": "NO-GO"
+                                    "go_no_go": "INFO-SOFT-BLOCK"
                                 })
                     else:
-                        _blocking_rows.append({"severity": "P0", "module": "ALL", "status": "missing", "rows_count": 0, "blocking_reason": "尚未執行外部資料同步或external_source_status空白", "go_no_go": "NO-GO"})
+                        _blocking_rows.append({"severity": "INFO", "module": "ALL", "status": "missing", "rows_count": 0, "blocking_reason": "尚未執行外部資料同步或external_source_status空白；V9.5.9僅作提示，不停止分析/交易邏輯", "go_no_go": "INFO-SOFT-BLOCK"})
                     tables["Blocking_Issues"] = pd.DataFrame(_blocking_rows) if _blocking_rows else pd.DataFrame([{"severity": "OK", "module": "ALL", "status": "ok", "rows_count": "", "blocking_reason": "", "go_no_go": "GO"}])
                     tables["Go_NoGo_Summary"] = pd.DataFrame([{
-                        "go_no_go": "NO-GO" if _blocking_rows else "GO",
+                        "go_no_go": "GO_WITH_EXTERNAL_INFO_WARNING" if _blocking_rows else "GO",
                         "blocking_count": len(_blocking_rows),
-                        "rule": "P0未過不得標示完成；mandatory external modules must be data_ready=1",
+                        "rule": "V9.5.9：外部資料不得直接控制trade_allowed；execution_ready/soft_block僅為資訊提示欄位",
                         "db_path": str(self.db.db_path),
                         "db_hash": self.db._safe_sha256(self.db.db_path),
                         "program_name": APP_NAME,
@@ -10616,7 +10705,7 @@ class AppUI:
             step="preflight_auto_sync",
             module="external_data",
         )
-        self.ui_call(self.append_log, f"[V9.5.1-PREFLIGHT-NO-GO] 自動同步後外部資料仍未就緒，停止 {context}：{final_reason}", "ERROR")
+        self.ui_call(self.append_log, f"[V9.5.9-PREFLIGHT-SOFT-BLOCK] 自動同步後外部資料仍未就緒，但不停止 {context}：{final_reason}", "WARNING")
         return 0, final_reason
 
     def show_top20(self):
@@ -10642,9 +10731,9 @@ class AppUI:
 
                 auto_ready, auto_reason = self._ensure_external_data_ready_auto_sync("AI選股TOP20")
                 if int(auto_ready) != 1:
-                    self.ui_call(self.finish_task, "AI選股TOP20", "AI選股停止：外部資料自動同步後仍未就緒")
-                    self.ui_call(messagebox.showwarning, "外部資料未就緒", "系統已自動執行「同步外部資料」，但必要外部資料仍未就緒，因此停止產生可下單名單。\n\n阻擋原因：\n" + str(auto_reason))
-                    return
+                    self.ui_call(self.append_log, "[V9.5.9-SOFT-BLOCK] 外部資料自動同步後仍未完整，但不停止AI分析/TOP20；execution_ready僅作資訊欄位。原因：" + str(auto_reason), "WARNING")
+                    self.ui_call(self.set_status, "AI選股TOP20繼續執行；外部資料未完整僅顯示SOFT_BLOCK提示")
+
 
                 def progress(idx, total_count, sid):
                     self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
