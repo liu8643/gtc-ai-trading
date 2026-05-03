@@ -152,7 +152,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.5.9 EXTERNAL_INFO_ONLY_PATCH V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.6.1 PRO STRATEGY_CONFIG_FIXED V16.2-R4"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2527,7 +2527,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.5.9_external_info_only_patch_v16.2_r4",
+                "program_version": "v9.6.1_pro_strategy_config_fixed_v16.2_r4",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -5589,6 +5589,12 @@ CORE_ANALYSIS_COLUMNS = [
     "stop_loss", "target_price", "target_1382", "target_1618",
     "rr", "win_grade", "win_rate", "tactical_light", "final_trade_decision",
     "ui_state", "bucket", "pool_role", "liquidity_status", "elimination_reason",
+    "strategy_profile", "strategy_nogo_detail", "strategy_config_summary",
+    "wave_text", "wave_condition_pass",
+    "threshold_model_score_min", "threshold_wave_trade_score_min", "threshold_rr_min",
+    "threshold_rsi_max", "threshold_price_dev_max", "threshold_atr_pct_max",
+    "fail_decision", "fail_model_score", "fail_wave_trade_score", "fail_wave_keyword",
+    "fail_liquidity", "fail_rsi", "fail_atr", "fail_price_deviation", "fail_rr", "fail_today_decision",
 ]
 
 DISPLAY_COLUMN_MAP = {
@@ -5672,6 +5678,466 @@ REPORT_DECISION_LIMITS = {
 
 
 
+# V9.6 STRATEGY_CONFIG：可調策略條件設定層
+STRATEGY_CONFIG_DIR = RUNTIME_DIR / "config"
+STRATEGY_CONFIG_JSON = STRATEGY_CONFIG_DIR / "strategy_config_v9_6.json"
+STRATEGY_CONFIG_EXCEL = STRATEGY_CONFIG_DIR / "strategy_config_v9_6.xlsx"
+
+DEFAULT_STRATEGY_CONFIG = {
+    "active_profile": "normal",
+    "profiles": {
+        "aggressive": {
+            "description": "激進模式：提高今日可下單機會，適合強多與題材主升段。",
+            "core_attack": {
+                "allowed_decisions": ["STRONG_BUY", "BUY", "DEFENSE"],
+                "model_score_min": 76.0,
+                "wave_trade_score_min": 76.0,
+                "require_wave_keyword": False,
+                "allowed_wave_keywords": ["第3浪", "推動浪"],
+            },
+            "execution": {
+                "rr_min": 1.20,
+                "rsi_max": 75.0,
+                "price_dev_max": 0.05,
+                "atr_pct_max": 10.0,
+                "required_liquidity_status": ["PASS"],
+                "allowed_decisions": ["STRONG_BUY", "BUY", "DEFENSE"],
+            },
+            "wait_pullback": {
+                "rr_min": 1.05,
+                "price_dev_min": 0.05,
+                "price_dev_max": 0.10,
+                "allowed_decisions": ["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"],
+            },
+        },
+        "normal": {
+            "description": "標準模式：沿用原始交易紀律，避免追價與低RR交易。",
+            "core_attack": {
+                "allowed_decisions": ["STRONG_BUY", "BUY", "DEFENSE"],
+                "model_score_min": 82.0,
+                "wave_trade_score_min": 82.0,
+                "require_wave_keyword": False,
+                "allowed_wave_keywords": ["第3浪", "推動浪"],
+            },
+            "execution": {
+                "rr_min": 1.50,
+                "rsi_max": 72.0,
+                "price_dev_max": 0.03,
+                "atr_pct_max": 8.0,
+                "required_liquidity_status": ["PASS"],
+                "allowed_decisions": ["STRONG_BUY", "BUY", "DEFENSE"],
+            },
+            "wait_pullback": {
+                "rr_min": 1.20,
+                "price_dev_min": 0.03,
+                "price_dev_max": 0.08,
+                "allowed_decisions": ["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"],
+            },
+        },
+        "conservative": {
+            "description": "保守模式：只做最乾淨結構，適合震盪或偏空環境。",
+            "core_attack": {
+                "allowed_decisions": ["STRONG_BUY", "BUY"],
+                "model_score_min": 88.0,
+                "wave_trade_score_min": 86.0,
+                "require_wave_keyword": True,
+                "allowed_wave_keywords": ["第3浪", "推動浪"],
+            },
+            "execution": {
+                "rr_min": 1.80,
+                "rsi_max": 68.0,
+                "price_dev_max": 0.02,
+                "atr_pct_max": 6.0,
+                "required_liquidity_status": ["PASS"],
+                "allowed_decisions": ["STRONG_BUY", "BUY"],
+            },
+            "wait_pullback": {
+                "rr_min": 1.40,
+                "price_dev_min": 0.02,
+                "price_dev_max": 0.06,
+                "allowed_decisions": ["STRONG_BUY", "BUY", "WAIT_PULLBACK"],
+            },
+        },
+    },
+    "validation_limits": {
+        "rr_min": [0.5, 5.0],
+        "rsi_max": [45.0, 90.0],
+        "price_dev_max": [0.0, 0.30],
+        "atr_pct_max": [1.0, 30.0],
+        "model_score_min": [0.0, 100.0],
+        "wave_trade_score_min": [0.0, 100.0],
+    },
+}
+
+
+def _deep_merge_strategy_config(base: dict, override: dict) -> dict:
+    out = json.loads(json.dumps(base, ensure_ascii=False))
+    def _merge(a, b):
+        for k, v in (b or {}).items():
+            if isinstance(v, dict) and isinstance(a.get(k), dict):
+                _merge(a[k], v)
+            else:
+                a[k] = v
+        return a
+    return _merge(out, override or {})
+
+
+class StrategyConfigManager:
+    """V9.6：策略參數設定管理器。設定來源優先順序：JSON > Excel > DEFAULT。"""
+    def __init__(self, json_path: Path = STRATEGY_CONFIG_JSON, excel_path: Path = STRATEGY_CONFIG_EXCEL):
+        self.json_path = Path(json_path)
+        self.excel_path = Path(excel_path)
+        self.config = json.loads(json.dumps(DEFAULT_STRATEGY_CONFIG, ensure_ascii=False))
+        self.last_load_message = "default"
+        self.load()
+
+    def ensure_files(self):
+        try:
+            STRATEGY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            if not self.json_path.exists():
+                self.json_path.write_text(json.dumps(DEFAULT_STRATEGY_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log_warning(f"[STRATEGY_CONFIG] 建立JSON預設檔失敗：{exc}")
+
+    def load(self) -> dict:
+        self.ensure_files()
+        cfg = json.loads(json.dumps(DEFAULT_STRATEGY_CONFIG, ensure_ascii=False))
+        loaded = []
+        try:
+            if self.json_path.exists():
+                raw = json.loads(self.json_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    cfg = _deep_merge_strategy_config(cfg, raw)
+                    loaded.append(str(self.json_path))
+        except Exception as exc:
+            log_warning(f"[STRATEGY_CONFIG] JSON載入失敗，使用預設值：{exc}")
+        try:
+            if self.excel_path.exists():
+                xl_cfg = self._load_excel_override(self.excel_path)
+                if xl_cfg:
+                    cfg = _deep_merge_strategy_config(cfg, xl_cfg)
+                    loaded.append(str(self.excel_path))
+        except Exception as exc:
+            log_warning(f"[STRATEGY_CONFIG] Excel載入失敗，略過Excel覆蓋：{exc}")
+        self.config = self._sanitize(cfg)
+        self.last_load_message = " | ".join(loaded) if loaded else "default"
+        log_info(f"[STRATEGY_CONFIG] loaded={self.last_load_message} active={self.get_active_profile_name()}")
+        return self.config
+
+    def _parse_value(self, v):
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return ""
+            if s.startswith("[") or s.startswith("{"):
+                try:
+                    return json.loads(s)
+                except Exception:
+                    pass
+            if "," in s and not re.search(r"[^A-Za-z0-9_\u4e00-\u9fff, .+-]", s):
+                return [x.strip() for x in s.split(",") if x.strip()]
+            if s.lower() in ("true", "yes", "y", "1"):
+                return True
+            if s.lower() in ("false", "no", "n", "0"):
+                return False
+            try:
+                return float(s)
+            except Exception:
+                return s
+        return v
+
+    def _load_excel_override(self, path: Path) -> dict:
+        try:
+            df = pd.read_excel(path, sheet_name="Strategy_Config")
+        except Exception:
+            return {}
+        if df is None or df.empty:
+            return {}
+        df = df.fillna("")
+        out = {"profiles": {}}
+        for _, row in df.iterrows():
+            profile = str(row.get("profile", "")).strip()
+            section = str(row.get("section", "")).strip()
+            key = str(row.get("key", "")).strip()
+            if not profile or not section or not key:
+                continue
+            value = self._parse_value(row.get("value", ""))
+            out.setdefault("profiles", {}).setdefault(profile, {}).setdefault(section, {})[key] = value
+        # Optional active profile sheet/value
+        active_candidates = df[(df.get("section", "") == "system") & (df.get("key", "") == "active_profile")]
+        if active_candidates is not None and not active_candidates.empty:
+            out["active_profile"] = str(active_candidates.iloc[0].get("value", "normal")).strip() or "normal"
+        return out
+
+    def _clamp(self, v, lo, hi, default):
+        try:
+            x = float(v)
+        except Exception:
+            x = float(default)
+        return max(float(lo), min(float(hi), x))
+
+    def _sanitize(self, cfg: dict) -> dict:
+        cfg = _deep_merge_strategy_config(DEFAULT_STRATEGY_CONFIG, cfg or {})
+        limits = cfg.get("validation_limits", {}) or {}
+        for profile_name, profile in (cfg.get("profiles") or {}).items():
+            exe = profile.get("execution", {})
+            core = profile.get("core_attack", {})
+            wait = profile.get("wait_pullback", {})
+            exe["rr_min"] = self._clamp(exe.get("rr_min"), *limits.get("rr_min", [0.5, 5.0]), DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["execution"]["rr_min"])
+            exe["rsi_max"] = self._clamp(exe.get("rsi_max"), *limits.get("rsi_max", [45, 90]), DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["execution"]["rsi_max"])
+            exe["price_dev_max"] = self._clamp(exe.get("price_dev_max"), *limits.get("price_dev_max", [0, 0.3]), DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["execution"]["price_dev_max"])
+            exe["atr_pct_max"] = self._clamp(exe.get("atr_pct_max"), *limits.get("atr_pct_max", [1, 30]), DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["execution"]["atr_pct_max"])
+            core["model_score_min"] = self._clamp(core.get("model_score_min"), *limits.get("model_score_min", [0, 100]), DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["core_attack"]["model_score_min"])
+            core["wave_trade_score_min"] = self._clamp(core.get("wave_trade_score_min"), *limits.get("wave_trade_score_min", [0, 100]), DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["core_attack"]["wave_trade_score_min"])
+            wait["rr_min"] = self._clamp(wait.get("rr_min"), 0.5, 5.0, DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["wait_pullback"]["rr_min"])
+            wait["price_dev_min"] = self._clamp(wait.get("price_dev_min"), 0.0, 0.3, DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["wait_pullback"]["price_dev_min"])
+            wait["price_dev_max"] = self._clamp(wait.get("price_dev_max"), 0.0, 0.3, DEFAULT_STRATEGY_CONFIG["profiles"]["normal"]["wait_pullback"]["price_dev_max"])
+        active = str(cfg.get("active_profile", "normal") or "normal").strip()
+        if active not in cfg.get("profiles", {}):
+            active = "normal"
+        cfg["active_profile"] = active
+        return cfg
+
+    def save_json(self):
+        self.ensure_files()
+        self.json_path.write_text(json.dumps(self.config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def set_active_profile(self, name: str):
+        name = str(name or "normal").strip()
+        if name not in self.config.get("profiles", {}):
+            name = "normal"
+        self.config["active_profile"] = name
+        self.save_json()
+
+    def update_active_values(self, values: dict):
+        profile = self.get_active_profile_name()
+        cfg = self.config.setdefault("profiles", {}).setdefault(profile, {})
+        for path, value in (values or {}).items():
+            parts = str(path).split(".")
+            if len(parts) != 2:
+                continue
+            cfg.setdefault(parts[0], {})[parts[1]] = value
+        self.config = self._sanitize(self.config)
+        self.save_json()
+        return self.get_active_profile()
+
+    def get_active_profile_name(self) -> str:
+        return str(self.config.get("active_profile", "normal") or "normal")
+
+    def get_active_profile(self) -> dict:
+        return dict((self.config.get("profiles") or {}).get(self.get_active_profile_name(), {}))
+
+    def summary_text(self) -> str:
+        p = self.get_active_profile()
+        e = p.get("execution", {})
+        c = p.get("core_attack", {})
+        return (
+            f"profile={self.get_active_profile_name()} | "
+            f"RR>={e.get('rr_min')} RSI<={e.get('rsi_max')} 偏離<={float(e.get('price_dev_max'))*100:.1f}% "
+            f"ATR<={e.get('atr_pct_max')} model>={c.get('model_score_min')} wave>={c.get('wave_trade_score_min')}"
+        )
+
+
+STRATEGY_CONFIG_MANAGER = StrategyConfigManager()
+
+
+def _active_strategy_config(cfg: dict | None = None) -> dict:
+    """V9.6.1：決策流程唯一策略設定入口。
+
+    DEFAULT_STRATEGY_CONFIG 只允許在 StrategyConfigManager._sanitize() 合併；
+    Decision/Execution/Pool 不再各自寫交易門檻 fallback。
+    """
+    return cfg if isinstance(cfg, dict) and cfg else STRATEGY_CONFIG_MANAGER.get_active_profile()
+
+
+def _strategy_section(cfg: dict | None, section: str) -> dict:
+    active = _active_strategy_config(cfg)
+    value = active[section]
+    if not isinstance(value, dict):
+        raise KeyError(f"Strategy config section invalid: {section}")
+    return value
+
+
+def get_strategy_threshold(cfg: dict | None, section: str, key: str):
+    """唯一門檻取值函式：禁止在決策流程散落 cfg.get(..., fallback)。"""
+    return _strategy_section(cfg, section)[key]
+
+
+def get_strategy_list(cfg: dict | None, section: str, key: str) -> list[str]:
+    value = get_strategy_threshold(cfg, section, key)
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if value is None:
+        return []
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _strategy_values(cfg: dict | None) -> tuple[dict, dict, dict]:
+    cfg = _active_strategy_config(cfg)
+    return _strategy_section(cfg, "core_attack"), _strategy_section(cfg, "execution"), _strategy_section(cfg, "wait_pullback")
+
+
+def _strategy_profile_name() -> str:
+    return STRATEGY_CONFIG_MANAGER.get_active_profile_name()
+
+
+def _strategy_summary_text() -> str:
+    return STRATEGY_CONFIG_MANAGER.summary_text()
+
+
+def _coerce_float(v, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        if np.isfinite(x):
+            return x
+    except Exception:
+        pass
+    return float(default)
+
+
+def _row_float(row, *keys, default: float = 0.0) -> float:
+    for key in keys:
+        try:
+            if key in row and str(row.get(key, "")).strip() not in ("", "nan", "None", "<NA>"):
+                return _coerce_float(row.get(key), default)
+        except Exception:
+            pass
+    return float(default)
+
+
+def _build_wave_text_from_df(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype="object")
+    parts = []
+    for col in ["wave_label", "wave", "trade_type"]:
+        parts.append(_safe_text_fill_series(df, col, ""))
+    return (parts[0] + " " + parts[1] + " " + parts[2]).astype(str).str.strip()
+
+
+def _match_wave_keyword_text(wave_text: str, core_cfg: dict) -> bool:
+    if not bool(core_cfg["require_wave_keyword"]):
+        return True
+    keywords = [str(x).strip() for x in core_cfg["allowed_wave_keywords"] if str(x).strip()]
+    if not keywords:
+        return True
+    text = str(wave_text or "")
+    return any(k in text for k in keywords)
+
+
+def _strategy_wave_keyword_mask(df: pd.DataFrame, core_cfg: dict) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    wave_text = _build_wave_text_from_df(df)
+    return wave_text.map(lambda s: _match_wave_keyword_text(str(s), core_cfg)).reindex(df.index).fillna(False)
+
+
+def _strategy_allowed_decisions(cfg: dict | None, section: str) -> list[str]:
+    return get_strategy_list(cfg, section, "allowed_decisions")
+
+
+def _strategy_required_liquidity(cfg: dict | None) -> list[str]:
+    return get_strategy_list(cfg, "execution", "required_liquidity_status")
+
+
+def _safe_strategy_series(df: pd.DataFrame, col: str, default=0, numeric: bool = False) -> pd.Series:
+    if df is None:
+        return pd.Series(dtype="float64" if numeric else "object")
+    if col in df.columns:
+        s = pd.Series(df[col], index=df.index, copy=True)
+    else:
+        s = pd.Series(default, index=df.index)
+    if numeric:
+        return pd.to_numeric(s, errors="coerce").fillna(default)
+    return s.fillna(default)
+
+
+def attach_strategy_nogo_columns(df: pd.DataFrame, cfg: dict | None = None, pool_stage: str = "candidate20") -> pd.DataFrame:
+    """V9.6.1：完整 NoGo_Detail 欄位化。
+
+    輸出人可讀 strategy_nogo_detail，也輸出機器可驗證 fail_* 與 threshold_* 欄位，
+    讓 today_buy=0 時可直接統計原因。
+    """
+    if df is None or df.empty:
+        return df
+    x = df.copy()
+    cfg = _active_strategy_config(cfg)
+    core_cfg, exe_cfg, wait_cfg = _strategy_values(cfg)
+
+    allowed_core = set(_strategy_allowed_decisions(cfg, "core_attack"))
+    allowed_exec = set(_strategy_allowed_decisions(cfg, "execution"))
+    required_liq = set(_strategy_required_liquidity(cfg))
+    model_min = float(get_strategy_threshold(cfg, "core_attack", "model_score_min"))
+    wave_min = float(get_strategy_threshold(cfg, "core_attack", "wave_trade_score_min"))
+    rr_min = float(get_strategy_threshold(cfg, "execution", "rr_min"))
+    rsi_max = float(get_strategy_threshold(cfg, "execution", "rsi_max"))
+    price_max = float(get_strategy_threshold(cfg, "execution", "price_dev_max"))
+    atr_max = float(get_strategy_threshold(cfg, "execution", "atr_pct_max"))
+
+    decision_s = _safe_strategy_series(x, "final_trade_decision", "", numeric=False).astype(str)
+    x["wave_text"] = _build_wave_text_from_df(x)
+    x["wave_condition_pass"] = _strategy_wave_keyword_mask(x, core_cfg).astype(int)
+
+    model_s = _safe_strategy_series(x, "model_score", 0.0, numeric=True)
+    wave_s = _safe_strategy_series(x, "wave_trade_score", 0.0, numeric=True)
+    liq_s = _safe_strategy_series(x, "liquidity_status", "", numeric=False).astype(str).str.upper()
+    rsi_s = pd.to_numeric(_safe_strategy_series(x, "rsi", np.nan, numeric=True), errors="coerce")
+    if rsi_s.isna().all():
+        rsi_s = _safe_strategy_series(x, "rsi14", 0.0, numeric=True)
+    rsi_s = rsi_s.fillna(0.0)
+    atr_s = _safe_strategy_series(x, "atr_pct", 999.0, numeric=True)
+    dev_s = _safe_strategy_series(x, "price_deviation", 0.0, numeric=True).abs()
+    rr_s = pd.to_numeric(_safe_strategy_series(x, "rr_live", np.nan, numeric=True), errors="coerce")
+    if rr_s.isna().all():
+        rr_s = _safe_strategy_series(x, "rr", 0.0, numeric=True)
+    rr_s = rr_s.fillna(0.0)
+
+    x["threshold_model_score_min"] = model_min
+    x["threshold_wave_trade_score_min"] = wave_min
+    x["threshold_rr_min"] = rr_min
+    x["threshold_rsi_max"] = rsi_max
+    x["threshold_price_dev_max"] = price_max
+    x["threshold_atr_pct_max"] = atr_max
+
+    x["fail_decision"] = (~decision_s.isin(allowed_core)).astype(int)
+    x["fail_model_score"] = (model_s < model_min).astype(int)
+    x["fail_wave_trade_score"] = (wave_s < wave_min).astype(int)
+    x["fail_wave_keyword"] = (x["wave_condition_pass"].astype(int).eq(0)).astype(int)
+    x["fail_liquidity"] = (~liq_s.isin(required_liq)).astype(int)
+    x["fail_rsi"] = (rsi_s > rsi_max).astype(int)
+    x["fail_atr"] = (atr_s > atr_max).astype(int)
+    x["fail_price_deviation"] = (dev_s > price_max).astype(int)
+    x["fail_rr"] = (rr_s < rr_min).astype(int)
+    x["fail_today_decision"] = (~decision_s.isin(allowed_exec)).astype(int)
+
+    reason_columns = [
+        ("fail_decision", lambda i: f"決策非主攻({decision_s.loc[i] or 'NA'})"),
+        ("fail_model_score", lambda i: f"model_score {model_s.loc[i]:.2f} < {model_min:g}"),
+        ("fail_wave_trade_score", lambda i: f"wave_trade_score {wave_s.loc[i]:.2f} < {wave_min:g}"),
+        ("fail_wave_keyword", lambda i: "波段型態非設定主升條件"),
+        ("fail_liquidity", lambda i: f"流動性 {liq_s.loc[i] or 'NA'} 不在 {sorted(required_liq)}"),
+        ("fail_rsi", lambda i: f"RSI {rsi_s.loc[i]:.2f} > {rsi_max:g}"),
+        ("fail_atr", lambda i: f"ATR% {atr_s.loc[i]:.2f} > {atr_max:g}"),
+        ("fail_price_deviation", lambda i: f"價格偏離 {dev_s.loc[i]*100:.2f}% > {price_max*100:.1f}%"),
+        ("fail_rr", lambda i: f"rr_live {rr_s.loc[i]:.2f} < {rr_min:g}"),
+        ("fail_today_decision", lambda i: "未進今日可下單決策清單"),
+    ]
+    reasons = []
+    for idx in x.index:
+        rs = []
+        for col, fn in reason_columns:
+            try:
+                if int(x.at[idx, col]) == 1:
+                    rs.append(fn(idx))
+            except Exception:
+                pass
+        reasons.append("；".join(dict.fromkeys(rs)) if rs else "PASS")
+
+    x["strategy_profile"] = _strategy_profile_name()
+    x["strategy_nogo_detail"] = reasons
+    x["strategy_config_summary"] = _strategy_summary_text()
+    return x
+
+
 def normalize_core_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=CORE_ANALYSIS_COLUMNS)
@@ -5681,6 +6147,11 @@ def normalize_core_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
         "mainstream_score", "breakout_score", "liquidity_score",
         "entry_low", "entry_high", "entry_mid", "price_deviation", "rr_live",
         "target_1382", "target_1618", "rr", "win_rate",
+        "threshold_model_score_min", "threshold_wave_trade_score_min", "threshold_rr_min",
+        "threshold_rsi_max", "threshold_price_dev_max", "threshold_atr_pct_max",
+        "wave_condition_pass", "fail_decision", "fail_model_score", "fail_wave_trade_score",
+        "fail_wave_keyword", "fail_liquidity", "fail_rsi", "fail_atr", "fail_price_deviation",
+        "fail_rr", "fail_today_decision",
     }
     for col in CORE_ANALYSIS_COLUMNS:
         if col not in x.columns:
@@ -6129,12 +6600,28 @@ class StrategyEngineV91:
         }
 
     @staticmethod
-    def decide_signal(model_score: float, trade_score: float, rr: float, rsi: float, wave: str) -> tuple[str, str]:
-        if model_score >= 82 and trade_score >= 82 and rr >= 1.5 and rsi <= 72 and wave in ("第3浪", "推動浪"):
+    def decide_signal(model_score: float, trade_score: float, rr: float, rsi: float, wave: str, cfg: dict | None = None) -> tuple[str, str]:
+        cfg = _active_strategy_config(cfg)
+        core_cfg, exe_cfg, wait_cfg = _strategy_values(cfg)
+        model_min = float(get_strategy_threshold(cfg, "core_attack", "model_score_min"))
+        wave_min = float(get_strategy_threshold(cfg, "core_attack", "wave_trade_score_min"))
+        rr_min = float(get_strategy_threshold(cfg, "execution", "rr_min"))
+        rsi_max = float(get_strategy_threshold(cfg, "execution", "rsi_max"))
+        wait_rr_min = float(get_strategy_threshold(cfg, "wait_pullback", "rr_min"))
+        wave_ok = _match_wave_keyword_text(str(wave or ""), core_cfg)
+
+        model_score = _coerce_float(model_score)
+        trade_score = _coerce_float(trade_score)
+        rr = _coerce_float(rr)
+        rsi = _coerce_float(rsi, 50.0)
+
+        if model_score >= model_min and trade_score >= wave_min and rr >= rr_min and rsi <= rsi_max and wave_ok:
             return "BUY", "可買"
-        if model_score >= 72 and trade_score >= 72 and rr >= 1.15:
+        weak_model_min = max(0.0, model_min - 10.0)
+        weak_wave_min = max(0.0, wave_min - 10.0)
+        if model_score >= weak_model_min and trade_score >= weak_wave_min and rr >= wait_rr_min and rsi <= rsi_max:
             return "WEAK BUY", "條件預掛"
-        if model_score >= 60 and rr >= 1.0:
+        if model_score >= max(0.0, model_min - 22.0) and rr >= max(1.0, wait_rr_min * 0.90):
             return "HOLD", "觀察"
         return "AVOID", "不可買"
 
@@ -6776,12 +7263,22 @@ class TradingPlanEngine:
         passed = int(score >= 3)
         return passed, "主升成立" if passed else "結構不足"
 
-    def _gate_execution(self, metrics: dict) -> tuple[int, str]:
-        price_deviation = float(metrics.get("price_deviation", 0) or 0)
-        rr_live = float(metrics.get("rr_live", 0) or 0)
+    def _gate_execution(self, metrics: dict, cfg: dict | None = None) -> tuple[int, str]:
+        cfg = _active_strategy_config(cfg)
+        price_deviation = abs(_coerce_float(metrics.get("price_deviation", 0), 0.0))
+        rr_live = _coerce_float(metrics.get("rr_live", 0), 0.0)
         liquidity_status = str(metrics.get("liquidity_status", "WATCH") or "WATCH").strip().upper()
-        passed = int((price_deviation <= 0.03) and (rr_live >= 1.5) and (liquidity_status == "PASS"))
-        return passed, "可執行" if passed else "位置不對"
+        price_max = float(get_strategy_threshold(cfg, "execution", "price_dev_max"))
+        rr_min = float(get_strategy_threshold(cfg, "execution", "rr_min"))
+        required_liq = set(_strategy_required_liquidity(cfg))
+        fail = []
+        if price_deviation > price_max:
+            fail.append(f"fail_price_deviation({price_deviation*100:.2f}%>{price_max*100:.1f}%)")
+        if rr_live < rr_min:
+            fail.append(f"fail_rr({rr_live:.2f}<{rr_min:g})")
+        if liquidity_status not in required_liq:
+            fail.append(f"fail_liquidity({liquidity_status or 'NA'} not in {sorted(required_liq)})")
+        return int(not fail), "PASS" if not fail else "/".join(fail)
 
     def build_plan(self, stock_id: str) -> dict:
         stock = self.db.get_stock_row(stock_id)
@@ -6894,6 +7391,7 @@ class TradingPlanEngine:
             indicator_score * V80_WEIGHTS["indicator"], 2
         )
 
+        active_strategy_config = STRATEGY_CONFIG_MANAGER.get_active_profile()
         wave_trade = StrategyEngineV91.wave_fib_trade_model(x)
         atr14 = float(last["atr14"]) if pd.notna(last["atr14"]) else max(close_ * 0.03, 0.01)
         atr_pct = round((atr14 / max(close_, 0.01)) * 100, 2)
@@ -6916,7 +7414,7 @@ class TradingPlanEngine:
         volume_ok = int(vol_ratio >= 1.0)
 
         win_grade, win_rate = WinRateEngine.estimate(hist)
-        decision, auto_state = StrategyEngineV91.decide_signal(model_score, float(wave_trade["wave_trade_score"]), rr, rsi, wave_label)
+        decision, auto_state = StrategyEngineV91.decide_signal(model_score, float(wave_trade["wave_trade_score"]), rr, rsi, wave_label, active_strategy_config)
 
         preferred_theme = any(key.lower() in str(stock.get("theme", "")).lower() for key in ThemeStrengthEngine.PREFERRED_KEYWORDS)
         liquidity = self.intraday_engine.evaluate(stock, hist, theme_hot=preferred_theme)
@@ -6975,7 +7473,7 @@ class TradingPlanEngine:
             "price_deviation": price_deviation,
             "rr_live": rr_live,
             "liquidity_status": liquidity_status,
-        })
+        }, active_strategy_config)
 
         if is_etf:
             final_trade_decision = "DEFENSE"
@@ -7173,6 +7671,12 @@ class MasterTradingEngine:
         execution_ready = pd.DataFrame()
         unique_decision = pd.DataFrame()
 
+        strategy_cfg = STRATEGY_CONFIG_MANAGER.load() or DEFAULT_STRATEGY_CONFIG
+        active_strategy = STRATEGY_CONFIG_MANAGER.get_active_profile()
+        core_cfg, exe_cfg, wait_cfg = _strategy_values(active_strategy)
+        if log_cb:
+            log_cb(f"[STRATEGY_CONFIG] {STRATEGY_CONFIG_MANAGER.summary_text()}")
+
         if not tradable.empty:
             tradable["decision_rank"] = tradable["decision"].map({"BUY": 3, "WEAK BUY": 2, "HOLD": 1}).fillna(0)
             tradable["preferred_rank"] = preferred_mask.reindex(tradable.index).fillna(False).astype(int)
@@ -7239,10 +7743,17 @@ class MasterTradingEngine:
 
             # 鎖死來源：core_attack5 只能由 candidate20 產生
             trade_top20 = attach_external_display_columns(trade_top20)
+            trade_top20 = attach_strategy_nogo_columns(trade_top20, active_strategy, "candidate20")
             core_source_base = apply_external_decision_filter(trade_top20, "core_attack5")
-            core_source = core_source_base[
-                core_source_base.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"])
-            ].copy() if not core_source_base.empty else pd.DataFrame()
+            if not core_source_base.empty:
+                allowed_core_decisions = _strategy_allowed_decisions(active_strategy, "core_attack")
+                core_decision_mask = core_source_base.get("final_trade_decision", pd.Series(dtype=str, index=core_source_base.index)).astype(str).isin(allowed_core_decisions)
+                core_model_mask = _safe_num_series(core_source_base, "model_score", 0) >= float(get_strategy_threshold(active_strategy, "core_attack", "model_score_min"))
+                core_wave_mask = _safe_num_series(core_source_base, "wave_trade_score", 0) >= float(get_strategy_threshold(active_strategy, "core_attack", "wave_trade_score_min"))
+                core_wave_keyword_mask = _strategy_wave_keyword_mask(core_source_base, core_cfg)
+                core_source = core_source_base[core_decision_mask & core_model_mask & core_wave_mask & core_wave_keyword_mask].copy()
+            else:
+                core_source = pd.DataFrame()
             if not core_source.empty:
                 core_source["stock_id"] = core_source["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
                 core_source = core_source.drop_duplicates(subset=["stock_id"], keep="first").copy()
@@ -7287,10 +7798,11 @@ class MasterTradingEngine:
                 execution_candidates = execution_candidates.drop_duplicates(subset=["stock_id"], keep="first")
                 execution_candidates["rsi"] = _safe_num_series(execution_candidates, "rsi", 0)
                 execution_candidates["atr_pct"] = _safe_num_series(execution_candidates, "atr_pct", 999)
+                required_liq = _strategy_required_liquidity(active_strategy)
                 execution_candidates = execution_candidates[
-                    (execution_candidates["liquidity_status"].astype(str) == "PASS") &
-                    (execution_candidates["rsi"] <= 72) &
-                    (execution_candidates["atr_pct"] <= 8)
+                    (execution_candidates["liquidity_status"].astype(str).isin(required_liq)) &
+                    (execution_candidates["rsi"] <= float(get_strategy_threshold(active_strategy, "execution", "rsi_max"))) &
+                    (execution_candidates["atr_pct"] <= float(get_strategy_threshold(active_strategy, "execution", "atr_pct_max")))
                 ].copy()
                 execution_candidates["entry_mid"] = _safe_num_series(execution_candidates, "entry_mid", 0)
                 execution_candidates["price_deviation"] = _safe_num_series(execution_candidates, "price_deviation", 0)
@@ -7307,19 +7819,27 @@ class MasterTradingEngine:
                     _safe_num_series(execution_candidates, "model_score", 0) * ew["model_score"]
                 ).round(2)
 
+                today_allowed_decisions = _strategy_allowed_decisions(active_strategy, "execution")
                 today_buy = execution_candidates[
-                    execution_candidates.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "DEFENSE"]) &
-                    (execution_candidates["price_deviation"] <= 0.03) &
-                    (execution_candidates["rr_live"] >= 1.5)
+                    execution_candidates.get("final_trade_decision", pd.Series(dtype=str, index=execution_candidates.index)).astype(str).isin(today_allowed_decisions) &
+                    (execution_candidates["price_deviation"].abs() <= float(get_strategy_threshold(active_strategy, "execution", "price_dev_max"))) &
+                    (execution_candidates["rr_live"] >= float(get_strategy_threshold(active_strategy, "execution", "rr_min")))
                 ].sort_values(["execution_score", "core_attack5_score", "liquidity_score", "model_score"], ascending=False).head(REPORT_DECISION_LIMITS["today_buy"]).copy()
                 if not today_buy.empty:
                     today_buy["pool_role"] = "今日可下單"
                     today_buy["ui_state"] = "可下單"
 
+                wait_allowed_decisions = _strategy_allowed_decisions(active_strategy, "wait_pullback")
+                wait_rr_min = float(get_strategy_threshold(active_strategy, "wait_pullback", "rr_min"))
+                wait_dev_min = float(get_strategy_threshold(active_strategy, "wait_pullback", "price_dev_min"))
+                wait_dev_max = float(get_strategy_threshold(active_strategy, "wait_pullback", "price_dev_max"))
+                today_dev_max = float(get_strategy_threshold(active_strategy, "execution", "price_dev_max"))
+                today_rr_min = float(get_strategy_threshold(active_strategy, "execution", "rr_min"))
+                abs_dev = execution_candidates["price_deviation"].abs()
                 wait_pullback = execution_candidates[
-                    execution_candidates.get("final_trade_decision", pd.Series(dtype=str)).astype(str).isin(["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"]) &
-                    (((execution_candidates["price_deviation"] > 0.03) & (execution_candidates["price_deviation"] <= 0.08) & (execution_candidates["rr_live"] >= 1.2)) |
-                     ((execution_candidates["price_deviation"] <= 0.03) & (execution_candidates["rr_live"] >= 1.2) & (execution_candidates["rr_live"] < 1.5)))
+                    execution_candidates.get("final_trade_decision", pd.Series(dtype=str, index=execution_candidates.index)).astype(str).isin(wait_allowed_decisions) &
+                    (((abs_dev > wait_dev_min) & (abs_dev <= wait_dev_max) & (execution_candidates["rr_live"] >= wait_rr_min)) |
+                     ((abs_dev <= today_dev_max) & (execution_candidates["rr_live"] >= wait_rr_min) & (execution_candidates["rr_live"] < today_rr_min)))
                 ].sort_values(["execution_score", "core_attack5_score", "liquidity_score", "model_score"], ascending=False).head(REPORT_DECISION_LIMITS["today_buy"]).copy()
 
             if not wait_pullback.empty and not today_buy.empty:
@@ -7336,7 +7856,7 @@ class MasterTradingEngine:
             unique_base = core_attack5.copy() if core_attack5 is not None else pd.DataFrame()
             if unique_base is not None and not unique_base.empty:
                 if "final_trade_decision" in unique_base.columns:
-                    unique_base = unique_base[unique_base["final_trade_decision"].astype(str).isin(["STRONG_BUY", "BUY", "WAIT_PULLBACK", "DEFENSE"])].copy()
+                    unique_base = unique_base[unique_base["final_trade_decision"].astype(str).isin(_strategy_allowed_decisions(active_strategy, "execution") + _strategy_allowed_decisions(active_strategy, "wait_pullback"))].copy()
                 unique_decision = unique_base.sort_values([c for c in ["core_attack5_score", "candidate20_score", "liquidity_score", "model_score", "win_rate", "rr"] if c in unique_base.columns], ascending=False).drop_duplicates(subset=["stock_id"], keep="first").head(REPORT_DECISION_LIMITS["unique_decision"]).copy()
             else:
                 unique_decision = pd.DataFrame()
@@ -7371,6 +7891,11 @@ class MasterTradingEngine:
         wait_pullback = apply_external_decision_filter(wait_pullback, "wait_pullback")
         execution_ready = apply_external_decision_filter(execution_ready, "execution_ready")
         unique_decision = apply_external_decision_filter(unique_decision, "unique_decision")
+        for _df_name in ["trade_top20", "core_attack5", "today_buy", "wait_pullback", "execution_ready", "unique_decision", "watch"]:
+            try:
+                locals()[_df_name] = attach_strategy_nogo_columns(locals().get(_df_name), active_strategy, _df_name)
+            except Exception as exc:
+                log_warning(f"[STRATEGY_CONFIG] attach NoGo failed {_df_name}: {exc}")
         dynamic_n = max(1, min(10, market["max_positions"] + 2))
         result = {
             "market": market,
@@ -7823,6 +8348,7 @@ class AppUI:
         self.data_engine = DataEngine(db)
         self.rank_engine = RankingEngine(db)
         self.master_trading_engine = MasterTradingEngine(db)
+        self.strategy_config = STRATEGY_CONFIG_MANAGER
         self.backtest_engine = BacktestEngine(db)
         self.portfolio_engine = PortfolioEngine(db)
         self.last_top20_df = pd.DataFrame()
@@ -8080,6 +8606,8 @@ class AppUI:
             "AI選股TOP20",
             "主攻5",
             "V3.5操作說明",
+            "策略設定",
+            "重新計算今日可下單",
             "v9策略回測",
             "初始化全市場",
             "建立完整歷史（一次）",
@@ -8144,6 +8672,7 @@ class AppUI:
         self.tab_order = ttk.Frame(self.left_notebook)
         self.tab_inst = ttk.Frame(self.left_notebook)
         self.tab_external = ttk.Frame(self.left_notebook)
+        self.tab_strategy = ttk.Frame(self.left_notebook)
         self.tab_backtest = ttk.Frame(self.left_notebook)
         self.left_notebook.add(self.tab_dashboard, text="交易儀表板")
         self.left_notebook.add(self.tab_sop, text="V3.5操作SOP")
@@ -8157,6 +8686,7 @@ class AppUI:
         self.left_notebook.add(self.tab_order, text="執行下單清單")
         self.left_notebook.add(self.tab_inst, text="組合交易計畫")
         self.left_notebook.add(self.tab_external, text="外部資料中心")
+        self.left_notebook.add(self.tab_strategy, text="策略設定")
         self.left_notebook.add(self.tab_backtest, text="回測視覺化")
         self.left_notebook.bind("<<NotebookTabChanged>>", self.on_left_tab_changed)
 
@@ -8186,8 +8716,8 @@ class AppUI:
             "theme": "題材", "count": "檔數", "avg_total": "平均總分", "avg_ai": "平均AI分", "top_name": "代表股"
         })
 
-        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "light", "engine", "price", "chg", "chg_pct", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target", "target1382", "target1618", "rr", "win_rate", "elim_reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "light": "燈號", "engine": "來源引擎", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target": "目標價", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "elim_reason": "淘汰原因"
+        self.top20_tree = self._make_tree(self.tab_top20, ("rank", "id", "name", "light", "engine", "price", "chg", "chg_pct", "bucket", "ui_action", "liquidity", "liq_score", "entry", "stop", "target", "target1382", "target1618", "rr", "win_rate", "strategy_nogo", "elim_reason"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "light": "燈號", "engine": "來源引擎", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target": "目標價", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "strategy_nogo": "不合格原因", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
@@ -8215,6 +8745,8 @@ class AppUI:
             "module": "模組", "source": "資料來源", "source_date": "資料日", "status": "狀態", "rows": "筆數", "ready": "DataReady",
             "last_success": "最後成功", "url": "Request URL", "blocking": "阻擋原因", "error": "錯誤/說明"
         })
+
+        self._build_strategy_config_tab()
 
         self.backtest_tree = self._make_tree(self.tab_backtest, ("rank", "id", "name", "win", "avg_ret", "cagr", "mdd", "sharpe", "samples"), {
             "rank": "排序", "id": "代號", "name": "名稱", "win": "勝率%", "avg_ret": "平均報酬%", "cagr": "CAGR%", "mdd": "MDD%", "sharpe": "Sharpe", "samples": "樣本數"
@@ -8271,6 +8803,147 @@ class AppUI:
         self.log_hsb.grid(row=1, column=0, sticky="ew")
         log_body.rowconfigure(0, weight=1)
         log_body.columnconfigure(0, weight=1)
+
+    def _build_strategy_config_tab(self):
+        frame = ttk.Frame(self.tab_strategy, padding=10)
+        frame.pack(fill="both", expand=True)
+        top = ttk.LabelFrame(frame, text="V9.6 策略參數設定（修改後可直接重算今日可下單）", padding=8)
+        top.pack(fill="x", pady=(0, 8))
+        self.strategy_profile_var = tk.StringVar(value=self.strategy_config.get_active_profile_name())
+        profiles = list((self.strategy_config.config.get("profiles") or {}).keys()) or ["normal"]
+        ttk.Label(top, text="策略模式").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.strategy_profile_cb = ttk.Combobox(top, textvariable=self.strategy_profile_var, values=profiles, width=16, state="readonly")
+        self.strategy_profile_cb.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        self.strategy_vars = {}
+        fields = [
+            ("core_attack.model_score_min", "AI模型分數下限", 0, 2),
+            ("core_attack.wave_trade_score_min", "波浪費波分數下限", 0, 4),
+            ("execution.rr_min", "今日可下單RR下限", 1, 0),
+            ("execution.rsi_max", "RSI上限", 1, 2),
+            ("execution.price_dev_max", "價格偏離上限(小數；0.03=3%)", 1, 4),
+            ("execution.atr_pct_max", "ATR%上限", 2, 0),
+            ("wait_pullback.rr_min", "等待回測RR下限", 2, 2),
+            ("wait_pullback.price_dev_max", "等待回測偏離上限", 2, 4),
+        ]
+        for key, label, row, col in fields:
+            ttk.Label(top, text=label).grid(row=row, column=col, sticky="w", padx=4, pady=4)
+            var = tk.StringVar(value="")
+            self.strategy_vars[key] = var
+            ttk.Entry(top, textvariable=var, width=12).grid(row=row, column=col+1, sticky="w", padx=4, pady=4)
+        btns = ttk.Frame(top)
+        btns.grid(row=3, column=0, columnspan=6, sticky="w", pady=(8, 2))
+        ttk.Button(btns, text="載入目前設定", command=self.refresh_strategy_config_ui).pack(side="left", padx=4)
+        ttk.Button(btns, text="套用設定", command=self.apply_strategy_config_from_ui).pack(side="left", padx=4)
+        ttk.Button(btns, text="重新計算今日可下單", command=self.recompute_today_buy_from_cache).pack(side="left", padx=4)
+        ttk.Button(btns, text="開啟設定資料夾", command=lambda: open_path(STRATEGY_CONFIG_DIR)).pack(side="left", padx=4)
+        self.strategy_summary = tk.Text(frame, wrap="word", height=16, font=("Consolas", 10))
+        self.strategy_summary.pack(fill="both", expand=True)
+        self.refresh_strategy_config_ui()
+
+    def refresh_strategy_config_ui(self):
+        try:
+            self.strategy_config.load()
+            profile = self.strategy_config.get_active_profile_name()
+            self.strategy_profile_var.set(profile)
+            cfg = self.strategy_config.get_active_profile()
+            for key, var in self.strategy_vars.items():
+                section, item = key.split(".")
+                value = (cfg.get(section, {}) or {}).get(item, "")
+                var.set(str(value))
+            text = [
+                "《V9.6 Strategy Config》",
+                f"目前設定來源：{self.strategy_config.last_load_message}",
+                f"JSON：{STRATEGY_CONFIG_JSON}",
+                f"Excel：{STRATEGY_CONFIG_EXCEL}",
+                "",
+                self.strategy_config.summary_text(),
+                "",
+                "說明：",
+                "1. 套用設定只改條件，不重新抓外部資料。",
+                "2. 重新計算今日可下單會使用目前快取TOP20/候選池重算，不需重啟程式。",
+                "3. price_dev_max 使用小數：0.03 = 3%。",
+                "4. execution_ready 仍為資訊欄位，不控制 trade_allowed。",
+            ]
+            self.strategy_summary.delete("1.0", tk.END)
+            self.strategy_summary.insert("1.0", "\n".join(text))
+        except Exception as exc:
+            messagebox.showerror("策略設定", f"載入設定失敗：{exc}")
+
+    def apply_strategy_config_from_ui(self):
+        try:
+            self.strategy_config.set_active_profile(self.strategy_profile_var.get())
+            values = {}
+            for key, var in self.strategy_vars.items():
+                raw = str(var.get()).strip()
+                try:
+                    values[key] = float(raw)
+                except Exception:
+                    values[key] = raw
+            self.strategy_config.update_active_values(values)
+            self.strategy_config.load()
+            self.refresh_strategy_config_ui()
+            self.append_log(f"[STRATEGY_CONFIG] 已套用：{self.strategy_config.summary_text()}")
+            self.set_status("策略設定已套用，可按『重新計算今日可下單』")
+        except Exception as exc:
+            messagebox.showerror("策略設定", f"套用設定失敗：{exc}")
+
+    def recompute_today_buy_from_cache(self):
+        try:
+            src = getattr(self, "last_candidate_top20_df", pd.DataFrame())
+            if src is None or src.empty:
+                src = getattr(self, "last_top20_df", pd.DataFrame())
+            if src is None or src.empty:
+                return messagebox.showwarning("策略設定", "尚無TOP20快取，請先執行 AI選股TOP20。")
+            self.strategy_config.load()
+            cfg = self.strategy_config.get_active_profile()
+            active_strategy = cfg
+            core_cfg, exe_cfg, wait_cfg = _strategy_values(cfg)
+            x = attach_strategy_nogo_columns(src.copy(), cfg, "candidate20")
+            allowed_core = _strategy_allowed_decisions(active_strategy, "core_attack")
+            core_mask = x.get("final_trade_decision", pd.Series(dtype=str, index=x.index)).astype(str).isin(allowed_core)
+            core_mask &= _safe_num_series(x, "model_score", 0) >= float(get_strategy_threshold(active_strategy, "core_attack", "model_score_min"))
+            core_mask &= _safe_num_series(x, "wave_trade_score", 0) >= float(get_strategy_threshold(active_strategy, "core_attack", "wave_trade_score_min"))
+            core_mask &= _strategy_wave_keyword_mask(x, core_cfg)
+            core = x[core_mask].copy()
+            if not core.empty:
+                if "core_attack5_score" not in core.columns or _safe_num_series(core, "core_attack5_score", 0).eq(0).all():
+                    core["core_attack5_score"] = _safe_num_series(core, "candidate20_score", _safe_num_series(core, "model_score", 0))
+                core = core.sort_values([c for c in ["core_attack5_score", "candidate20_score", "liquidity_score", "model_score", "win_rate"] if c in core.columns], ascending=False).head(REPORT_DECISION_LIMITS["core_attack5"]).copy()
+                core["pool_role"] = "主攻5"
+            required_liq = _strategy_required_liquidity(active_strategy)
+            ec = normalize_core_analysis_df(core) if core is not None and not core.empty else pd.DataFrame()
+            today = pd.DataFrame(); wait = pd.DataFrame()
+            if ec is not None and not ec.empty:
+                ec["rsi"] = _safe_num_series(ec, "rsi", 0)
+                ec["atr_pct"] = _safe_num_series(ec, "atr_pct", 999)
+                ec["price_deviation"] = _safe_num_series(ec, "price_deviation", 0)
+                ec["rr_live"] = _safe_num_series(ec, "rr_live", _safe_num_series(ec, "rr", 0))
+                ec = ec[(ec["liquidity_status"].astype(str).isin(required_liq)) & (ec["rsi"] <= float(get_strategy_threshold(active_strategy, "execution", "rsi_max"))) & (ec["atr_pct"] <= float(get_strategy_threshold(active_strategy, "execution", "atr_pct_max")))].copy()
+                if not ec.empty:
+                    allowed_today = _strategy_allowed_decisions(active_strategy, "execution")
+                    ec["execution_score"] = _safe_num_series(ec, "core_attack5_score", _safe_num_series(ec, "candidate20_score", 0))
+                    today = ec[ec.get("final_trade_decision", pd.Series(dtype=str, index=ec.index)).astype(str).isin(allowed_today) & (ec["price_deviation"].abs() <= float(get_strategy_threshold(active_strategy, "execution", "price_dev_max"))) & (ec["rr_live"] >= float(get_strategy_threshold(active_strategy, "execution", "rr_min")))].copy()
+                    today = today.sort_values([c for c in ["execution_score", "core_attack5_score", "liquidity_score", "model_score"] if c in today.columns], ascending=False).head(REPORT_DECISION_LIMITS["today_buy"])
+                    if not today.empty:
+                        today["pool_role"] = "今日可下單"; today["ui_state"] = "可下單"
+                    wait_allowed = _strategy_allowed_decisions(active_strategy, "wait_pullback")
+                    abs_dev = ec["price_deviation"].abs()
+                    wait = ec[ec.get("final_trade_decision", pd.Series(dtype=str, index=ec.index)).astype(str).isin(wait_allowed) & (abs_dev > float(get_strategy_threshold(active_strategy, "wait_pullback", "price_dev_min"))) & (abs_dev <= float(get_strategy_threshold(active_strategy, "wait_pullback", "price_dev_max"))) & (ec["rr_live"] >= float(get_strategy_threshold(active_strategy, "wait_pullback", "rr_min")))].copy()
+                    if not wait.empty:
+                        wait["pool_role"] = "等待回測"; wait["ui_state"] = "等待回測"
+            self.last_attack_df = self.enrich_price_and_export_fields(attach_strategy_nogo_columns(core, cfg, "core_attack5"), id_col="stock_id") if core is not None and not core.empty else pd.DataFrame()
+            self.last_top5_df = self.last_attack_df.head(5).copy() if self.last_attack_df is not None and not self.last_attack_df.empty else pd.DataFrame()
+            self.last_today_buy_df = self.enrich_price_and_export_fields(attach_strategy_nogo_columns(today, cfg, "today_buy"), id_col="stock_id") if today is not None and not today.empty else pd.DataFrame()
+            self.last_wait_df = self.enrich_price_and_export_fields(attach_strategy_nogo_columns(wait, cfg, "wait_pullback"), id_col="stock_id") if wait is not None and not wait.empty else pd.DataFrame()
+            self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df)) if self.last_today_buy_df is not None else pd.DataFrame()
+            self.refresh_top20_and_order_views()
+            self.populate_operation_sop(self.master_trading_engine.market_engine.get_market_regime(), src, self.last_today_buy_df, self.last_wait_df, self.last_attack_df, self.last_defense_df)
+            self.left_notebook.select(self.tab_order if self.last_today_buy_df is not None and not self.last_today_buy_df.empty else self.tab_strategy)
+            self.append_log(f"[STRATEGY_CONFIG][RECOMPUTE] {self.strategy_config.summary_text()}｜主攻={0 if self.last_attack_df is None else len(self.last_attack_df)}｜今日可下單={0 if self.last_today_buy_df is None else len(self.last_today_buy_df)}｜等待={0 if self.last_wait_df is None else len(self.last_wait_df)}")
+            self.set_status(f"策略重算完成｜今日可下單 {0 if self.last_today_buy_df is None else len(self.last_today_buy_df)}｜等待 {0 if self.last_wait_df is None else len(self.last_wait_df)}")
+        except Exception as exc:
+            traceback.print_exc()
+            messagebox.showerror("策略設定", f"重新計算失敗：{exc}")
 
     def _make_tree(self, parent, cols, headers):
         frame = ttk.Frame(parent)
@@ -10023,7 +10696,7 @@ class AppUI:
                     r.get("entry_zone", "-"), r.get("stop_loss", "-"), str(r.get("target_price", r.get("目標價", "-"))),
                     f"{float(r.get('target_1382', 0) or 0):.2f}", f"{float(r.get('target_1618', 0) or 0):.2f}",
                     f"{float(r.get('rr', 0) or 0):.2f}", f"{float(r.get('win_rate', 0) or 0):.1f}",
-                    r.get("elimination_reason", "")
+                    r.get("strategy_nogo_detail", ""), r.get("elimination_reason", "")
                 ))
 
         if self.last_top5_df is not None and not self.last_top5_df.empty:
@@ -10813,7 +11486,7 @@ class AppUI:
                     f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
                     f"市場說明：{market['memo']}",
                     f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可下單：{len(today_buy)}｜條件預掛：{len(wait_pullback)}｜防守：{defend_cnt}｜淘汰：{eliminated_cnt}",
-                    f"交易門檻：決策 BUY / WEAK BUY｜支撐 > 0｜壓力 > 支撐｜再依六模組總分排序",
+                    f"交易門檻：{STRATEGY_CONFIG_MANAGER.summary_text()}",
                     "操作用途：先看今日可下單，再看條件預掛，沒有進場區就不下單。",
                     "",
                     "【TOP20 觀察池 前5檔】",
