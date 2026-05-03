@@ -152,7 +152,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.1 PRO STRATEGY_CONFIG_FIXED V16.2-R4"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2527,7 +2527,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.1_pro_strategy_config_fixed_v16.2_r4",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3252,22 +3252,39 @@ class RankingEngine:
         success = 0
         skipped = 0
 
-        # V9.5.7：先建立/更新 EPS Matrix feature，再合併進 Ranking；不在 Excel/UI 重算。
-        run_id = self.db.log_system_run(event="ranking_rebuild", status="start", message="Ranking rebuild with EPS_MATRIX_PATCH", module="ranking")
-        feature_engine = FinancialFeatureEngine(self.db)
-        feature_df = feature_engine.build_feature_batch(run_id=run_id, write_db=True)
-        if feature_df is None or feature_df.empty:
-            feature_df = self.db.get_latest_financial_features()
+        # V9.6.2 FUNDAMENTAL_LOCAL_CACHE：Ranking 不再負責下載或重建 EPS Matrix。
+        # 正確流程：每日增量更新先同步 external_valuation / external_revenue，再寫入 financial_feature_daily；
+        # 重排行只讀本地 financial_feature_daily，避免每次排行時即時抓網路或產生 E_NA-R_NA 假評分。
+        run_id = self.db.log_system_run(event="ranking_rebuild", status="start", message="Ranking rebuild reads local financial_feature_daily only", module="ranking")
+        feature_df = self.db.get_latest_financial_features()
         feature_map = {}
         if feature_df is not None and not feature_df.empty and "stock_id" in feature_df.columns:
             feature_map = {str(r.get("stock_id")): dict(r) for _, r in feature_df.iterrows()}
+            ne_ratio = 0.0
+            try:
+                if "data_quality_flag" in feature_df.columns:
+                    flags = feature_df["data_quality_flag"].fillna("").astype(str)
+                    ne_ratio = float(flags.str.contains("NE", case=False, na=False).mean())
+                elif "matrix_cell" in feature_df.columns:
+                    cells = feature_df["matrix_cell"].fillna("").astype(str)
+                    ne_ratio = float(cells.eq("E_NA-R_NA").mean())
+            except Exception:
+                ne_ratio = 0.0
+            msg = f"[EPS MATRIX][MERGE] 只讀本地 financial_feature_daily｜features={len(feature_map)}｜NE_ratio={ne_ratio:.2%}"
             if log_cb:
-                log_cb(f"[EPS MATRIX][MERGE] financial_feature_daily 可合併 {len(feature_map)} 檔")
-            log_info(f"[EPS MATRIX][MERGE] run_id={run_id} features={len(feature_map)}")
+                log_cb(msg)
+            log_info(f"{msg}｜run_id={run_id}")
+            if ne_ratio >= 0.80:
+                warn = "[EPS MATRIX][GATE][WARNING] financial_feature_daily 大量 NE，基本面資料不足；排行可產出但不可視為可下單依據，請先執行每日增量更新同步基本面。"
+                if log_cb:
+                    log_cb(warn)
+                log_warning(f"{warn}｜run_id={run_id}")
+                self.db.log_system_run(event="financial_feature_quality_gate", status="warning", message=f"NE_ratio={ne_ratio:.2%}; features={len(feature_map)}", run_id=run_id, module="eps_matrix")
         else:
             if log_cb:
-                log_cb("[EPS MATRIX][MERGE] 無 financial_feature_daily，Ranking 使用中性財務分數")
-            log_warning(f"[EPS MATRIX][MERGE] run_id={run_id} features=0")
+                log_cb("[EPS MATRIX][MERGE] 無本地 financial_feature_daily，Ranking 使用中性財務分數；請先執行每日增量更新同步基本面。")
+            log_warning(f"[EPS MATRIX][MERGE] run_id={run_id} features=0; local cache missing")
+            self.db.log_system_run(event="financial_feature_quality_gate", status="warning", message="financial_feature_daily missing; ranking uses neutral financial score", run_id=run_id, module="eps_matrix")
 
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
@@ -3311,7 +3328,7 @@ class RankingEngine:
             if progress_cb:
                 progress_cb(idx, total, stock_id, success, 0, skipped, "ok")
             if log_cb and (idx % 100 == 0 or idx == total):
-                log_cb(f"重排行進度 {idx}/{total}｜已納入 {success} 檔｜跳過 {skipped} 檔｜EPS矩陣合併")
+                log_cb(f"重排行進度 {idx}/{total}｜已納入 {success} 檔｜跳過 {skipped} 檔｜本地EPS矩陣合併")
         if not rows:
             return 0
 
@@ -3320,7 +3337,7 @@ class RankingEngine:
         merged = df.merge(master[["stock_id", "industry"]], on="stock_id", how="left")
         df["rank_industry"] = merged.groupby("industry")["total_score"].rank(method="dense", ascending=False).astype(int)
         self.db.replace_ranking(df)
-        self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with EPS_MATRIX_PATCH", run_id=run_id, module="ranking")
+        self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with FUNDAMENTAL_LOCAL_CACHE", run_id=run_id, module="ranking")
         return len(df)
 
 
@@ -4467,6 +4484,112 @@ class ExternalDataFetcher:
         )
         self.db.log_system_run(event="external_pipeline", status=result.status, message=f"module={module}; rows={result.rows_count}; ready={result.data_ready}; error={result.error_message}", run_id=run_id, step="write", module=module, duration_ms=(time.time()-t0)*1000)
         return result
+
+    def sync_fundamental_local_cache(self, modules: list[str] | tuple[str, ...] | None = None, run_id: str | None = None, log_cb=None) -> dict:
+        """V9.6.2：基本面本地快取同步。
+
+        用途：每日增量更新流程中，先把不同來源的 EPS/估值與月營收下載並寫入 SQLite，
+        再由 FinancialFeatureEngine 產生 financial_feature_daily。之後 Ranking 只讀本地快取，
+        不再於重排行時即時抓網路或重建資料。
+        """
+        run_id = run_id or self.db.log_system_run(
+            event="fundamental_local_cache_sync",
+            status="start",
+            message="sync valuation/revenue to local DB before ranking",
+            step="start",
+            module="fundamental_cache",
+        )
+        wanted = list(modules or ["valuation", "revenue"])
+        results = []
+        if log_cb:
+            log_cb(f"[FUNDAMENTAL CACHE][START] modules={','.join(wanted)}｜run_id={run_id}")
+        for module in wanted:
+            cfg = ExternalSourceConfig.SOURCES.get(module)
+            if not cfg:
+                msg = f"module設定不存在：{module}"
+                log_warning(f"[FUNDAMENTAL CACHE][SKIP] {msg}")
+                results.append({"module": module, "status": "skip", "data_ready": 0, "rows_count": 0, "error_message": msg})
+                continue
+            result = self._execute_module(module, cfg, run_id)
+            results.append(result.to_dict())
+            if log_cb:
+                log_cb(f"[FUNDAMENTAL CACHE][{module}] status={result.status}｜ready={result.data_ready}｜rows={result.rows_count}｜source_date={result.source_date}")
+
+        feature_rows = 0
+        ne_ratio = 1.0
+        feature_status = "fail"
+        try:
+            feature_df = FinancialFeatureEngine(self.db).build_feature_batch(run_id=run_id, write_db=True)
+            feature_rows = int(0 if feature_df is None else len(feature_df))
+            if feature_df is not None and not feature_df.empty:
+                feature_status = "success"
+                if "data_quality_flag" in feature_df.columns:
+                    flags = feature_df["data_quality_flag"].fillna("").astype(str)
+                    ne_ratio = float(flags.str.contains("NE", case=False, na=False).mean())
+                elif "matrix_cell" in feature_df.columns:
+                    cells = feature_df["matrix_cell"].fillna("").astype(str)
+                    ne_ratio = float(cells.eq("E_NA-R_NA").mean())
+                else:
+                    ne_ratio = 0.0
+            self.db.log_external_data(
+                module="financial_feature_daily",
+                source_name="Fundamental Local Cache Feature Builder",
+                official_url="external_valuation + external_revenue",
+                request_url="internal:FinancialFeatureEngine.build_feature_batch",
+                source_date=datetime.now().strftime("%Y-%m-%d"),
+                status=feature_status,
+                http_status="internal",
+                rows_count=feature_rows,
+                run_id=run_id,
+                step="feature",
+                target_table="financial_feature_daily",
+                data_ready=1 if feature_rows > 0 else 0,
+                blocking_reason="" if feature_rows > 0 else "financial_feature_daily rows=0",
+                source_level="derived_local_cache",
+            )
+        except Exception as exc:
+            feature_status = "fail"
+            log_warning(f"[FUNDAMENTAL CACHE][FEATURE][ERROR] {exc}")
+            self.db.log_external_data(
+                module="financial_feature_daily",
+                source_name="Fundamental Local Cache Feature Builder",
+                official_url="external_valuation + external_revenue",
+                request_url="internal:FinancialFeatureEngine.build_feature_batch",
+                source_date=datetime.now().strftime("%Y-%m-%d"),
+                status="fail",
+                http_status="internal",
+                rows_count=0,
+                error_message=str(exc),
+                run_id=run_id,
+                step="feature",
+                target_table="financial_feature_daily",
+                data_ready=0,
+                blocking_reason=str(exc),
+                source_level="derived_local_cache",
+            )
+
+        quality_status = "ok" if feature_rows > 0 and ne_ratio < 0.80 else "warning"
+        message = f"features={feature_rows}; NE_ratio={ne_ratio:.2%}; modules={','.join(wanted)}"
+        self.db.log_system_run(
+            event="fundamental_local_cache_sync",
+            status=quality_status,
+            message=message,
+            run_id=run_id,
+            step="finish",
+            module="fundamental_cache",
+        )
+        if log_cb:
+            log_cb(f"[FUNDAMENTAL CACHE][FINISH] {message}")
+            if ne_ratio >= 0.80:
+                log_cb("[FUNDAMENTAL CACHE][WARNING] EPS/Revenue 覆蓋率不足，若直接下單需人工確認基本面資料來源。")
+        return {
+            "run_id": run_id,
+            "modules": wanted,
+            "results": results,
+            "feature_rows": feature_rows,
+            "ne_ratio": ne_ratio,
+            "status": quality_status,
+        }
 
     def refresh_external_data_pipeline(self, run_id: str | None = None) -> dict:
         run_id = run_id or self.db.log_system_run(event="external_refresh", status="start", message="V9.4 true external data pipeline start", step="start")
@@ -11248,6 +11371,17 @@ class AppUI:
                     self.ui_call(self.update_task, "每日增量更新", idx, total_count, counters["ok"], counters["fail"], counters["skip"], sid)
 
                 success, failed, rows = self.data_engine.update_incremental(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+
+                # V9.6.2 FUNDAMENTAL_LOCAL_CACHE：每日更新完成後先同步基本面本地快取，再重排行。
+                # 順序固定為：行情 → external_valuation/external_revenue → financial_feature_daily → ranking_result。
+                self.ui_call(self.append_log, "[FUNDAMENTAL CACHE] 每日行情更新完成，開始同步 EPS/估值與月營收本地快取")
+                cache_result = ExternalDataFetcher(self.db).sync_fundamental_local_cache(
+                    modules=["valuation", "revenue"],
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                )
+                if float(cache_result.get("ne_ratio", 1.0) or 1.0) >= 0.80:
+                    self.ui_call(self.append_log, f"[FUNDAMENTAL CACHE][WARNING] financial_feature_daily NE_ratio={cache_result.get('ne_ratio', 1.0):.2%}，排行會標示基本面資料不足。")
+
                 self.ui_call(self.start_task, "重建排行", total)
                 rank_skip = {"skip": 0}
                 def rank_progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
@@ -11258,8 +11392,8 @@ class AppUI:
                 self.ui_call(self.refresh_filters, True)
                 self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.show_welcome_message)
-                self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，排行 {rank_count} 檔。")
-                self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n排行 {rank_count} 檔\n（TWSE/TPEX 官方優先，只更新今日）")
+                self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
+                self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n基本面特徵 {cache_result.get('feature_rows', 0)} 筆\n排行 {rank_count} 檔\n（行情 + EPS/估值 + 月營收已先寫入本地DB）")
             except OperationCancelled:
                 self.ui_call(self.append_log, "每日更新/重排行已中斷")
                 self.ui_call(self.finish_task, "每日增量更新", "作業已中斷")
