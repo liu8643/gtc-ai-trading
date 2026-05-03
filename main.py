@@ -4956,7 +4956,14 @@ class MarginDecisionEngine:
 
 
 class FinancialFeatureEngine:
-    """V9.5.7 EPS_MATRIX_PATCH：把 external_valuation / external_revenue 轉成可進 Ranking / Decision / UI / Excel 的 EPS 矩陣特徵。"""
+    """V9.6.2-R6：把 external_valuation / external_revenue 正確合併成 financial_feature_daily。
+
+    修正重點：
+    1. 所有 stock_id 先 normalize，避免 50 / 0050 / 2330.TW 對不起來。
+    2. external_valuation / external_revenue 進 feature 前先做欄位標準化。
+    3. EPS_YOY 缺值不再被視為核心 NE，避免 NE_ratio 被 EPS_YOY_NE 誤判為 100%。
+    4. Log 明確輸出 valuation_hit / revenue_hit / core_ne_ratio，方便驗收。
+    """
     MATRIX_SCORE = {
         ("E3", "R3"): 100, ("E3", "R2"): 88, ("E3", "R1"): 48, ("E3", "R0"): 25,
         ("E2", "R3"): 92,  ("E2", "R2"): 75, ("E2", "R1"): 45, ("E2", "R0"): 22,
@@ -4976,7 +4983,7 @@ class FinancialFeatureEngine:
             if v is None:
                 return default
             s = str(v).replace(",", "").replace("%", "").strip()
-            if s in ("", "-", "--", "nan", "None", "NULL", "null"):
+            if s in ("", "-", "--", "nan", "None", "NULL", "null", "<NA>", "NaN"):
                 return default
             out = float(s)
             if not np.isfinite(out):
@@ -4992,13 +4999,88 @@ class FinancialFeatureEngine:
         except Exception:
             return lo
 
+    @staticmethod
+    def _normalize_stock_id_series(s: pd.Series) -> pd.Series:
+        return s.astype(str).map(normalize_stock_id)
+
+    @staticmethod
+    def _first_numeric(row: pd.Series, names: list[str], default=np.nan):
+        for name in names:
+            if name in row.index:
+                v = FinancialFeatureEngine._num(row.get(name), np.nan)
+                if np.isfinite(v):
+                    return v
+        return default
+
+    def _standardize_feature_source(self, df: pd.DataFrame, table: str, date_col: str) -> pd.DataFrame:
+        """把外部表轉成 feature builder 可穩定 merge 的格式。"""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        x = df.copy()
+        if "stock_id" not in x.columns:
+            return pd.DataFrame()
+
+        x["stock_id"] = self._normalize_stock_id_series(x["stock_id"])
+        x = x[x["stock_id"] != ""].copy()
+        if x.empty:
+            return pd.DataFrame()
+
+        if date_col in x.columns:
+            x[date_col] = x[date_col].astype(str).str.strip()
+            x = x.sort_values(["stock_id", date_col])
+        else:
+            x[date_col] = ""
+
+        # 欄位別名容錯：避免下載端欄位名稱微幅差異導致全 NA。
+        if table == "external_valuation":
+            alias_map = {
+                "PER": "pe", "PBR": "pb", "殖利率": "dividend_yield",
+                "close": "close_price", "收盤價": "close_price",
+                "EPS": "eps", "eps_latest": "eps", "eps_proxy": "eps_ttm",
+            }
+            for src, dst in alias_map.items():
+                if src in x.columns and dst not in x.columns:
+                    x[dst] = x[src]
+            for c in ["close_price", "pe", "pb", "dividend_yield", "eps", "eps_ttm", "roe", "gross_margin", "operating_margin"]:
+                if c not in x.columns:
+                    x[c] = np.nan
+                x[c] = pd.to_numeric(x[c], errors="coerce")
+            # 若 eps_ttm 空，允許 eps 或 price/pe 反推，至少讓 EPS bucket 不全 E_NA。
+            missing = x["eps_ttm"].isna()
+            if "eps" in x.columns:
+                x.loc[missing, "eps_ttm"] = pd.to_numeric(x.loc[missing, "eps"], errors="coerce")
+            missing = x["eps_ttm"].isna()
+            if missing.any():
+                x.loc[missing, "eps_ttm"] = [
+                    calculate_eps_ttm(price, pe) for price, pe in zip(x.loc[missing, "close_price"], x.loc[missing, "pe"])
+                ]
+            for c in ["fiscal_year_quarter", "source_date", "source_url"]:
+                if c not in x.columns:
+                    x[c] = ""
+                x[c] = x[c].fillna("").astype(str)
+
+        if table == "external_revenue":
+            alias_map = {
+                "revenue_yoy": "yoy", "monthly_yoy": "yoy", "YoY": "yoy",
+                "累計增減": "cumulative_yoy", "cumulative_revenue_yoy": "cumulative_yoy",
+            }
+            for src, dst in alias_map.items():
+                if src in x.columns and dst not in x.columns:
+                    x[dst] = x[src]
+            for c in ["revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy"]:
+                if c not in x.columns:
+                    x[c] = np.nan
+                x[c] = pd.to_numeric(x[c], errors="coerce")
+            if "source_date" not in x.columns:
+                x["source_date"] = ""
+            x["source_date"] = x["source_date"].fillna("").astype(str)
+
+        x = x.drop_duplicates(subset=["stock_id", date_col], keep="last")
+        return x.drop_duplicates(subset=["stock_id"], keep="last").copy()
+
     def _latest_by_stock(self, table: str, date_col: str) -> pd.DataFrame:
         df = self.db.read_table(table, limit=None)
-        if df is None or df.empty or "stock_id" not in df.columns:
-            return pd.DataFrame()
-        if date_col in df.columns:
-            df = df.sort_values(["stock_id", date_col])
-        return df.drop_duplicates(subset=["stock_id"], keep="last").copy()
+        return self._standardize_feature_source(df, table, date_col)
 
     def build_eps_ttm(self, row: pd.Series) -> tuple[float, str]:
         eps_ttm = self._num(row.get("eps_ttm"), np.nan)
@@ -5053,15 +5135,15 @@ class FinancialFeatureEngine:
         except Exception:
             ey = np.nan
         if eps_bucket == "E3" and rev_bucket == "R3" and (not np.isfinite(ey) or ey >= 10):
-            return "U1"  # 高 EPS + 高成長
+            return "U1"
         if eps_bucket == "E2" and rev_bucket == "R3" and (not np.isfinite(ey) or ey >= 0):
             return "U1"
         if eps_bucket == "E3" and rev_bucket == "R2":
-            return "U2"  # 成熟穩健
+            return "U2"
         if eps_bucket in ("E0", "E1") and rev_bucket == "R3":
-            return "U3"  # 轉機/低基期
+            return "U3"
         if eps_bucket == "E3" and rev_bucket in ("R0", "R1"):
-            return "U4"  # 高EPS但業務衰退
+            return "U4"
         if eps_bucket == "E_NA" or rev_bucket == "R_NA":
             return "U0"
         return "U0"
@@ -5084,18 +5166,18 @@ class FinancialFeatureEngine:
 
     def calc_data_quality_flag(self, eps_flag: str, revenue_yoy, eps_yoy, source_trace: dict) -> str:
         flags = []
+        # 核心資料只有 EPS / Revenue 缺失才標 NE；EPS YoY 缺失只是補充資料缺口。
         if eps_flag and eps_flag != "OK":
             flags.append(eps_flag)
         if not np.isfinite(self._num(revenue_yoy, np.nan)):
             flags.append("REV_NE")
-        if not np.isfinite(self._num(eps_yoy, np.nan)):
-            flags.append("EPS_YOY_NE")
-        if not source_trace:
+        if not bool(source_trace.get("valuation_hit")) and not bool(source_trace.get("revenue_hit")):
             flags.append("SOURCE_NE")
+        if not np.isfinite(self._num(eps_yoy, np.nan)):
+            flags.append("EPS_YOY_MISSING")
         return "OK" if not flags else "|".join(flags)
 
     def calc_revenue_eps_score(self, matrix_score, eps_ttm, revenue_yoy, modifier) -> float:
-        # 避免只用一張矩陣，保留 EPS 與營收連續分數。
         eps = self._num(eps_ttm, np.nan)
         rev = self._num(revenue_yoy, np.nan)
         eps_score = 40.0
@@ -5115,19 +5197,33 @@ class FinancialFeatureEngine:
         revenue = self._latest_by_stock("external_revenue", "revenue_month")
         if master is None or master.empty:
             return pd.DataFrame()
+
         base = master[["stock_id"]].copy()
+        base["stock_id"] = self._normalize_stock_id_series(base["stock_id"])
+        base = base[base["stock_id"] != ""].drop_duplicates(subset=["stock_id"], keep="first").copy()
+
+        valuation_hit = 0
+        revenue_hit = 0
         if valuation is not None and not valuation.empty:
             keep_val = [c for c in ["stock_id", "data_date", "close_price", "pe", "pb", "dividend_yield", "eps", "eps_ttm", "roe", "gross_margin", "operating_margin", "fiscal_year_quarter", "source_date", "source_url"] if c in valuation.columns]
-            base = base.merge(valuation[keep_val], on="stock_id", how="left")
+            val_src = valuation[keep_val].copy()
+            base = base.merge(val_src, on="stock_id", how="left")
+            valuation_hit = int(base["data_date"].fillna("").astype(str).ne("").sum()) if "data_date" in base.columns else 0
+
         if revenue is not None and not revenue.empty:
-            keep_rev = [c for c in ["stock_id", "revenue_month", "yoy", "cumulative_yoy", "source_date"] if c in revenue.columns]
-            base = base.merge(revenue[keep_rev], on="stock_id", how="left", suffixes=("", "_revenue"))
+            keep_rev = [c for c in ["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_yoy", "source_date"] if c in revenue.columns]
+            rev_src = revenue[keep_rev].copy()
+            base = base.merge(rev_src, on="stock_id", how="left", suffixes=("", "_revenue"))
+            revenue_hit = int(base["revenue_month"].fillna("").astype(str).ne("").sum()) if "revenue_month" in base.columns else 0
+
         rows = []
         for _, r in base.iterrows():
-            sid = str(r.get("stock_id", "")).strip()
+            sid = normalize_stock_id(r.get("stock_id", ""))
+            if not sid:
+                continue
             eps_ttm, eps_flag = self.build_eps_ttm(r)
-            revenue_yoy = self._num(r.get("yoy", r.get("cumulative_yoy", np.nan)), np.nan)
-            eps_yoy = self._num(r.get("eps_yoy", np.nan), np.nan)
+            revenue_yoy = self._first_numeric(r, ["yoy", "cumulative_yoy", "revenue_yoy"], np.nan)
+            eps_yoy = self._first_numeric(r, ["eps_yoy", "eps_ttm_yoy"], np.nan)
             eps_b = self.classify_eps_bucket(eps_ttm)
             rev_b = self.classify_revenue_bucket(revenue_yoy)
             matrix_cell = f"{eps_b}-{rev_b}"
@@ -5136,6 +5232,8 @@ class FinancialFeatureEngine:
             modifier = self.calc_modifier(eps_yoy, r.get("roe", np.nan), r.get("gross_margin", np.nan), r.get("pe", np.nan))
             score = self.calc_revenue_eps_score(matrix_base, eps_ttm, revenue_yoy, modifier)
             source_trace = {
+                "valuation_hit": bool(str(r.get("data_date", "") or "").strip()),
+                "revenue_hit": bool(str(r.get("revenue_month", "") or "").strip()),
                 "valuation_date": str(r.get("data_date", "") or ""),
                 "valuation_source": str(r.get("source_url", "") or ""),
                 "revenue_month": str(r.get("revenue_month", "") or ""),
@@ -5151,9 +5249,16 @@ class FinancialFeatureEngine:
                 "source_date": str(r.get("source_date_revenue", r.get("source_date", "")) or ""),
                 "run_id": run_id, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
+
         out = pd.DataFrame(rows)
         if write_db and out is not None and not out.empty:
             self.db.replace_financial_feature_batch(out, run_id=run_id)
+            core_ne_ratio = float(out["data_quality_flag"].fillna("").astype(str).str.contains(r"EPS_NE|REV_NE|SOURCE_NE", regex=True).mean())
+            log_info(
+                f"[EPS MATRIX][MERGE][R6] run_id={run_id} master={len(base)} valuation_rows={0 if valuation is None else len(valuation)} "
+                f"revenue_rows={0 if revenue is None else len(revenue)} valuation_hit={valuation_hit} revenue_hit={revenue_hit} "
+                f"core_NE_ratio={core_ne_ratio:.2%}"
+            )
             sample = out.head(log_limit)
             for _, rr in sample.iterrows():
                 log_info(f"[EPS MATRIX][BUILD] run_id={run_id} stock={rr.get('stock_id')} eps_ttm={rr.get('eps_ttm')} rev_yoy={rr.get('revenue_yoy')} cell={rr.get('matrix_cell')} cat={rr.get('eps_category')} score={rr.get('revenue_eps_score')} flag={rr.get('data_quality_flag')}")
