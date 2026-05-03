@@ -152,7 +152,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R8_DEBUG_TRADE_ALLOWED_CONFIG"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R9_MARKET_SNAPSHOT_FIXED"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -179,7 +179,11 @@ TWSE_MARGIN_COMPARE_PAGE = "https://www.twse.com.tw/IIH2/zh/compare/margin.html"
 # V9.5.8 DATA_INTEGRITY_PATCH：market_snapshot 不可再使用 internal:price_history 當 success。
 # 只有 TWSE 官方市場指數資料成功解析，market_snapshot 才允許 data_ready=1。
 TWSE_MARKET_SNAPSHOT_ENDPOINT_TEMPLATE = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date}&type=MS"
-MARKET_PROXY_DECISION_POLICY = "internal:price_history proxy 僅可作偵錯，不可寫入 Ready。外部資料不得直接控制 trade_allowed。"
+MARKET_PROXY_DECISION_POLICY = (
+    "R9：market_snapshot 優先使用 TWSE 官方 MI_INDEX；若官方即時資料尚未更新或解析失敗，"
+    "允許使用本地 price_history 建立 local_cache_fallback，讓系統可先分析/回測/選股；"
+    "source_level 會明確標示 local_cache_fallback_not_official，且外部資料不得直接控制 trade_allowed。"
+)
 ANALYSIS_EXECUTION_SPLIT_POLICY = (
     "V9.5.9：外部資料不作交易控制開關；analysis_ready 永遠允許技術分析；"
     "execution_ready 僅作資訊/提示/Excel/Log 欄位；trade_allowed 只由技術面、RR、風控條件決定。"
@@ -3366,10 +3370,10 @@ class ExternalSourceConfig:
             "request_template": TWSE_MARKET_SNAPSHOT_ENDPOINT_TEMPLATE,
             "target_table": "market_snapshot",
             "required_columns": ["snapshot_date", "market_score", "market_mode"],
-            "fallback_days": 7,
+            "fallback_days": 15,
             "mandatory": True,
             "parser": "fetch_market_snapshot",
-            "source_priority": "1.TWSE MI_INDEX 官方市場指數 → 2.日期 fallback 找最近交易日；禁止 internal:price_history proxy 當 Ready",
+            "source_priority": "1.TWSE MI_INDEX 官方市場指數 → 2.日期 fallback 找最近交易日 → 3.本地 price_history local_cache_fallback（清楚標示非官方，但不讓系統空轉）",
             "data_integrity_policy": MARKET_PROXY_DECISION_POLICY,
         },
         "institutional": {
@@ -3563,8 +3567,23 @@ class ExternalDataFetcher:
         self.writer = ExternalDataWriter(db)
 
     def _request_json(self, url: str, timeout: int = 30) -> tuple[object, str]:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"})
-        return resp.json(), str(resp.status_code)
+        """R9：官方資料請求統一入口。加上 raise_for_status 與 JSON 失敗診斷，避免 silent fail。"""
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.twse.com.tw/",
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+        http_status = str(resp.status_code)
+        resp.raise_for_status()
+        try:
+            return resp.json(), http_status
+        except Exception as exc:
+            preview = (resp.text or "")[:300].replace("\n", " ").replace("\r", " ")
+            raise RuntimeError(f"JSON解析失敗｜status={http_status}｜preview={preview}") from exc
 
     def _date_candidates(self, fallback_days: int) -> list[tuple[str, str, int]]:
         base_date = datetime.now()
@@ -3584,12 +3603,20 @@ class ExternalDataFetcher:
             return float(default)
 
     def _normalize_twse_dataset(self, payload) -> tuple[list, list]:
+        """R9：TWSE JSON 可能是 {fields,data}、{tables:[{fields,data}]} 或 list，統一轉成 fields/data。"""
         if isinstance(payload, dict):
             fields = payload.get("fields") or payload.get("stat") or []
-            data = payload.get("data") or payload.get("tables", [{}])[0].get("data", []) if payload.get("tables") else payload.get("data", [])
+            data = payload.get("data")
+            tables = payload.get("tables")
+            if (not data) and isinstance(tables, list) and tables:
+                first = tables[0] if isinstance(tables[0], dict) else {}
+                fields = fields or first.get("fields") or first.get("stat") or []
+                data = first.get("data") or []
             if isinstance(data, dict):
                 data = data.get("data", [])
-            return fields, data or []
+            if data is None:
+                data = []
+            return list(fields or []), list(data or [])
         if isinstance(payload, list):
             return [], payload
         return [], []
@@ -3617,27 +3644,62 @@ class ExternalDataFetcher:
             log_warning(f"[DATA_INTEGRITY][MARKET] 清除 proxy market_snapshot 失敗：{exc}")
 
     def _parse_twse_market_index_snapshot(self, payload, date_iso: str, request_url: str) -> pd.DataFrame:
-        """V9.5.8：解析 TWSE MI_INDEX type=MS，取得加權指數作 market_snapshot。"""
+        """R9：解析 TWSE MI_INDEX type=MS，強化欄位對應與格式變動容錯。"""
         fields, data = self._normalize_twse_dataset(payload)
         rows = data if isinstance(data, list) else []
-        target = None
+        target_values = None
+        target_map = {}
+
         for rec in rows:
             vals = list(rec.values()) if isinstance(rec, dict) else (list(rec) if isinstance(rec, (list, tuple)) else [])
             if not vals:
                 continue
-            joined = " ".join(str(v) for v in vals)
-            if "發行量加權股價指數" in joined or "TAIEX" in joined:
-                target = vals
+
+            if isinstance(rec, dict):
+                rec_map = {str(k).strip(): v for k, v in rec.items()}
+            else:
+                rec_map = {str(k).strip(): v for k, v in zip(fields, vals)} if fields else {}
+
+            joined = " ".join(str(v) for v in vals) + " " + " ".join(str(k) for k in rec_map.keys())
+            if ("發行量加權股價指數" in joined) or ("加權股價指數" in joined) or ("TAIEX" in joined):
+                target_values = vals
+                target_map = rec_map
                 break
-        if target is None:
+
+        if target_values is None:
             return pd.DataFrame()
 
-        # 常見欄位：指數、收盤指數、漲跌(+/-)、漲跌點數、漲跌百分比(%)。
-        taiex_close = self._clean_market_number(target[1] if len(target) > 1 else np.nan)
-        change_points = self._clean_market_number(target[3] if len(target) > 3 else (target[2] if len(target) > 2 else np.nan), default=0.0)
-        change_pct = self._clean_market_number(target[4] if len(target) > 4 else np.nan, default=np.nan)
+        def pick_by_key(candidates, pos=None, default=np.nan):
+            for key in candidates:
+                for actual_key, actual_val in target_map.items():
+                    if key in str(actual_key):
+                        val = self._clean_market_number(actual_val, default=default)
+                        if np.isfinite(val):
+                            return val
+            if pos is not None and len(target_values) > pos:
+                return self._clean_market_number(target_values[pos], default=default)
+            return float(default)
+
+        taiex_close = pick_by_key(["收盤指數", "收盤價", "指數"], pos=1, default=np.nan)
+        change_points = pick_by_key(["漲跌點數", "漲跌"], pos=3, default=0.0)
+        change_pct = pick_by_key(["漲跌百分比", "漲跌幅"], pos=4, default=np.nan)
+
+        # 若欄位位置改版造成 close 取到名稱或錯欄，掃描數值欄補救。
+        if (not np.isfinite(taiex_close)) or taiex_close <= 100:
+            numeric_vals = []
+            for v in target_values:
+                n = self._clean_market_number(v, default=np.nan)
+                if np.isfinite(n):
+                    numeric_vals.append(float(n))
+            # TAIEX 通常會是整列最大的數值之一，避開 0/百分比/漲跌點數。
+            candidates = [v for v in numeric_vals if v > 1000]
+            if candidates:
+                taiex_close = float(candidates[0])
+
         if not np.isfinite(change_pct) and np.isfinite(taiex_close) and taiex_close != 0:
-            change_pct = change_points / max(abs(taiex_close - change_points), 1.0) * 100.0
+            prev = max(abs(taiex_close - change_points), 1.0)
+            change_pct = change_points / prev * 100.0
+
         if not np.isfinite(taiex_close) or taiex_close <= 0:
             return pd.DataFrame()
 
@@ -3658,52 +3720,173 @@ class ExternalDataFetcher:
             "us10y": np.nan,
             "dxy": np.nan,
             "breadth": np.nan,
-            "source_status": "success_twse_official_mi_index",
+            "source_status": "success_twse_official_mi_index_r9",
             "source_type": "official",
             "source_url": request_url,
             "source_level": "official_twse_mi_index",
-            "proxy_reason": "V9.5.8 DATA_INTEGRITY_PATCH：未使用 internal:price_history proxy；全球市場欄位未接官方來源時保持空值，不用0假資料。",
+            "proxy_reason": "R9：TWSE官方MI_INDEX解析成功；不使用假資料。",
+            "update_time": now,
+        }])
+
+    def _build_market_snapshot_from_local_price_history(self, date_iso: str = "", reason: str = "") -> pd.DataFrame:
+        """R9：官方 market_snapshot 不可用時，從本地 price_history 建立可追溯市場快照。
+
+        注意：
+        - 這不是 TWSE 官方加權指數；source_level 會標示 local_cache_fallback_not_official。
+        - 用途是避免 EXE 在官網延遲/假日/API改版時 market_snapshot=0，導致整個交易系統空轉。
+        - trade_allowed 仍不由外部資料直接控制。
+        """
+        try:
+            with self.db.lock:
+                latest_row = self.db.conn.cursor().execute("SELECT MAX(date) FROM price_history").fetchone()
+                latest_date = str(latest_row[0]) if latest_row and latest_row[0] else ""
+                if not latest_date:
+                    return pd.DataFrame()
+                prev_row = self.db.conn.cursor().execute("SELECT MAX(date) FROM price_history WHERE date < ?", (latest_date,)).fetchone()
+                prev_date = str(prev_row[0]) if prev_row and prev_row[0] else ""
+                today_df = pd.read_sql_query(
+                    "SELECT stock_id, close, volume, turnover FROM price_history WHERE date=?",
+                    self.db.conn,
+                    params=[latest_date],
+                )
+                prev_df = pd.read_sql_query(
+                    "SELECT stock_id, close AS prev_close FROM price_history WHERE date=?",
+                    self.db.conn,
+                    params=[prev_date],
+                ) if prev_date else pd.DataFrame()
+        except Exception as exc:
+            log_warning(f"[MARKET_SNAPSHOT][LOCAL_FALLBACK] 讀取 price_history 失敗：{exc}")
+            return pd.DataFrame()
+
+        if today_df is None or today_df.empty:
+            return pd.DataFrame()
+        today_df["stock_id"] = today_df["stock_id"].astype(str).map(normalize_stock_id)
+        today_df["close"] = pd.to_numeric(today_df["close"], errors="coerce")
+        today_df["volume"] = pd.to_numeric(today_df.get("volume", 0), errors="coerce").fillna(0)
+        today_df["turnover"] = pd.to_numeric(today_df.get("turnover", 0), errors="coerce").fillna(0)
+        today_df = today_df.dropna(subset=["close"])
+        if today_df.empty:
+            return pd.DataFrame()
+
+        breadth = np.nan
+        change_pct = 0.0
+        if prev_df is not None and not prev_df.empty:
+            prev_df["stock_id"] = prev_df["stock_id"].astype(str).map(normalize_stock_id)
+            prev_df["prev_close"] = pd.to_numeric(prev_df["prev_close"], errors="coerce")
+            merged = today_df.merge(prev_df[["stock_id", "prev_close"]], on="stock_id", how="left")
+            valid = merged.dropna(subset=["prev_close"]).copy()
+            valid = valid[valid["prev_close"] > 0]
+            if not valid.empty:
+                valid["ret_pct"] = (valid["close"] / valid["prev_close"] - 1.0) * 100.0
+                breadth = round(float((valid["ret_pct"] > 0).mean() * 100.0), 2)
+                # 用成交值加權，若成交值缺失則用等權平均。
+                w = pd.to_numeric(valid.get("turnover", 0), errors="coerce").fillna(0)
+                if float(w.sum()) > 0:
+                    change_pct = float((valid["ret_pct"] * w).sum() / w.sum())
+                else:
+                    change_pct = float(valid["ret_pct"].mean())
+
+        # 這裡不是官方TAIEX，只是本地市場代理值；用平均收盤價保持欄位不空。
+        taiex_proxy = float(today_df["close"].mean())
+        market_score = 50.0 + max(-20.0, min(20.0, float(change_pct if np.isfinite(change_pct) else 0.0) * 10.0))
+        market_score = round(max(0.0, min(100.0, market_score)), 2)
+        market_mode = "Risk_ON" if market_score >= 60 else "Risk_OFF" if market_score <= 40 else "Neutral"
+        taiex_trend = "多頭" if change_pct > 0 else "空頭" if change_pct < 0 else "中性"
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        return pd.DataFrame([{
+            "snapshot_date": latest_date or date_iso or datetime.now().strftime("%Y-%m-%d"),
+            "market_score": market_score,
+            "market_mode": market_mode,
+            "taiex_close": taiex_proxy,
+            "taiex_trend": taiex_trend,
+            "sp500_close": np.nan,
+            "nasdaq_close": np.nan,
+            "vix": np.nan,
+            "us10y": np.nan,
+            "dxy": np.nan,
+            "breadth": breadth,
+            "source_status": "fallback_local_price_history_cache_r9",
+            "source_type": "local_cache",
+            "source_url": "internal:price_history",
+            "source_level": "local_cache_fallback_not_official",
+            "proxy_reason": f"R9 本地快取fallback：官方TWSE MI_INDEX暫不可用；latest_date={latest_date}; rows={len(today_df)}; reason={reason}",
             "update_time": now,
         }])
 
     def fetch_market_snapshot(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
-        """V9.5.8 DATA_INTEGRITY_PATCH：
-        market_snapshot 必須來自 TWSE 官方 MI_INDEX。internal:price_history proxy 不可再被視為 success/fallback/data_ready。
-        若 TWSE 官方資料未取到，回傳 fail/data_ready=0，讓 mandatory_ready 阻擋今日可下單。
+        """R9 MARKET_SNAPSHOT_FIXED：
+        1) 優先抓 TWSE 官方 MI_INDEX，含日期 fallback + retry + 強化解析。
+        2) 若官方資料尚未更新、假日、網路/JSON/欄位改版造成失敗，改用本地 price_history 建立 local cache fallback。
+        3) 每一步都寫 log；data_ready=1 代表 market_snapshot 表不再空轉，但 source_level 會清楚標示是否官方。
         """
+        print("====== MARKET_SNAPSHOT R9 START ======")
         self._purge_proxy_market_snapshot_rows()
         last_error = ""
         last_url = cfg.get("request_template", "")
-        for date_ymd, date_iso, offset in self._date_candidates(cfg.get("fallback_days", 7)):
+        attempts = []
+        max_retry_per_date = 2
+
+        for date_ymd, date_iso, offset in self._date_candidates(cfg.get("fallback_days", 15)):
             url = str(cfg.get("request_template", TWSE_MARKET_SNAPSHOT_ENDPOINT_TEMPLATE)).format(date=date_ymd)
             last_url = url
-            try:
-                payload, http_status = self._request_json(url)
-                df = self._parse_twse_market_index_snapshot(payload, date_iso, url)
-                if df is not None and not df.empty:
-                    log_info(f"[DATA_INTEGRITY][MARKET] official success rows={len(df)} date={date_iso} url={url}")
-                    return ExternalPipelineResult(
-                        module,
-                        "success" if offset == 0 else "fallback",
-                        df=df,
-                        source_name=cfg.get("source_name", ""),
-                        official_url=cfg.get("official_url", ""),
-                        request_url=url,
-                        source_date=date_iso,
-                        http_status=http_status,
-                        fallback_count=offset,
-                        target_table=cfg.get("target_table", ""),
-                        data_ready=1,
-                        source_level="official_twse_mi_index",
-                    )
-                last_error = f"TWSE MI_INDEX 無可解析加權指數資料 date={date_ymd}"
-            except Exception as exc:
-                last_error = f"{url} | {exc}"
-                log_warning(f"[DATA_INTEGRITY][MARKET] official fetch failed: {last_error}")
-                continue
+            for retry_no in range(1, max_retry_per_date + 1):
+                try:
+                    print(f"[MARKET_SNAPSHOT R9] official try date={date_ymd} retry={retry_no} url={url}")
+                    payload, http_status = self._request_json(url, timeout=30)
+                    df = self._parse_twse_market_index_snapshot(payload, date_iso, url)
+                    attempts.append({"date": date_iso, "retry": retry_no, "status": http_status, "rows": 0 if df is None else len(df)})
+                    if df is not None and not df.empty:
+                        print(f"[MARKET_SNAPSHOT R9] official success rows={len(df)} date={date_iso}")
+                        log_info(f"[MARKET_SNAPSHOT][R9] official success rows={len(df)} date={date_iso} url={url}")
+                        return ExternalPipelineResult(
+                            module,
+                            "success" if offset == 0 else "fallback",
+                            df=df,
+                            source_name=cfg.get("source_name", ""),
+                            official_url=cfg.get("official_url", ""),
+                            request_url=url,
+                            source_date=date_iso,
+                            http_status=http_status,
+                            fallback_count=offset,
+                            target_table=cfg.get("target_table", ""),
+                            data_ready=1,
+                            source_level="official_twse_mi_index",
+                        )
+                    last_error = f"TWSE MI_INDEX 無可解析加權指數資料 date={date_ymd} retry={retry_no}"
+                    log_warning(f"[MARKET_SNAPSHOT][R9] {last_error}")
+                except Exception as exc:
+                    last_error = f"{url} | retry={retry_no} | {exc}"
+                    attempts.append({"date": date_iso, "retry": retry_no, "status": "error", "error": str(exc)[:200]})
+                    log_warning(f"[MARKET_SNAPSHOT][R9] official fetch failed: {last_error}")
+                    time.sleep(0.4 * retry_no)
 
-        # 不再建立 fallback_proxy_from_internal_price_history 的 market_snapshot row。
-        # 原因：proxy 只能診斷，不可讓 Decision Layer 誤判 global_external_ready=1。
+        local_df = self._build_market_snapshot_from_local_price_history(
+            reason=last_error or "TWSE official market snapshot unavailable"
+        )
+        if local_df is not None and not local_df.empty:
+            print(f"[MARKET_SNAPSHOT R9] local cache fallback success rows={len(local_df)} date={local_df.iloc[0].get('snapshot_date')}")
+            log_warning(
+                "[MARKET_SNAPSHOT][R9] official failed; local price_history fallback used "
+                f"rows={len(local_df)} reason={last_error}"
+            )
+            return ExternalPipelineResult(
+                module,
+                "fallback",
+                df=local_df,
+                source_name="本地 price_history 市場快照 fallback",
+                official_url=cfg.get("official_url", ""),
+                request_url="internal:price_history",
+                source_date=str(local_df.iloc[0].get("snapshot_date", datetime.now().strftime("%Y-%m-%d"))),
+                http_status="local_cache",
+                fallback_count=int(cfg.get("fallback_days", 15) or 15),
+                error_message=(last_error or ""),
+                target_table=cfg.get("target_table", ""),
+                data_ready=1,
+                source_level="local_cache_fallback_not_official",
+            )
+
+        print("[MARKET_SNAPSHOT R9] fail: official and local fallback unavailable")
         return ExternalPipelineResult(
             module,
             "fail",
@@ -3713,11 +3896,11 @@ class ExternalDataFetcher:
             request_url=last_url,
             source_date=datetime.now().strftime("%Y-%m-%d"),
             http_status="",
-            fallback_count=int(cfg.get("fallback_days", 7) or 0),
-            error_message=(last_error or "TWSE 官方 market_snapshot 未取得；internal proxy 已禁止作為 Ready"),
+            fallback_count=int(cfg.get("fallback_days", 15) or 15),
+            error_message=(last_error or "TWSE 官方 market_snapshot 未取得，且本地 price_history 無可用資料"),
             target_table=cfg.get("target_table", ""),
             data_ready=0,
-            source_level="official_failed_proxy_blocked",
+            source_level="official_failed_local_cache_missing",
         )
 
     def fetch_institutional(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
@@ -11619,9 +11802,9 @@ class AppUI:
 
                 # V9.6.2 FUNDAMENTAL_LOCAL_CACHE：每日更新完成後先同步基本面本地快取，再重排行。
                 # 順序固定為：行情 → external_valuation/external_revenue → financial_feature_daily → ranking_result。
-                self.ui_call(self.append_log, "[FUNDAMENTAL CACHE] 每日行情更新完成，開始同步 EPS/估值與月營收本地快取")
+                self.ui_call(self.append_log, "[FUNDAMENTAL CACHE] 每日行情更新完成，開始同步 market_snapshot + EPS/估值 + 月營收本地快取")
                 cache_result = ExternalDataFetcher(self.db).sync_fundamental_local_cache(
-                    modules=["valuation", "revenue"],
+                    modules=["market_snapshot", "valuation", "revenue"],
                     log_cb=lambda msg: self.ui_call(self.append_log, msg),
                 )
                 if float(cache_result.get("ne_ratio", 1.0) or 1.0) >= 0.80:
