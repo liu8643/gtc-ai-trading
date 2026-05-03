@@ -152,7 +152,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R7_MAPPING_STRICT"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R8_DEBUG_TRADE_ALLOWED_CONFIG"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -5335,6 +5335,22 @@ class FinancialFeatureEngine:
         both_na_ratio = float((out["matrix_cell"].astype(str) == "E_NA-R_NA").mean())
         core_ne_ratio = float(out["data_quality_flag"].fillna("").astype(str).str.contains(r"EPS_NE|REV_NE|SOURCE_NE", regex=True).mean())
 
+        # V9.6.2-R8：強制輸出 merge 驗證資訊到 console / EXE 視窗。
+        # 不只依賴 log_info，避免 UI log 未接到時無法確認 EPS / Revenue 是否真的合併成功。
+        try:
+            print("\n====== DEBUG R8 FINANCIAL MERGE ======", flush=True)
+            print(f"valuation_rows={valuation_rows}", flush=True)
+            print(f"revenue_rows={revenue_rows}", flush=True)
+            print(f"valuation_hit={valuation_hit}", flush=True)
+            print(f"revenue_hit={revenue_hit}", flush=True)
+            print(f"eps_ok={eps_ok}", flush=True)
+            print(f"revenue_ok={revenue_ok}", flush=True)
+            print(f"both_NA_ratio={both_na_ratio:.2%}", flush=True)
+            print(f"core_NE_ratio={core_ne_ratio:.2%}", flush=True)
+            print("======================================\n", flush=True)
+        except Exception:
+            pass
+
         if write_db:
             self.db.replace_financial_feature_batch(out, run_id=run_id)
             log_info(
@@ -5620,10 +5636,51 @@ class DecisionLayerEngine:
             blocking_parts.append("technical_gate")
         if eps_category_block:
             blocking_parts.append("eps_matrix_u4_high_eps_decline")
+
+        # V9.6.2-R8：trade_allowed 正式接上 strategy_config active_profile。
+        # 外部資料缺口仍只作資訊提示，不直接控制 trade_allowed；真正下單開關由
+        # strategy_config.execution 的 RR / RSI / 價格偏離 / ATR / decision / liquidity 控制。
+        active_strategy = STRATEGY_CONFIG_MANAGER.get_active_profile()
+        rr_min = float(get_strategy_threshold(active_strategy, "execution", "rr_min"))
+        rsi_max = float(get_strategy_threshold(active_strategy, "execution", "rsi_max"))
+        price_dev_max = float(get_strategy_threshold(active_strategy, "execution", "price_dev_max"))
+        atr_pct_max = float(get_strategy_threshold(active_strategy, "execution", "atr_pct_max"))
+        allowed_decisions = set(_strategy_allowed_decisions(active_strategy, "execution"))
+        required_liquidity = set(_strategy_required_liquidity(active_strategy))
+
+        rr_value = _row_float(plan, "rr_live", "rr", default=0.0)
+        rsi_value = _row_float(plan, "rsi", "rsi14", default=0.0)
+        price_dev_value = abs(_row_float(plan, "price_deviation", "price_dev", default=0.0))
+        atr_value = _row_float(plan, "atr_pct", "atr", default=999.0)
+        decision_value = str(plan.get("final_trade_decision", plan.get("decision", "")) or "").strip()
+        liquidity_value = str(plan.get("liquidity_status", "") or "").strip()
+
+        config_fail_parts = []
+        if decision_value not in allowed_decisions:
+            config_fail_parts.append(f"fail_decision:{decision_value}")
+        if required_liquidity and liquidity_value not in required_liquidity:
+            config_fail_parts.append(f"fail_liquidity:{liquidity_value}")
+        if rr_value < rr_min:
+            config_fail_parts.append(f"fail_rr:{rr_value:.2f}<{rr_min:.2f}")
+        if rsi_value > rsi_max:
+            config_fail_parts.append(f"fail_rsi:{rsi_value:.2f}>{rsi_max:.2f}")
+        if price_dev_value > price_dev_max:
+            config_fail_parts.append(f"fail_price_deviation:{price_dev_value:.4f}>{price_dev_max:.4f}")
+        if atr_value > atr_pct_max:
+            config_fail_parts.append(f"fail_atr:{atr_value:.2f}>{atr_pct_max:.2f}")
+
+        if config_fail_parts:
+            blocking_parts.extend(config_fail_parts)
+
         # V9.5.9 核心修正：外部資料缺口不加入 blocking_parts；trade_allowed 不看 execution_ready/external_ready。
         if soft_block:
             gate_policy_note += "；外部資料未完整形成SOFT_BLOCK提示，但不作交易開關。"
-        trade_allowed = int(not blocking_parts and all(v == 1 for v in gates.values()))
+        gate_policy_note += (
+            f"；R8 trade_allowed=config execution｜profile={STRATEGY_CONFIG_MANAGER.get_active_profile_name()}｜"
+            f"RR>={rr_min} RSI<={rsi_max} 偏離<={price_dev_max:.4f} ATR<={atr_pct_max}｜"
+            f"decision={decision_value} liquidity={liquidity_value}"
+        )
+        trade_allowed = int((not blocking_parts) and all(v == 1 for v in gates.values()))
 
         gate_summary = f"Market={market_mode}/{market_score:.1f}; MarketReady={market_status.get('ready')}; Flow={flow['score']}; Fundamental={fundamental['score']}; Margin={margin['score']}; Event={event['score']}; Risk={risk['score']}; GlobalExternalReady={global_external_ready}; StockCoverage={stock_external_coverage_state}; States={gate_states}"
         blocking_reason = "；".join([str(x) for x in blocking_parts if str(x).strip()])
