@@ -152,7 +152,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R9_MARKET_SNAPSHOT_FIXED"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R10_MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2128,6 +2128,7 @@ class DBManager:
             update_time TEXT
         )
         """)
+        self._ensure_market_snapshot_r10_schema(cur)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS external_revenue (
             stock_id TEXT,
@@ -2354,6 +2355,76 @@ class DBManager:
         ]:
             cur.execute(sql)
 
+    def _ensure_market_snapshot_r10_schema(self, cur):
+        """R10：market_snapshot 改為「每檔股票一筆」的全市場快照表。
+
+        R9 的 market_snapshot 只有 snapshot_date PRIMARY KEY，fallback 時只能寫入 1 筆市場總覽，
+        無法支撐 Decision Layer 所需的 close/volume/rsi/atr/price_dev/ma20/ma60。
+        R10 若偵測到舊表沒有 stock_id 或仍是單一 snapshot_date 主鍵，會自動備份舊表並重建。
+        """
+        try:
+            info = cur.execute("PRAGMA table_info(market_snapshot)").fetchall()
+            cols = {str(r[1]) for r in info}
+            pk_cols = [str(r[1]) for r in info if int(r[5] or 0) > 0]
+            need_rebuild = ("stock_id" not in cols) or (set(pk_cols) != {"snapshot_date", "stock_id"})
+            if need_rebuild and info:
+                backup = "market_snapshot_legacy_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+                cur.execute(f"ALTER TABLE market_snapshot RENAME TO {backup}")
+                log_warning(f"[R10][SCHEMA] market_snapshot 舊結構已備份為 {backup}，改建全市場快照表")
+        except Exception as exc:
+            log_warning(f"[R10][SCHEMA] market_snapshot schema probe failed: {exc}")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_snapshot (
+            snapshot_date TEXT,
+            stock_id TEXT,
+            stock_name TEXT,
+            market TEXT,
+            industry TEXT,
+            close REAL,
+            open REAL,
+            high REAL,
+            low REAL,
+            volume REAL,
+            turnover REAL,
+            rsi REAL,
+            rsi14 REAL,
+            atr REAL,
+            atr_pct REAL,
+            price_dev REAL,
+            price_deviation REAL,
+            ma20 REAL,
+            ma60 REAL,
+            market_score REAL,
+            market_mode TEXT,
+            taiex_close REAL,
+            taiex_trend TEXT,
+            sp500_close REAL,
+            nasdaq_close REAL,
+            vix REAL,
+            us10y REAL,
+            dxy REAL,
+            breadth REAL,
+            source_status TEXT,
+            source_type TEXT,
+            source_url TEXT,
+            source_level TEXT,
+            proxy_reason TEXT,
+            update_time TEXT,
+            PRIMARY KEY(snapshot_date, stock_id)
+        )
+        """)
+        for col, ddl in [
+            ("stock_id", "stock_id TEXT"), ("stock_name", "stock_name TEXT"), ("market", "market TEXT"), ("industry", "industry TEXT"),
+            ("close", "close REAL"), ("open", "open REAL"), ("high", "high REAL"), ("low", "low REAL"),
+            ("volume", "volume REAL"), ("turnover", "turnover REAL"), ("rsi", "rsi REAL"), ("rsi14", "rsi14 REAL"),
+            ("atr", "atr REAL"), ("atr_pct", "atr_pct REAL"), ("price_dev", "price_dev REAL"), ("price_deviation", "price_deviation REAL"),
+            ("ma20", "ma20 REAL"), ("ma60", "ma60 REAL"),
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE market_snapshot ADD COLUMN {ddl}")
+            except Exception:
+                pass
+
     def _ensure_external_schema_columns(self, cur):
         def _cols(table):
             try:
@@ -2500,6 +2571,12 @@ class DBManager:
             ("macro_margin_score", "macro_margin_score REAL DEFAULT 50"),
             ("macro_margin_state", "macro_margin_state TEXT DEFAULT 'NE'"),
             ("margin_decision_note", "margin_decision_note TEXT DEFAULT ''"),
+            ("fail_reason", "fail_reason TEXT DEFAULT ''"),
+            ("rsi", "rsi REAL"),
+            ("atr_pct", "atr_pct REAL"),
+            ("price_deviation", "price_deviation REAL"),
+            ("model_score", "model_score REAL"),
+            ("wave_trade_score", "wave_trade_score REAL"),
         ]:
             _add("trade_plan", col, ddl)
 
@@ -2630,6 +2707,7 @@ class DBManager:
             "data_quality_flag": "NE", "financial_score": 50.0, "eps_matrix_decision_note": "",
             "margin_balance": 0.0, "short_balance": 0.0, "margin_change": 0.0, "short_change": 0.0, "margin_utilization": 0.0,
             "retail_heat_score": 50.0, "margin_score": 50.0, "margin_state": "NE", "macro_margin_score": 50.0, "macro_margin_state": "NE", "margin_decision_note": "",
+            "fail_reason": "", "rsi": np.nan, "atr_pct": np.nan, "price_deviation": np.nan, "model_score": np.nan, "wave_trade_score": np.nan,
         }
         for c, d in defaults.items():
             if c not in x.columns:
@@ -2637,13 +2715,13 @@ class DBManager:
         if "entry_mid" in x.columns:
             close_series = pd.to_numeric(x["close"], errors="coerce").fillna(0)
             x.loc[close_series.eq(0), "close"] = pd.to_numeric(x.loc[close_series.eq(0), "entry_mid"], errors="coerce").fillna(0)
-        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score"]:
-            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
+        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score"]:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "analysis_ready", "execution_ready", "soft_block"]:
             if c not in x.columns:
                 x[c] = 0
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "analysis_ready", "execution_ready", "soft_block", "block_reason", "execution_block_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "update_time"]
+        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "fail_reason", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "analysis_ready", "execution_ready", "soft_block", "block_reason", "execution_block_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "update_time"]
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -3710,6 +3788,19 @@ class ExternalDataFetcher:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return pd.DataFrame([{
             "snapshot_date": date_iso,
+            "stock_id": "TAIEX",
+            "stock_name": "發行量加權股價指數",
+            "market": "指數",
+            "industry": "大盤",
+            "close": float(taiex_close),
+            "rsi": np.nan,
+            "rsi14": np.nan,
+            "atr": np.nan,
+            "atr_pct": np.nan,
+            "price_dev": np.nan,
+            "price_deviation": np.nan,
+            "ma20": np.nan,
+            "ma60": np.nan,
             "market_score": market_score,
             "market_mode": market_mode,
             "taiex_close": float(taiex_close),
@@ -3729,90 +3820,168 @@ class ExternalDataFetcher:
         }])
 
     def _build_market_snapshot_from_local_price_history(self, date_iso: str = "", reason: str = "") -> pd.DataFrame:
-        """R9：官方 market_snapshot 不可用時，從本地 price_history 建立可追溯市場快照。
+        """R10：從本地 price_history 建立「全市場、每檔股票最新一筆」market_snapshot fallback。
 
-        注意：
-        - 這不是 TWSE 官方加權指數；source_level 會標示 local_cache_fallback_not_official。
-        - 用途是避免 EXE 在官網延遲/假日/API改版時 market_snapshot=0，導致整個交易系統空轉。
-        - trade_allowed 仍不由外部資料直接控制。
+        修正 R9 只寫 1 筆市場總覽的問題。R10 會：
+        1) 用 SQL JOIN 取每一檔股票最新交易日資料，不是整張表 tail(1)。
+        2) 以 price_history 計算 close/volume/rsi/atr/price_dev/ma20/ma60。
+        3) 寫入 market_snapshot 時每檔一筆，rows 應接近全市場 2000+。
         """
         try:
+            latest_sql = """
+                SELECT p.stock_id, p.date, p.open, p.high, p.low, p.close, p.volume, p.turnover
+                FROM price_history p
+                JOIN (
+                    SELECT stock_id, MAX(date) AS max_date
+                    FROM price_history
+                    GROUP BY stock_id
+                ) latest
+                  ON p.stock_id = latest.stock_id
+                 AND p.date = latest.max_date
+            """
+            hist_sql = """
+                SELECT stock_id, date, open, high, low, close, volume, turnover
+                FROM price_history
+                WHERE stock_id IN (SELECT DISTINCT stock_id FROM price_history)
+                ORDER BY stock_id, date
+            """
             with self.db.lock:
-                latest_row = self.db.conn.cursor().execute("SELECT MAX(date) FROM price_history").fetchone()
-                latest_date = str(latest_row[0]) if latest_row and latest_row[0] else ""
-                if not latest_date:
-                    return pd.DataFrame()
-                prev_row = self.db.conn.cursor().execute("SELECT MAX(date) FROM price_history WHERE date < ?", (latest_date,)).fetchone()
-                prev_date = str(prev_row[0]) if prev_row and prev_row[0] else ""
-                today_df = pd.read_sql_query(
-                    "SELECT stock_id, close, volume, turnover FROM price_history WHERE date=?",
-                    self.db.conn,
-                    params=[latest_date],
-                )
-                prev_df = pd.read_sql_query(
-                    "SELECT stock_id, close AS prev_close FROM price_history WHERE date=?",
-                    self.db.conn,
-                    params=[prev_date],
-                ) if prev_date else pd.DataFrame()
+                latest_df = pd.read_sql_query(latest_sql, self.db.conn)
+                hist_df = pd.read_sql_query(hist_sql, self.db.conn)
+                master_df = pd.read_sql_query("SELECT stock_id, stock_name, market, industry FROM stocks_master", self.db.conn)
         except Exception as exc:
-            log_warning(f"[MARKET_SNAPSHOT][LOCAL_FALLBACK] 讀取 price_history 失敗：{exc}")
+            log_warning(f"[MARKET_SNAPSHOT][R10_LOCAL_FALLBACK] 讀取 price_history 失敗：{exc}")
             return pd.DataFrame()
 
-        if today_df is None or today_df.empty:
-            return pd.DataFrame()
-        today_df["stock_id"] = today_df["stock_id"].astype(str).map(normalize_stock_id)
-        today_df["close"] = pd.to_numeric(today_df["close"], errors="coerce")
-        today_df["volume"] = pd.to_numeric(today_df.get("volume", 0), errors="coerce").fillna(0)
-        today_df["turnover"] = pd.to_numeric(today_df.get("turnover", 0), errors="coerce").fillna(0)
-        today_df = today_df.dropna(subset=["close"])
-        if today_df.empty:
+        if latest_df is None or latest_df.empty:
             return pd.DataFrame()
 
+        for _df in (latest_df, hist_df, master_df):
+            if _df is not None and not _df.empty and "stock_id" in _df.columns:
+                _df["stock_id"] = _df["stock_id"].astype(str).map(normalize_stock_id)
+        for c in ["open", "high", "low", "close", "volume", "turnover"]:
+            if c in latest_df.columns:
+                latest_df[c] = pd.to_numeric(latest_df[c], errors="coerce")
+            if c in hist_df.columns:
+                hist_df[c] = pd.to_numeric(hist_df[c], errors="coerce")
+        latest_df = latest_df.dropna(subset=["stock_id", "close"]).copy()
+        latest_df = latest_df[latest_df["stock_id"].astype(str).ne("")]
+        if latest_df.empty:
+            return pd.DataFrame()
+
+        def _calc_last_tech(g: pd.DataFrame) -> pd.Series:
+            g = g.sort_values("date").copy()
+            close = pd.to_numeric(g["close"], errors="coerce")
+            high = pd.to_numeric(g.get("high", close), errors="coerce")
+            low = pd.to_numeric(g.get("low", close), errors="coerce")
+            prev_close = close.shift(1)
+            ma20 = close.rolling(20, min_periods=1).mean()
+            ma60 = close.rolling(60, min_periods=1).mean()
+            delta = close.diff()
+            up = delta.clip(lower=0)
+            down = -delta.clip(upper=0)
+            ma_up = up.ewm(com=13, adjust=False).mean()
+            ma_down = down.ewm(com=13, adjust=False).mean()
+            rs = ma_up / ma_down.replace(0, np.nan)
+            rsi14 = 100 - (100 / (1 + rs))
+            tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+            atr = tr.rolling(14, min_periods=1).mean()
+            last_close = float(close.iloc[-1]) if len(close) else np.nan
+            last_ma20 = float(ma20.iloc[-1]) if len(ma20) else np.nan
+            last_atr = float(atr.iloc[-1]) if len(atr) else np.nan
+            price_dev = ((last_close - last_ma20) / max(abs(last_ma20), 0.01)) if np.isfinite(last_close) and np.isfinite(last_ma20) else np.nan
+            atr_pct = (last_atr / max(abs(last_close), 0.01) * 100.0) if np.isfinite(last_atr) and np.isfinite(last_close) else np.nan
+            return pd.Series({
+                "rsi": float(rsi14.iloc[-1]) if len(rsi14) and pd.notna(rsi14.iloc[-1]) else np.nan,
+                "rsi14": float(rsi14.iloc[-1]) if len(rsi14) and pd.notna(rsi14.iloc[-1]) else np.nan,
+                "atr": last_atr,
+                "atr_pct": atr_pct,
+                "price_dev": price_dev,
+                "price_deviation": price_dev,
+                "ma20": last_ma20,
+                "ma60": float(ma60.iloc[-1]) if len(ma60) and pd.notna(ma60.iloc[-1]) else np.nan,
+            })
+
+        try:
+            tech_df = hist_df.dropna(subset=["stock_id", "close"]).groupby("stock_id", group_keys=False).apply(_calc_last_tech).reset_index()
+        except Exception as exc:
+            log_warning(f"[MARKET_SNAPSHOT][R10_LOCAL_FALLBACK] 技術欄位計算失敗，改用空值：{exc}")
+            tech_df = pd.DataFrame({"stock_id": latest_df["stock_id"].unique()})
+
+        out = latest_df.merge(tech_df, on="stock_id", how="left")
+        if master_df is not None and not master_df.empty:
+            out = out.merge(master_df.drop_duplicates("stock_id"), on="stock_id", how="left")
+        for c in ["stock_name", "market", "industry"]:
+            if c not in out.columns:
+                out[c] = ""
+            out[c] = out[c].fillna("").astype(str)
+
+        latest_date = str(out["date"].dropna().astype(str).max()) if "date" in out.columns and not out.empty else (date_iso or datetime.now().strftime("%Y-%m-%d"))
+        # 市場分數以最新全市場漲跌廣度與等權報酬估算；明確標示為 local_cache_fallback_not_official。
         breadth = np.nan
         change_pct = 0.0
-        if prev_df is not None and not prev_df.empty:
+        try:
+            prev_sql = """
+                SELECT p.stock_id, p.close AS prev_close
+                FROM price_history p
+                JOIN (
+                    SELECT stock_id, MAX(date) AS prev_date
+                    FROM price_history
+                    WHERE date < ?
+                    GROUP BY stock_id
+                ) prev
+                  ON p.stock_id=prev.stock_id AND p.date=prev.prev_date
+            """
+            with self.db.lock:
+                prev_df = pd.read_sql_query(prev_sql, self.db.conn, params=[latest_date])
             prev_df["stock_id"] = prev_df["stock_id"].astype(str).map(normalize_stock_id)
             prev_df["prev_close"] = pd.to_numeric(prev_df["prev_close"], errors="coerce")
-            merged = today_df.merge(prev_df[["stock_id", "prev_close"]], on="stock_id", how="left")
-            valid = merged.dropna(subset=["prev_close"]).copy()
+            valid = out[["stock_id", "close", "turnover"]].merge(prev_df, on="stock_id", how="left").dropna(subset=["prev_close", "close"])
             valid = valid[valid["prev_close"] > 0]
             if not valid.empty:
                 valid["ret_pct"] = (valid["close"] / valid["prev_close"] - 1.0) * 100.0
                 breadth = round(float((valid["ret_pct"] > 0).mean() * 100.0), 2)
-                # 用成交值加權，若成交值缺失則用等權平均。
                 w = pd.to_numeric(valid.get("turnover", 0), errors="coerce").fillna(0)
-                if float(w.sum()) > 0:
-                    change_pct = float((valid["ret_pct"] * w).sum() / w.sum())
-                else:
-                    change_pct = float(valid["ret_pct"].mean())
+                change_pct = float((valid["ret_pct"] * w).sum() / w.sum()) if float(w.sum()) > 0 else float(valid["ret_pct"].mean())
+        except Exception as exc:
+            log_warning(f"[MARKET_SNAPSHOT][R10_LOCAL_FALLBACK] 市場廣度估算失敗：{exc}")
 
-        # 這裡不是官方TAIEX，只是本地市場代理值；用平均收盤價保持欄位不空。
-        taiex_proxy = float(today_df["close"].mean())
         market_score = 50.0 + max(-20.0, min(20.0, float(change_pct if np.isfinite(change_pct) else 0.0) * 10.0))
         market_score = round(max(0.0, min(100.0, market_score)), 2)
         market_mode = "Risk_ON" if market_score >= 60 else "Risk_OFF" if market_score <= 40 else "Neutral"
         taiex_trend = "多頭" if change_pct > 0 else "空頭" if change_pct < 0 else "中性"
+        taiex_proxy = float(pd.to_numeric(out.get("close", pd.Series(dtype=float)), errors="coerce").mean())
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        return pd.DataFrame([{
-            "snapshot_date": latest_date or date_iso or datetime.now().strftime("%Y-%m-%d"),
-            "market_score": market_score,
-            "market_mode": market_mode,
-            "taiex_close": taiex_proxy,
-            "taiex_trend": taiex_trend,
-            "sp500_close": np.nan,
-            "nasdaq_close": np.nan,
-            "vix": np.nan,
-            "us10y": np.nan,
-            "dxy": np.nan,
-            "breadth": breadth,
-            "source_status": "fallback_local_price_history_cache_r9",
-            "source_type": "local_cache",
-            "source_url": "internal:price_history",
-            "source_level": "local_cache_fallback_not_official",
-            "proxy_reason": f"R9 本地快取fallback：官方TWSE MI_INDEX暫不可用；latest_date={latest_date}; rows={len(today_df)}; reason={reason}",
-            "update_time": now,
-        }])
+        out["snapshot_date"] = latest_date
+        out["market_score"] = market_score
+        out["market_mode"] = market_mode
+        out["taiex_close"] = taiex_proxy
+        out["taiex_trend"] = taiex_trend
+        out["sp500_close"] = np.nan
+        out["nasdaq_close"] = np.nan
+        out["vix"] = np.nan
+        out["us10y"] = np.nan
+        out["dxy"] = np.nan
+        out["breadth"] = breadth
+        out["source_status"] = "fallback_local_price_history_full_market_r10"
+        out["source_type"] = "local_cache"
+        out["source_url"] = "internal:price_history_full_market_latest_by_stock"
+        out["source_level"] = "local_cache_fallback_not_official"
+        out["proxy_reason"] = f"R10 全市場本地快取fallback：每檔股票最新一筆；latest_date={latest_date}; rows={len(out)}; reason={reason}"
+        out["update_time"] = now
+        keep = [
+            "snapshot_date", "stock_id", "stock_name", "market", "industry", "close", "open", "high", "low", "volume", "turnover",
+            "rsi", "rsi14", "atr", "atr_pct", "price_dev", "price_deviation", "ma20", "ma60",
+            "market_score", "market_mode", "taiex_close", "taiex_trend", "sp500_close", "nasdaq_close", "vix", "us10y", "dxy", "breadth",
+            "source_status", "source_type", "source_url", "source_level", "proxy_reason", "update_time"
+        ]
+        for c in keep:
+            if c not in out.columns:
+                out[c] = np.nan if c not in ["stock_id", "stock_name", "market", "industry", "snapshot_date", "market_mode", "taiex_trend", "source_status", "source_type", "source_url", "source_level", "proxy_reason", "update_time"] else ""
+        out = out[keep].drop_duplicates(subset=["snapshot_date", "stock_id"], keep="last")
+        print(f"[MARKET_SNAPSHOT R10] local full-market fallback rows={len(out)} latest_date={latest_date}")
+        log_warning(f"[MARKET_SNAPSHOT][R10] local full-market fallback rows={len(out)} latest_date={latest_date}")
+        return out
 
     def fetch_market_snapshot(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
         """R9 MARKET_SNAPSHOT_FIXED：
@@ -3865,9 +4034,9 @@ class ExternalDataFetcher:
             reason=last_error or "TWSE official market snapshot unavailable"
         )
         if local_df is not None and not local_df.empty:
-            print(f"[MARKET_SNAPSHOT R9] local cache fallback success rows={len(local_df)} date={local_df.iloc[0].get('snapshot_date')}")
+            print(f"[MARKET_SNAPSHOT R10] local full-market fallback success rows={len(local_df)} date={local_df.iloc[0].get('snapshot_date')}")
             log_warning(
-                "[MARKET_SNAPSHOT][R9] official failed; local price_history fallback used "
+                "[MARKET_SNAPSHOT][R10] official failed; local full-market price_history fallback used "
                 f"rows={len(local_df)} reason={last_error}"
             )
             return ExternalPipelineResult(
@@ -5832,9 +6001,15 @@ class DecisionLayerEngine:
         required_liquidity = set(_strategy_required_liquidity(active_strategy))
 
         rr_value = _row_float(plan, "rr_live", "rr", default=0.0)
-        rsi_value = _row_float(plan, "rsi", "rsi14", default=0.0)
-        price_dev_value = abs(_row_float(plan, "price_deviation", "price_dev", default=0.0))
-        atr_value = _row_float(plan, "atr_pct", "atr", default=999.0)
+        rsi_raw_value = _row_float(plan, "rsi", "rsi14", default=np.nan)
+        price_dev_raw_value = _row_float(plan, "price_deviation", "price_dev", default=np.nan)
+        atr_raw_value = _row_float(plan, "atr_pct", "atr", default=np.nan)
+        rsi_missing = pd.isna(rsi_raw_value)
+        atr_missing = pd.isna(atr_raw_value)
+        price_dev_missing = pd.isna(price_dev_raw_value)
+        rsi_value = 999.0 if rsi_missing else float(rsi_raw_value)
+        price_dev_value = 999.0 if price_dev_missing else abs(float(price_dev_raw_value))
+        atr_value = 999.0 if atr_missing else float(atr_raw_value)
         decision_value = str(plan.get("final_trade_decision", plan.get("decision", "")) or "").strip()
         liquidity_value = str(plan.get("liquidity_status", "") or "").strip()
 
@@ -5843,13 +6018,19 @@ class DecisionLayerEngine:
             config_fail_parts.append(f"fail_decision:{decision_value}")
         if required_liquidity and liquidity_value not in required_liquidity:
             config_fail_parts.append(f"fail_liquidity:{liquidity_value}")
-        if rr_value < rr_min:
-            config_fail_parts.append(f"fail_rr:{rr_value:.2f}<{rr_min:.2f}")
-        if rsi_value > rsi_max:
+        if pd.isna(rr_value) or rr_value < rr_min:
+            config_fail_parts.append(f"fail_rr:{0.0 if pd.isna(rr_value) else rr_value:.2f}<{rr_min:.2f}")
+        if rsi_missing:
+            config_fail_parts.append("FAIL_RSI_NA")
+        elif rsi_value > rsi_max:
             config_fail_parts.append(f"fail_rsi:{rsi_value:.2f}>{rsi_max:.2f}")
-        if price_dev_value > price_dev_max:
+        if price_dev_missing:
+            config_fail_parts.append("FAIL_PRICE_DEV_NA")
+        elif price_dev_value > price_dev_max:
             config_fail_parts.append(f"fail_price_deviation:{price_dev_value:.4f}>{price_dev_max:.4f}")
-        if atr_value > atr_pct_max:
+        if atr_missing:
+            config_fail_parts.append("FAIL_ATR_NA")
+        elif atr_value > atr_pct_max:
             config_fail_parts.append(f"fail_atr:{atr_value:.2f}>{atr_pct_max:.2f}")
 
         if config_fail_parts:
@@ -5914,6 +6095,12 @@ class DecisionLayerEngine:
             "macro_margin_state": margin.get("macro_margin_state", "NE"),
             "margin_decision_note": margin.get("margin_decision_note", ""),
             "external_blocking_reason": blocking_reason,
+            "fail_reason": blocking_reason,
+            "rsi": np.nan if rsi_missing else rsi_value,
+            "atr_pct": np.nan if atr_missing else atr_value,
+            "price_deviation": np.nan if price_dev_missing else price_dev_value,
+            "model_score": plan.get("model_score", np.nan),
+            "wave_trade_score": plan.get("wave_trade_score", np.nan),
             "pipeline_run_id": str(plan.get("pipeline_run_id", "")),
             "external_run_id": str(plan.get("pipeline_run_id", "")),
             "decision_run_id": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
@@ -6145,7 +6332,7 @@ CORE_ANALYSIS_COLUMNS = [
     "threshold_model_score_min", "threshold_wave_trade_score_min", "threshold_rr_min",
     "threshold_rsi_max", "threshold_price_dev_max", "threshold_atr_pct_max",
     "fail_decision", "fail_model_score", "fail_wave_trade_score", "fail_wave_keyword",
-    "fail_liquidity", "fail_rsi", "fail_atr", "fail_price_deviation", "fail_rr", "fail_today_decision",
+    "fail_liquidity", "fail_rsi_na", "fail_atr_na", "fail_price_dev_na", "fail_rsi", "fail_atr", "fail_price_deviation", "fail_rr", "fail_today_decision", "fail_reason",
 ]
 
 DISPLAY_COLUMN_MAP = {
@@ -6631,12 +6818,21 @@ def attach_strategy_nogo_columns(df: pd.DataFrame, cfg: dict | None = None, pool
     model_s = _safe_strategy_series(x, "model_score", 0.0, numeric=True)
     wave_s = _safe_strategy_series(x, "wave_trade_score", 0.0, numeric=True)
     liq_s = _safe_strategy_series(x, "liquidity_status", "", numeric=False).astype(str).str.upper()
-    rsi_s = pd.to_numeric(_safe_strategy_series(x, "rsi", np.nan, numeric=True), errors="coerce")
-    if rsi_s.isna().all():
-        rsi_s = _safe_strategy_series(x, "rsi14", 0.0, numeric=True)
-    rsi_s = rsi_s.fillna(0.0)
-    atr_s = _safe_strategy_series(x, "atr_pct", 999.0, numeric=True)
-    dev_s = _safe_strategy_series(x, "price_deviation", 0.0, numeric=True).abs()
+    rsi_raw = pd.to_numeric(_safe_strategy_series(x, "rsi", np.nan, numeric=True), errors="coerce")
+    rsi14_raw = pd.to_numeric(_safe_strategy_series(x, "rsi14", np.nan, numeric=True), errors="coerce")
+    rsi_s = rsi_raw.where(rsi_raw.notna(), rsi14_raw)
+    rsi_na = rsi_s.isna()
+    rsi_s_cmp = rsi_s.fillna(999.0)
+    atr_raw = pd.to_numeric(_safe_strategy_series(x, "atr_pct", np.nan, numeric=True), errors="coerce")
+    atr_alt_raw = pd.to_numeric(_safe_strategy_series(x, "atr", np.nan, numeric=True), errors="coerce")
+    atr_s = atr_raw.where(atr_raw.notna(), atr_alt_raw)
+    atr_na = atr_s.isna()
+    atr_s_cmp = atr_s.fillna(999.0)
+    dev_raw = pd.to_numeric(_safe_strategy_series(x, "price_deviation", np.nan, numeric=True), errors="coerce")
+    dev_alt_raw = pd.to_numeric(_safe_strategy_series(x, "price_dev", np.nan, numeric=True), errors="coerce")
+    dev_s = dev_raw.where(dev_raw.notna(), dev_alt_raw).abs()
+    dev_na = dev_s.isna()
+    dev_s_cmp = dev_s.fillna(999.0)
     rr_s = pd.to_numeric(_safe_strategy_series(x, "rr_live", np.nan, numeric=True), errors="coerce")
     if rr_s.isna().all():
         rr_s = _safe_strategy_series(x, "rr", 0.0, numeric=True)
@@ -6654,9 +6850,12 @@ def attach_strategy_nogo_columns(df: pd.DataFrame, cfg: dict | None = None, pool
     x["fail_wave_trade_score"] = (wave_s < wave_min).astype(int)
     x["fail_wave_keyword"] = (x["wave_condition_pass"].astype(int).eq(0)).astype(int)
     x["fail_liquidity"] = (~liq_s.isin(required_liq)).astype(int)
-    x["fail_rsi"] = (rsi_s > rsi_max).astype(int)
-    x["fail_atr"] = (atr_s > atr_max).astype(int)
-    x["fail_price_deviation"] = (dev_s > price_max).astype(int)
+    x["fail_rsi_na"] = rsi_na.astype(int)
+    x["fail_atr_na"] = atr_na.astype(int)
+    x["fail_price_dev_na"] = dev_na.astype(int)
+    x["fail_rsi"] = (rsi_s_cmp > rsi_max).astype(int)
+    x["fail_atr"] = (atr_s_cmp > atr_max).astype(int)
+    x["fail_price_deviation"] = (dev_s_cmp > price_max).astype(int)
     x["fail_rr"] = (rr_s < rr_min).astype(int)
     x["fail_today_decision"] = (~decision_s.isin(allowed_exec)).astype(int)
 
@@ -6666,9 +6865,12 @@ def attach_strategy_nogo_columns(df: pd.DataFrame, cfg: dict | None = None, pool
         ("fail_wave_trade_score", lambda i: f"wave_trade_score {wave_s.loc[i]:.2f} < {wave_min:g}"),
         ("fail_wave_keyword", lambda i: "波段型態非設定主升條件"),
         ("fail_liquidity", lambda i: f"流動性 {liq_s.loc[i] or 'NA'} 不在 {sorted(required_liq)}"),
-        ("fail_rsi", lambda i: f"RSI {rsi_s.loc[i]:.2f} > {rsi_max:g}"),
-        ("fail_atr", lambda i: f"ATR% {atr_s.loc[i]:.2f} > {atr_max:g}"),
-        ("fail_price_deviation", lambda i: f"價格偏離 {dev_s.loc[i]*100:.2f}% > {price_max*100:.1f}%"),
+        ("fail_rsi_na", lambda i: "FAIL_RSI_NA：RSI欄位缺值"),
+        ("fail_atr_na", lambda i: "FAIL_ATR_NA：ATR/ATR%欄位缺值"),
+        ("fail_price_dev_na", lambda i: "FAIL_PRICE_DEV_NA：price_dev/price_deviation欄位缺值"),
+        ("fail_rsi", lambda i: f"RSI {rsi_s_cmp.loc[i]:.2f} > {rsi_max:g}"),
+        ("fail_atr", lambda i: f"ATR% {atr_s_cmp.loc[i]:.2f} > {atr_max:g}"),
+        ("fail_price_deviation", lambda i: f"價格偏離 {dev_s_cmp.loc[i]*100:.2f}% > {price_max*100:.1f}%"),
         ("fail_rr", lambda i: f"rr_live {rr_s.loc[i]:.2f} < {rr_min:g}"),
         ("fail_today_decision", lambda i: "未進今日可下單決策清單"),
     ]
@@ -6685,6 +6887,7 @@ def attach_strategy_nogo_columns(df: pd.DataFrame, cfg: dict | None = None, pool
 
     x["strategy_profile"] = _strategy_profile_name()
     x["strategy_nogo_detail"] = reasons
+    x["fail_reason"] = reasons
     x["strategy_config_summary"] = _strategy_summary_text()
     return x
 
@@ -6701,7 +6904,7 @@ def normalize_core_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
         "threshold_model_score_min", "threshold_wave_trade_score_min", "threshold_rr_min",
         "threshold_rsi_max", "threshold_price_dev_max", "threshold_atr_pct_max",
         "wave_condition_pass", "fail_decision", "fail_model_score", "fail_wave_trade_score",
-        "fail_wave_keyword", "fail_liquidity", "fail_rsi", "fail_atr", "fail_price_deviation",
+        "fail_wave_keyword", "fail_liquidity", "fail_rsi_na", "fail_atr_na", "fail_price_dev_na", "fail_rsi", "fail_atr", "fail_price_deviation",
         "fail_rr", "fail_today_decision",
     }
     for col in CORE_ANALYSIS_COLUMNS:
@@ -9482,6 +9685,14 @@ class AppUI:
                     wait = ec[ec.get("final_trade_decision", pd.Series(dtype=str, index=ec.index)).astype(str).isin(wait_allowed) & (abs_dev > float(get_strategy_threshold(active_strategy, "wait_pullback", "price_dev_min"))) & (abs_dev <= float(get_strategy_threshold(active_strategy, "wait_pullback", "price_dev_max"))) & (ec["rr_live"] >= float(get_strategy_threshold(active_strategy, "wait_pullback", "rr_min")))].copy()
                     if not wait.empty:
                         wait["pool_role"] = "等待回測"; wait["ui_state"] = "等待回測"
+            self.last_no_go_df = self.enrich_price_and_export_fields(attach_strategy_nogo_columns(x, cfg, "candidate20"), id_col="stock_id") if x is not None and not x.empty else pd.DataFrame()
+            try:
+                if self.last_no_go_df is not None and not self.last_no_go_df.empty and "strategy_nogo_detail" in self.last_no_go_df.columns:
+                    _ng = self.last_no_go_df[self.last_no_go_df["strategy_nogo_detail"].astype(str).ne("PASS")].head(10)
+                    for _, _r in _ng.iterrows():
+                        self.append_log(f"[NO_GO][R10] {_r.get('stock_id','')} {_r.get('stock_name','')}｜{_r.get('strategy_nogo_detail','')}")
+            except Exception:
+                pass
             self.last_attack_df = self.enrich_price_and_export_fields(attach_strategy_nogo_columns(core, cfg, "core_attack5"), id_col="stock_id") if core is not None and not core.empty else pd.DataFrame()
             self.last_top5_df = self.last_attack_df.head(5).copy() if self.last_attack_df is not None and not self.last_attack_df.empty else pd.DataFrame()
             self.last_today_buy_df = self.enrich_price_and_export_fields(attach_strategy_nogo_columns(today, cfg, "today_buy"), id_col="stock_id") if today is not None and not today.empty else pd.DataFrame()
@@ -11083,6 +11294,10 @@ class AppUI:
                             if "trade_allowed" in _tp.columns:
                                 _ready = _tp[pd.to_numeric(_tp["trade_allowed"], errors="coerce").fillna(0).astype(int).eq(1)].copy()
                                 tables["Execution_Ready"] = _ready[ext_cols].copy() if not _ready.empty else pd.DataFrame(columns=ext_cols)
+                            _nogo_cols = [c for c in ["stock_id", "stock_name", "rr", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "trade_allowed", "final_trade_decision", "fail_reason", "external_blocking_reason", "decision_reason_short"] if c in _tp.columns]
+                            if _nogo_cols:
+                                _nogo = _tp[pd.to_numeric(_tp.get("trade_allowed", 0), errors="coerce").fillna(0).astype(int).eq(0)].copy()
+                                tables["今日不可下單原因"] = _nogo[_nogo_cols].copy() if not _nogo.empty else pd.DataFrame(columns=_nogo_cols)
                     _val_rows = []
                     _ffv = self.db.read_table("financial_feature_daily", limit=None)
                     if _ffv is not None and not _ffv.empty:
@@ -11135,6 +11350,14 @@ class AppUI:
                 try:
                     if CLASSIFICATION_V2_UNCLASSIFIED_PATH.exists():
                         tables["Unclassified_Report"] = pd.read_excel(CLASSIFICATION_V2_UNCLASSIFIED_PATH)
+                except Exception:
+                    pass
+                try:
+                    _last_nogo = getattr(self, "last_no_go_df", pd.DataFrame())
+                    if _last_nogo is not None and not _last_nogo.empty:
+                        _cols = [c for c in ["stock_id", "stock_name", "rr", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "trade_allowed", "final_trade_decision", "strategy_nogo_detail", "fail_reason"] if c in _last_nogo.columns]
+                        if _cols:
+                            tables["今日不可下單原因"] = _last_nogo[_cols].copy()
                 except Exception:
                     pass
                 if "Ranking" in tables:
@@ -12306,4 +12529,5 @@ if __name__ == "__main__":
 
 
 # V9.5.6 MARGIN_INTEGRATED PATCH MARKER: external_margin + macro_margin_sentiment + DecisionLayer margin_score completed.
+# V9.6.2-R10 MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON MARKER
 # V9.5.8 DATA_INTEGRITY_PATCH MARKER: market_snapshot proxy blocked; only TWSE MI_INDEX official data can set data_ready=1.
