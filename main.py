@@ -197,6 +197,25 @@ MARGIN_DATA_SOURCE_POLICY = [
 ]
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 
+
+# FIX9 AI投資組合引擎：獨立於原 TOP20。TOP20 保留「主流TOP20 + 起爆TOP20 + 雙引擎共振」原設計；
+# AI投資組合使用 pool_config.json 控制勾選、配額與權重，不回寫/取代 TOP20。
+AI_PORTFOLIO_CONFIG_PATH = RUNTIME_DIR / "pool_config.json"
+DEFAULT_AI_PORTFOLIO_CONFIG = {
+    "市場主流池": {"enabled": True, "quota": 5, "weight": 1.20},
+    "未來科技池": {"enabled": True, "quota": 5, "weight": 1.15},
+    "營收成長池": {"enabled": True, "quota": 3, "weight": 1.10},
+    "價值池": {"enabled": True, "quota": 3, "weight": 1.00},
+    "波段攻擊池": {"enabled": True, "quota": 3, "weight": 1.15},
+    "老師低接池": {"enabled": True, "quota": 2, "weight": 1.05},
+    "ETF防守池": {"enabled": False, "quota": 3, "weight": 0.80},
+    "排除風險池": {"enabled": True, "quota": 20, "weight": 0.00},
+}
+AI_PORTFOLIO_FUTURE_TECH_KEYWORDS = [
+    "AI", "AI伺服器", "ASIC", "CPO", "光模組", "光通訊", "矽光子", "散熱", "液冷", "電源", "HVDC",
+    "機器人", "Edge", "邊緣", "AI-RAN", "6G", "網通", "資料中心", "半導體", "RISC-V", "先進封裝",
+]
+
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH = LOG_DIR / f"gtc_ai_trading_{datetime.now().strftime('%Y%m%d')}.log"
@@ -2577,31 +2596,6 @@ class DBManager:
             ("price_deviation", "price_deviation REAL"),
             ("model_score", "model_score REAL"),
             ("wave_trade_score", "wave_trade_score REAL"),
-            # FIX7 TOP20 cache-based pool restore: preserve dual-engine lineage in trade_plan cache.
-            ("candidate_engine", "candidate_engine TEXT DEFAULT ''"),
-            ("source_count", "source_count INTEGER DEFAULT 1"),
-            ("candidate20_score", "candidate20_score REAL"),
-            ("core_attack5_score", "core_attack5_score REAL"),
-            ("execution_score", "execution_score REAL"),
-            ("mainstream_score", "mainstream_score REAL"),
-            ("breakout_score", "breakout_score REAL"),
-            # FIX8: multi-pool TOP20 cache composition fields. These are cache/display lineage fields only.
-            ("source_pools", "source_pools TEXT DEFAULT ''"),
-            ("pool_market_mainstream", "pool_market_mainstream INTEGER DEFAULT 0"),
-            ("pool_future_tech", "pool_future_tech INTEGER DEFAULT 0"),
-            ("pool_growth", "pool_growth INTEGER DEFAULT 0"),
-            ("pool_value", "pool_value INTEGER DEFAULT 0"),
-            ("pool_low_base", "pool_low_base INTEGER DEFAULT 0"),
-            ("pool_breakout", "pool_breakout INTEGER DEFAULT 0"),
-            ("pool_teacher_low_buy", "pool_teacher_low_buy INTEGER DEFAULT 0"),
-            ("pool_exclude_risk", "pool_exclude_risk INTEGER DEFAULT 0"),
-            ("future_theme_score", "future_theme_score REAL"),
-            ("growth_score", "growth_score REAL"),
-            ("value_score", "value_score REAL"),
-            ("low_base_score", "low_base_score REAL"),
-            ("teacher_risk_flag", "teacher_risk_flag INTEGER DEFAULT 0"),
-            ("exclude_reason", "exclude_reason TEXT DEFAULT ''"),
-            ("avoid_swap_flag", "avoid_swap_flag INTEGER DEFAULT 0"),
         ]:
             _add("trade_plan", col, ddl)
 
@@ -2733,13 +2727,6 @@ class DBManager:
             "margin_balance": 0.0, "short_balance": 0.0, "margin_change": 0.0, "short_change": 0.0, "margin_utilization": 0.0,
             "retail_heat_score": 50.0, "margin_score": 50.0, "margin_state": "NE", "macro_margin_score": 50.0, "macro_margin_state": "NE", "margin_decision_note": "",
             "fail_reason": "", "rsi": np.nan, "atr_pct": np.nan, "price_deviation": np.nan, "model_score": np.nan, "wave_trade_score": np.nan,
-            # FIX7: TOP20 must be reconstructed from cached pools, so these lineage fields must not be dropped.
-            "candidate_engine": "", "source_count": 1, "candidate20_score": np.nan, "core_attack5_score": np.nan,
-            "execution_score": np.nan, "mainstream_score": np.nan, "breakout_score": np.nan,
-            "source_pools": "", "pool_market_mainstream": 0, "pool_future_tech": 0, "pool_growth": 0,
-            "pool_value": 0, "pool_low_base": 0, "pool_breakout": 0, "pool_teacher_low_buy": 0,
-            "pool_exclude_risk": 0, "future_theme_score": np.nan, "growth_score": np.nan, "value_score": np.nan,
-            "low_base_score": np.nan, "teacher_risk_flag": 0, "exclude_reason": "", "avoid_swap_flag": 0,
         }
         for c, d in defaults.items():
             if c not in x.columns:
@@ -2747,13 +2734,13 @@ class DBManager:
         if "entry_mid" in x.columns:
             close_series = pd.to_numeric(x["close"], errors="coerce").fillna(0)
             x.loc[close_series.eq(0), "close"] = pd.to_numeric(x.loc[close_series.eq(0), "entry_mid"], errors="coerce").fillna(0)
-        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "source_count", "candidate20_score", "core_attack5_score", "execution_score", "mainstream_score", "breakout_score", "future_theme_score", "growth_score", "value_score", "low_base_score"]:
+        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score"]:
             x[c] = pd.to_numeric(x[c], errors="coerce")
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "analysis_ready", "execution_ready", "soft_block"]:
             if c not in x.columns:
                 x[c] = 0
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "fail_reason", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "analysis_ready", "execution_ready", "soft_block", "block_reason", "execution_block_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "candidate_engine", "source_count", "candidate20_score", "core_attack5_score", "execution_score", "mainstream_score", "breakout_score", "source_pools", "pool_market_mainstream", "pool_future_tech", "pool_growth", "pool_value", "pool_low_base", "pool_breakout", "pool_teacher_low_buy", "pool_exclude_risk", "future_theme_score", "growth_score", "value_score", "low_base_score", "teacher_risk_flag", "exclude_reason", "avoid_swap_flag", "update_time"]
+        keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "fail_reason", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "analysis_ready", "execution_ready", "soft_block", "block_reason", "execution_block_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "update_time"]
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -8399,14 +8386,15 @@ class MasterTradingEngine:
 
         base = filtered_df.copy()
         hot_themes = ThemeStrengthEngine.get_hot_themes(base)
-        try:
-            feature_rows = FinancialFeatureEngine(self.db).build_feature_batch(write_db=True)
-            if log_cb:
-                log_cb(f"[EPS MATRIX][BUILD] AI選股前已更新 financial_feature_daily：{0 if feature_rows is None else len(feature_rows)} 筆")
-        except Exception as exc:
-            log_warning(f"[EPS MATRIX][BUILD][WARN] AI選股前 feature 建立失敗：{exc}")
-            if log_cb:
-                log_cb(f"[EPS MATRIX][BUILD][WARN] {exc}")
+        # FIX9：TOP20 保留原「主流TOP20 + 起爆TOP20 + 雙引擎共振」池化設計，
+        # 但不得在 AI TOP20 入口重建 EPS Matrix；EPS/financial_feature_daily 應由每日增量更新完成。
+        # 此處只讀既有快取，避免 TOP20/投資組合引擎誤觸發全市場重型重算。
+        if log_cb:
+            try:
+                feature_rows = self.db.get_latest_financial_features()
+                log_cb(f"[EPS MATRIX][READ-ONLY] AI選股只讀 financial_feature_daily cache：{0 if feature_rows is None else len(feature_rows)} 筆")
+            except Exception as exc:
+                log_cb(f"[EPS MATRIX][READ-ONLY][WARN] financial_feature_daily 讀取失敗：{exc}")
 
         plans = []
         sids = base["stock_id"].astype(str).tolist()
@@ -9150,6 +9138,11 @@ class AppUI:
         self.last_wait_df = pd.DataFrame()
         self.last_operation_sop_df = pd.DataFrame()
         self.last_unique_decision_df = pd.DataFrame()
+        self.last_ai_portfolio_tables = {}
+        self.last_ai_portfolio_df = pd.DataFrame()
+        self.ai_portfolio_vars = {}
+        self.ai_portfolio_quota_vars = {}
+        self.ai_portfolio_weight_vars = {}
         self.current_chart_path = None
         self.plan_cache = {}
         self.backtest_cache = {}
@@ -9390,6 +9383,7 @@ class AppUI:
         self.action_cb = ttk.Combobox(row2, textvariable=self.action_var, width=18, state="readonly")
         self.action_cb["values"] = [
             "AI選股TOP20",
+            "AI投資組合引擎",
             "主攻5",
             "V3.5操作說明",
             "策略設定",
@@ -9416,7 +9410,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "AI投資組合", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -9453,6 +9447,7 @@ class AppUI:
         self.tab_sector = ttk.Frame(self.left_notebook)
         self.tab_theme = ttk.Frame(self.left_notebook)
         self.tab_top20 = ttk.Frame(self.left_notebook)
+        self.tab_ai_portfolio = ttk.Frame(self.left_notebook)
         self.tab_top5 = ttk.Frame(self.left_notebook)
         self.tab_unique = ttk.Frame(self.left_notebook)
         self.tab_order = ttk.Frame(self.left_notebook)
@@ -9467,6 +9462,7 @@ class AppUI:
         self.left_notebook.add(self.tab_sector, text="類股熱度")
         self.left_notebook.add(self.tab_theme, text="題材輪動")
         self.left_notebook.add(self.tab_top20, text="強勢候選20")
+        self.left_notebook.add(self.tab_ai_portfolio, text="AI投資組合")
         self.left_notebook.add(self.tab_top5, text="主攻5")
         self.left_notebook.add(self.tab_unique, text="唯一決策")
         self.left_notebook.add(self.tab_order, text="執行下單清單")
@@ -9506,6 +9502,12 @@ class AppUI:
             "rank": "排序", "id": "代號", "name": "名稱", "light": "燈號", "engine": "來源引擎", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "ui_action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target": "目標價", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "strategy_nogo": "不合格原因", "elim_reason": "淘汰原因"
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
+
+        self._build_ai_portfolio_controls()
+        self.ai_portfolio_tree = self._make_tree(self.tab_ai_portfolio, ("rank", "id", "name", "pool", "score", "quota", "weight", "price", "total", "ai", "rr", "reason"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "pool": "池別", "score": "組合分", "quota": "配額", "weight": "權重", "price": "現價", "total": "總分", "ai": "AI分", "rr": "RR", "reason": "入池原因"
+        })
+        self.ai_portfolio_tree.bind("<<TreeviewSelect>>", self.on_select_ai_portfolio)
 
         self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "price", "chg", "chg_pct", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
             "rank": "排序", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "state": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
@@ -10018,6 +10020,7 @@ class AppUI:
             "重整外部資料狀態顯示": self.refresh_external_data_status,
             "查看外部原始資料": self.export_external_raw_sample,
             "AI選股TOP20": self.show_top20,
+            "AI投資組合引擎": self.show_ai_portfolio_engine,
             "主攻5": self.show_top5,
             "V3.5操作說明": self.show_operation_guide,
             "v9策略回測": self.show_strategy_backtest,
@@ -11169,6 +11172,7 @@ class AppUI:
             mapping = {
                 "TOP20": getattr(self, "last_top20_df", pd.DataFrame()),
                 "TOP5": getattr(self, "last_top5_df", pd.DataFrame()),
+                "AI投資組合": getattr(self, "last_ai_portfolio_df", pd.DataFrame()),
                 "今日可下單": getattr(self, "last_today_buy_df", pd.DataFrame()),
                 "等待回測": getattr(self, "last_wait_df", pd.DataFrame()),
                 "條件預掛": getattr(self, "last_wait_df", pd.DataFrame()),
@@ -11225,6 +11229,237 @@ class AppUI:
 
 
 
+    def _build_ai_portfolio_controls(self):
+        """FIX9：建立獨立 AI投資組合引擎控制區；不影響 TOP20。"""
+        control = ttk.LabelFrame(self.tab_ai_portfolio, text="AI投資組合引擎｜勾選池別 / 配額 / 權重（不取代TOP20）", padding=8)
+        control.pack(fill="x", padx=4, pady=4)
+        cfg = self.load_ai_portfolio_config()
+        pools = list(DEFAULT_AI_PORTFOLIO_CONFIG.keys())
+        for idx, pool in enumerate(pools):
+            row = idx // 4
+            base_col = (idx % 4) * 4
+            item = cfg.get(pool, DEFAULT_AI_PORTFOLIO_CONFIG.get(pool, {}))
+            enabled_var = tk.BooleanVar(value=bool(item.get("enabled", True)))
+            quota_var = tk.IntVar(value=int(item.get("quota", 3) or 3))
+            weight_var = tk.DoubleVar(value=float(item.get("weight", 1.0) or 1.0))
+            self.ai_portfolio_vars[pool] = enabled_var
+            self.ai_portfolio_quota_vars[pool] = quota_var
+            self.ai_portfolio_weight_vars[pool] = weight_var
+            ttk.Checkbutton(control, text=pool, variable=enabled_var).grid(row=row, column=base_col, sticky="w", padx=(2, 2), pady=2)
+            ttk.Label(control, text="配額").grid(row=row, column=base_col + 1, sticky="e")
+            ttk.Spinbox(control, from_=0, to=20, width=4, textvariable=quota_var).grid(row=row, column=base_col + 2, sticky="w")
+            ttk.Entry(control, textvariable=weight_var, width=5).grid(row=row, column=base_col + 3, sticky="w", padx=(2, 10))
+        btn_row = ttk.Frame(control)
+        btn_row.grid(row=3, column=0, columnspan=16, sticky="w", pady=(6, 0))
+        ttk.Button(btn_row, text="產出AI投資組合", command=self.show_ai_portfolio_engine).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="儲存組合設定", command=self.save_ai_portfolio_config_from_ui).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="匯出AI投資組合報表", command=self.export_ai_portfolio_report).pack(side="left", padx=4)
+        ttk.Label(btn_row, text="說明：TOP20仍走原短線主攻雙引擎；本頁只做獨立投資組合分池。").pack(side="left", padx=12)
+
+    def load_ai_portfolio_config(self) -> dict:
+        cfg = json.loads(json.dumps(DEFAULT_AI_PORTFOLIO_CONFIG, ensure_ascii=False))
+        try:
+            if AI_PORTFOLIO_CONFIG_PATH.exists():
+                raw = json.loads(AI_PORTFOLIO_CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    for pool, item in raw.items():
+                        if pool in cfg and isinstance(item, dict):
+                            cfg[pool].update(item)
+        except Exception as exc:
+            log_warning(f"[AI_PORTFOLIO] pool_config 讀取失敗，改用預設：{exc}")
+        return cfg
+
+    def save_ai_portfolio_config_from_ui(self):
+        try:
+            cfg = self._get_ai_portfolio_config_from_ui()
+            AI_PORTFOLIO_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.append_log(f"[AI_PORTFOLIO] 組合設定已儲存：{AI_PORTFOLIO_CONFIG_PATH}")
+            messagebox.showinfo("AI投資組合", f"組合設定已儲存：\n{AI_PORTFOLIO_CONFIG_PATH}")
+        except Exception as exc:
+            messagebox.showerror("AI投資組合", f"儲存組合設定失敗：{exc}")
+
+    def _get_ai_portfolio_config_from_ui(self) -> dict:
+        cfg = {}
+        for pool, default in DEFAULT_AI_PORTFOLIO_CONFIG.items():
+            enabled = bool(self.ai_portfolio_vars.get(pool, tk.BooleanVar(value=default.get("enabled", True))).get()) if self.ai_portfolio_vars else bool(default.get("enabled", True))
+            try:
+                quota = int(self.ai_portfolio_quota_vars.get(pool).get()) if pool in self.ai_portfolio_quota_vars else int(default.get("quota", 3))
+            except Exception:
+                quota = int(default.get("quota", 3))
+            try:
+                weight = float(self.ai_portfolio_weight_vars.get(pool).get()) if pool in self.ai_portfolio_weight_vars else float(default.get("weight", 1.0))
+            except Exception:
+                weight = float(default.get("weight", 1.0))
+            cfg[pool] = {"enabled": enabled, "quota": max(0, quota), "weight": weight}
+        return cfg
+
+    def _ai_portfolio_base_df(self) -> pd.DataFrame:
+        ranking = self.db.get_latest_ranking()
+        if ranking is None or ranking.empty:
+            return pd.DataFrame()
+        x = ranking.copy()
+        try:
+            x = self.enrich_price_and_export_fields(x, id_col="stock_id")
+        except Exception:
+            pass
+        for c in ["stock_id", "stock_name", "market", "industry", "theme", "signal", "action"]:
+            if c not in x.columns:
+                x[c] = ""
+            x[c] = x[c].fillna("").astype(str)
+        for c in ["total_score", "ai_score", "momentum_score", "trend_score", "volume_score", "risk_score", "financial_score", "revenue_eps_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "rr"]:
+            if c not in x.columns:
+                x[c] = np.nan
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+        x["is_etf_pool"] = x["market"].eq("ETF") | x["stock_id"].str.startswith("00") | x["stock_name"].str.contains("ETF|高股息|債|REIT", case=False, regex=True)
+        return x
+
+    def _ai_portfolio_pool_reason(self, pool_name: str) -> str:
+        mapping = {
+            "市場主流池": "題材/產業均分位於前段，代表當前資金主流。",
+            "未來科技池": "題材/產業/名稱命中AI、ASIC、CPO、網通、散熱、電源等未來科技關鍵字。",
+            "營收成長池": "營收YoY、財務分數或AI分數具成長動能；用營收先行替代落後EPS。",
+            "價值池": "低PE/低PB/殖利率或財務分數較佳，偏穩健價值。",
+            "波段攻擊池": "總分、AI、趨勢、量能或技術訊號偏強，適合波段觀察。",
+            "老師低接池": "訊號/建議偏低接、拉回、整理偏多，適合等支撐。",
+            "ETF防守池": "ETF/防守資產獨立分流，不混入短線TOP20。",
+            "排除風險池": "弱勢、風險分偏低、總分偏低或建議減碼/觀望。",
+        }
+        return mapping.get(pool_name, "依池別規則入選。")
+
+    def build_ai_portfolio_tables(self, config: dict | None = None) -> dict:
+        config = config or self._get_ai_portfolio_config_from_ui()
+        base = self._ai_portfolio_base_df()
+        if base is None or base.empty:
+            return {"01_AI投資組合總表": pd.DataFrame(), "10_組合設定與查檢表": pd.DataFrame([{"項目": "狀態", "內容": "ranking_result 無資料"}])}
+        stock_base = base[~base["is_etf_pool"]].copy()
+        etf_base = base[base["is_etf_pool"]].copy()
+        theme_score = stock_base.groupby("theme", as_index=False).agg(theme_avg_total=("total_score", "mean"), theme_avg_ai=("ai_score", "mean"), theme_count=("stock_id", "count")) if not stock_base.empty else pd.DataFrame()
+        if not theme_score.empty:
+            theme_score["theme_rank_score"] = theme_score["theme_avg_total"].fillna(0) * 0.65 + theme_score["theme_avg_ai"].fillna(0) * 0.35
+            hot_cut = theme_score["theme_rank_score"].quantile(0.80)
+            hot_themes = set(theme_score[theme_score["theme_rank_score"] >= hot_cut]["theme"].astype(str).tolist())
+        else:
+            hot_themes = set()
+        future_pat = "|".join([re.escape(k) for k in AI_PORTFOLIO_FUTURE_TECH_KEYWORDS])
+        pools = {}
+        pools["02_市場主流池"] = stock_base[stock_base["theme"].isin(hot_themes)].copy() if hot_themes else stock_base.sort_values(["total_score", "ai_score"], ascending=False).head(30).copy()
+        pools["03_未來科技池"] = stock_base[(stock_base["theme"].str.contains(future_pat, case=False, regex=True)) | (stock_base["industry"].str.contains(future_pat, case=False, regex=True)) | (stock_base["stock_name"].str.contains(future_pat, case=False, regex=True))].copy()
+        pools["04_營收成長池"] = stock_base[((stock_base["revenue_yoy"].fillna(-999) >= 20) | (stock_base["revenue_eps_score"].fillna(0) >= 65) | ((stock_base["ai_score"].fillna(0) >= 70) & (stock_base["total_score"].fillna(0) >= 55)))].copy()
+        pools["05_價值池"] = stock_base[(((stock_base["pe"].fillna(999) > 0) & (stock_base["pe"].fillna(999) <= 20)) | ((stock_base["pb"].fillna(999) > 0) & (stock_base["pb"].fillna(999) <= 2.5)) | (stock_base["dividend_yield"].fillna(0) >= 3) | (stock_base["financial_score"].fillna(0) >= 70))].copy()
+        pools["06_波段攻擊池"] = stock_base[((stock_base["total_score"].fillna(0) >= 65) | (stock_base["ai_score"].fillna(0) >= 70) | (stock_base["trend_score"].fillna(0) >= 70) | (stock_base["volume_score"].fillna(0) >= 70) | (stock_base["signal"].str.contains("強勢|突破|偏多", regex=True)))].copy()
+        pools["07_老師低接池"] = stock_base[(stock_base["action"].str.contains("低接|拉回|等待|區間", regex=True)) | (stock_base["signal"].str.contains("整理偏多|區間整理", regex=True))].copy()
+        pools["08_ETF防守池"] = etf_base.copy()
+        pools["09_排除風險池"] = base[((base["risk_score"].fillna(100) <= 35) | (base["total_score"].fillna(0) < 45) | (base["signal"].str.contains("轉弱|急跌|風險", regex=True)) | (base["action"].str.contains("減碼|觀望|防守", regex=True)))].copy()
+        sheet_to_pool = {
+            "02_市場主流池": "市場主流池", "03_未來科技池": "未來科技池", "04_營收成長池": "營收成長池", "05_價值池": "價值池",
+            "06_波段攻擊池": "波段攻擊池", "07_老師低接池": "老師低接池", "08_ETF防守池": "ETF防守池", "09_排除風險池": "排除風險池",
+        }
+        out_tables = {}
+        combined = []
+        base_cols = [c for c in ["stock_id", "stock_name", "market", "industry", "theme", "現價", "漲跌", "漲跌幅%", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "rr", "signal", "action"] if c in base.columns]
+        for sheet_name, dfp in pools.items():
+            pool_name = sheet_to_pool[sheet_name]
+            item = config.get(pool_name, DEFAULT_AI_PORTFOLIO_CONFIG.get(pool_name, {}))
+            quota = int(item.get("quota", 0) or 0)
+            weight = float(item.get("weight", 1.0) or 1.0)
+            enabled = bool(item.get("enabled", False))
+            x = dfp.copy()
+            if not x.empty:
+                x["portfolio_pool"] = pool_name
+                x["pool_quota"] = quota
+                x["pool_weight"] = weight
+                x["pool_reason"] = self._ai_portfolio_pool_reason(pool_name)
+                x["portfolio_score"] = (x["total_score"].fillna(0) * 0.45 + x["ai_score"].fillna(0) * 0.35 + x["revenue_eps_score"].fillna(50) * 0.10 + x["volume_score"].fillna(0) * 0.10) * weight
+                x = x.sort_values(["portfolio_score", "total_score", "ai_score"], ascending=False)
+                x["pool_rank"] = range(1, len(x) + 1)
+            display_cols = ["pool_rank", "portfolio_pool", "portfolio_score", "pool_quota", "pool_weight", "pool_reason"] + base_cols
+            out_tables[sheet_name] = x[[c for c in display_cols if c in x.columns]].head(max(50, quota if quota else 20)).copy() if not x.empty else pd.DataFrame(columns=display_cols)
+            if enabled and quota > 0 and pool_name != "排除風險池" and not x.empty:
+                combined.append(x.head(quota).copy())
+        if combined:
+            combo = pd.concat(combined, ignore_index=True)
+            combo["source_pool_count"] = combo.groupby("stock_id")["portfolio_pool"].transform("nunique")
+            combo["source_pools"] = combo.groupby("stock_id")["portfolio_pool"].transform(lambda s: "、".join(sorted(set(s.astype(str)))))
+            combo = combo.sort_values(["source_pool_count", "portfolio_score", "total_score", "ai_score"], ascending=False).drop_duplicates("stock_id", keep="first").head(20).copy()
+            combo["portfolio_rank"] = range(1, len(combo) + 1)
+        else:
+            combo = pd.DataFrame()
+        main_cols = ["portfolio_rank", "stock_id", "stock_name", "portfolio_pool", "source_pools", "source_pool_count", "portfolio_score", "pool_quota", "pool_weight", "pool_reason"] + base_cols
+        out_tables["01_AI投資組合總表"] = combo[[c for c in main_cols if c in combo.columns]].copy() if combo is not None and not combo.empty else pd.DataFrame(columns=main_cols)
+        checklist_rows = []
+        for pool_name, item in config.items():
+            sheet_name = next((k for k, v in sheet_to_pool.items() if v == pool_name), "")
+            checklist_rows.append({
+                "項目": pool_name, "啟用": bool(item.get("enabled", False)), "配額": int(item.get("quota", 0) or 0), "權重": float(item.get("weight", 0) or 0),
+                "候選數": int(len(out_tables.get(sheet_name, pd.DataFrame()))), "說明": self._ai_portfolio_pool_reason(pool_name),
+                "驗收": "獨立於TOP20；不改寫trade_top20/candidate20/core_attack5"
+            })
+        out_tables["10_組合設定與查檢表"] = pd.DataFrame(checklist_rows)
+        return out_tables
+
+    def _populate_ai_portfolio_tree(self, df: pd.DataFrame):
+        try:
+            self.ai_portfolio_tree.delete(*self.ai_portfolio_tree.get_children())
+            if df is None or df.empty:
+                return
+            for _, r in df.iterrows():
+                self.ai_portfolio_tree.insert("", "end", values=(
+                    r.get("portfolio_rank", ""), r.get("stock_id", ""), r.get("stock_name", ""), r.get("portfolio_pool", ""),
+                    round(float(r.get("portfolio_score", 0) or 0), 2), r.get("pool_quota", ""), r.get("pool_weight", ""),
+                    r.get("現價", r.get("close", "")), r.get("total_score", ""), r.get("ai_score", ""), r.get("rr", ""), r.get("pool_reason", "")
+                ))
+        except Exception as exc:
+            self.append_log(f"[AI_PORTFOLIO] UI填表失敗：{exc}", "ERROR")
+
+    def show_ai_portfolio_engine(self):
+        def worker():
+            try:
+                self.ui_call(self.clear_log)
+                self.ui_call(self.start_task, "AI投資組合引擎", 3)
+                cfg = self._get_ai_portfolio_config_from_ui()
+                AI_PORTFOLIO_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.ui_call(self.update_task, "AI投資組合引擎", 1, 3, item="建立分池")
+                tables = self.build_ai_portfolio_tables(cfg)
+                main = tables.get("01_AI投資組合總表", pd.DataFrame())
+                self.last_ai_portfolio_tables = tables
+                self.last_ai_portfolio_df = main
+                self.ui_call(self._populate_ai_portfolio_tree, main)
+                self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
+                self.ui_call(self.update_task, "AI投資組合引擎", 2, 3, item=f"組合={len(main)}")
+                self.ui_call(self.finish_task, "AI投資組合引擎", f"AI投資組合完成｜主表 {len(main)} 檔｜TOP20原設計未變動")
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 完成：主表={len(main)}｜設定={AI_PORTFOLIO_CONFIG_PATH}")
+            except Exception as exc:
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 失敗：{exc}", "ERROR")
+                self.ui_call(messagebox.showerror, "AI投資組合", f"AI投資組合引擎失敗：\n{exc}")
+        self._run_in_thread(worker, "ai_portfolio_engine")
+
+    def export_ai_portfolio_report(self):
+        def worker():
+            try:
+                cfg = self._get_ai_portfolio_config_from_ui()
+                tables = self.build_ai_portfolio_tables(cfg)
+                self.last_ai_portfolio_tables = tables
+                self.last_ai_portfolio_df = tables.get("01_AI投資組合總表", pd.DataFrame())
+                out_base = RUNTIME_DIR / f"AI_Portfolio_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                out_path, out_type = write_table_bundle(out_base, tables, preferred="excel")
+                self.ui_call(self._populate_ai_portfolio_tree, self.last_ai_portfolio_df)
+                self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
+                self.ui_call(messagebox.showinfo, "AI投資組合", f"AI投資組合報表已輸出（{out_type}）：\n{out_path}")
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 報表輸出：{out_path}")
+                try:
+                    open_path(out_path)
+                except Exception:
+                    pass
+            except Exception as exc:
+                self.ui_call(messagebox.showerror, "AI投資組合", f"匯出AI投資組合失敗：\n{exc}")
+        self._run_in_thread(worker, "export_ai_portfolio")
+
+    def on_select_ai_portfolio(self, event=None):
+        stock_id = self._tree_selected_stock_id(self.ai_portfolio_tree, 1)
+        if stock_id and not self._should_ignore_select_event(stock_id, "AI投資組合"):
+            self.sync_all_views(stock_id, source="AI投資組合")
+
+
     def build_daily_summary_sheet(self) -> pd.DataFrame:
         market = getattr(self, "last_market_context", {}) or {}
         top20 = getattr(self, "last_top20_df", pd.DataFrame())
@@ -11253,7 +11488,8 @@ class AppUI:
     def build_report_usage_sheet(self) -> pd.DataFrame:
         rows = [
             {"報表": "Ranking", "用途": "雷達表，不直接下單。"},
-            {"報表": "Trade_TOP20", "用途": "候選20，進第二層分析。"},
+            {"報表": "Trade_TOP20", "用途": "候選20，進第二層分析。原TOP20保留主流TOP20+起爆TOP20+雙引擎共振，不被AI投資組合取代。"},
+            {"報表": "AI投資組合總表", "用途": "使用者勾選池別、配額、權重後產出的策略組合；獨立於TOP20。"},
             {"報表": "Trade_TOP5", "用途": "主力成立 + 主升成立的主攻池。"},
             {"報表": "Today_Buy", "用途": "只放位置仍正確、可直接執行的主攻股。"},
             {"報表": "Wait_Pullback", "用途": "主流/突破候選，但位置未到，可等待回測。"},
@@ -11288,6 +11524,11 @@ class AppUI:
                     tables["Theme"] = theme
                 if self.last_top20_df is not None and not self.last_top20_df.empty:
                     tables["Trade_TOP20"] = self.last_top20_df
+                ai_tables = getattr(self, "last_ai_portfolio_tables", {}) or {}
+                for _ai_sheet in ["01_AI投資組合總表", "02_市場主流池", "03_未來科技池", "04_營收成長池", "05_價值池", "06_波段攻擊池", "07_老師低接池", "08_ETF防守池", "09_排除風險池", "10_組合設定與查檢表"]:
+                    _ai_df = ai_tables.get(_ai_sheet, pd.DataFrame()) if isinstance(ai_tables, dict) else pd.DataFrame()
+                    if _ai_df is not None and not _ai_df.empty:
+                        tables[_ai_sheet] = _ai_df
                 if self.last_top5_df is not None and not self.last_top5_df.empty:
                     tables["Trade_TOP5"] = self.last_top5_df
                 if getattr(self, "last_today_buy_df", pd.DataFrame()) is not None and not getattr(self, "last_today_buy_df", pd.DataFrame()).empty:
@@ -12198,266 +12439,42 @@ class AppUI:
         self.ui_call(self.append_log, f"[V9.5.9-PREFLIGHT-SOFT-BLOCK] 自動同步後外部資料仍未就緒，但不停止 {context}：{final_reason}", "WARNING")
         return 0, final_reason
 
-    def _read_latest_trade_plan_cache(self) -> pd.DataFrame:
-        """FIX7：AI TOP20 只讀每日更新/上次池化後的 trade_plan 快取，不重建排行、不觸發 EPS BUILD。"""
-        try:
-            q = """
-            SELECT tp.*
-            FROM trade_plan tp
-            JOIN (
-                SELECT run_id, MAX(update_time) AS max_update_time, COUNT(*) AS rows_count
-                FROM trade_plan
-                GROUP BY run_id
-                ORDER BY max_update_time DESC
-                LIMIT 1
-            ) latest
-              ON tp.run_id = latest.run_id
-            ORDER BY
-                CASE tp.source_rank
-                    WHEN 'candidate20' THEN 1
-                    WHEN 'core_attack5' THEN 2
-                    WHEN 'today_buy' THEN 3
-                    WHEN 'wait_pullback' THEN 4
-                    WHEN 'unique_decision' THEN 5
-                    WHEN 'defense' THEN 6
-                    ELSE 9
-                END,
-                COALESCE(tp.candidate20_score, tp.core_attack5_score, tp.execution_score, tp.model_score, 0) DESC,
-                COALESCE(tp.model_score,0) DESC
-            """
-            with self.db.lock:
-                df = pd.read_sql_query(q, self.db.conn)
-            if df is None or df.empty:
-                return pd.DataFrame()
-            if "stock_id" in df.columns:
-                df["stock_id"] = df["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
-            return df
-        except Exception as exc:
-            log_warning(f"[AI_TOP20_CACHE][READ_FAIL] {exc}")
-            return pd.DataFrame()
-
-    def _compose_top20_from_trade_plan_cache(self, cache_df: pd.DataFrame) -> dict:
-        """FIX8：從 trade_plan/ranking_result 快取建立多池別 TOP20。
-
-        原則：
-        1) 不呼叫 get_trade_pool()。
-        2) 不呼叫 RankingEngine.rebuild()。
-        3) 不呼叫 FinancialFeatureEngine.build_feature_batch()。
-        4) 不直接取 ranking_result 前20。
-        5) 只用每日更新/上次池化後已存在的快取資料做輕量分池、去重與共振排序。
-        """
-        market = self.master_trading_engine.market_engine.get_market_regime()
-        empty = pd.DataFrame()
-        base_return = {
-            "market": market, "trade_top20": empty, "attack": empty, "watch": empty, "defense": empty,
-            "today_buy": empty, "wait_pullback": empty, "theme_summary": empty, "eliminated": empty,
-            "unique_decision": empty, "tradable_top20": empty,
-        }
-        if cache_df is None or cache_df.empty:
-            return base_return
-
-        x = cache_df.copy()
-        for col in ["source_rank", "pool_role", "candidate_engine", "stock_id", "stock_name", "theme", "industry", "final_trade_decision", "ui_state", "fail_reason", "decision_reason", "gate_summary", "source_pools", "exclude_reason"]:
-            if col not in x.columns:
-                x[col] = ""
-            x[col] = x[col].fillna("").astype(str)
-        x["stock_id"] = x["stock_id"].map(normalize_stock_id).astype(str).str.strip()
-        x = x[x["stock_id"].ne("")].copy()
-        if x.empty:
-            return base_return
-
-        numeric_defaults = {
-            "source_count": 1, "candidate20_score": 0, "core_attack5_score": 0, "execution_score": 0,
-            "mainstream_score": 0, "breakout_score": 0, "liquidity_score": 0, "model_score": 0,
-            "wave_trade_score": 0, "rr": 0, "rr_live": 0, "win_rate": 0, "financial_score": 50,
-            "revenue_eps_score": 50, "revenue_yoy": 0, "eps_yoy": 0, "eps_ttm": 0, "pe": 0,
-            "pb": 0, "dividend_yield": 0, "price_deviation": 0, "rsi": 50, "atr_pct": 0,
-            "risk_gate": 1, "trade_allowed": 0, "future_theme_score": 0, "growth_score": 0,
-            "value_score": 0, "low_base_score": 0,
-        }
-        for col, default in numeric_defaults.items():
-            if col not in x.columns:
-                x[col] = default
-            x[col] = pd.to_numeric(x[col], errors="coerce").fillna(default)
-
-        # 風險池先判斷：保留風險原因，不讓高分弱勢股被誤放入主攻。
-        risk_text = (
-            x["final_trade_decision"].str.upper() + " " +
-            x["ui_state"].str.upper() + " " +
-            x["fail_reason"].str.upper() + " " +
-            x["decision_reason"].str.upper() + " " +
-            x["gate_summary"].str.upper()
-        )
-        x["pool_exclude_risk"] = (
-            risk_text.str.contains("AVOID|REDUCE|ELIMINATE|BLOCK|停損|排除|風險|兩高不過|弱勢|不建議", regex=True, na=False) |
-            (x["risk_gate"].eq(0) & x["trade_allowed"].eq(0))
-        ).astype(int)
-        x["teacher_risk_flag"] = risk_text.str.contains("兩高不過|墓碑|流星|長上影|KD|MACD|靠0翻負|頸線受壓", regex=True, na=False).astype(int)
-        x["avoid_swap_flag"] = x["pool_exclude_risk"].astype(int)
-        x["exclude_reason"] = np.where(x["pool_exclude_risk"].eq(1),
-                                        np.where(x["fail_reason"].str.strip().ne(""), x["fail_reason"], x["decision_reason"]), "")
-
-        # 市場主流池：已存在的 mainstream_score 為主；沒有時用流動性/模型分數代理。
-        if "mainstream_score" not in x.columns or float(pd.to_numeric(x["mainstream_score"], errors="coerce").fillna(0).max()) <= 0:
-            x["mainstream_score"] = (x["model_score"] * 0.40 + x["liquidity_score"] * 0.35 + x["win_rate"] * 0.15 + x["rr"].clip(upper=3) * 3).round(2)
-        x["pool_market_mainstream"] = 0
-
-        # 未來科技池：快取輕量標籤，不抓網路、不重算；用 theme/industry/名稱辨識未來主流。
-        future_keywords = "AI|ASIC|CPO|光模組|光通訊|AI伺服器|伺服器|機器人|ROBOT|EDGE|邊緣|AI-RAN|6G|網通|資料中心|散熱|液冷|半導體|先進封裝|矽光子|PCIe|AI MCU|資安|Security"
-        future_text = (x["stock_name"] + " " + x["industry"] + " " + x["theme"]).str.upper()
-        future_mask = future_text.str.contains(future_keywords, regex=True, na=False)
-        x["future_theme_score"] = np.where(future_mask, (65 + x["mainstream_score"].clip(0, 100) * 0.25 + x["model_score"].clip(0, 100) * 0.10).round(2), 0)
-        x["pool_future_tech"] = future_mask.astype(int)
-
-        # 成長模型池：用每日更新後的 financial_feature_daily/ranking_result 已寫進 trade_plan 的快取欄位。
-        x["growth_score"] = (
-            x["financial_score"].clip(0, 100) * 0.35 +
-            x["revenue_eps_score"].clip(0, 100) * 0.25 +
-            x["revenue_yoy"].clip(-50, 100).add(50).clip(0, 100) * 0.20 +
-            x["eps_yoy"].clip(-50, 100).add(50).clip(0, 100) * 0.10 +
-            x["model_score"].clip(0, 100) * 0.10
-        ).round(2)
-        x["pool_growth"] = (x["growth_score"] >= 60).astype(int)
-
-        # 價值模型池：低估/防守，不取代主攻，只增加來源池。
-        pe_score = np.where(x["pe"].gt(0), (100 - (x["pe"].clip(0, 50) * 2)).clip(0, 100), 45)
-        pb_score = np.where(x["pb"].gt(0), (100 - (x["pb"].clip(0, 10) * 8)).clip(0, 100), 45)
-        div_score = x["dividend_yield"].clip(0, 10) * 10
-        x["value_score"] = (pd.Series(pe_score, index=x.index) * 0.35 + pd.Series(pb_score, index=x.index) * 0.25 + div_score * 0.25 + x["financial_score"].clip(0, 100) * 0.15).round(2)
-        x["pool_value"] = (x["value_score"] >= 60).astype(int)
-
-        # 低位階候選池：等待回測/支撐不破/低乖離，避免追高。
-        low_base_role = x["source_rank"].isin(["wait_pullback", "unique_decision"]) | x["pool_role"].isin(["等待回測", "等拉回", "條件預掛", "唯一決策"])
-        low_deviation = x["price_deviation"].abs().le(0.08) | x["price_deviation"].eq(0)
-        rsi_ok = x["rsi"].between(35, 72) | x["rsi"].eq(50)
-        x["low_base_score"] = (x["model_score"].clip(0, 100) * 0.30 + x["rr"].clip(0, 3) * 12 + x["liquidity_score"].clip(0, 100) * 0.20 + x["mainstream_score"].clip(0, 100) * 0.20).round(2)
-        x["pool_low_base"] = (low_base_role | (low_deviation & rsi_ok & x["low_base_score"].ge(55))).astype(int)
-
-        # 主升突破池：使用已存在 breakout_score/起爆TOP20 快取，不重新跑全市場。
-        x["pool_breakout"] = ((x["source_rank"].eq("candidate20") & x["candidate_engine"].str.contains("起爆|突破|雙引擎|多引擎", na=False)) | x["breakout_score"].ge(60)).astype(int)
-
-        # 老師低接池：老師語義層，若先前流程已有 wait_pullback / 支撐區 / Watch，就保留成池。
-        teacher_text = (x["final_trade_decision"] + " " + x["ui_state"] + " " + x["decision_reason"] + " " + x["pool_role"]).str.upper()
-        x["pool_teacher_low_buy"] = (teacher_text.str.contains("WATCH|WAIT|低接|支撐|拉回|條件預掛|等待回測", regex=True, na=False) & x["pool_exclude_risk"].eq(0)).astype(int)
-
-        def _take_pool(df: pd.DataFrame, flag_col: str, score_cols: list[str], n: int = 10) -> pd.DataFrame:
-            if df is None or df.empty or flag_col not in df.columns:
-                return pd.DataFrame()
-            pool = df[df[flag_col].eq(1) & df["pool_exclude_risk"].eq(0)].copy()
-            if pool.empty:
-                return pool
-            cols = [c for c in score_cols if c in pool.columns]
-            if cols:
-                pool = pool.sort_values(cols, ascending=False)
-            return pool.drop_duplicates(subset=["stock_id"], keep="first").head(n).copy()
-
-        pools = {
-            "市場主流": _take_pool(x, "pool_market_mainstream", ["mainstream_score", "liquidity_score", "model_score"], 10),
-            "未來科技": _take_pool(x, "pool_future_tech", ["future_theme_score", "mainstream_score", "model_score"], 10),
-            "成長": _take_pool(x, "pool_growth", ["growth_score", "financial_score", "model_score"], 10),
-            "價值": _take_pool(x, "pool_value", ["value_score", "financial_score", "dividend_yield"], 10),
-            "低位階": _take_pool(x, "pool_low_base", ["low_base_score", "rr", "model_score"], 10),
-            "主升突破": _take_pool(x, "pool_breakout", ["breakout_score", "candidate20_score", "model_score"], 10),
-            "老師低接": _take_pool(x, "pool_teacher_low_buy", ["low_base_score", "rr", "model_score"], 10),
-        }
-        # 確保原 candidate20 快取仍可參與，但不是唯一來源；它只是多池的一個來源。
-        raw_candidate20 = x[x["source_rank"].eq("candidate20") | x["pool_role"].eq("強勢候選20")].copy()
-        if not raw_candidate20.empty:
-            pools["原candidate20"] = raw_candidate20.sort_values(["source_count", "candidate20_score", "mainstream_score", "breakout_score", "model_score"], ascending=False).head(20).copy()
-
-        combined = []
-        for pool_name, dfp in pools.items():
-            if dfp is None or dfp.empty:
-                continue
-            tmp = dfp.copy()
-            tmp["_pool_name"] = pool_name
-            combined.append(tmp)
-        if not combined:
-            log_warning("[AI_TOP20_CACHE][BLOCK] 無任何快取池別候選；不使用 ranking_result 前20 代替。")
-            candidate20 = pd.DataFrame()
-        else:
-            long_pool = pd.concat(combined, ignore_index=True)
-            long_pool["stock_id"] = long_pool["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
-            source_summary = long_pool.groupby("stock_id")["_pool_name"].apply(lambda s: "、".join(sorted(set(str(v) for v in s if str(v).strip())))).reset_index(name="source_pools")
-            source_counts = long_pool.groupby("stock_id")["_pool_name"].nunique().reset_index(name="source_count_calc")
-            scored = long_pool.sort_values(["source_count", "candidate20_score", "mainstream_score", "breakout_score", "model_score"], ascending=False).drop_duplicates(subset=["stock_id"], keep="first").copy()
-            scored = scored.merge(source_summary, on="stock_id", how="left", suffixes=("", "_calc"))
-            scored = scored.merge(source_counts, on="stock_id", how="left")
-            scored["source_count"] = np.maximum(pd.to_numeric(scored.get("source_count", 1), errors="coerce").fillna(1).astype(int), pd.to_numeric(scored["source_count_calc"], errors="coerce").fillna(1).astype(int))
-            scored["source_pools"] = scored["source_pools_calc"] if "source_pools_calc" in scored.columns else scored["source_pools"]
-            scored["candidate_engine"] = np.where(scored["source_count"].ge(3), "多引擎共振", np.where(scored["source_count"].ge(2), "雙引擎共振", scored["_pool_name"].astype(str) + "TOP"))
-            scored["pool_role"] = "強勢候選20"
-            scored["multi_pool_score"] = (
-                scored["source_count"].clip(1, 7) * 8 +
-                scored["mainstream_score"].clip(0, 100) * 0.18 +
-                scored["future_theme_score"].clip(0, 100) * 0.14 +
-                scored["growth_score"].clip(0, 100) * 0.12 +
-                scored["value_score"].clip(0, 100) * 0.08 +
-                scored["low_base_score"].clip(0, 100) * 0.10 +
-                scored["breakout_score"].clip(0, 100) * 0.14 +
-                scored["model_score"].clip(0, 100) * 0.12 +
-                scored["liquidity_score"].clip(0, 100) * 0.08 +
-                scored["rr"].clip(0, 3) * 2
-            ).round(2)
-            candidate20 = scored[scored["pool_exclude_risk"].eq(0)].sort_values(["multi_pool_score", "source_count", "mainstream_score", "breakout_score", "model_score"], ascending=False).drop_duplicates(subset=["stock_id"], keep="first").head(REPORT_DECISION_LIMITS["candidate20"]).copy()
-            if not candidate20.empty:
-                candidate20 = attach_external_display_columns(candidate20)
-
-        attack = x[x["source_rank"].eq("core_attack5") | x["pool_role"].eq("主攻5")].copy()
-        today_buy = x[x["source_rank"].eq("today_buy") | x["pool_role"].eq("今日可下單")].copy()
-        wait_pullback = x[x["source_rank"].eq("wait_pullback") | x["pool_role"].isin(["等待回測", "等拉回", "條件預掛"])].copy()
-        unique_decision = x[x["source_rank"].eq("unique_decision") | x["pool_role"].eq("唯一決策")].copy()
-        defense = x[x["source_rank"].eq("defense") | x["pool_role"].eq("防守")].copy()
-        eliminated = x[x["pool_exclude_risk"].eq(1)].copy()
-
-        candidate_ids = set(_pool_stock_id_series(candidate20).tolist()) if candidate20 is not None and not candidate20.empty else set()
-        for name, dfp in [("attack", attack), ("today_buy", today_buy), ("wait_pullback", wait_pullback), ("unique_decision", unique_decision)]:
-            if dfp is not None and not dfp.empty:
-                outside = sorted(set(_pool_stock_id_series(dfp).tolist()) - candidate_ids)
-                if outside:
-                    log_warning(f"[AI_TOP20_CACHE][AUDIT] {name} 不在 candidate20：{','.join(outside[:20])}")
-
-        core_ids = set(_pool_stock_id_series(attack).tolist()) if attack is not None and not attack.empty else set()
-        watch = candidate20[~candidate20["stock_id"].isin(core_ids)].copy() if candidate20 is not None and not candidate20.empty else pd.DataFrame()
-        if not watch.empty:
-            watch["pool_role"] = "觀察"
-            watch["ui_state"] = "觀察"
-
-        theme_summary = pd.DataFrame()
-        try:
-            full_rank = self.db.get_latest_ranking()
-            theme_summary = ThemeStrengthEngine.summarize(full_rank) if full_rank is not None and not full_rank.empty else pd.DataFrame()
-        except Exception:
-            theme_summary = pd.DataFrame()
-
-        log_info(f"[AI_TOP20_CACHE][FINAL][FIX8] candidate20={len(candidate20)}｜attack={len(attack)}｜today_buy={len(today_buy)}｜wait={len(wait_pullback)}｜multi_pool=1｜mode=cache_only_no_rebuild")
-        return {
-            "market": market,
-            "trade_top20": candidate20,
-            "tradable_top20": candidate20.copy() if candidate20 is not None else pd.DataFrame(),
-            "attack": attack.drop_duplicates(subset=["stock_id"], keep="first") if attack is not None and not attack.empty else pd.DataFrame(),
-            "watch": watch,
-            "defense": defense.drop_duplicates(subset=["stock_id"], keep="first") if defense is not None and not defense.empty else pd.DataFrame(),
-            "today_buy": today_buy.drop_duplicates(subset=["stock_id"], keep="first") if today_buy is not None and not today_buy.empty else pd.DataFrame(),
-            "wait_pullback": wait_pullback.drop_duplicates(subset=["stock_id"], keep="first") if wait_pullback is not None and not wait_pullback.empty else pd.DataFrame(),
-            "theme_summary": theme_summary,
-            "eliminated": eliminated.drop_duplicates(subset=["stock_id"], keep="first") if eliminated is not None and not eliminated.empty else pd.DataFrame(),
-            "unique_decision": unique_decision.drop_duplicates(subset=["stock_id"], keep="first") if unique_decision is not None and not unique_decision.empty else pd.DataFrame(),
-        }
-
     def show_top20(self):
-        # FIX7：AI TOP20 不重建排行、不直接取 ranking 前20；只讀每日更新/上次池化後的 trade_plan 快取並依池別重組。
-        cache_df = self._read_latest_trade_plan_cache()
-        if cache_df is None or cache_df.empty:
-            return messagebox.showwarning("提醒", "目前沒有 TOP20 池別快取。請先執行每日更新或完整池化流程產生 trade_plan；AI TOP20 不會用排行前20代替。")
+        if not self.ensure_ranking_ready(auto_rebuild=True):
+            return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
+        df = self._filtered_ranking()
+        if df.empty:
+            try:
+                full_df = self.db.get_latest_ranking()
+                if full_df is not None and not full_df.empty:
+                    df = self.enrich_price_and_export_fields(full_df.sort_values(["rank_all"]).reset_index(drop=True), id_col="stock_id")
+                    self.set_status("目前篩選條件無資料，AI選股TOP20 已改用完整排行執行。")
+                else:
+                    return messagebox.showwarning("提醒", "目前沒有可用排行資料")
+            except Exception:
+                return messagebox.showwarning("提醒", "目前篩選條件下沒有可用資料")
 
         def worker():
             try:
+                total = len(df)
                 self.ui_call(self.clear_log)
-                self.ui_call(self.start_task, "AI選股TOP20", len(cache_df))
-                self.ui_call(self.append_log, "[AI_TOP20_CACHE] 只讀 trade_plan 快取；不重建排行、不觸發 EPS MATRIX BUILD、不使用 ranking_result 前20。")
+                self.ui_call(self.start_task, "AI選股TOP20", total)
 
-                trade = self._compose_top20_from_trade_plan_cache(cache_df)
+                auto_ready, auto_reason = self._ensure_external_data_ready_auto_sync("AI選股TOP20")
+                if int(auto_ready) != 1:
+                    self.ui_call(self.append_log, "[V9.5.9-SOFT-BLOCK] 外部資料自動同步後仍未完整，但不停止AI分析/TOP20；execution_ready僅作資訊欄位。原因：" + str(auto_reason), "WARNING")
+                    self.ui_call(self.set_status, "AI選股TOP20繼續執行；外部資料未完整僅顯示SOFT_BLOCK提示")
+
+
+                def progress(idx, total_count, sid):
+                    self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
+
+                trade = self.master_trading_engine.get_trade_pool(
+                    df,
+                    progress_cb=progress,
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                    cancel_cb=lambda: self.cancel_event.is_set(),
+                )
                 market = trade["market"]
                 trade_top20 = trade["trade_top20"]
                 tradable_top20 = trade.get("tradable_top20", pd.DataFrame())
@@ -12481,26 +12498,28 @@ class AppUI:
                         bt_rows.append(bt)
                     bt_df = pd.DataFrame(bt_rows)
                     top5 = pd.concat([top5.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
-                self.last_top5_df = self.enrich_price_and_export_fields(top5.copy(), id_col="stock_id") if top5 is not None else pd.DataFrame()
+                self.last_top5_df = self.enrich_price_and_export_fields(top5.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_top5_df)
                 self.cache_backtest_dataframe(self.last_top5_df)
-                self.last_attack_df = self.enrich_price_and_export_fields(attack.copy(), id_col="stock_id") if attack is not None and not attack.empty else pd.DataFrame()
+                self.last_attack_df = self.enrich_price_and_export_fields(attack.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_attack_df)
-                self.last_watch_df = self.enrich_price_and_export_fields(watch.copy(), id_col="stock_id") if watch is not None and not watch.empty else pd.DataFrame()
+                self.last_watch_df = self.enrich_price_and_export_fields(watch.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_watch_df)
-                self.last_defense_df = self.enrich_price_and_export_fields(defense.copy(), id_col="stock_id") if defense is not None and not defense.empty else pd.DataFrame()
+                self.last_defense_df = self.enrich_price_and_export_fields(defense.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_defense_df)
-                self.last_theme_summary_df = theme_summary.copy() if theme_summary is not None else pd.DataFrame()
-                self.last_today_buy_df = self.enrich_price_and_export_fields(today_buy.copy(), id_col="stock_id") if today_buy is not None and not today_buy.empty else pd.DataFrame()
+                self.last_theme_summary_df = theme_summary.copy()
+                self.last_today_buy_df = self.enrich_price_and_export_fields(today_buy.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_today_buy_df)
-                self.last_wait_df = self.enrich_price_and_export_fields(wait_pullback.copy(), id_col="stock_id") if wait_pullback is not None and not wait_pullback.empty else pd.DataFrame()
+                self.last_wait_df = self.enrich_price_and_export_fields(wait_pullback.copy(), id_col="stock_id")
                 self.cache_trade_dataframe(self.last_wait_df)
                 self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df))
                 inst_plan_raw = self.portfolio_engine.build_institutional_plan(self.last_today_buy_df.copy())
                 self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(inst_plan_raw, id_col="代號"))
                 unique_raw = trade.get("unique_decision", pd.DataFrame())
-                self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(REPORT_DECISION_LIMITS["unique_decision"]) if unique_raw is not None and not unique_raw.empty else pd.DataFrame()
-
+                if unique_raw is not None and not unique_raw.empty:
+                    self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(REPORT_DECISION_LIMITS["unique_decision"])
+                else:
+                    self.last_unique_decision_df = pd.DataFrame()
                 assert_phase1_report_consistency(
                     self.last_top20_df,
                     self.last_attack_df,
@@ -12517,41 +12536,41 @@ class AppUI:
                 self.ui_call(self.left_notebook.select, self.tab_top20)
                 self.ui_call(self.open_three_windows)
 
-                defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if trade_top20 is not None and not trade_top20.empty and "bucket" in trade_top20.columns else 0
+                defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
                 eliminated_cnt = len(eliminated) if eliminated is not None else 0
                 lines = [
-                    "《FIX7 AI TOP20 快取池別版》",
-                    f"市場判斷：{market.get('regime','-')}（{float(market.get('score',0) or 0):.2f}）｜市場廣度 {float(market.get('breadth',0) or 0):.1f}",
-                    f"市場說明：{market.get('memo','')}",
+                    "《v9.5 EXTERNAL DECISION INTEGRATED 操作版》",
+                    f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
+                    f"市場說明：{market['memo']}",
                     f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可下單：{len(today_buy)}｜條件預掛：{len(wait_pullback)}｜防守：{defend_cnt}｜淘汰：{eliminated_cnt}",
-                    "資料來源：trade_plan 快取池別；不重建排行；不使用 ranking_result 前20。",
                     f"交易門檻：{STRATEGY_CONFIG_MANAGER.summary_text()}",
+                    "操作用途：先看今日可下單，再看條件預掛，沒有進場區就不下單。",
                     "",
                     "【TOP20 觀察池 前5檔】",
                 ]
-                if trade_top20 is None or trade_top20.empty:
-                    lines.append("目前無 candidate20 池別快取，請先執行每日更新/池化流程。")
+                if trade_top20.empty:
+                    lines.append("目前無符合條件標的")
                 else:
                     for i, (_, r) in enumerate(trade_top20.head(REPORT_DECISION_LIMITS["core_attack5"]).iterrows(), start=1):
-                        lines.append(f"{i}. {r.get('stock_id','')} {r.get('stock_name','')}｜{r.get('candidate_engine','-')}｜池={r.get('source_pools', r.get('pool_role','-'))}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r.get('final_trade_decision', r.get('trade_action','-'))}｜RR {float(r.get('rr',0) or 0):.2f}")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
 
                 lines.extend(["", "【今日可下單】"])
-                if today_buy is None or today_buy.empty:
+                if today_buy.empty:
                     lines.append("今日無符合 SOP 的可買名單（允許空白，不為湊數放寬）。")
                 else:
                     for i, (_, r) in enumerate(today_buy.iterrows(), start=1):
-                        lines.append(f"{i}. {r.get('stock_id','')} {r.get('stock_name','')}｜{r.get('final_trade_decision', r.get('trade_action','-'))}｜RR {float(r.get('rr',0) or 0):.2f}｜{r.get('entry_zone','')}")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
 
                 lines.extend(["", "【條件預掛】"])
-                if wait_pullback is None or wait_pullback.empty:
+                if wait_pullback.empty:
                     lines.append("無條件預掛")
                 else:
                     for i, (_, r) in enumerate(wait_pullback.iterrows(), start=1):
-                        lines.append(f"{i}. {r.get('stock_id','')} {r.get('stock_name','')}｜條件預掛｜RR {float(r.get('rr',0) or 0):.2f}｜{r.get('entry_zone','')}")
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜條件預掛｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
 
                 self.ui_call(self.detail.delete, "1.0", tk.END)
                 self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
-                self.ui_call(self.finish_task, "AI選股TOP20", f"AI TOP20 快取載入完成：TOP20 {len(trade_top20)}｜今日可下單 {len(today_buy)}｜等待 {len(wait_pullback)}")
+                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：TOP20 {len(trade_top20)}｜今日可下單 {len(today_buy)}｜等待 {len(wait_pullback)}")
             except OperationCancelled:
                 self.ui_call(self.finish_task, "AI選股TOP20", "AI選股TOP20 已中斷")
             except Exception as e:
