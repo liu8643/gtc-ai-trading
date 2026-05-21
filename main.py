@@ -216,6 +216,30 @@ AI_PORTFOLIO_FUTURE_TECH_KEYWORDS = [
     "機器人", "Edge", "邊緣", "AI-RAN", "6G", "網通", "資料中心", "半導體", "RISC-V", "先進封裝",
 ]
 
+
+# FIX10-P0：AI投資組合主表/各池報表必備交易計畫欄位。
+# 目的：補齊「買進下緣、買進上緣、停損、目標1、目標2、RR、風險旗標」，
+# 並讓 UI Treeview 可水平/垂直捲動查看完整欄位；TOP20 原雙引擎邏輯不受影響。
+AI_PORTFOLIO_DISPLAY_COLUMNS = [
+    ("portfolio_rank", "排序", 60),
+    ("stock_id", "代號", 80),
+    ("stock_name", "名稱", 120),
+    ("portfolio_pool", "池別", 120),
+    ("portfolio_score", "組合分", 85),
+    ("pool_quota", "配額", 65),
+    ("pool_weight", "權重", 65),
+    ("現價", "現價", 75),
+    ("買進下緣", "買進下緣", 90),
+    ("買進上緣", "買進上緣", 90),
+    ("停損", "停損", 80),
+    ("目標1", "目標1", 80),
+    ("目標2", "目標2", 80),
+    ("RR", "RR", 70),
+    ("風險旗標", "風險旗標", 100),
+    ("pool_reason", "入池原因", 260),
+]
+AI_PORTFOLIO_TRADE_COLUMNS = ["買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標"]
+
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH = LOG_DIR / f"gtc_ai_trading_{datetime.now().strftime('%Y%m%d')}.log"
@@ -9504,9 +9528,15 @@ class AppUI:
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
         self._build_ai_portfolio_controls()
-        self.ai_portfolio_tree = self._make_tree(self.tab_ai_portfolio, ("rank", "id", "name", "pool", "score", "quota", "weight", "price", "total", "ai", "rr", "reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "pool": "池別", "score": "組合分", "quota": "配額", "weight": "權重", "price": "現價", "total": "總分", "ai": "AI分", "rr": "RR", "reason": "入池原因"
-        })
+        # FIX10-P0：AI投資組合表格加入交易計畫欄位，並沿用 _make_tree 內建 x/y scrollbar。
+        _ai_cols = tuple(col for col, _label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS)
+        _ai_headers = {col: label for col, label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS}
+        self.ai_portfolio_tree = self._make_tree(self.tab_ai_portfolio, _ai_cols, _ai_headers)
+        for _col, _label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS:
+            try:
+                self.ai_portfolio_tree.column(_col, width=int(_width), minwidth=max(55, int(_width) - 15), stretch=False)
+            except Exception:
+                pass
         self.ai_portfolio_tree.bind("<<TreeviewSelect>>", self.on_select_ai_portfolio)
 
         self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "price", "chg", "chg_pct", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
@@ -11311,7 +11341,171 @@ class AppUI:
                 x[c] = np.nan
             x[c] = pd.to_numeric(x[c], errors="coerce")
         x["is_etf_pool"] = x["market"].eq("ETF") | x["stock_id"].str.startswith("00") | x["stock_name"].str.contains("ETF|高股息|債|REIT", case=False, regex=True)
+        # FIX10-P0：AI投資組合需顯示交易計畫欄位，從最新 trade_plan 讀取 entry/stop/target/RR。
+        try:
+            plan = self._ai_portfolio_latest_trade_plan_fields()
+            if plan is not None and not plan.empty:
+                x = x.merge(plan, on="stock_id", how="left", suffixes=("", "_plan"))
+                for _src, _dst in [("stock_name_plan", "stock_name"), ("market_plan", "market"), ("industry_plan", "industry"), ("theme_plan", "theme")]:
+                    if _src in x.columns and _dst in x.columns:
+                        x[_dst] = x[_dst].replace("", pd.NA).fillna(x[_src]).fillna("").astype(str)
+        except Exception as exc:
+            self.append_log(f"[AI_PORTFOLIO] trade_plan交易欄位合併失敗：{exc}", "WARNING")
         return x
+
+    def _ai_portfolio_latest_trade_plan_fields(self) -> pd.DataFrame:
+        """FIX10-P0：取得最新 trade_plan 的買進/停損/目標/RR欄位；只讀快取，不重建TOP20。"""
+        try:
+            q = """
+            SELECT tp.*
+            FROM trade_plan tp
+            JOIN (
+                SELECT MAX(plan_date) AS plan_date
+                FROM trade_plan
+            ) d ON tp.plan_date = d.plan_date
+            """
+            with self.db.lock:
+                plan = pd.read_sql_query(q, self.db.conn)
+        except Exception:
+            return pd.DataFrame()
+        if plan is None or plan.empty or "stock_id" not in plan.columns:
+            return pd.DataFrame()
+        plan = plan.copy()
+        plan["stock_id"] = plan["stock_id"].astype(str).map(normalize_stock_id)
+        if "update_time" in plan.columns:
+            plan = plan.sort_values(["stock_id", "update_time"])
+        plan = plan.drop_duplicates("stock_id", keep="last")
+        keep = [
+            "stock_id", "stock_name", "market", "industry", "theme", "entry_low", "entry_high", "stop_loss",
+            "target_price", "target_1382", "target_1618", "rr", "rr_live", "risk_score", "fail_reason",
+            "block_reason", "execution_block_reason", "decision_reason", "final_trade_decision", "ui_state"
+        ]
+        for c in keep:
+            if c not in plan.columns:
+                plan[c] = np.nan if c not in ["stock_id", "stock_name", "market", "industry", "theme", "fail_reason", "block_reason", "execution_block_reason", "decision_reason", "final_trade_decision", "ui_state"] else ""
+        rename = {
+            "stock_name": "stock_name_plan", "market": "market_plan", "industry": "industry_plan", "theme": "theme_plan",
+            "rr": "rr_plan", "risk_score": "risk_score_plan"
+        }
+        return plan[[c for c in keep if c in plan.columns]].rename(columns=rename)
+
+    def _num_or_nan(self, value) -> float:
+        try:
+            v = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+            return float(v) if pd.notna(v) and np.isfinite(v) else np.nan
+        except Exception:
+            return np.nan
+
+    def _format_ai_portfolio_num(self, value, digits: int = 2):
+        v = self._num_or_nan(value)
+        if not np.isfinite(v) or abs(v) < 1e-12:
+            return "-"
+        return round(float(v), digits)
+
+    def _risk_flag_for_ai_portfolio(self, row: pd.Series, rr_value: float) -> tuple[str, str]:
+        pool = str(row.get("portfolio_pool", ""))
+        signal = str(row.get("signal", ""))
+        action = str(row.get("action", ""))
+        fail_reason = " / ".join([str(row.get(k, "") or "") for k in ["fail_reason", "block_reason", "execution_block_reason"] if str(row.get(k, "") or "").strip()])
+        risk_score = self._num_or_nan(row.get("risk_score", row.get("risk_score_plan", np.nan)))
+        price_dev = self._num_or_nan(row.get("price_deviation", row.get("price_dev", np.nan)))
+        if pool == "排除風險池" or re.search("轉弱|急跌|減碼|觀望|防守|不合格|禁止|AVOID", signal + action + fail_reason, flags=re.I):
+            return "AVOID", fail_reason or "排除風險池或轉弱/減碼訊號"
+        if np.isfinite(rr_value) and rr_value < 1.2:
+            return "HIGH", f"RR偏低({rr_value:.2f})"
+        if np.isfinite(risk_score) and risk_score <= 35:
+            return "HIGH", f"risk_score偏低({risk_score:.2f})"
+        if np.isfinite(price_dev) and abs(price_dev) >= 0.08:
+            return "HIGH", f"乖離偏大({price_dev:.2%})"
+        if np.isfinite(rr_value) and rr_value < 1.5:
+            return "MID", f"RR未達1.5({rr_value:.2f})"
+        return "LOW", "交易欄位無重大風險旗標"
+
+    def _apply_ai_portfolio_trade_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """FIX10-P0：補齊買進下緣/上緣/停損/目標1/目標2/RR/風險旗標。
+        優先使用 trade_plan；缺值時用最新現價建立保守估算，並於風險原因標明。
+        """
+        if df is None:
+            return pd.DataFrame()
+        x = df.copy()
+        if x.empty:
+            for c in AI_PORTFOLIO_TRADE_COLUMNS + ["風險原因"]:
+                x[c] = []
+            return x
+        # 交易欄位來源轉數值
+        for c in ["entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "rr_plan", "現價", "close"]:
+            if c in x.columns:
+                x[c] = pd.to_numeric(x[c], errors="coerce")
+        lows, highs, stops, t1s, t2s, rrs, flags, reasons = [], [], [], [], [], [], [], []
+        for _, row in x.iterrows():
+            close_v = self._num_or_nan(row.get("現價", row.get("close", np.nan)))
+            entry_low = self._num_or_nan(row.get("entry_low", np.nan))
+            entry_high = self._num_or_nan(row.get("entry_high", np.nan))
+            stop_loss = self._num_or_nan(row.get("stop_loss", np.nan))
+            target_1 = self._num_or_nan(row.get("target_price", np.nan))
+            target_2 = self._num_or_nan(row.get("target_1382", np.nan))
+            if not np.isfinite(target_2):
+                target_2 = self._num_or_nan(row.get("target_1618", np.nan))
+            estimated = False
+            if np.isfinite(close_v) and close_v > 0:
+                if not np.isfinite(entry_low) or entry_low <= 0:
+                    entry_low = close_v * 0.98; estimated = True
+                if not np.isfinite(entry_high) or entry_high <= 0:
+                    entry_high = close_v * 1.00; estimated = True
+                if entry_low > entry_high:
+                    entry_low, entry_high = entry_high, entry_low
+                if not np.isfinite(stop_loss) or stop_loss <= 0 or stop_loss >= entry_high:
+                    stop_loss = entry_low * 0.93; estimated = True
+                if not np.isfinite(target_1) or target_1 <= entry_high:
+                    target_1 = entry_high * 1.08; estimated = True
+                if not np.isfinite(target_2) or target_2 <= target_1:
+                    target_2 = entry_high * 1.15; estimated = True
+            rr_value = self._num_or_nan(row.get("rr_live", np.nan))
+            if not np.isfinite(rr_value):
+                rr_value = self._num_or_nan(row.get("rr_plan", row.get("rr", np.nan)))
+            if (not np.isfinite(rr_value) or rr_value <= 0) and all(np.isfinite(v) for v in [entry_high, stop_loss, target_1]) and entry_high > stop_loss:
+                rr_value = (target_1 - entry_high) / max(entry_high - stop_loss, 1e-6)
+            flag, reason = self._risk_flag_for_ai_portfolio(row, rr_value)
+            if estimated:
+                reason = (reason + "；" if reason else "") + "部分交易價位由現價保守推估，需以正式交易計畫覆核"
+            lows.append(self._format_ai_portfolio_num(entry_low))
+            highs.append(self._format_ai_portfolio_num(entry_high))
+            stops.append(self._format_ai_portfolio_num(stop_loss))
+            t1s.append(self._format_ai_portfolio_num(target_1))
+            t2s.append(self._format_ai_portfolio_num(target_2))
+            rrs.append(self._format_ai_portfolio_num(rr_value))
+            flags.append(flag)
+            reasons.append(reason or "-")
+        x["買進下緣"] = lows
+        x["買進上緣"] = highs
+        x["停損"] = stops
+        x["目標1"] = t1s
+        x["目標2"] = t2s
+        x["RR"] = rrs
+        x["風險旗標"] = flags
+        x["風險原因"] = reasons
+        return x
+
+    def _ai_portfolio_display_df(self, df: pd.DataFrame, main: bool = False) -> pd.DataFrame:
+        x = self._apply_ai_portfolio_trade_columns(df)
+        if x is None or x.empty:
+            cols = [c for c, _, _ in AI_PORTFOLIO_DISPLAY_COLUMNS] + ["風險原因", "source_pools", "source_pool_count"]
+            return pd.DataFrame(columns=cols)
+        desired = [c for c, _, _ in AI_PORTFOLIO_DISPLAY_COLUMNS]
+        if main:
+            desired = ["portfolio_rank", "stock_id", "stock_name", "portfolio_pool", "source_pools", "source_pool_count", "portfolio_score", "pool_quota", "pool_weight", "現價", "買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標", "風險原因", "pool_reason", "market", "industry", "theme", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"]
+        else:
+            desired = ["pool_rank", "stock_id", "stock_name", "portfolio_pool", "portfolio_score", "pool_quota", "pool_weight", "現價", "買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標", "風險原因", "pool_reason", "market", "industry", "theme", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"]
+        for c in desired:
+            if c not in x.columns:
+                x[c] = ""
+        out = x[[c for c in desired if c in x.columns]].copy()
+        # 顯示格式整理：避免 nan 直接進 UI/Excel。
+        out = out.replace([np.inf, -np.inf], np.nan)
+        for c in out.columns:
+            if c not in ["stock_id"]:
+                out[c] = out[c].where(pd.notna(out[c]), "-")
+        return out
 
     def _ai_portfolio_pool_reason(self, pool_name: str) -> str:
         mapping = {
@@ -11356,7 +11550,8 @@ class AppUI:
         }
         out_tables = {}
         combined = []
-        base_cols = [c for c in ["stock_id", "stock_name", "market", "industry", "theme", "現價", "漲跌", "漲跌幅%", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "rr", "signal", "action"] if c in base.columns]
+        # FIX10-P0：報表欄位以「交易計畫欄位」為核心，避免重複 stock_id/stock_name 與 rr nan。
+        base_cols = [c for c in ["market", "industry", "theme", "現價", "漲跌", "漲跌幅%", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"] if c in base.columns]
         for sheet_name, dfp in pools.items():
             pool_name = sheet_to_pool[sheet_name]
             item = config.get(pool_name, DEFAULT_AI_PORTFOLIO_CONFIG.get(pool_name, {}))
@@ -11372,8 +11567,7 @@ class AppUI:
                 x["portfolio_score"] = (x["total_score"].fillna(0) * 0.45 + x["ai_score"].fillna(0) * 0.35 + x["revenue_eps_score"].fillna(50) * 0.10 + x["volume_score"].fillna(0) * 0.10) * weight
                 x = x.sort_values(["portfolio_score", "total_score", "ai_score"], ascending=False)
                 x["pool_rank"] = range(1, len(x) + 1)
-            display_cols = ["pool_rank", "portfolio_pool", "portfolio_score", "pool_quota", "pool_weight", "pool_reason"] + base_cols
-            out_tables[sheet_name] = x[[c for c in display_cols if c in x.columns]].head(max(50, quota if quota else 20)).copy() if not x.empty else pd.DataFrame(columns=display_cols)
+            out_tables[sheet_name] = self._ai_portfolio_display_df(x.head(max(50, quota if quota else 20)).copy(), main=False) if not x.empty else self._ai_portfolio_display_df(pd.DataFrame(), main=False)
             if enabled and quota > 0 and pool_name != "排除風險池" and not x.empty:
                 combined.append(x.head(quota).copy())
         if combined:
@@ -11384,14 +11578,18 @@ class AppUI:
             combo["portfolio_rank"] = range(1, len(combo) + 1)
         else:
             combo = pd.DataFrame()
-        main_cols = ["portfolio_rank", "stock_id", "stock_name", "portfolio_pool", "source_pools", "source_pool_count", "portfolio_score", "pool_quota", "pool_weight", "pool_reason"] + base_cols
-        out_tables["01_AI投資組合總表"] = combo[[c for c in main_cols if c in combo.columns]].copy() if combo is not None and not combo.empty else pd.DataFrame(columns=main_cols)
+        # FIX10-P0：主表第一張輸出，並補齊買進/停損/目標/RR/風險旗標。
+        main_table = self._ai_portfolio_display_df(combo.copy(), main=True) if combo is not None and not combo.empty else self._ai_portfolio_display_df(pd.DataFrame(), main=True)
+        ordered_tables = {"01_AI投資組合總表": main_table}
+        ordered_tables.update(out_tables)
+        out_tables = ordered_tables
         checklist_rows = []
         for pool_name, item in config.items():
             sheet_name = next((k for k, v in sheet_to_pool.items() if v == pool_name), "")
             checklist_rows.append({
                 "項目": pool_name, "啟用": bool(item.get("enabled", False)), "配額": int(item.get("quota", 0) or 0), "權重": float(item.get("weight", 0) or 0),
                 "候選數": int(len(out_tables.get(sheet_name, pd.DataFrame()))), "說明": self._ai_portfolio_pool_reason(pool_name),
+                "交易欄位": "買進下緣/買進上緣/停損/目標1/目標2/RR/風險旗標",
                 "驗收": "獨立於TOP20；不改寫trade_top20/candidate20/core_attack5"
             })
         out_tables["10_組合設定與查檢表"] = pd.DataFrame(checklist_rows)
@@ -11405,8 +11603,10 @@ class AppUI:
             for _, r in df.iterrows():
                 self.ai_portfolio_tree.insert("", "end", values=(
                     r.get("portfolio_rank", ""), r.get("stock_id", ""), r.get("stock_name", ""), r.get("portfolio_pool", ""),
-                    round(float(r.get("portfolio_score", 0) or 0), 2), r.get("pool_quota", ""), r.get("pool_weight", ""),
-                    r.get("現價", r.get("close", "")), r.get("total_score", ""), r.get("ai_score", ""), r.get("rr", ""), r.get("pool_reason", "")
+                    round(float(pd.to_numeric(pd.Series([r.get("portfolio_score", 0)]), errors="coerce").fillna(0).iloc[0]), 2),
+                    r.get("pool_quota", ""), r.get("pool_weight", ""), r.get("現價", r.get("close", "")),
+                    r.get("買進下緣", ""), r.get("買進上緣", ""), r.get("停損", ""), r.get("目標1", ""),
+                    r.get("目標2", ""), r.get("RR", r.get("rr", "")), r.get("風險旗標", ""), r.get("pool_reason", "")
                 ))
         except Exception as exc:
             self.append_log(f"[AI_PORTFOLIO] UI填表失敗：{exc}", "ERROR")
@@ -11426,8 +11626,8 @@ class AppUI:
                 self.ui_call(self._populate_ai_portfolio_tree, main)
                 self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
                 self.ui_call(self.update_task, "AI投資組合引擎", 2, 3, item=f"組合={len(main)}")
-                self.ui_call(self.finish_task, "AI投資組合引擎", f"AI投資組合完成｜主表 {len(main)} 檔｜TOP20原設計未變動")
-                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 完成：主表={len(main)}｜設定={AI_PORTFOLIO_CONFIG_PATH}")
+                self.ui_call(self.finish_task, "AI投資組合引擎", f"AI投資組合完成｜主表 {len(main)} 檔｜交易欄位已補齊｜TOP20原設計未變動")
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 完成：主表={len(main)}｜交易欄位={AI_PORTFOLIO_TRADE_COLUMNS}｜設定={AI_PORTFOLIO_CONFIG_PATH}")
             except Exception as exc:
                 self.ui_call(self.append_log, f"[AI_PORTFOLIO] 失敗：{exc}", "ERROR")
                 self.ui_call(messagebox.showerror, "AI投資組合", f"AI投資組合引擎失敗：\n{exc}")
@@ -11445,7 +11645,7 @@ class AppUI:
                 self.ui_call(self._populate_ai_portfolio_tree, self.last_ai_portfolio_df)
                 self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
                 self.ui_call(messagebox.showinfo, "AI投資組合", f"AI投資組合報表已輸出（{out_type}）：\n{out_path}")
-                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 報表輸出：{out_path}")
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 報表輸出：{out_path}｜已含買進下緣/買進上緣/停損/目標1/目標2/RR/風險旗標")
                 try:
                     open_path(out_path)
                 except Exception:
@@ -11457,6 +11657,23 @@ class AppUI:
     def on_select_ai_portfolio(self, event=None):
         stock_id = self._tree_selected_stock_id(self.ai_portfolio_tree, 1)
         if stock_id and not self._should_ignore_select_event(stock_id, "AI投資組合"):
+            try:
+                df = getattr(self, "last_ai_portfolio_df", pd.DataFrame())
+                if isinstance(df, pd.DataFrame) and not df.empty and "stock_id" in df.columns:
+                    row_df = df[df["stock_id"].astype(str).map(normalize_stock_id).eq(normalize_stock_id(stock_id))].head(1)
+                    if not row_df.empty:
+                        r = row_df.iloc[0]
+                        detail = (
+                            f"《AI投資組合》\n"
+                            f"股票：{r.get('stock_name','')}（{r.get('stock_id','')}）｜池別：{r.get('portfolio_pool','')}\n"
+                            f"買進區間：{r.get('買進下緣','-')} ～ {r.get('買進上緣','-')}｜停損：{r.get('停損','-')}\n"
+                            f"目標1：{r.get('目標1','-')}｜目標2：{r.get('目標2','-')}｜RR：{r.get('RR','-')}\n"
+                            f"風險旗標：{r.get('風險旗標','-')}｜原因：{r.get('風險原因', r.get('pool_reason','-'))}"
+                        )
+                        self.detail.delete("1.0", "end")
+                        self.detail.insert("end", detail)
+            except Exception:
+                pass
             self.sync_all_views(stock_id, source="AI投資組合")
 
 
