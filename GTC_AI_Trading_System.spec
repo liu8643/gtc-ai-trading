@@ -41,433 +41,6 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# Phase 1+：KPattern 模組化安全接入點（FINAL FIX）
-# 說明：
-# 1) 主程式只保留 Hook，不把型態邏輯塞回主程式。
-# 2) 依序支援目前 GitHub 結構：
-#    A. services/kpattern_service.py
-#    B. kpattern_module/kpattern_pipeline.py
-#    C. engines/kpattern_pipeline.py（舊資料夾相容）
-# 3) 若 services 內仍引用舊 engines 路徑，主程式會自動改用 kpattern_module pipeline，
-#    避免因路徑重構造成 KPattern 只跑 fallback。
-# 4) fallback run 支援 **kwargs，避免 context 參數造成 TypeError。
-try:
-    from services.kpattern_service import KPatternService as _ExternalKPatternService
-    KPatternService = _ExternalKPatternService
-    KPATTERN_SERVICE_IMPORT_STATUS = "external_service_loaded"
-except Exception as _service_import_exc:
-    try:
-        from kpattern_module.kpattern_pipeline import KPatternPipeline as _KPatternPipeline
-
-        class KPatternService:
-            """主程式內建相容層：直接呼叫 kpattern_module.KPatternPipeline。"""
-
-            def __init__(self):
-                self.pipeline = _KPatternPipeline()
-
-            def run(self, df, price_history=None, **kwargs):
-                return self.pipeline.run(df, price_history_df=price_history, **kwargs)
-
-        KPATTERN_SERVICE_IMPORT_STATUS = f"kpattern_module_pipeline_loaded_after_service_fail: {_service_import_exc}"
-    except Exception as _module_import_exc:
-        try:
-            from engines.kpattern_pipeline import KPatternPipeline as _LegacyKPatternPipeline
-
-            class KPatternService:
-                """舊 engines 資料夾相容層。"""
-
-                def __init__(self):
-                    self.pipeline = _LegacyKPatternPipeline()
-
-                def run(self, df, price_history=None, **kwargs):
-                    return self.pipeline.run(df, price_history_df=price_history, **kwargs)
-
-            KPATTERN_SERVICE_IMPORT_STATUS = f"legacy_engines_pipeline_loaded: service_fail={_service_import_exc}; module_fail={_module_import_exc}"
-        except Exception as _legacy_import_exc:
-            KPATTERN_SERVICE_IMPORT_STATUS = (
-                "fallback_service_used: "
-                f"service_fail={_service_import_exc}; "
-                f"kpattern_module_fail={_module_import_exc}; "
-                f"engines_fail={_legacy_import_exc}"
-            )
-
-            class KPatternService:
-                def run(self, df, price_history=None, **kwargs):
-                    print(f"[KPatternService][fallback] called successfully｜{KPATTERN_SERVICE_IMPORT_STATUS}")
-                    return df
-
-# Teacher Strategy 模組化安全接入點（V17 TEACHER_STRATEGY_HOOK）
-# 原則：主程式只做 Hook / merge / display / export，不把顧奎國老師策略邏輯塞回主程式。
-# 主要邏輯放在 teacher_strategy/；服務接線放在 services/teacher_strategy_service.py。
-try:
-    from services.teacher_strategy_service import TeacherStrategyService as _ExternalTeacherStrategyService
-    TeacherStrategyService = _ExternalTeacherStrategyService
-    TEACHER_STRATEGY_IMPORT_STATUS = "external_service_loaded"
-except Exception as _teacher_service_import_exc:
-    TeacherStrategyService = None
-    TEACHER_STRATEGY_IMPORT_STATUS = f"teacher_strategy_service_unavailable: {_teacher_service_import_exc}"
-
-
-# KPattern 固定欄位：主程式只讀這組輸出，後續擴充只改 kpattern_module。
-KPATTERN_RANKING_COLUMNS = [
-    "kpattern_code", "kpattern_name", "kpattern_score", "kpattern_signal",
-    "kpattern_trade_bias", "kpattern_trade_advice", "kpattern_reason",
-    "kpattern_position", "kpattern_position_ratio",
-    "kpattern_volume_confirm", "kpattern_volume_ratio", "kpattern_volume_score",
-    "kpattern_risk_flag", "final_trade_score", "kpattern_rank_adjustment",
-]
-
-
-def _kpattern_default_payload() -> dict:
-    return {
-        "kpattern_code": "NEUTRAL",
-        "kpattern_name": "無明確型態",
-        "kpattern_score": 0.0,
-        "kpattern_signal": "NEUTRAL",
-        "kpattern_trade_bias": "NEUTRAL",
-        "kpattern_trade_advice": "觀察",
-        "kpattern_reason": "KPattern 未觸發",
-        "kpattern_position": "資料不足",
-        "kpattern_position_ratio": 0.0,
-        "kpattern_volume_confirm": "中性",
-        "kpattern_volume_ratio": 1.0,
-        "kpattern_volume_score": 0.0,
-        "kpattern_risk_flag": "NO",
-        "final_trade_score": 50.0,
-        "kpattern_rank_adjustment": 0.0,
-    }
-
-
-def _extract_kpattern_payload(hist_df) -> dict:
-    payload = _kpattern_default_payload()
-    try:
-        if hist_df is None or getattr(hist_df, "empty", True):
-            return payload
-        last = hist_df.iloc[-1]
-        for col in KPATTERN_RANKING_COLUMNS:
-            if col in hist_df.columns:
-                payload[col] = last.get(col, payload.get(col))
-    except Exception as exc:
-        try:
-            log_warning(f"[KPattern] payload extract failed: {exc}")
-        except Exception:
-            pass
-    return payload
-
-
-def apply_kpattern_pipeline_safe(df, price_history=None, context: str = ""):
-    """主程式固定 KPattern Hook。
-    只呼叫 Service，不在主程式內寫型態邏輯；失敗時回傳原 df 並補中性欄位。
-    """
-    try:
-        out = KPatternService().run(df=df, price_history=price_history, context=context)
-        if out is None:
-            out = df
-    except Exception as exc:
-        try:
-            log_warning(f"[KPattern] pipeline skipped context={context}: {exc}")
-        except Exception:
-            pass
-        out = df
-    try:
-        defaults = _kpattern_default_payload()
-        for col, default in defaults.items():
-            if col not in out.columns:
-                out[col] = default
-        try:
-            out = finalize_teacher_strategy_fields(out)
-        except Exception:
-            pass
-        return out
-    except Exception:
-        return out
-
-
-TEACHER_STRATEGY_COLUMNS = [
-    "teacher_strategy_class", "teacher_final_decision", "teacher_light",
-    "teacher_gate", "teacher_trade_allowed", "teacher_ui_bucket", "teacher_priority", "teacher_score",
-    "teacher_no_trade_reason", "position_stage", "position_score",
-    "two_high_fail", "weak_gate", "weak_score",
-    "rotation", "sector_strength_score",
-    "flow_score", "rs_score", "teacher_buy_zone", "teacher_stop_loss",
-    "teacher_target_price", "teacher_reason", "teacher_source",
-]
-
-
-def _teacher_strategy_default_payload() -> dict:
-    return {
-        "teacher_strategy_class": "未評估",
-        "teacher_final_decision": "WATCH",
-        "teacher_light": "⚫",
-        "teacher_gate": "NE",
-        "teacher_trade_allowed": 0,
-        "teacher_ui_bucket": "未評估",
-        "teacher_priority": 9999,
-        "teacher_score": 0.0,
-        "teacher_no_trade_reason": "TeacherStrategy 尚未接管交易總閘",
-        "position_stage": "未知",
-        "position_score": 0.0,
-        "two_high_fail": False,
-        "weak_gate": "NE",
-        "weak_score": 0.0,
-        "rotation": "未知",
-        "sector_strength_score": 0.0,
-        "flow_score": 0.0,
-        "rs_score": 0.0,
-        "teacher_buy_zone": "",
-        "teacher_stop_loss": "",
-        "teacher_target_price": "",
-        "teacher_reason": "TeacherStrategy 尚未接入或資料不足",
-        "teacher_source": TEACHER_STRATEGY_IMPORT_STATUS,
-    }
-
-
-
-def finalize_teacher_strategy_fields(df: pd.DataFrame) -> pd.DataFrame:
-    """V17 Phase3：老師策略交易總閘欄位標準化。
-    目的：
-    1) 產出獨立 teacher_trade_allowed，不再混在舊 Decision Layer。
-    2) 產出 teacher_ui_bucket / teacher_priority / teacher_no_trade_reason，供 UI 五區與 Excel 直接使用。
-    3) 只做欄位整合與風控 Gate，不在 UI 重算策略。
-    """
-    if df is None:
-        return df
-    x = df.copy()
-    defaults = _teacher_strategy_default_payload()
-    for col, default in defaults.items():
-        if col not in x.columns:
-            x[col] = default
-
-    def _txt(col, default=""):
-        if col not in x.columns:
-            return pd.Series(default, index=x.index, dtype="object")
-        return pd.Series(x[col], index=x.index, copy=True).fillna(default).astype(str)
-
-    def _num(col, default=0.0):
-        if col not in x.columns:
-            return pd.Series(default, index=x.index, dtype="float64")
-        return pd.to_numeric(pd.Series(x[col], index=x.index, copy=True), errors="coerce").fillna(default)
-
-    decision = _txt("teacher_final_decision", "WATCH").str.upper().str.replace(" ", "_", regex=False)
-    teacher_gate = _txt("teacher_gate", "NE").str.upper()
-    weak_gate = _txt("weak_gate", "NE").str.upper()
-    position_score = _num("position_score", 0.0)
-    weak_score = _num("weak_score", 0.0)
-    rr = _num("rr_live", np.nan)
-    if rr.isna().all():
-        rr = _num("rr", 0.0)
-    rsi = _num("rsi", np.nan)
-    if rsi.isna().all():
-        rsi = _num("rsi14", 50.0)
-    price_dev = _num("price_deviation", np.nan)
-    if price_dev.isna().all():
-        price_dev = _num("price_dev", 0.0)
-
-    if "two_high_fail" in x.columns:
-        two_high_raw = pd.Series(x["two_high_fail"], index=x.index, copy=True).fillna(False)
-        two_high = two_high_raw.astype(str).str.upper().isin(["TRUE", "1", "YES", "Y", "是"])
-    else:
-        two_high = pd.Series(False, index=x.index)
-
-    buy_decision = decision.isin(["BUY", "LOW_BUY", "LOW BUY"])
-    wait_decision = decision.str.contains("WAIT|WATCH|PULLBACK", case=False, na=False)
-    block_decision = decision.str.contains("AVOID|REDUCE|BLOCK|SELL|排除|減碼", case=False, na=False)
-
-    hard_block = (
-        weak_gate.eq("BLOCK") |
-        teacher_gate.eq("BLOCK") |
-        two_high |
-        block_decision |
-        (weak_score >= 70) |
-        (rsi >= 78) |
-        (price_dev >= 0.20)
-    )
-    soft_block = (
-        weak_gate.eq("WARNING") |
-        (position_score < 60) |
-        ((rr > 0) & (rr < 1.0))
-    )
-    allowed = buy_decision & (~hard_block) & (~soft_block)
-    x["teacher_trade_allowed"] = allowed.astype(int)
-
-    bucket = pd.Series("觀察", index=x.index, dtype="object")
-    bucket.loc[allowed & decision.isin(["BUY"])] = "今日可買"
-    bucket.loc[allowed & decision.isin(["LOW_BUY", "LOW BUY"])] = "低位階翻多"
-    bucket.loc[(~allowed) & wait_decision & (~hard_block)] = "等拉回"
-    bucket.loc[hard_block] = "排除"
-    x["teacher_ui_bucket"] = bucket
-
-    priority_map = {"今日可買": 1, "低位階翻多": 2, "等拉回": 3, "觀察": 4, "排除": 9, "未評估": 99}
-    x["teacher_priority"] = x["teacher_ui_bucket"].map(priority_map).fillna(99).astype(int)
-    # V17-R2：老師策略獨立排序分數，不再沿用 TOP20 / rank_all。
-    sector_score = _num("sector_strength_score", 0.0)
-    flow_score = _num("flow_score", 0.0)
-    rs_score = _num("rs_score", 0.0)
-    rr_score = rr.where(rr > 0, 0).clip(lower=0, upper=3) * 10
-    penalty = hard_block.astype(int) * 60 + soft_block.astype(int) * 25
-    x["teacher_score"] = (position_score * 0.35 + sector_score * 0.25 + flow_score * 0.15 + rs_score * 0.15 + rr_score * 0.10 - penalty).clip(lower=0, upper=100).round(2)
-
-    reasons = []
-    for i in x.index:
-        rs = []
-        if bool(hard_block.loc[i]):
-            if str(weak_gate.loc[i]) == "BLOCK": rs.append("weak_gate=BLOCK")
-            if bool(two_high.loc[i]): rs.append("兩高不過")
-            if float(weak_score.loc[i]) >= 70: rs.append("weak_score>=70")
-            if pd.notna(rsi.loc[i]) and float(rsi.loc[i]) >= 78: rs.append("RSI過熱")
-            if pd.notna(price_dev.loc[i]) and float(price_dev.loc[i]) >= 0.20: rs.append("乖離過大")
-            if str(decision.loc[i]) in ["AVOID", "REDUCE"]: rs.append(f"teacher_decision={decision.loc[i]}")
-        elif bool(soft_block.loc[i]):
-            if str(weak_gate.loc[i]) == "WARNING": rs.append("weak_gate=WARNING")
-            if float(position_score.loc[i]) < 60: rs.append("position_score<60")
-            if pd.notna(rr.loc[i]) and float(rr.loc[i]) > 0 and float(rr.loc[i]) < 1.0: rs.append("RR<1")
-        elif bool(allowed.loc[i]):
-            rs.append("Teacher Gate PASS")
-        else:
-            rs.append("未達BUY/LOW_BUY條件")
-        reasons.append("；".join(rs))
-    x["teacher_no_trade_reason"] = reasons
-    return x
-
-def apply_teacher_strategy_pipeline_safe(ranking_df, price_history_df=None, market_df=None, institutional_df=None, context: str = "", log_cb=None):
-    """主程式固定 Teacher Strategy Hook。
-    只呼叫 services.teacher_strategy_service，不在主程式內寫老師策略判斷邏輯。
-    失敗時回傳原 ranking_df 並補中性欄位，避免 UI / Excel / DB 因缺欄位中斷。
-    """
-    if ranking_df is None:
-        return ranking_df
-    out = ranking_df.copy()
-    defaults = _teacher_strategy_default_payload()
-    try:
-        if TeacherStrategyService is None:
-            for col, default in defaults.items():
-                if col not in out.columns:
-                    out[col] = default
-            return out
-        teacher_df = TeacherStrategyService().run(
-            ranking_df=out,
-            price_history_df=price_history_df,
-            market_df=market_df,
-            institutional_df=institutional_df,
-        )
-        if teacher_df is not None and isinstance(teacher_df, pd.DataFrame) and not teacher_df.empty:
-            if "stock_id" in teacher_df.columns and "stock_id" in out.columns:
-                teacher_df = normalize_teacher_merge_context_columns(teacher_df)
-                # 避免重複欄位造成 _x/_y 污染；老師策略欄位以最新 service 結果為準。
-                drop_cols = [c for c in TEACHER_STRATEGY_COLUMNS if c in out.columns]
-                if drop_cols:
-                    out = out.drop(columns=drop_cols, errors="ignore")
-                out = out.merge(teacher_df, on="stock_id", how="left", suffixes=("", "_teacher"))
-                out = normalize_ranking_result_columns(out)
-            else:
-                for col in teacher_df.columns:
-                    if col not in out.columns and len(teacher_df[col]) == len(out):
-                        out[col] = teacher_df[col].values
-                out = normalize_ranking_result_columns(out)
-        for col, default in defaults.items():
-            if col not in out.columns:
-                out[col] = default
-            else:
-                out[col] = out[col].fillna(default)
-        out = finalize_teacher_strategy_fields(out)
-        try:
-            msg = f"[TeacherStrategy] merged context={context} rows={len(out)} status={TEACHER_STRATEGY_IMPORT_STATUS}"
-            if log_cb:
-                log_cb(msg)
-            log_info(msg)
-        except Exception:
-            pass
-        return out
-    except Exception as exc:
-        try:
-            msg = f"[TeacherStrategy] pipeline skipped context={context}: {exc}"
-            if log_cb:
-                log_cb(msg)
-            log_warning(msg)
-        except Exception:
-            pass
-        for col, default in defaults.items():
-            if col not in out.columns:
-                out[col] = default
-        return out
-
-
-# V17-R4 DAILY_UPDATE_SCHEMA_GUARD：避免 pandas merge 產生的 date_x/date_y 污染 DB 寫入。
-def normalize_ranking_result_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """寫入 ranking_result 前的欄位正規化。
-
-    修正重點：
-    1) pandas merge 產生 date_x / date_y 時，統一回正式欄位 date。
-    2) date_x / date_y 不屬於正式 schema，必須移除。
-    3) 其他 *_x / *_y 欄位若是 merge 副產品，優先保留原欄位，避免寫 DB 失敗。
-    """
-    if df is None:
-        return df
-    x = df.copy()
-
-    if "date" not in x.columns:
-        if "date_x" in x.columns:
-            x["date"] = x["date_x"]
-        elif "date_y" in x.columns:
-            x["date"] = x["date_y"]
-
-    for c in ["date_x", "date_y"]:
-        if c in x.columns:
-            x = x.drop(columns=[c])
-
-    # 清理其他 pandas merge suffix 欄位：若 base 欄位已存在，直接丟棄；若 base 不存在，回填為 base。
-    suffix_cols = [c for c in list(x.columns) if isinstance(c, str) and (c.endswith("_x") or c.endswith("_y"))]
-    for c in suffix_cols:
-        base = c[:-2]
-        if base in x.columns:
-            x = x.drop(columns=[c])
-        else:
-            x = x.rename(columns={c: base})
-    return x
-
-
-def filter_df_to_table_schema(conn, df: pd.DataFrame, table_name: str, log_prefix: str = "DB_SCHEMA_GUARD") -> pd.DataFrame:
-    """依 SQLite 既有 schema 白名單過濾 DataFrame 欄位，避免未知欄位導致 INSERT 失敗。"""
-    if df is None:
-        return df
-    x = df.copy()
-    try:
-        safe_table = re.sub(r"[^A-Za-z0-9_]", "", str(table_name or ""))
-        if not safe_table:
-            return x
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({safe_table})")
-        table_cols = [str(r[1]) for r in cur.fetchall()]
-        if not table_cols:
-            return x
-        keep_cols = [c for c in x.columns if c in table_cols]
-        dropped = [c for c in x.columns if c not in table_cols]
-        if dropped:
-            try:
-                log_warning(f"[{log_prefix}] {safe_table} drop non-schema columns before insert: {dropped}")
-            except Exception:
-                pass
-        return x[keep_cols]
-    except Exception as exc:
-        try:
-            log_warning(f"[{log_prefix}] schema filter failed for {table_name}: {exc}")
-        except Exception:
-            pass
-        return x
-
-
-def normalize_teacher_merge_context_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """TeacherStrategy 回傳資料只允許老師策略欄位進入排名表，避免 rank context 的 date_x/date_y 污染 ranking_result。"""
-    if df is None:
-        return df
-    x = normalize_ranking_result_columns(df.copy())
-    if "stock_id" not in x.columns:
-        return x
-    allowed = ["stock_id"] + [c for c in TEACHER_STRATEGY_COLUMNS if c in x.columns]
-    # 保留服務端可能提供的必要老師欄位，但不讓 date/open/high/low/close 等 context 欄位重新 merge 回 ranking_result。
-    return x[allowed].drop_duplicates(subset=["stock_id"], keep="last")
-
-
 try:
     import yfinance as yf
 except Exception:
@@ -579,15 +152,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO V17-PHASE3_TEACHER_UI_GATE"
-
-# V17-P1 STARTUP_REAL_FIX：2026-05-15
-# 目的：第二次開程式不得再於 MainThread 執行 build_display_columns / EPS MATRIX / AI TOP20 重計算。
-STARTUP_REAL_FIX_ID = "V17-P1-STARTUP-REAL-FIX-20260515"
-# 強制關閉顯示欄位缺欄位 WARNING；若要除錯，請改用 GTC_ALLOW_DISPLAY_SCHEMA_WARNING=1。
-os.environ["GTC_DEBUG_DISPLAY_SCHEMA"] = "0"
-os.environ.setdefault("GTC_ALLOW_DISPLAY_SCHEMA_WARNING", "0")
-os.environ.setdefault("GTC_DEBUG_EPS_CACHE", "0")
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R10_MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -631,6 +196,49 @@ MARGIN_DATA_SOURCE_POLICY = [
     "禁止 Mitake / 券商 SDK / 未授權商業資料",
 ]
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
+
+
+# FIX9 AI投資組合引擎：獨立於原 TOP20。TOP20 保留「主流TOP20 + 起爆TOP20 + 雙引擎共振」原設計；
+# AI投資組合使用 pool_config.json 控制勾選、配額與權重，不回寫/取代 TOP20。
+AI_PORTFOLIO_CONFIG_PATH = RUNTIME_DIR / "pool_config.json"
+DEFAULT_AI_PORTFOLIO_CONFIG = {
+    "市場主流池": {"enabled": True, "quota": 5, "weight": 1.20},
+    "未來科技池": {"enabled": True, "quota": 5, "weight": 1.15},
+    "營收成長池": {"enabled": True, "quota": 3, "weight": 1.10},
+    "價值池": {"enabled": True, "quota": 3, "weight": 1.00},
+    "波段攻擊池": {"enabled": True, "quota": 3, "weight": 1.15},
+    "老師低接池": {"enabled": True, "quota": 2, "weight": 1.05},
+    "ETF防守池": {"enabled": False, "quota": 3, "weight": 0.80},
+    "排除風險池": {"enabled": True, "quota": 20, "weight": 0.00},
+}
+AI_PORTFOLIO_FUTURE_TECH_KEYWORDS = [
+    "AI", "AI伺服器", "ASIC", "CPO", "光模組", "光通訊", "矽光子", "散熱", "液冷", "電源", "HVDC",
+    "機器人", "Edge", "邊緣", "AI-RAN", "6G", "網通", "資料中心", "半導體", "RISC-V", "先進封裝",
+]
+
+
+# FIX10-P0：AI投資組合主表/各池報表必備交易計畫欄位。
+# 目的：補齊「買進下緣、買進上緣、停損、目標1、目標2、RR、風險旗標」，
+# 並讓 UI Treeview 可水平/垂直捲動查看完整欄位；TOP20 原雙引擎邏輯不受影響。
+AI_PORTFOLIO_DISPLAY_COLUMNS = [
+    ("portfolio_rank", "排序", 60),
+    ("stock_id", "代號", 80),
+    ("stock_name", "名稱", 120),
+    ("portfolio_pool", "池別", 120),
+    ("portfolio_score", "組合分", 85),
+    ("pool_quota", "配額", 65),
+    ("pool_weight", "權重", 65),
+    ("現價", "現價", 75),
+    ("買進下緣", "買進下緣", 90),
+    ("買進上緣", "買進上緣", 90),
+    ("停損", "停損", 80),
+    ("目標1", "目標1", 80),
+    ("目標2", "目標2", 80),
+    ("RR", "RR", 70),
+    ("風險旗標", "風險旗標", 100),
+    ("pool_reason", "入池原因", 260),
+]
+AI_PORTFOLIO_TRADE_COLUMNS = ["買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標"]
 
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -685,7 +293,6 @@ def log_exception(message: str, exc: Exception | None = None):
         pass
 
 SELECTED_PLOT_FONT = configure_matplotlib_cjk_font()
-log_info(f"[STARTUP_REAL_FIX] active={STARTUP_REAL_FIX_ID}｜display_schema_warning=OFF｜startup_light_no_build_display=ON")
 
 
 PACKED_DATA_DIR = BASE_DIR / "data"
@@ -2773,41 +2380,6 @@ class DBManager:
             PRIMARY KEY(run_id, stock_id, source_rank)
         )
         """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS teacher_strategy_snapshot (
-            snapshot_date TEXT,
-            stock_id TEXT,
-            stock_name TEXT,
-            rank_all INTEGER,
-            total_score REAL,
-            teacher_score REAL,
-            teacher_strategy_class TEXT,
-            teacher_final_decision TEXT,
-            teacher_light TEXT,
-            teacher_gate TEXT,
-            teacher_trade_allowed INTEGER DEFAULT 0,
-            teacher_ui_bucket TEXT,
-            teacher_priority INTEGER DEFAULT 9999,
-            teacher_no_trade_reason TEXT,
-            position_stage TEXT,
-            position_score REAL,
-            two_high_fail INTEGER DEFAULT 0,
-            weak_gate TEXT,
-            weak_score REAL,
-            rotation TEXT,
-            sector_strength_score REAL,
-            flow_score REAL,
-            rs_score REAL,
-            teacher_buy_zone TEXT,
-            teacher_stop_loss TEXT,
-            teacher_target_price TEXT,
-            teacher_reason TEXT,
-            teacher_source TEXT,
-            source_hash TEXT,
-            update_time TEXT,
-            PRIMARY KEY(snapshot_date, stock_id)
-        )
-        """)
         self._ensure_external_schema_columns(cur)
         for sql in [
             "CREATE INDEX IF NOT EXISTS idx_system_run_log_run_id ON system_run_log(run_id)",
@@ -2823,7 +2395,6 @@ class DBManager:
             "CREATE INDEX IF NOT EXISTS idx_financial_feature_stock_date ON financial_feature_daily(stock_id, feature_date)",
             "CREATE INDEX IF NOT EXISTS idx_external_detail_module ON external_source_status_detail(module, source_key, source_date)",
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_gate_state ON trade_plan(trade_allowed, market_gate_state, flow_gate_state, fundamental_gate_state)",
-            "CREATE INDEX IF NOT EXISTS idx_teacher_snapshot_date_priority ON teacher_strategy_snapshot(snapshot_date, teacher_priority, teacher_score)",
         ]:
             cur.execute(sql)
 
@@ -2989,48 +2560,6 @@ class DBManager:
             ("revenue_eps_score", "revenue_eps_score REAL DEFAULT 50"),
             ("data_quality_flag", "data_quality_flag TEXT"),
             ("source_trace_json", "source_trace_json TEXT"),
-            ("kpattern_code", "kpattern_code TEXT DEFAULT 'NEUTRAL'"),
-            ("kpattern_name", "kpattern_name TEXT DEFAULT ''"),
-            ("kpattern_score", "kpattern_score REAL DEFAULT 0"),
-            ("kpattern_signal", "kpattern_signal TEXT DEFAULT 'NEUTRAL'"),
-            ("kpattern_trade_bias", "kpattern_trade_bias TEXT DEFAULT 'NEUTRAL'"),
-            ("kpattern_trade_advice", "kpattern_trade_advice TEXT DEFAULT ''"),
-            ("kpattern_reason", "kpattern_reason TEXT DEFAULT ''"),
-            ("kpattern_position", "kpattern_position TEXT DEFAULT ''"),
-            ("kpattern_position_ratio", "kpattern_position_ratio REAL DEFAULT 0"),
-            ("kpattern_volume_confirm", "kpattern_volume_confirm TEXT DEFAULT '中性'"),
-            ("kpattern_volume_ratio", "kpattern_volume_ratio REAL DEFAULT 1"),
-            ("kpattern_volume_score", "kpattern_volume_score REAL DEFAULT 0"),
-            ("kpattern_risk_flag", "kpattern_risk_flag TEXT DEFAULT 'NO'"),
-            ("final_trade_score", "final_trade_score REAL DEFAULT 50"),
-            ("kpattern_rank_adjustment", "kpattern_rank_adjustment REAL DEFAULT 0"),
-        ]:
-            _add("ranking_result", col, ddl)
-
-        for col, ddl in [
-            ("teacher_strategy_class", "teacher_strategy_class TEXT DEFAULT '未評估'"),
-            ("teacher_final_decision", "teacher_final_decision TEXT DEFAULT 'WATCH'"),
-            ("teacher_light", "teacher_light TEXT DEFAULT '⚫'"),
-            ("teacher_gate", "teacher_gate TEXT DEFAULT 'NE'"),
-            ("teacher_trade_allowed", "teacher_trade_allowed INTEGER DEFAULT 0"),
-            ("teacher_ui_bucket", "teacher_ui_bucket TEXT DEFAULT '未評估'"),
-            ("teacher_priority", "teacher_priority INTEGER DEFAULT 9999"),
-            ("teacher_score", "teacher_score REAL DEFAULT 0"),
-            ("teacher_no_trade_reason", "teacher_no_trade_reason TEXT DEFAULT ''"),
-            ("position_stage", "position_stage TEXT DEFAULT '未知'"),
-            ("position_score", "position_score REAL DEFAULT 0"),
-            ("two_high_fail", "two_high_fail INTEGER DEFAULT 0"),
-            ("weak_gate", "weak_gate TEXT DEFAULT 'NE'"),
-            ("weak_score", "weak_score REAL DEFAULT 0"),
-            ("rotation", "rotation TEXT DEFAULT '未知'"),
-            ("sector_strength_score", "sector_strength_score REAL DEFAULT 0"),
-            ("flow_score", "flow_score REAL DEFAULT 0"),
-            ("rs_score", "rs_score REAL DEFAULT 0"),
-            ("teacher_buy_zone", "teacher_buy_zone TEXT DEFAULT ''"),
-            ("teacher_stop_loss", "teacher_stop_loss TEXT DEFAULT ''"),
-            ("teacher_target_price", "teacher_target_price TEXT DEFAULT ''"),
-            ("teacher_reason", "teacher_reason TEXT DEFAULT ''"),
-            ("teacher_source", "teacher_source TEXT DEFAULT ''"),
         ]:
             _add("ranking_result", col, ddl)
 
@@ -3091,29 +2620,6 @@ class DBManager:
             ("price_deviation", "price_deviation REAL"),
             ("model_score", "model_score REAL"),
             ("wave_trade_score", "wave_trade_score REAL"),
-            ("teacher_strategy_class", "teacher_strategy_class TEXT DEFAULT '未評估'"),
-            ("teacher_final_decision", "teacher_final_decision TEXT DEFAULT 'WATCH'"),
-            ("teacher_light", "teacher_light TEXT DEFAULT '⚫'"),
-            ("teacher_gate", "teacher_gate TEXT DEFAULT 'NE'"),
-            ("teacher_trade_allowed", "teacher_trade_allowed INTEGER DEFAULT 0"),
-            ("teacher_ui_bucket", "teacher_ui_bucket TEXT DEFAULT '未評估'"),
-            ("teacher_priority", "teacher_priority INTEGER DEFAULT 9999"),
-            ("teacher_score", "teacher_score REAL DEFAULT 0"),
-            ("teacher_no_trade_reason", "teacher_no_trade_reason TEXT DEFAULT ''"),
-            ("position_stage", "position_stage TEXT DEFAULT '未知'"),
-            ("position_score", "position_score REAL DEFAULT 0"),
-            ("two_high_fail", "two_high_fail INTEGER DEFAULT 0"),
-            ("weak_gate", "weak_gate TEXT DEFAULT 'NE'"),
-            ("weak_score", "weak_score REAL DEFAULT 0"),
-            ("rotation", "rotation TEXT DEFAULT '未知'"),
-            ("sector_strength_score", "sector_strength_score REAL DEFAULT 0"),
-            ("flow_score", "flow_score REAL DEFAULT 0"),
-            ("rs_score", "rs_score REAL DEFAULT 0"),
-            ("teacher_buy_zone", "teacher_buy_zone TEXT DEFAULT ''"),
-            ("teacher_stop_loss", "teacher_stop_loss TEXT DEFAULT ''"),
-            ("teacher_target_price", "teacher_target_price TEXT DEFAULT ''"),
-            ("teacher_reason", "teacher_reason TEXT DEFAULT ''"),
-            ("teacher_source", "teacher_source TEXT DEFAULT ''"),
         ]:
             _add("trade_plan", col, ddl)
 
@@ -3246,23 +2752,19 @@ class DBManager:
             "retail_heat_score": 50.0, "margin_score": 50.0, "margin_state": "NE", "macro_margin_score": 50.0, "macro_margin_state": "NE", "margin_decision_note": "",
             "fail_reason": "", "rsi": np.nan, "atr_pct": np.nan, "price_deviation": np.nan, "model_score": np.nan, "wave_trade_score": np.nan,
         }
-        defaults.update(_teacher_strategy_default_payload())
         for c, d in defaults.items():
             if c not in x.columns:
                 x[c] = d
         if "entry_mid" in x.columns:
             close_series = pd.to_numeric(x["close"], errors="coerce").fillna(0)
             x.loc[close_series.eq(0), "close"] = pd.to_numeric(x.loc[close_series.eq(0), "entry_mid"], errors="coerce").fillna(0)
-        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "position_score", "weak_score", "sector_strength_score", "flow_score", "rs_score", "teacher_priority", "teacher_score"]:
+        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score"]:
             x[c] = pd.to_numeric(x[c], errors="coerce")
-        for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "analysis_ready", "execution_ready", "soft_block", "teacher_trade_allowed"]:
+        for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "analysis_ready", "execution_ready", "soft_block"]:
             if c not in x.columns:
                 x[c] = 0
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
         keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "fail_reason", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "analysis_ready", "execution_ready", "soft_block", "block_reason", "execution_block_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "update_time"]
-        for _teacher_col in TEACHER_STRATEGY_COLUMNS:
-            if _teacher_col not in keep:
-                keep.append(_teacher_col)
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -3454,75 +2956,13 @@ class DBManager:
         return int(row[0]) if row and row[0] is not None else 0
 
     def replace_ranking(self, df: pd.DataFrame):
-        """安全寫入 ranking_result。
-
-        V17-R4 修正每日增量更新後 table ranking_result has no column named date_x：
-        - 寫入前統一 date_x/date_y → date
-        - 移除 pandas merge suffix 欄位
-        - 套用 ranking_result schema 白名單，只寫入 DB 已存在欄位
-        - 先完成欄位檢查，再 DELETE 舊資料，避免寫入失敗造成當日排行被清空
-        """
-        if df is None or df.empty:
-            return
         today = datetime.now().strftime("%Y-%m-%d")
-        x = normalize_ranking_result_columns(df)
-        if "date" not in x.columns:
-            x["date"] = today
-        x["date"] = x["date"].fillna(today).astype(str).replace("", today)
-        # 重排行以今日為準；若上游殘留其他日期，統一寫今日，避免 DELETE/INSERT 日期不一致。
-        x["date"] = today
         with self.lock:
-            x = filter_df_to_table_schema(self.conn, x, "ranking_result", log_prefix="RANKING_RESULT_WRITE")
             cur = self.conn.cursor()
             cur.execute("DELETE FROM ranking_result WHERE date=?", (today,))
             self.conn.commit()
-            x.to_sql("ranking_result", self.conn, if_exists="append", index=False)
+            df.to_sql("ranking_result", self.conn, if_exists="append", index=False)
             self.conn.commit()
-
-
-    def replace_teacher_strategy_snapshot(self, df: pd.DataFrame, snapshot_date: str | None = None, source_hash: str = ""):
-        """V17-R2：儲存老師策略獨立快照，避免老師頁每次開啟都重算，也避免沿用 TOP20。"""
-        if df is None or df.empty:
-            return 0
-        snapshot_date = snapshot_date or datetime.now().strftime("%Y-%m-%d")
-        x = df.copy()
-        x["snapshot_date"] = snapshot_date
-        x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        x["source_hash"] = str(source_hash or "")
-        defaults = _teacher_strategy_default_payload()
-        keep = [
-            "snapshot_date", "stock_id", "stock_name", "rank_all", "total_score", "teacher_score",
-            "teacher_strategy_class", "teacher_final_decision", "teacher_light", "teacher_gate",
-            "teacher_trade_allowed", "teacher_ui_bucket", "teacher_priority", "teacher_no_trade_reason",
-            "position_stage", "position_score", "two_high_fail", "weak_gate", "weak_score", "rotation",
-            "sector_strength_score", "flow_score", "rs_score", "teacher_buy_zone", "teacher_stop_loss",
-            "teacher_target_price", "teacher_reason", "teacher_source", "source_hash", "update_time"
-        ]
-        for c in keep:
-            if c not in x.columns:
-                x[c] = defaults.get(c, 0 if c in ("teacher_trade_allowed", "two_high_fail") else "")
-        for c in ["rank_all", "teacher_trade_allowed", "teacher_priority", "two_high_fail"]:
-            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        for c in ["total_score", "teacher_score", "position_score", "weak_score", "sector_strength_score", "flow_score", "rs_score"]:
-            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
-        x = x[keep].drop_duplicates(subset=["snapshot_date", "stock_id"], keep="last")
-        with self.lock:
-            self.conn.execute("DELETE FROM teacher_strategy_snapshot WHERE snapshot_date=?", (snapshot_date,))
-            x.to_sql("teacher_strategy_snapshot", self.conn, if_exists="append", index=False)
-            self.conn.commit()
-        return len(x)
-
-    def get_latest_teacher_strategy_snapshot(self) -> pd.DataFrame:
-        q = """
-        SELECT * FROM teacher_strategy_snapshot
-        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM teacher_strategy_snapshot)
-        ORDER BY teacher_priority ASC, teacher_score DESC, rank_all ASC
-        """
-        with self.lock:
-            try:
-                return pd.read_sql_query(q, self.conn)
-            except Exception:
-                return pd.DataFrame()
 
     def get_latest_ranking(self) -> pd.DataFrame:
         q = """
@@ -3991,8 +3431,6 @@ class RankingEngine:
                     progress_cb(idx, total, stock_id, success, 0, skipped, "skip")
                 continue
             hist = DataEngine.attach(hist)
-            hist = apply_kpattern_pipeline_safe(hist, price_history=hist, context=f"ranking:{stock_id}")
-            kpattern_payload = _extract_kpattern_payload(hist)
             score = StrategyEngineV91.score(hist)
             technical_total = float(score.get("total_score", 0) or 0)
             feat = feature_map.get(stock_id, {})
@@ -4000,24 +3438,19 @@ class RankingEngine:
             valuation_score = float(pd.to_numeric(pd.Series([feat.get("revenue_eps_score", 50)]), errors="coerce").fillna(50).iloc[0])
             liquidity_score = float(score.get("volume_score", 0) or 0)
             theme_score = float(score.get("ai_score", 0) or 0)
-            kpattern_adjustment = float(pd.to_numeric(pd.Series([kpattern_payload.get("kpattern_rank_adjustment", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
             final_total = round(
                 technical_total * 0.50 +
                 revenue_eps_score * 0.20 +
                 valuation_score * 0.10 +
                 liquidity_score * 0.10 +
-                theme_score * 0.10 +
-                kpattern_adjustment,
+                theme_score * 0.10,
                 2
             )
-            final_total = max(0.0, min(100.0, final_total))
             score["technical_total_score"] = round(technical_total, 2)
             score["financial_score"] = round(revenue_eps_score, 2)
             score["total_score"] = final_total
             for c in ["eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "source_trace_json"]:
                 score[c] = feat.get(c, np.nan if c in ["eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score"] else "")
-            for c, v in kpattern_payload.items():
-                score[c] = v
             rows.append({
                 "date": today,
                 "stock_id": stock_id,
@@ -4037,10 +3470,6 @@ class RankingEngine:
         df["rank_all"] = np.arange(1, len(df) + 1)
         merged = df.merge(master[["stock_id", "industry"]], on="stock_id", how="left")
         df["rank_industry"] = merged.groupby("industry")["total_score"].rank(method="dense", ascending=False).astype(int)
-        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-        # 重建排行只允許讀取既有快取與重算 ranking_result。
-        # 停用多做段落：不得在重建排行中再跑 TeacherStrategy full merge，避免與每日增量更新重疊。
-        # df = apply_teacher_strategy_pipeline_safe(df, price_history_df=None, context="ranking_rebuild", log_cb=log_cb)
         self.db.replace_ranking(df)
         self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with FUNDAMENTAL_LOCAL_CACHE", run_id=run_id, module="ranking")
         return len(df)
@@ -6227,31 +5656,7 @@ class FinancialFeatureEngine:
         score = 0.5 * float(matrix_score) + 0.3 * eps_score + 0.2 * rev_score + float(modifier)
         return round(self._clamp(score), 2)
 
-
-    def _existing_feature_batch_ok(self, feature_date: str, master_count: int, coverage_ratio: float = 0.90) -> tuple[bool, int]:
-        """P0效能修正：同一交易日 financial_feature_daily 已完成時，AI TOP20/顯示層不得再次重建2267筆。"""
-        try:
-            with self.db.lock:
-                cur = self.db.conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM financial_feature_daily WHERE feature_date=?", (feature_date,))
-                row_count = int((cur.fetchone() or [0])[0] or 0)
-            min_rows = int(max(1, master_count) * float(coverage_ratio))
-            return row_count >= min_rows, row_count
-        except Exception:
-            return False, 0
-
-    def _load_feature_batch_from_cache(self, feature_date: str) -> pd.DataFrame:
-        try:
-            with self.db.lock:
-                return pd.read_sql_query(
-                    "SELECT * FROM financial_feature_daily WHERE feature_date=?",
-                    self.db.conn,
-                    params=(feature_date,),
-                )
-        except Exception:
-            return pd.DataFrame()
-
-    def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 0, force_rebuild: bool = False) -> pd.DataFrame:
+    def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 10) -> pd.DataFrame:
         run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         feature_date = datetime.now().strftime("%Y-%m-%d")
         master = self.db.get_master()
@@ -6260,15 +5665,6 @@ class FinancialFeatureEngine:
         latest_close_map = self._latest_close_map()
         if master is None or master.empty:
             return pd.DataFrame()
-
-        if write_db and not force_rebuild:
-            cache_ok, cache_rows = self._existing_feature_batch_ok(feature_date, len(master))
-            if cache_ok:
-                # V17-P1 STARTUP_REAL_FIX：cache hit 不再於 MainThread 預設輸出，
-                # 避免使用者誤判為正在重建 EPS MATRIX；需要除錯才開 GTC_DEBUG_EPS_CACHE=1。
-                if str(os.getenv("GTC_DEBUG_EPS_CACHE", "0")).strip() == "1":
-                    log_info(f"[EPS MATRIX][CACHE HIT][R8] feature_date={feature_date} rows={cache_rows} skip_rebuild=1")
-                return self._load_feature_batch_from_cache(feature_date)
 
         base = master[["stock_id"]].copy()
         base["stock_id"] = self._normalize_stock_id_series(base["stock_id"])
@@ -6334,21 +5730,21 @@ class FinancialFeatureEngine:
         both_na_ratio = float((out["matrix_cell"].astype(str) == "E_NA-R_NA").mean())
         core_ne_ratio = float(out["data_quality_flag"].fillna("").astype(str).str.contains(r"EPS_NE|REV_NE|SOURCE_NE", regex=True).mean())
 
-        # V17-PERF：預設不再大量輸出 console；需要逐項驗證時設定 GTC_DEBUG_EPS_MATRIX=1。
-        if str(os.getenv("GTC_DEBUG_EPS_MATRIX", "0")).strip() == "1":
-            try:
-                print("\n====== DEBUG R8 FINANCIAL MERGE ======", flush=True)
-                print(f"valuation_rows={valuation_rows}", flush=True)
-                print(f"revenue_rows={revenue_rows}", flush=True)
-                print(f"valuation_hit={valuation_hit}", flush=True)
-                print(f"revenue_hit={revenue_hit}", flush=True)
-                print(f"eps_ok={eps_ok}", flush=True)
-                print(f"revenue_ok={revenue_ok}", flush=True)
-                print(f"both_NA_ratio={both_na_ratio:.2%}", flush=True)
-                print(f"core_NE_ratio={core_ne_ratio:.2%}", flush=True)
-                print("======================================\n", flush=True)
-            except Exception:
-                pass
+        # V9.6.2-R8：強制輸出 merge 驗證資訊到 console / EXE 視窗。
+        # 不只依賴 log_info，避免 UI log 未接到時無法確認 EPS / Revenue 是否真的合併成功。
+        try:
+            print("\n====== DEBUG R8 FINANCIAL MERGE ======", flush=True)
+            print(f"valuation_rows={valuation_rows}", flush=True)
+            print(f"revenue_rows={revenue_rows}", flush=True)
+            print(f"valuation_hit={valuation_hit}", flush=True)
+            print(f"revenue_hit={revenue_hit}", flush=True)
+            print(f"eps_ok={eps_ok}", flush=True)
+            print(f"revenue_ok={revenue_ok}", flush=True)
+            print(f"both_NA_ratio={both_na_ratio:.2%}", flush=True)
+            print(f"core_NE_ratio={core_ne_ratio:.2%}", flush=True)
+            print("======================================\n", flush=True)
+        except Exception:
+            pass
 
         if write_db:
             self.db.replace_financial_feature_batch(out, run_id=run_id)
@@ -6357,10 +5753,9 @@ class FinancialFeatureEngine:
                 f"valuation_hit={valuation_hit} revenue_hit={revenue_hit} eps_ok={eps_ok} revenue_ok={revenue_ok} "
                 f"both_NA_ratio={both_na_ratio:.2%} core_NE_ratio={core_ne_ratio:.2%}"
             )
-            if int(log_limit or 0) > 0:
-                sample = out.head(int(log_limit))
-                for _, rr in sample.iterrows():
-                    log_info(f"[EPS MATRIX][BUILD][R7] run_id={run_id} stock={rr.get('stock_id')} eps_ttm={rr.get('eps_ttm')} rev_yoy={rr.get('revenue_yoy')} cell={rr.get('matrix_cell')} cat={rr.get('eps_category')} score={rr.get('revenue_eps_score')} flag={rr.get('data_quality_flag')}")
+            sample = out.head(log_limit)
+            for _, rr in sample.iterrows():
+                log_info(f"[EPS MATRIX][BUILD][R7] run_id={run_id} stock={rr.get('stock_id')} eps_ttm={rr.get('eps_ttm')} rev_yoy={rr.get('revenue_yoy')} cell={rr.get('matrix_cell')} cat={rr.get('eps_category')} score={rr.get('revenue_eps_score')} flag={rr.get('data_quality_flag')}")
             log_info(f"[EPS MATRIX][BUILD][R7] run_id={run_id} rows={len(out)}")
         return out
 
@@ -6766,11 +6161,7 @@ class DecisionLayerEngine:
             out["ui_state"] = "可交易-部分外部資料NE"
         if eps_matrix_decision_note:
             out["decision_reason_short"] = short_reason(str(out.get("decision_reason_short", "")) + "｜" + eps_matrix_decision_note, 160)
-        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-        # 停用逐檔 EPS MATRIX DECISION INFO log。
-        # 原因：快速重算排行 / TOP20 / UI refresh 若誤入本函式，會刷 2080 筆以上 log 並拖慢 MainThread。
-        # 如需除錯，請改用 GTC_DEBUG_EPS_CACHE=1 後再臨時打開。
-        # log_info(f"[EPS MATRIX][DECISION] stock={stock_id} cat={eps_category} cell={matrix_cell} score={revenue_eps_score} trade_allowed={trade_allowed}")
+        log_info(f"[EPS MATRIX][DECISION] stock={stock_id} cat={eps_category} cell={matrix_cell} score={revenue_eps_score} trade_allowed={trade_allowed}")
         return out
 
     def evaluate_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -7567,91 +6958,18 @@ def normalize_core_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
     return x[CORE_ANALYSIS_COLUMNS].copy()
 
 
-
-def ensure_trade_display_source_fields(df: pd.DataFrame) -> pd.DataFrame:
-    """V17-P0 STARTUP_PERF_GUARD：顯示層前置欄位一次補齊。
-
-    目的：
-    1) 第二次開程式時，UI 不再因 build_display_columns 逐欄觸發缺欄位 WARNING。
-    2) 把缺少的交易顯示欄位改為「一次性向量化預設」，避免 MainThread 產生大量 log 與補值開銷。
-    3) 此函式不重算策略、不抓外部資料、不重建 EPS MATRIX，只做輕量 schema 對齊。
-    """
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df
-    x = df.copy()
-    idx = x.index
-
-    def _num(col: str, default=np.nan):
-        if col in x.columns:
-            return pd.to_numeric(pd.Series(x[col], index=idx, copy=True), errors="coerce")
-        return pd.Series(default, index=idx, dtype="float64")
-
-    close = _num("close", np.nan)
-    if close.isna().all() and "現價" in x.columns:
-        close = _num("現價", np.nan)
-    atr = _num("atr", np.nan)
-    atr_pct = _num("atr_pct", np.nan)
-    if atr.isna().all():
-        atr = (close.abs() * atr_pct.fillna(2.5) / 100.0).replace(0, np.nan)
-    atr = atr.fillna((close.abs() * 0.025).replace(0, np.nan)).fillna(1.0)
-
-    defaults = {
-        "entry": close,
-        "entry_low": (close - atr * 0.5),
-        "entry_high": (close + atr * 0.5),
-        "entry_zone": pd.Series("", index=idx, dtype="object"),
-        "stop": (close - atr * 1.5),
-        "stop_loss": (close - atr * 1.5),
-        "target_price": (close + atr * 2.0),
-        "target_1382": (close + atr * 2.0),
-        "target1382": (close + atr * 2.0),
-        "target_1618": (close + atr * 2.6),
-        "position_pct": pd.Series(0.0, index=idx, dtype="float64"),
-        "kelly_raw": pd.Series(0.0, index=idx, dtype="float64"),
-        "qty": pd.Series(0, index=idx, dtype="int64"),
-        "shares": pd.Series(0, index=idx, dtype="int64"),
-        "suggest_qty": pd.Series(0, index=idx, dtype="int64"),
-        "amount": pd.Series(0.0, index=idx, dtype="float64"),
-        "suggest_amount": pd.Series(0.0, index=idx, dtype="float64"),
-        "single_position_pct": pd.Series(0.0, index=idx, dtype="float64"),
-        "single_pct": pd.Series(0.0, index=idx, dtype="float64"),
-        "theme_exposure_pct": pd.Series(0.0, index=idx, dtype="float64"),
-        "theme_pct": pd.Series(0.0, index=idx, dtype="float64"),
-        "industry_exposure_pct": pd.Series(0.0, index=idx, dtype="float64"),
-        "industry_pct": pd.Series(0.0, index=idx, dtype="float64"),
-        "portfolio_state": pd.Series("未配置", index=idx, dtype="object"),
-        "risk_note": pd.Series("", index=idx, dtype="object"),
-        "priority": pd.Series(np.arange(1, len(x) + 1), index=idx, dtype="int64"),
-    }
-    for col, val in defaults.items():
-        if col not in x.columns:
-            x[col] = val
-    return x
-
 def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    x = ensure_trade_display_source_fields(df)
-    if x is None or x.empty:
-        return pd.DataFrame()
+    x = df.copy()
     # V9.5.9：補齊外部資訊欄位，避免 UI/Excel 因缺欄位或純量 fillna 崩潰。
     for col, default in [("analysis_ready", 1), ("execution_ready", 0), ("soft_block", 0), ("block_reason", ""), ("execution_block_reason", "")]:
-        if col not in x.columns:
-            x[col] = default
-    # V17 Teacher Strategy：補齊老師策略欄位，UI/Excel 僅呈現不重算。
-    for col, default in _teacher_strategy_default_payload().items():
         if col not in x.columns:
             x[col] = default
 
 
     def _log_missing_columns(*cols: str):
-        # V17-P1 STARTUP_REAL_FIX：
-        # 這裡原本會在 MainThread 逐欄輸出 WARNING，造成第二次開程式看起來「沒有回應」。
-        # 顯示欄位缺值已由 ensure_trade_display_source_fields() 一次向量化補齊，
-        # 因此預設完全靜默；只有明確設定 GTC_ALLOW_DISPLAY_SCHEMA_WARNING=1 才允許輸出。
-        if str(os.getenv("GTC_ALLOW_DISPLAY_SCHEMA_WARNING", "0")).strip() != "1":
-            return
         missing = sorted({c for c in cols if c not in x.columns})
         if missing:
             key = tuple(missing)
@@ -7753,13 +7071,6 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("資料來源層級", "market_source_level"), ("決策摘要", "decision_reason_short"),
         ("全域外部Ready", "global_external_ready"), ("個股覆蓋狀態", "stock_external_coverage_state"),
         ("Gate說明", "gate_policy_note"),
-        ("老師策略", "teacher_strategy_class"), ("老師決策", "teacher_final_decision"), ("老師燈號", "teacher_light"),
-        ("老師Gate", "teacher_gate"), ("老師可交易", "teacher_trade_allowed"), ("老師UI分類", "teacher_ui_bucket"),
-        ("老師優先級", "teacher_priority"), ("老師不交易原因", "teacher_no_trade_reason"),
-        ("位階判斷", "position_stage"), ("位階分數", "position_score"),
-        ("兩高不過", "two_high_fail"), ("弱勢Gate", "weak_gate"), ("弱勢分數", "weak_score"), ("類股輪動", "rotation"),
-        ("類股強度", "sector_strength_score"), ("資金流向分", "flow_score"), ("相對強弱RS", "rs_score"),
-        ("老師買點", "teacher_buy_zone"), ("老師停損", "teacher_stop_loss"), ("老師目標", "teacher_target_price"), ("老師理由", "teacher_reason"),
         ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "priority"), ("優先級", "優先級"),
     ]
     for zh, src in alias_pairs:
@@ -7786,7 +7097,7 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         x["優先級"] = pd.to_numeric(_safe_first_series(["priority", "優先級"], default=np.nan, numeric=True), errors="coerce")
         x["優先級"] = x["優先級"].fillna(pd.Series(np.arange(1, len(x) + 1), index=x.index))
 
-    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額", "PE", "PB", "殖利率%", "EPS_TTM", "EPS YoY", "營收YoY", "財務分數", "估值分", "位階分數", "弱勢分數", "類股強度", "資金流向分", "相對強弱RS", "老師可交易", "老師優先級"]
+    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額", "PE", "PB", "殖利率%", "EPS_TTM", "EPS YoY", "營收YoY", "財務分數", "估值分"]
     for col in numeric_display:
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
@@ -9099,17 +8410,15 @@ class MasterTradingEngine:
 
         base = filtered_df.copy()
         hot_themes = ThemeStrengthEngine.get_hot_themes(base)
-        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-        # AI選股TOP20 / 顯示功能不得再建立 financial_feature_daily。
-        # EPS Matrix Build 應只在「每日增量更新」執行；TOP20 只能讀取快取。
-        # try:
-        #     feature_rows = FinancialFeatureEngine(self.db).build_feature_batch(write_db=True, log_limit=0)
-        #     if log_cb:
-        #         log_cb(f"[EPS MATRIX][BUILD] AI選股前已更新 financial_feature_daily：{0 if feature_rows is None else len(feature_rows)} 筆")
-        # except Exception as exc:
-        #     log_warning(f"[EPS MATRIX][BUILD][WARN] AI選股前 feature 建立失敗：{exc}")
-        #     if log_cb:
-        #         log_cb(f"[EPS MATRIX][BUILD][WARN] {exc}")
+        # FIX9：TOP20 保留原「主流TOP20 + 起爆TOP20 + 雙引擎共振」池化設計，
+        # 但不得在 AI TOP20 入口重建 EPS Matrix；EPS/financial_feature_daily 應由每日增量更新完成。
+        # 此處只讀既有快取，避免 TOP20/投資組合引擎誤觸發全市場重型重算。
+        if log_cb:
+            try:
+                feature_rows = self.db.get_latest_financial_features()
+                log_cb(f"[EPS MATRIX][READ-ONLY] AI選股只讀 financial_feature_daily cache：{0 if feature_rows is None else len(feature_rows)} 筆")
+            except Exception as exc:
+                log_cb(f"[EPS MATRIX][READ-ONLY][WARN] financial_feature_daily 讀取失敗：{exc}")
 
         plans = []
         sids = base["stock_id"].astype(str).tolist()
@@ -9853,6 +9162,11 @@ class AppUI:
         self.last_wait_df = pd.DataFrame()
         self.last_operation_sop_df = pd.DataFrame()
         self.last_unique_decision_df = pd.DataFrame()
+        self.last_ai_portfolio_tables = {}
+        self.last_ai_portfolio_df = pd.DataFrame()
+        self.ai_portfolio_vars = {}
+        self.ai_portfolio_quota_vars = {}
+        self.ai_portfolio_weight_vars = {}
         self.current_chart_path = None
         self.plan_cache = {}
         self.backtest_cache = {}
@@ -9865,8 +9179,6 @@ class AppUI:
         self.worker = None
         self.cancel_event = threading.Event()
         self.current_job = None
-        self.top20_snapshot_ttl_sec = 24 * 60 * 60
-        self.top20_snapshot_signature = ""
         self.history_batch_size = 25
         self.history_sleep_sec = 0.6
         self.last_job_summary = {}
@@ -9922,8 +9234,7 @@ class AppUI:
 
                 def _refresh_and_mark():
                     try:
-                        # V17-P1 STARTUP_REAL_FIX：startup_light 已改為只讀排行快照，不觸發 build_display_columns。
-                        self.refresh_all_tables(auto_rebuild=False, startup_light=True)
+                        self.refresh_all_tables()
                     finally:
                         done.set()
 
@@ -10053,7 +9364,6 @@ class AppUI:
         ranking = self.db.get_latest_ranking()
         if ranking is not None and not ranking.empty:
             return True
-        # V17-R2：啟動/刷新畫面不允許自動重建排行；只有使用者明確執行功能時才 auto_rebuild。
         if auto_rebuild and self.db.get_total_price_rows() > 0:
             try:
                 count = self.rank_engine.rebuild()
@@ -10061,18 +9371,6 @@ class AppUI:
             except Exception:
                 return False
         return False
-
-    def has_usable_local_db(self) -> tuple[bool, str]:
-        """判斷本地 DB 是否已有可直接載入的資料；供啟動快取 Gate 使用。"""
-        try:
-            master_rows = len(self.db.get_master())
-            price_rows = int(self.db.get_total_price_rows())
-            ranking_rows = int(self.db.get_ranking_rows_count())
-            last_date = self.db.get_last_price_date() or ""
-            ok = master_rows > 0 and price_rows > 0 and ranking_rows > 0
-            return ok, f"master={master_rows} price_rows={price_rows} ranking_rows={ranking_rows} last_date={last_date}"
-        except Exception as exc:
-            return False, f"db_check_failed={exc}"
 
     def _build_ui(self):
         toolbar = ttk.Frame(self.root, padding=8)
@@ -10109,6 +9407,7 @@ class AppUI:
         self.action_cb = ttk.Combobox(row2, textvariable=self.action_var, width=18, state="readonly")
         self.action_cb["values"] = [
             "AI選股TOP20",
+            "AI投資組合引擎",
             "主攻5",
             "V3.5操作說明",
             "策略設定",
@@ -10135,7 +9434,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "老師策略", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "AI投資組合", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -10172,9 +9471,9 @@ class AppUI:
         self.tab_sector = ttk.Frame(self.left_notebook)
         self.tab_theme = ttk.Frame(self.left_notebook)
         self.tab_top20 = ttk.Frame(self.left_notebook)
+        self.tab_ai_portfolio = ttk.Frame(self.left_notebook)
         self.tab_top5 = ttk.Frame(self.left_notebook)
         self.tab_unique = ttk.Frame(self.left_notebook)
-        self.tab_teacher = ttk.Frame(self.left_notebook)
         self.tab_order = ttk.Frame(self.left_notebook)
         self.tab_inst = ttk.Frame(self.left_notebook)
         self.tab_external = ttk.Frame(self.left_notebook)
@@ -10187,9 +9486,9 @@ class AppUI:
         self.left_notebook.add(self.tab_sector, text="類股熱度")
         self.left_notebook.add(self.tab_theme, text="題材輪動")
         self.left_notebook.add(self.tab_top20, text="強勢候選20")
+        self.left_notebook.add(self.tab_ai_portfolio, text="AI投資組合")
         self.left_notebook.add(self.tab_top5, text="主攻5")
         self.left_notebook.add(self.tab_unique, text="唯一決策")
-        self.left_notebook.add(self.tab_teacher, text="老師策略")
         self.left_notebook.add(self.tab_order, text="執行下單清單")
         self.left_notebook.add(self.tab_inst, text="組合交易計畫")
         self.left_notebook.add(self.tab_external, text="外部資料中心")
@@ -10228,6 +9527,18 @@ class AppUI:
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
+        self._build_ai_portfolio_controls()
+        # FIX10-P0：AI投資組合表格加入交易計畫欄位，並沿用 _make_tree 內建 x/y scrollbar。
+        _ai_cols = tuple(col for col, _label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS)
+        _ai_headers = {col: label for col, label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS}
+        self.ai_portfolio_tree = self._make_tree(self.tab_ai_portfolio, _ai_cols, _ai_headers)
+        for _col, _label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS:
+            try:
+                self.ai_portfolio_tree.column(_col, width=int(_width), minwidth=max(55, int(_width) - 15), stretch=False)
+            except Exception:
+                pass
+        self.ai_portfolio_tree.bind("<<TreeviewSelect>>", self.on_select_ai_portfolio)
+
         self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "price", "chg", "chg_pct", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
             "rank": "排序", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "state": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "rr": "RR", "win_rate": "勝率%", "backtest": "回測勝率%", "cagr": "CAGR%", "mdd": "MDD%"
         })
@@ -10237,8 +9548,6 @@ class AppUI:
             "rank": "排序", "id": "代號", "name": "名稱", "trade_allowed": "可下單", "market_gate": "Market", "flow_gate": "Flow", "fund_gate": "Fundamental", "event_gate": "Event", "risk_gate": "Risk", "external_ready": "ExternalReady", "source_date": "外部資料日", "source_level": "來源層級", "block_reason": "阻擋原因", "decision": "決策摘要"
         })
         self.unique_tree.bind("<<TreeviewSelect>>", self.on_select_unique)
-
-        self._build_teacher_strategy_tab()
 
         self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "chg", "chg_pct", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note", "trade_allowed", "market_gate", "flow_gate", "fund_gate", "event_gate", "risk_gate", "block_reason"), {
             "priority": "優先級", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註", "trade_allowed": "外部允許", "market_gate": "Market", "flow_gate": "Flow", "fund_gate": "Fundamental", "event_gate": "Event", "risk_gate": "Risk", "block_reason": "外部阻擋"
@@ -10593,8 +9902,6 @@ class AppUI:
             return
         if current_tab == str(self.tab_rotation):
             self.clear_right_panel(source="產業輪動模式")
-        elif hasattr(self, "tab_teacher") and current_tab == str(self.tab_teacher):
-            self.refresh_teacher_strategy_table()
 
     def on_select_rotation(self, event=None):
         sel = self.rotation_tree.selection()
@@ -10743,6 +10050,7 @@ class AppUI:
             "重整外部資料狀態顯示": self.refresh_external_data_status,
             "查看外部原始資料": self.export_external_raw_sample,
             "AI選股TOP20": self.show_top20,
+            "AI投資組合引擎": self.show_ai_portfolio_engine,
             "主攻5": self.show_top5,
             "V3.5操作說明": self.show_operation_guide,
             "v9策略回測": self.show_strategy_backtest,
@@ -10869,9 +10177,7 @@ class AppUI:
 
     def _run_in_thread(self, target, name="worker"):
         if self.worker is not None and self.worker.is_alive():
-            running = self.current_job or "背景作業"
-            messagebox.showwarning("提醒", f"{running} 正在執行中，請稍候；系統已防止重複啟動。")
-            log_warning(f"[JOB][SKIP] request={name} running={running}")
+            messagebox.showwarning("提醒", "背景作業進行中，請稍候。")
             return
 
         def runner():
@@ -11889,336 +11195,6 @@ class AppUI:
                 except Exception:
                     pass
 
-    def _build_teacher_strategy_tab(self):
-        """V17 Phase3：老師策略五區中控台。
-        UI 只讀取 teacher_result / trade_plan / ranking 欄位，不在 UI 層重新計算老師策略。
-        """
-        top = ttk.Frame(self.tab_teacher, padding=6)
-        top.pack(fill="both", expand=True)
-        top.rowconfigure(1, weight=2)
-        top.rowconfigure(2, weight=3)
-        top.columnconfigure(0, weight=1)
-        top.columnconfigure(1, weight=1)
-        top.columnconfigure(2, weight=1)
-
-        ctrl = ttk.Frame(top)
-        ctrl.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        self.teacher_filter_var = tk.StringVar(value="全部")
-        ttk.Label(ctrl, text="老師策略篩選").pack(side="left")
-        self.teacher_filter_cb = ttk.Combobox(ctrl, textvariable=self.teacher_filter_var, width=14, state="readonly")
-        self.teacher_filter_cb["values"] = ["全部", "今日可買", "低位階翻多", "等拉回", "排除", "觀察"]
-        self.teacher_filter_cb.pack(side="left", padx=4)
-        ttk.Button(ctrl, text="刷新老師策略", command=lambda: self.refresh_teacher_strategy_table(force_rebuild=True)).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="匯出老師策略", command=self.export_teacher_strategy_ui_tables).pack(side="left", padx=4)
-        self.teacher_status_var = tk.StringVar(value="老師策略：等待資料")
-        ttk.Label(ctrl, textvariable=self.teacher_status_var).pack(side="right")
-        self.teacher_filter_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_teacher_strategy_table())
-
-        lf_market = ttk.LabelFrame(top, text="1 市場結構 / Decision Gate")
-        lf_market.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
-        self.teacher_market_tree = self._make_tree(lf_market, ("metric", "value", "desc"), {
-            "metric": "指標", "value": "狀態/數值", "desc": "說明"
-        })
-
-        lf_rotation = ttk.LabelFrame(top, text="2 類股輪動 / Sector Rotation")
-        lf_rotation.grid(row=1, column=1, sticky="nsew", padx=4, pady=(0, 4))
-        self.teacher_rotation_tree = self._make_tree(lf_rotation, ("rotation", "count", "avg_sector", "avg_flow", "avg_rs", "buy_count"), {
-            "rotation": "類股輪動", "count": "檔數", "avg_sector": "類股強度", "avg_flow": "資金分", "avg_rs": "RS", "buy_count": "可買數"
-        })
-        self.teacher_rotation_tree.bind("<<TreeviewSelect>>", self.on_select_teacher_rotation)
-
-        lf_low = ttk.LabelFrame(top, text="3 低位階翻多 / Low Base")
-        lf_low.grid(row=1, column=2, sticky="nsew", padx=(4, 0), pady=(0, 4))
-        self.teacher_lowbase_tree = self._make_tree(lf_low, ("rank", "id", "name", "position", "score", "buy_zone", "reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "position": "位階", "score": "位階分", "buy_zone": "拉回買點", "reason": "理由"
-        })
-        self.teacher_lowbase_tree.bind("<<TreeviewSelect>>", self.on_select_teacher_generic)
-
-        lf_exclude = ttk.LabelFrame(top, text="4 兩高不過 / 排除清單")
-        lf_exclude.grid(row=2, column=0, sticky="nsew", padx=(0, 4), pady=(4, 0))
-        self.teacher_exclude_tree = self._make_tree(lf_exclude, ("rank", "id", "name", "weak_gate", "weak_score", "two_high", "reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "weak_gate": "弱勢Gate", "weak_score": "弱勢分", "two_high": "兩高不過", "reason": "排除原因"
-        })
-        self.teacher_exclude_tree.bind("<<TreeviewSelect>>", self.on_select_teacher_generic)
-
-        lf_today = ttk.LabelFrame(top, text="5 今日策略清單 / BUY・LOW BUY・WAIT・AVOID")
-        lf_today.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=(4, 0), pady=(4, 0))
-        self.teacher_today_tree = self._make_tree(lf_today, ("rank", "id", "name", "light", "bucket", "decision", "allowed", "position", "rotation", "buy_zone", "stop", "target", "reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "light": "燈號", "bucket": "UI分類", "decision": "老師決策",
-            "allowed": "可交易", "position": "位階", "rotation": "類股輪動", "buy_zone": "買點", "stop": "停損", "target": "目標", "reason": "老師理由"
-        })
-        self.teacher_today_tree.bind("<<TreeviewSelect>>", self.on_select_teacher_generic)
-        # 相容舊方法/下載目標：teacher_tree 指向今日策略主表。
-        self.teacher_tree = self.teacher_today_tree
-
-    def _clear_tree_safe(self, tree):
-        try:
-            tree.delete(*tree.get_children())
-        except Exception:
-            pass
-
-    def _source_hash_for_df(self, df: pd.DataFrame) -> str:
-        try:
-            if df is None or df.empty:
-                return ""
-            cols = [c for c in ["stock_id", "rank_all", "total_score", "date"] if c in df.columns]
-            raw = df[cols].head(3000).to_csv(index=False)
-            return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        except Exception:
-            return ""
-
-    def _attach_teacher_technical_fields(self, df: pd.DataFrame, max_rows: int | None = None) -> pd.DataFrame:
-        """V17-R2：老師策略需要 ma20/ma60/rsi/macd/量比/前高；缺欄位時從 price_history 補齊。"""
-        if df is None or df.empty or "stock_id" not in df.columns:
-            return df if df is not None else pd.DataFrame()
-        x = df.copy()
-        target_index = x.index if max_rows is None else x.head(max_rows).index
-        tech_rows = []
-        for idx in target_index:
-            sid = str(x.at[idx, "stock_id"]).strip()
-            payload = {"__idx": idx}
-            try:
-                hist = self.db.get_price_history(sid)
-                if hist is not None and len(hist) >= 20:
-                    h = DataEngine.attach(hist.sort_values("date").reset_index(drop=True))
-                    last = h.iloc[-1]
-                    prev = h.iloc[-2] if len(h) >= 2 else last
-                    vol_ma20 = pd.to_numeric(h["volume"].tail(20), errors="coerce").mean()
-                    volume_ratio = float(last.get("volume", 0) or 0) / float(vol_ma20) if vol_ma20 and pd.notna(vol_ma20) else 1.0
-                    recent_highs = pd.to_numeric(h["high"].tail(60), errors="coerce").dropna().nlargest(2).tolist()
-                    close = float(last.get("close", 0) or 0)
-                    ma20 = float(last.get("ma20", 0) or 0)
-                    price_dev = (close - ma20) / ma20 if close > 0 and ma20 > 0 else 0.0
-                    for col in ["open", "high", "low", "close", "volume", "ma5", "ma10", "ma20", "ma60", "macd_hist", "rsi14", "k", "d"]:
-                        payload[col] = last.get(col, None)
-                    payload["prev_high"] = prev.get("high", None)
-                    payload["recent_high_1"] = recent_highs[0] if len(recent_highs) > 0 else 0
-                    payload["recent_high_2"] = recent_highs[1] if len(recent_highs) > 1 else 0
-                    payload["volume_ratio"] = round(volume_ratio, 3)
-                    payload["price_deviation"] = round(price_dev, 4)
-                    payload["price_dev"] = round(price_dev, 4)
-                    payload["atr_pct"] = abs(float(last.get("high", close) or close) - float(last.get("low", close) or close)) / close if close > 0 else 0.03
-            except Exception as exc:
-                payload["teacher_tech_error"] = str(exc)
-            tech_rows.append(payload)
-        if tech_rows:
-            t = pd.DataFrame(tech_rows).set_index("__idx")
-            for col in t.columns:
-                if col not in x.columns or x[col].isna().all() or str(col).startswith("teacher_tech"):
-                    x.loc[t.index, col] = t[col]
-                else:
-                    # 只補空值，不覆蓋既有有效欄位。
-                    mask = x.loc[t.index, col].isna() if col in x.columns else pd.Series(True, index=t.index)
-                    x.loc[t.index[mask], col] = t.loc[t.index[mask], col]
-        return x
-
-    def _build_teacher_strategy_df(self, base_df: pd.DataFrame, context: str = "teacher_strategy") -> pd.DataFrame:
-        if base_df is None or base_df.empty:
-            return pd.DataFrame()
-        x = base_df.copy()
-        if "stock_id" not in x.columns and "代號" in x.columns:
-            x["stock_id"] = x["代號"].astype(str).map(normalize_stock_id)
-        if "stock_name" not in x.columns and "名稱" in x.columns:
-            x["stock_name"] = x["名稱"]
-        x = self.enrich_price_and_export_fields(x, id_col="stock_id")
-        x = self._attach_teacher_technical_fields(x)
-        x = apply_teacher_strategy_pipeline_safe(x, price_history_df=None, context=context, log_cb=lambda msg: self.ui_call(self.append_log, msg))
-        x = finalize_teacher_strategy_fields(x)
-        sort_cols = [c for c in ["teacher_priority", "teacher_score", "rank_all"] if c in x.columns]
-        if sort_cols:
-            ascending = [True if c == "teacher_priority" else False if c == "teacher_score" else True for c in sort_cols]
-            x = x.sort_values(sort_cols, ascending=ascending, na_position="last")
-        return x.reset_index(drop=True)
-
-    def _get_teacher_strategy_source_df(self, df: pd.DataFrame | None = None, force_rebuild: bool = False) -> pd.DataFrame:
-        """V17-R2：老師策略資料源改為「全市場 Ranking → TeacherStrategyService → teacher_snapshot」。
-        禁止在無指定 df 時優先使用 last_top20_df，避免老師策略與 TOP20 完全相同。
-        """
-        if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
-            return self._build_teacher_strategy_df(df, context="teacher_explicit_input")
-
-        if not force_rebuild:
-            mem = getattr(self, "last_teacher_strategy_df", pd.DataFrame())
-            if isinstance(mem, pd.DataFrame) and not mem.empty:
-                return mem.copy()
-            try:
-                snap = self.db.get_latest_teacher_strategy_snapshot()
-                if snap is not None and not snap.empty:
-                    self.last_teacher_strategy_df = snap.copy()
-                    return snap.reset_index(drop=True)
-            except Exception:
-                pass
-
-        try:
-            base = self.db.get_latest_ranking()
-        except Exception:
-            base = pd.DataFrame()
-        if base is None or base.empty:
-            return pd.DataFrame()
-        x = self._build_teacher_strategy_df(base, context="teacher_from_full_ranking")
-        try:
-            self.last_teacher_strategy_df = x.copy()
-            self.db.replace_teacher_strategy_snapshot(x, source_hash=self._source_hash_for_df(base))
-        except Exception as exc:
-            log_warning(f"teacher_strategy_snapshot write skipped: {exc}")
-        return x.reset_index(drop=True)
-
-    def _teacher_market_summary_rows(self, x: pd.DataFrame) -> list[tuple]:
-        if x is None or x.empty:
-            return [("資料狀態", "無資料", "尚未產生 ranking / teacher_result")]
-        total = len(x)
-        buy_count = int(pd.to_numeric(x.get("teacher_trade_allowed", 0), errors="coerce").fillna(0).sum()) if "teacher_trade_allowed" in x.columns else 0
-        exclude_count = int((x.get("teacher_ui_bucket", pd.Series("", index=x.index)).astype(str) == "排除").sum()) if "teacher_ui_bucket" in x.columns else 0
-        low_count = int(x.get("position_stage", pd.Series("", index=x.index)).astype(str).str.contains("低位階|主升初段|主升3浪", na=False).sum()) if "position_stage" in x.columns else 0
-        avg_sector = pd.to_numeric(x.get("sector_strength_score", pd.Series(0, index=x.index)), errors="coerce").fillna(0).mean()
-        avg_flow = pd.to_numeric(x.get("flow_score", pd.Series(0, index=x.index)), errors="coerce").fillna(0).mean()
-        avg_rs = pd.to_numeric(x.get("rs_score", pd.Series(0, index=x.index)), errors="coerce").fillna(0).mean()
-        mode = "可積極選股" if buy_count >= 5 and avg_sector >= 60 else ("偏防守" if exclude_count > total * 0.35 else "中性觀察")
-        return [
-            ("市場結構", mode, "由老師可交易數、排除數、類股強度綜合判斷"),
-            ("老師可交易", f"{buy_count} / {total}", "teacher_trade_allowed=1"),
-            ("低位階/主升候選", str(low_count), "position_stage 包含低位階翻多/主升初段/主升3浪"),
-            ("排除清單", str(exclude_count), "weak_gate=BLOCK 或 two_high_fail 或 REDUCE/AVOID"),
-            ("平均類股強度", f"{avg_sector:.2f}", "sector_strength_score"),
-            ("平均資金流", f"{avg_flow:.2f}", "flow_score"),
-            ("平均RS", f"{avg_rs:.2f}", "rs_score"),
-        ]
-
-    def _teacher_insert_today_rows(self, tree, x: pd.DataFrame, limit: int = 300):
-        self._clear_tree_safe(tree)
-        if x is None or x.empty:
-            return
-        filter_value = getattr(self, "teacher_filter_var", tk.StringVar(value="全部")).get() if hasattr(self, "teacher_filter_var") else "全部"
-        y = x.copy()
-        if filter_value and filter_value != "全部" and "teacher_ui_bucket" in y.columns:
-            y = y[y["teacher_ui_bucket"].astype(str).eq(filter_value)].copy()
-        for i, (_, r) in enumerate(y.head(limit).iterrows(), start=1):
-            tree.insert("", "end", values=(
-                i, r.get("stock_id", r.get("代號", "")), r.get("stock_name", r.get("名稱", "")),
-                r.get("teacher_light", r.get("老師燈號", "⚫")), r.get("teacher_ui_bucket", r.get("老師UI分類", "觀察")),
-                r.get("teacher_final_decision", r.get("老師決策", "WATCH")), r.get("teacher_trade_allowed", r.get("老師可交易", 0)),
-                r.get("position_stage", r.get("位階判斷", "未知")), r.get("rotation", r.get("類股輪動", "未知")),
-                r.get("teacher_buy_zone", r.get("老師買點", "")), r.get("teacher_stop_loss", r.get("老師停損", "")),
-                r.get("teacher_target_price", r.get("老師目標", "")), r.get("teacher_reason", r.get("老師理由", "")),
-            ))
-
-    def refresh_teacher_strategy_table(self, df: pd.DataFrame | None = None, force_rebuild: bool = False):
-        """刷新老師策略五區中控台。UI 僅讀取 teacher_result 欄位，不在 UI 重算策略。"""
-        try:
-            x = self._get_teacher_strategy_source_df(df, force_rebuild=force_rebuild)
-            if x is None or x.empty:
-                return
-            # 1 市場結構
-            if hasattr(self, "teacher_market_tree"):
-                self._clear_tree_safe(self.teacher_market_tree)
-                for row in self._teacher_market_summary_rows(x):
-                    self.teacher_market_tree.insert("", "end", values=row)
-            # 2 類股輪動
-            if hasattr(self, "teacher_rotation_tree"):
-                self._clear_tree_safe(self.teacher_rotation_tree)
-                if "rotation" in x.columns:
-                    g = x.groupby("rotation", dropna=False).agg(
-                        count=("stock_id", "count"),
-                        avg_sector=("sector_strength_score", "mean"),
-                        avg_flow=("flow_score", "mean"),
-                        avg_rs=("rs_score", "mean"),
-                        buy_count=("teacher_trade_allowed", "sum"),
-                    ).reset_index().sort_values(["buy_count", "avg_sector"], ascending=False)
-                    for _, r in g.iterrows():
-                        self.teacher_rotation_tree.insert("", "end", values=(r.get("rotation", "未知"), int(r.get("count", 0)), f"{float(r.get('avg_sector',0)):.2f}", f"{float(r.get('avg_flow',0)):.2f}", f"{float(r.get('avg_rs',0)):.2f}", int(r.get("buy_count", 0))))
-            # 3 低位階翻多
-            if hasattr(self, "teacher_lowbase_tree"):
-                self._clear_tree_safe(self.teacher_lowbase_tree)
-                low = x[x.get("position_stage", pd.Series("", index=x.index)).astype(str).str.contains("低位階|主升初段|主升3浪", na=False)].copy()
-                low = low.sort_values(["teacher_priority", "position_score"], ascending=[True, False], na_position="last") if not low.empty and "position_score" in low.columns else low
-                for i, (_, r) in enumerate(low.head(100).iterrows(), start=1):
-                    self.teacher_lowbase_tree.insert("", "end", values=(i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("position_stage", ""), r.get("position_score", 0), r.get("teacher_buy_zone", ""), r.get("teacher_reason", "")))
-            # 4 排除清單
-            if hasattr(self, "teacher_exclude_tree"):
-                self._clear_tree_safe(self.teacher_exclude_tree)
-                exclude = x[(x.get("teacher_ui_bucket", pd.Series("", index=x.index)).astype(str).eq("排除")) | (x.get("weak_gate", pd.Series("", index=x.index)).astype(str).eq("BLOCK")) | (x.get("two_high_fail", pd.Series(False, index=x.index)).astype(str).str.upper().isin(["TRUE", "1", "YES", "是"]))].copy()
-                exclude = exclude.sort_values(["weak_score"], ascending=False, na_position="last") if not exclude.empty and "weak_score" in exclude.columns else exclude
-                for i, (_, r) in enumerate(exclude.head(150).iterrows(), start=1):
-                    self.teacher_exclude_tree.insert("", "end", values=(i, r.get("stock_id", ""), r.get("stock_name", ""), r.get("weak_gate", ""), r.get("weak_score", 0), r.get("two_high_fail", False), r.get("teacher_no_trade_reason", r.get("teacher_reason", ""))))
-            # 5 今日策略清單
-            if hasattr(self, "teacher_today_tree"):
-                self._teacher_insert_today_rows(self.teacher_today_tree, x)
-            self.last_teacher_strategy_df = x.copy()
-            if hasattr(self, "teacher_status_var"):
-                allowed = int(pd.to_numeric(x.get("teacher_trade_allowed", 0), errors="coerce").fillna(0).sum()) if "teacher_trade_allowed" in x.columns else 0
-                self.teacher_status_var.set(f"老師策略：{len(x)}檔｜可交易 {allowed}｜排除 {int((x.get('teacher_ui_bucket', pd.Series('', index=x.index)).astype(str)=='排除').sum())}")
-        except Exception as exc:
-            log_warning(f"刷新老師策略分頁失敗：{exc}")
-
-    def on_select_teacher_generic(self, event=None):
-        try:
-            tree = event.widget if event is not None and hasattr(event, "widget") else self.teacher_tree
-            sel = tree.selection()
-            if not sel:
-                return
-            vals = tree.item(sel[0], "values")
-            if vals and len(vals) >= 2:
-                self.select_stock(str(vals[1]), source="teacher_strategy")
-        except Exception:
-            pass
-
-    def on_select_teacher_rotation(self, event=None):
-        try:
-            sel = self.teacher_rotation_tree.selection()
-            if not sel:
-                return
-            vals = self.teacher_rotation_tree.item(sel[0], "values")
-            rotation_name = str(vals[0]) if vals else ""
-            df = getattr(self, "last_teacher_strategy_df", pd.DataFrame())
-            if isinstance(df, pd.DataFrame) and not df.empty and "rotation" in df.columns:
-                cand = df[df["rotation"].astype(str).eq(rotation_name)].copy()
-                if not cand.empty:
-                    cand = cand.sort_values(["teacher_trade_allowed", "sector_strength_score", "rs_score"], ascending=[False, False, False], na_position="last")
-                    self.sync_all_views(str(cand.iloc[0].get("stock_id", "")), source=f"老師策略/類股輪動/{rotation_name}")
-        except Exception:
-            pass
-
-    def on_select_teacher(self, event=None):
-        self.on_select_teacher_generic(event)
-
-    def export_teacher_strategy_ui_tables(self):
-        try:
-            df = getattr(self, "last_teacher_strategy_df", pd.DataFrame())
-            if df is None or df.empty:
-                df = self._get_teacher_strategy_source_df()
-            if df is None or df.empty:
-                return messagebox.showwarning("提醒", "目前沒有老師策略資料可匯出。")
-            tables = self.build_teacher_strategy_export_tables(df)
-            base = RUNTIME_DIR / f"Teacher_Strategy_UI_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            out_path, out_type = write_table_bundle(base, tables, preferred="excel")
-            messagebox.showinfo("完成", f"老師策略UI報表已輸出（{out_type}）：\n{out_path}")
-        except Exception as exc:
-            messagebox.showerror("錯誤", str(exc))
-
-    def build_teacher_strategy_export_tables(self, df: pd.DataFrame) -> dict:
-        x = self._get_teacher_strategy_source_df(df)
-        tables = {}
-        if x is None or x.empty:
-            return {"老師策略_空資料": pd.DataFrame([{"message": "no teacher strategy data"}])}
-        keep = [c for c in ["stock_id", "stock_name", "老師燈號", "老師UI分類", "老師決策", "老師可交易", "位階判斷", "位階分數", "弱勢Gate", "弱勢分數", "兩高不過", "類股輪動", "類股強度", "資金流向分", "相對強弱RS", "老師買點", "老師停損", "老師目標", "老師不交易原因", "老師理由", "現價", "RR", "勝率"] if c in x.columns]
-        view = x[keep].copy() if keep else x.copy()
-        tables["老師策略_TOP10"] = view.sort_values(["老師可交易", "位階分數", "類股強度"], ascending=[False, False, False], na_position="last").head(10) if {"老師可交易", "位階分數", "類股強度"}.issubset(view.columns) else view.head(10)
-        tables["今日可買清單"] = view[view.get("老師可交易", pd.Series(0, index=view.index)).astype(str).isin(["1", "True", "true"])] if "老師可交易" in view.columns else pd.DataFrame(columns=view.columns)
-        tables["等拉回清單"] = view[view.get("老師UI分類", pd.Series("", index=view.index)).astype(str).eq("等拉回")] if "老師UI分類" in view.columns else pd.DataFrame(columns=view.columns)
-        tables["低位階翻多清單"] = view[view.get("位階判斷", pd.Series("", index=view.index)).astype(str).str.contains("低位階|主升初段|主升3浪", na=False)] if "位階判斷" in view.columns else pd.DataFrame(columns=view.columns)
-        tables["兩高不過排除清單"] = view[(view.get("老師UI分類", pd.Series("", index=view.index)).astype(str).eq("排除")) | (view.get("弱勢Gate", pd.Series("", index=view.index)).astype(str).eq("BLOCK"))] if "老師UI分類" in view.columns else pd.DataFrame(columns=view.columns)
-        if "類股輪動" in view.columns:
-            tables["類股輪動強弱表"] = view.groupby("類股輪動", dropna=False).size().reset_index(name="檔數")
-        if "資金流向分" in view.columns:
-            tables["資金流入排行"] = view.sort_values("資金流向分", ascending=False, na_position="last").head(50)
-        tables["策略公式與欄位來源"] = pd.DataFrame([
-            {"欄位": "teacher_trade_allowed", "來源": "finalize_teacher_strategy_fields", "公式": "BUY/LOW_BUY 且 weak_gate!=BLOCK、two_high_fail=False、position_score>=60、RR>=1", "UI位置": "老師策略/今日策略清單"},
-            {"欄位": "teacher_ui_bucket", "來源": "finalize_teacher_strategy_fields", "公式": "今日可買 / 低位階翻多 / 等拉回 / 排除 / 觀察", "UI位置": "老師策略五區"},
-            {"欄位": "two_high_fail", "來源": "two_high_fail_engine", "公式": "兩高不過/假突破/高檔爆量不漲", "UI位置": "排除清單"},
-            {"欄位": "rotation", "來源": "rotation_filter_engine", "公式": "AI主流/強勢主流/弱勢族群/中性", "UI位置": "類股輪動"},
-        ])
-        return tables
-
     def export_selected_data(self):
         target = self.download_target_var.get().strip() or "TOP20"
 
@@ -12226,6 +11202,7 @@ class AppUI:
             mapping = {
                 "TOP20": getattr(self, "last_top20_df", pd.DataFrame()),
                 "TOP5": getattr(self, "last_top5_df", pd.DataFrame()),
+                "AI投資組合": getattr(self, "last_ai_portfolio_df", pd.DataFrame()),
                 "今日可下單": getattr(self, "last_today_buy_df", pd.DataFrame()),
                 "等待回測": getattr(self, "last_wait_df", pd.DataFrame()),
                 "條件預掛": getattr(self, "last_wait_df", pd.DataFrame()),
@@ -12241,10 +11218,6 @@ class AppUI:
                 "未分類清單": pd.read_excel(CLASSIFICATION_V2_UNCLASSIFIED_PATH) if CLASSIFICATION_V2_UNCLASSIFIED_PATH.exists() else pd.DataFrame(),
                 "分類V2摘要": pd.DataFrame([get_classification_v2_summary()]) if get_classification_v2_summary() else pd.DataFrame(),
             }
-            try:
-                mapping["老師策略"] = self._get_teacher_strategy_source_df(getattr(self, "last_teacher_strategy_df", pd.DataFrame()))
-            except Exception:
-                mapping["老師策略"] = getattr(self, "last_teacher_strategy_df", pd.DataFrame())
             mapping["唯一決策"] = getattr(self, "last_unique_decision_df", pd.DataFrame())
             df = mapping.get(target, pd.DataFrame())
             if df is None:
@@ -12262,7 +11235,6 @@ class AppUI:
                     "執行下單清單": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "組合交易計畫": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
                     "唯一決策": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "market", "industry", "theme", "ui_state", "entry_zone", "stop_loss", "target_price", "rr", "win_rate", "decision", "final_trade_decision"],
-                    "老師策略": ["stock_id", "stock_name", "老師燈號", "老師UI分類", "老師決策", "老師可交易", "位階判斷", "弱勢Gate", "類股輪動", "老師買點", "老師停損", "老師目標", "老師理由"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                     "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
                     "分類V2摘要": ["total", "official", "manual", "rule_engine", "ai_infer", "unclassified", "covered", "coverage_pct", "report_time", "unclassified_report"],
@@ -12285,6 +11257,424 @@ class AppUI:
 
         self._run_in_thread(worker, f"export_{target}")
 
+
+
+    def _build_ai_portfolio_controls(self):
+        """FIX9：建立獨立 AI投資組合引擎控制區；不影響 TOP20。"""
+        control = ttk.LabelFrame(self.tab_ai_portfolio, text="AI投資組合引擎｜勾選池別 / 配額 / 權重（不取代TOP20）", padding=8)
+        control.pack(fill="x", padx=4, pady=4)
+        cfg = self.load_ai_portfolio_config()
+        pools = list(DEFAULT_AI_PORTFOLIO_CONFIG.keys())
+        for idx, pool in enumerate(pools):
+            row = idx // 4
+            base_col = (idx % 4) * 4
+            item = cfg.get(pool, DEFAULT_AI_PORTFOLIO_CONFIG.get(pool, {}))
+            enabled_var = tk.BooleanVar(value=bool(item.get("enabled", True)))
+            quota_var = tk.IntVar(value=int(item.get("quota", 3) or 3))
+            weight_var = tk.DoubleVar(value=float(item.get("weight", 1.0) or 1.0))
+            self.ai_portfolio_vars[pool] = enabled_var
+            self.ai_portfolio_quota_vars[pool] = quota_var
+            self.ai_portfolio_weight_vars[pool] = weight_var
+            ttk.Checkbutton(control, text=pool, variable=enabled_var).grid(row=row, column=base_col, sticky="w", padx=(2, 2), pady=2)
+            ttk.Label(control, text="配額").grid(row=row, column=base_col + 1, sticky="e")
+            ttk.Spinbox(control, from_=0, to=20, width=4, textvariable=quota_var).grid(row=row, column=base_col + 2, sticky="w")
+            ttk.Entry(control, textvariable=weight_var, width=5).grid(row=row, column=base_col + 3, sticky="w", padx=(2, 10))
+        btn_row = ttk.Frame(control)
+        btn_row.grid(row=3, column=0, columnspan=16, sticky="w", pady=(6, 0))
+        ttk.Button(btn_row, text="產出AI投資組合", command=self.show_ai_portfolio_engine).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="儲存組合設定", command=self.save_ai_portfolio_config_from_ui).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="匯出AI投資組合報表", command=self.export_ai_portfolio_report).pack(side="left", padx=4)
+        ttk.Label(btn_row, text="說明：TOP20仍走原短線主攻雙引擎；本頁只做獨立投資組合分池。").pack(side="left", padx=12)
+
+    def load_ai_portfolio_config(self) -> dict:
+        cfg = json.loads(json.dumps(DEFAULT_AI_PORTFOLIO_CONFIG, ensure_ascii=False))
+        try:
+            if AI_PORTFOLIO_CONFIG_PATH.exists():
+                raw = json.loads(AI_PORTFOLIO_CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    for pool, item in raw.items():
+                        if pool in cfg and isinstance(item, dict):
+                            cfg[pool].update(item)
+        except Exception as exc:
+            log_warning(f"[AI_PORTFOLIO] pool_config 讀取失敗，改用預設：{exc}")
+        return cfg
+
+    def save_ai_portfolio_config_from_ui(self):
+        try:
+            cfg = self._get_ai_portfolio_config_from_ui()
+            AI_PORTFOLIO_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.append_log(f"[AI_PORTFOLIO] 組合設定已儲存：{AI_PORTFOLIO_CONFIG_PATH}")
+            messagebox.showinfo("AI投資組合", f"組合設定已儲存：\n{AI_PORTFOLIO_CONFIG_PATH}")
+        except Exception as exc:
+            messagebox.showerror("AI投資組合", f"儲存組合設定失敗：{exc}")
+
+    def _get_ai_portfolio_config_from_ui(self) -> dict:
+        cfg = {}
+        for pool, default in DEFAULT_AI_PORTFOLIO_CONFIG.items():
+            enabled = bool(self.ai_portfolio_vars.get(pool, tk.BooleanVar(value=default.get("enabled", True))).get()) if self.ai_portfolio_vars else bool(default.get("enabled", True))
+            try:
+                quota = int(self.ai_portfolio_quota_vars.get(pool).get()) if pool in self.ai_portfolio_quota_vars else int(default.get("quota", 3))
+            except Exception:
+                quota = int(default.get("quota", 3))
+            try:
+                weight = float(self.ai_portfolio_weight_vars.get(pool).get()) if pool in self.ai_portfolio_weight_vars else float(default.get("weight", 1.0))
+            except Exception:
+                weight = float(default.get("weight", 1.0))
+            cfg[pool] = {"enabled": enabled, "quota": max(0, quota), "weight": weight}
+        return cfg
+
+    def _ai_portfolio_base_df(self) -> pd.DataFrame:
+        ranking = self.db.get_latest_ranking()
+        if ranking is None or ranking.empty:
+            return pd.DataFrame()
+        x = ranking.copy()
+        try:
+            x = self.enrich_price_and_export_fields(x, id_col="stock_id")
+        except Exception:
+            pass
+        for c in ["stock_id", "stock_name", "market", "industry", "theme", "signal", "action"]:
+            if c not in x.columns:
+                x[c] = ""
+            x[c] = x[c].fillna("").astype(str)
+        for c in ["total_score", "ai_score", "momentum_score", "trend_score", "volume_score", "risk_score", "financial_score", "revenue_eps_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "rr"]:
+            if c not in x.columns:
+                x[c] = np.nan
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+        x["is_etf_pool"] = x["market"].eq("ETF") | x["stock_id"].str.startswith("00") | x["stock_name"].str.contains("ETF|高股息|債|REIT", case=False, regex=True)
+        # FIX10-P0：AI投資組合需顯示交易計畫欄位，從最新 trade_plan 讀取 entry/stop/target/RR。
+        try:
+            plan = self._ai_portfolio_latest_trade_plan_fields()
+            if plan is not None and not plan.empty:
+                x = x.merge(plan, on="stock_id", how="left", suffixes=("", "_plan"))
+                for _src, _dst in [("stock_name_plan", "stock_name"), ("market_plan", "market"), ("industry_plan", "industry"), ("theme_plan", "theme")]:
+                    if _src in x.columns and _dst in x.columns:
+                        x[_dst] = x[_dst].replace("", pd.NA).fillna(x[_src]).fillna("").astype(str)
+        except Exception as exc:
+            self.append_log(f"[AI_PORTFOLIO] trade_plan交易欄位合併失敗：{exc}", "WARNING")
+        return x
+
+    def _ai_portfolio_latest_trade_plan_fields(self) -> pd.DataFrame:
+        """FIX10-P0：取得最新 trade_plan 的買進/停損/目標/RR欄位；只讀快取，不重建TOP20。"""
+        try:
+            q = """
+            SELECT tp.*
+            FROM trade_plan tp
+            JOIN (
+                SELECT MAX(plan_date) AS plan_date
+                FROM trade_plan
+            ) d ON tp.plan_date = d.plan_date
+            """
+            with self.db.lock:
+                plan = pd.read_sql_query(q, self.db.conn)
+        except Exception:
+            return pd.DataFrame()
+        if plan is None or plan.empty or "stock_id" not in plan.columns:
+            return pd.DataFrame()
+        plan = plan.copy()
+        plan["stock_id"] = plan["stock_id"].astype(str).map(normalize_stock_id)
+        if "update_time" in plan.columns:
+            plan = plan.sort_values(["stock_id", "update_time"])
+        plan = plan.drop_duplicates("stock_id", keep="last")
+        keep = [
+            "stock_id", "stock_name", "market", "industry", "theme", "entry_low", "entry_high", "stop_loss",
+            "target_price", "target_1382", "target_1618", "rr", "rr_live", "risk_score", "fail_reason",
+            "block_reason", "execution_block_reason", "decision_reason", "final_trade_decision", "ui_state"
+        ]
+        for c in keep:
+            if c not in plan.columns:
+                plan[c] = np.nan if c not in ["stock_id", "stock_name", "market", "industry", "theme", "fail_reason", "block_reason", "execution_block_reason", "decision_reason", "final_trade_decision", "ui_state"] else ""
+        rename = {
+            "stock_name": "stock_name_plan", "market": "market_plan", "industry": "industry_plan", "theme": "theme_plan",
+            "rr": "rr_plan", "risk_score": "risk_score_plan"
+        }
+        return plan[[c for c in keep if c in plan.columns]].rename(columns=rename)
+
+    def _num_or_nan(self, value) -> float:
+        try:
+            v = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+            return float(v) if pd.notna(v) and np.isfinite(v) else np.nan
+        except Exception:
+            return np.nan
+
+    def _format_ai_portfolio_num(self, value, digits: int = 2):
+        v = self._num_or_nan(value)
+        if not np.isfinite(v) or abs(v) < 1e-12:
+            return "-"
+        return round(float(v), digits)
+
+    def _risk_flag_for_ai_portfolio(self, row: pd.Series, rr_value: float) -> tuple[str, str]:
+        pool = str(row.get("portfolio_pool", ""))
+        signal = str(row.get("signal", ""))
+        action = str(row.get("action", ""))
+        fail_reason = " / ".join([str(row.get(k, "") or "") for k in ["fail_reason", "block_reason", "execution_block_reason"] if str(row.get(k, "") or "").strip()])
+        risk_score = self._num_or_nan(row.get("risk_score", row.get("risk_score_plan", np.nan)))
+        price_dev = self._num_or_nan(row.get("price_deviation", row.get("price_dev", np.nan)))
+        if pool == "排除風險池" or re.search("轉弱|急跌|減碼|觀望|防守|不合格|禁止|AVOID", signal + action + fail_reason, flags=re.I):
+            return "AVOID", fail_reason or "排除風險池或轉弱/減碼訊號"
+        if np.isfinite(rr_value) and rr_value < 1.2:
+            return "HIGH", f"RR偏低({rr_value:.2f})"
+        if np.isfinite(risk_score) and risk_score <= 35:
+            return "HIGH", f"risk_score偏低({risk_score:.2f})"
+        if np.isfinite(price_dev) and abs(price_dev) >= 0.08:
+            return "HIGH", f"乖離偏大({price_dev:.2%})"
+        if np.isfinite(rr_value) and rr_value < 1.5:
+            return "MID", f"RR未達1.5({rr_value:.2f})"
+        return "LOW", "交易欄位無重大風險旗標"
+
+    def _apply_ai_portfolio_trade_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """FIX10-P0：補齊買進下緣/上緣/停損/目標1/目標2/RR/風險旗標。
+        優先使用 trade_plan；缺值時用最新現價建立保守估算，並於風險原因標明。
+        """
+        if df is None:
+            return pd.DataFrame()
+        x = df.copy()
+        if x.empty:
+            for c in AI_PORTFOLIO_TRADE_COLUMNS + ["風險原因"]:
+                x[c] = []
+            return x
+        # 交易欄位來源轉數值
+        for c in ["entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "rr_plan", "現價", "close"]:
+            if c in x.columns:
+                x[c] = pd.to_numeric(x[c], errors="coerce")
+        lows, highs, stops, t1s, t2s, rrs, flags, reasons = [], [], [], [], [], [], [], []
+        for _, row in x.iterrows():
+            close_v = self._num_or_nan(row.get("現價", row.get("close", np.nan)))
+            entry_low = self._num_or_nan(row.get("entry_low", np.nan))
+            entry_high = self._num_or_nan(row.get("entry_high", np.nan))
+            stop_loss = self._num_or_nan(row.get("stop_loss", np.nan))
+            target_1 = self._num_or_nan(row.get("target_price", np.nan))
+            target_2 = self._num_or_nan(row.get("target_1382", np.nan))
+            if not np.isfinite(target_2):
+                target_2 = self._num_or_nan(row.get("target_1618", np.nan))
+            estimated = False
+            if np.isfinite(close_v) and close_v > 0:
+                if not np.isfinite(entry_low) or entry_low <= 0:
+                    entry_low = close_v * 0.98; estimated = True
+                if not np.isfinite(entry_high) or entry_high <= 0:
+                    entry_high = close_v * 1.00; estimated = True
+                if entry_low > entry_high:
+                    entry_low, entry_high = entry_high, entry_low
+                if not np.isfinite(stop_loss) or stop_loss <= 0 or stop_loss >= entry_high:
+                    stop_loss = entry_low * 0.93; estimated = True
+                if not np.isfinite(target_1) or target_1 <= entry_high:
+                    target_1 = entry_high * 1.08; estimated = True
+                if not np.isfinite(target_2) or target_2 <= target_1:
+                    target_2 = entry_high * 1.15; estimated = True
+            rr_value = self._num_or_nan(row.get("rr_live", np.nan))
+            if not np.isfinite(rr_value):
+                rr_value = self._num_or_nan(row.get("rr_plan", row.get("rr", np.nan)))
+            if (not np.isfinite(rr_value) or rr_value <= 0) and all(np.isfinite(v) for v in [entry_high, stop_loss, target_1]) and entry_high > stop_loss:
+                rr_value = (target_1 - entry_high) / max(entry_high - stop_loss, 1e-6)
+            flag, reason = self._risk_flag_for_ai_portfolio(row, rr_value)
+            if estimated:
+                reason = (reason + "；" if reason else "") + "部分交易價位由現價保守推估，需以正式交易計畫覆核"
+            lows.append(self._format_ai_portfolio_num(entry_low))
+            highs.append(self._format_ai_portfolio_num(entry_high))
+            stops.append(self._format_ai_portfolio_num(stop_loss))
+            t1s.append(self._format_ai_portfolio_num(target_1))
+            t2s.append(self._format_ai_portfolio_num(target_2))
+            rrs.append(self._format_ai_portfolio_num(rr_value))
+            flags.append(flag)
+            reasons.append(reason or "-")
+        x["買進下緣"] = lows
+        x["買進上緣"] = highs
+        x["停損"] = stops
+        x["目標1"] = t1s
+        x["目標2"] = t2s
+        x["RR"] = rrs
+        x["風險旗標"] = flags
+        x["風險原因"] = reasons
+        return x
+
+    def _ai_portfolio_display_df(self, df: pd.DataFrame, main: bool = False) -> pd.DataFrame:
+        x = self._apply_ai_portfolio_trade_columns(df)
+        if x is None or x.empty:
+            cols = [c for c, _, _ in AI_PORTFOLIO_DISPLAY_COLUMNS] + ["風險原因", "source_pools", "source_pool_count"]
+            return pd.DataFrame(columns=cols)
+        desired = [c for c, _, _ in AI_PORTFOLIO_DISPLAY_COLUMNS]
+        if main:
+            desired = ["portfolio_rank", "stock_id", "stock_name", "portfolio_pool", "source_pools", "source_pool_count", "portfolio_score", "pool_quota", "pool_weight", "現價", "買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標", "風險原因", "pool_reason", "market", "industry", "theme", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"]
+        else:
+            desired = ["pool_rank", "stock_id", "stock_name", "portfolio_pool", "portfolio_score", "pool_quota", "pool_weight", "現價", "買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標", "風險原因", "pool_reason", "market", "industry", "theme", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"]
+        for c in desired:
+            if c not in x.columns:
+                x[c] = ""
+        out = x[[c for c in desired if c in x.columns]].copy()
+        # 顯示格式整理：避免 nan 直接進 UI/Excel。
+        out = out.replace([np.inf, -np.inf], np.nan)
+        for c in out.columns:
+            if c not in ["stock_id"]:
+                out[c] = out[c].where(pd.notna(out[c]), "-")
+        return out
+
+    def _ai_portfolio_pool_reason(self, pool_name: str) -> str:
+        mapping = {
+            "市場主流池": "題材/產業均分位於前段，代表當前資金主流。",
+            "未來科技池": "題材/產業/名稱命中AI、ASIC、CPO、網通、散熱、電源等未來科技關鍵字。",
+            "營收成長池": "營收YoY、財務分數或AI分數具成長動能；用營收先行替代落後EPS。",
+            "價值池": "低PE/低PB/殖利率或財務分數較佳，偏穩健價值。",
+            "波段攻擊池": "總分、AI、趨勢、量能或技術訊號偏強，適合波段觀察。",
+            "老師低接池": "訊號/建議偏低接、拉回、整理偏多，適合等支撐。",
+            "ETF防守池": "ETF/防守資產獨立分流，不混入短線TOP20。",
+            "排除風險池": "弱勢、風險分偏低、總分偏低或建議減碼/觀望。",
+        }
+        return mapping.get(pool_name, "依池別規則入選。")
+
+    def build_ai_portfolio_tables(self, config: dict | None = None) -> dict:
+        config = config or self._get_ai_portfolio_config_from_ui()
+        base = self._ai_portfolio_base_df()
+        if base is None or base.empty:
+            return {"01_AI投資組合總表": pd.DataFrame(), "10_組合設定與查檢表": pd.DataFrame([{"項目": "狀態", "內容": "ranking_result 無資料"}])}
+        stock_base = base[~base["is_etf_pool"]].copy()
+        etf_base = base[base["is_etf_pool"]].copy()
+        theme_score = stock_base.groupby("theme", as_index=False).agg(theme_avg_total=("total_score", "mean"), theme_avg_ai=("ai_score", "mean"), theme_count=("stock_id", "count")) if not stock_base.empty else pd.DataFrame()
+        if not theme_score.empty:
+            theme_score["theme_rank_score"] = theme_score["theme_avg_total"].fillna(0) * 0.65 + theme_score["theme_avg_ai"].fillna(0) * 0.35
+            hot_cut = theme_score["theme_rank_score"].quantile(0.80)
+            hot_themes = set(theme_score[theme_score["theme_rank_score"] >= hot_cut]["theme"].astype(str).tolist())
+        else:
+            hot_themes = set()
+        future_pat = "|".join([re.escape(k) for k in AI_PORTFOLIO_FUTURE_TECH_KEYWORDS])
+        pools = {}
+        pools["02_市場主流池"] = stock_base[stock_base["theme"].isin(hot_themes)].copy() if hot_themes else stock_base.sort_values(["total_score", "ai_score"], ascending=False).head(30).copy()
+        pools["03_未來科技池"] = stock_base[(stock_base["theme"].str.contains(future_pat, case=False, regex=True)) | (stock_base["industry"].str.contains(future_pat, case=False, regex=True)) | (stock_base["stock_name"].str.contains(future_pat, case=False, regex=True))].copy()
+        pools["04_營收成長池"] = stock_base[((stock_base["revenue_yoy"].fillna(-999) >= 20) | (stock_base["revenue_eps_score"].fillna(0) >= 65) | ((stock_base["ai_score"].fillna(0) >= 70) & (stock_base["total_score"].fillna(0) >= 55)))].copy()
+        pools["05_價值池"] = stock_base[(((stock_base["pe"].fillna(999) > 0) & (stock_base["pe"].fillna(999) <= 20)) | ((stock_base["pb"].fillna(999) > 0) & (stock_base["pb"].fillna(999) <= 2.5)) | (stock_base["dividend_yield"].fillna(0) >= 3) | (stock_base["financial_score"].fillna(0) >= 70))].copy()
+        pools["06_波段攻擊池"] = stock_base[((stock_base["total_score"].fillna(0) >= 65) | (stock_base["ai_score"].fillna(0) >= 70) | (stock_base["trend_score"].fillna(0) >= 70) | (stock_base["volume_score"].fillna(0) >= 70) | (stock_base["signal"].str.contains("強勢|突破|偏多", regex=True)))].copy()
+        pools["07_老師低接池"] = stock_base[(stock_base["action"].str.contains("低接|拉回|等待|區間", regex=True)) | (stock_base["signal"].str.contains("整理偏多|區間整理", regex=True))].copy()
+        pools["08_ETF防守池"] = etf_base.copy()
+        pools["09_排除風險池"] = base[((base["risk_score"].fillna(100) <= 35) | (base["total_score"].fillna(0) < 45) | (base["signal"].str.contains("轉弱|急跌|風險", regex=True)) | (base["action"].str.contains("減碼|觀望|防守", regex=True)))].copy()
+        sheet_to_pool = {
+            "02_市場主流池": "市場主流池", "03_未來科技池": "未來科技池", "04_營收成長池": "營收成長池", "05_價值池": "價值池",
+            "06_波段攻擊池": "波段攻擊池", "07_老師低接池": "老師低接池", "08_ETF防守池": "ETF防守池", "09_排除風險池": "排除風險池",
+        }
+        out_tables = {}
+        combined = []
+        # FIX10-P0：報表欄位以「交易計畫欄位」為核心，避免重複 stock_id/stock_name 與 rr nan。
+        base_cols = [c for c in ["market", "industry", "theme", "現價", "漲跌", "漲跌幅%", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"] if c in base.columns]
+        for sheet_name, dfp in pools.items():
+            pool_name = sheet_to_pool[sheet_name]
+            item = config.get(pool_name, DEFAULT_AI_PORTFOLIO_CONFIG.get(pool_name, {}))
+            quota = int(item.get("quota", 0) or 0)
+            weight = float(item.get("weight", 1.0) or 1.0)
+            enabled = bool(item.get("enabled", False))
+            x = dfp.copy()
+            if not x.empty:
+                x["portfolio_pool"] = pool_name
+                x["pool_quota"] = quota
+                x["pool_weight"] = weight
+                x["pool_reason"] = self._ai_portfolio_pool_reason(pool_name)
+                x["portfolio_score"] = (x["total_score"].fillna(0) * 0.45 + x["ai_score"].fillna(0) * 0.35 + x["revenue_eps_score"].fillna(50) * 0.10 + x["volume_score"].fillna(0) * 0.10) * weight
+                x = x.sort_values(["portfolio_score", "total_score", "ai_score"], ascending=False)
+                x["pool_rank"] = range(1, len(x) + 1)
+            out_tables[sheet_name] = self._ai_portfolio_display_df(x.head(max(50, quota if quota else 20)).copy(), main=False) if not x.empty else self._ai_portfolio_display_df(pd.DataFrame(), main=False)
+            if enabled and quota > 0 and pool_name != "排除風險池" and not x.empty:
+                combined.append(x.head(quota).copy())
+        if combined:
+            combo = pd.concat(combined, ignore_index=True)
+            combo["source_pool_count"] = combo.groupby("stock_id")["portfolio_pool"].transform("nunique")
+            combo["source_pools"] = combo.groupby("stock_id")["portfolio_pool"].transform(lambda s: "、".join(sorted(set(s.astype(str)))))
+            combo = combo.sort_values(["source_pool_count", "portfolio_score", "total_score", "ai_score"], ascending=False).drop_duplicates("stock_id", keep="first").head(20).copy()
+            combo["portfolio_rank"] = range(1, len(combo) + 1)
+        else:
+            combo = pd.DataFrame()
+        # FIX10-P0：主表第一張輸出，並補齊買進/停損/目標/RR/風險旗標。
+        main_table = self._ai_portfolio_display_df(combo.copy(), main=True) if combo is not None and not combo.empty else self._ai_portfolio_display_df(pd.DataFrame(), main=True)
+        ordered_tables = {"01_AI投資組合總表": main_table}
+        ordered_tables.update(out_tables)
+        out_tables = ordered_tables
+        checklist_rows = []
+        for pool_name, item in config.items():
+            sheet_name = next((k for k, v in sheet_to_pool.items() if v == pool_name), "")
+            checklist_rows.append({
+                "項目": pool_name, "啟用": bool(item.get("enabled", False)), "配額": int(item.get("quota", 0) or 0), "權重": float(item.get("weight", 0) or 0),
+                "候選數": int(len(out_tables.get(sheet_name, pd.DataFrame()))), "說明": self._ai_portfolio_pool_reason(pool_name),
+                "交易欄位": "買進下緣/買進上緣/停損/目標1/目標2/RR/風險旗標",
+                "驗收": "獨立於TOP20；不改寫trade_top20/candidate20/core_attack5"
+            })
+        out_tables["10_組合設定與查檢表"] = pd.DataFrame(checklist_rows)
+        return out_tables
+
+    def _populate_ai_portfolio_tree(self, df: pd.DataFrame):
+        try:
+            self.ai_portfolio_tree.delete(*self.ai_portfolio_tree.get_children())
+            if df is None or df.empty:
+                return
+            for _, r in df.iterrows():
+                self.ai_portfolio_tree.insert("", "end", values=(
+                    r.get("portfolio_rank", ""), r.get("stock_id", ""), r.get("stock_name", ""), r.get("portfolio_pool", ""),
+                    round(float(pd.to_numeric(pd.Series([r.get("portfolio_score", 0)]), errors="coerce").fillna(0).iloc[0]), 2),
+                    r.get("pool_quota", ""), r.get("pool_weight", ""), r.get("現價", r.get("close", "")),
+                    r.get("買進下緣", ""), r.get("買進上緣", ""), r.get("停損", ""), r.get("目標1", ""),
+                    r.get("目標2", ""), r.get("RR", r.get("rr", "")), r.get("風險旗標", ""), r.get("pool_reason", "")
+                ))
+        except Exception as exc:
+            self.append_log(f"[AI_PORTFOLIO] UI填表失敗：{exc}", "ERROR")
+
+    def show_ai_portfolio_engine(self):
+        def worker():
+            try:
+                self.ui_call(self.clear_log)
+                self.ui_call(self.start_task, "AI投資組合引擎", 3)
+                cfg = self._get_ai_portfolio_config_from_ui()
+                AI_PORTFOLIO_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.ui_call(self.update_task, "AI投資組合引擎", 1, 3, item="建立分池")
+                tables = self.build_ai_portfolio_tables(cfg)
+                main = tables.get("01_AI投資組合總表", pd.DataFrame())
+                self.last_ai_portfolio_tables = tables
+                self.last_ai_portfolio_df = main
+                self.ui_call(self._populate_ai_portfolio_tree, main)
+                self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
+                self.ui_call(self.update_task, "AI投資組合引擎", 2, 3, item=f"組合={len(main)}")
+                self.ui_call(self.finish_task, "AI投資組合引擎", f"AI投資組合完成｜主表 {len(main)} 檔｜交易欄位已補齊｜TOP20原設計未變動")
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 完成：主表={len(main)}｜交易欄位={AI_PORTFOLIO_TRADE_COLUMNS}｜設定={AI_PORTFOLIO_CONFIG_PATH}")
+            except Exception as exc:
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 失敗：{exc}", "ERROR")
+                self.ui_call(messagebox.showerror, "AI投資組合", f"AI投資組合引擎失敗：\n{exc}")
+        self._run_in_thread(worker, "ai_portfolio_engine")
+
+    def export_ai_portfolio_report(self):
+        def worker():
+            try:
+                cfg = self._get_ai_portfolio_config_from_ui()
+                tables = self.build_ai_portfolio_tables(cfg)
+                self.last_ai_portfolio_tables = tables
+                self.last_ai_portfolio_df = tables.get("01_AI投資組合總表", pd.DataFrame())
+                out_base = RUNTIME_DIR / f"AI_Portfolio_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                out_path, out_type = write_table_bundle(out_base, tables, preferred="excel")
+                self.ui_call(self._populate_ai_portfolio_tree, self.last_ai_portfolio_df)
+                self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
+                self.ui_call(messagebox.showinfo, "AI投資組合", f"AI投資組合報表已輸出（{out_type}）：\n{out_path}")
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 報表輸出：{out_path}｜已含買進下緣/買進上緣/停損/目標1/目標2/RR/風險旗標")
+                try:
+                    open_path(out_path)
+                except Exception:
+                    pass
+            except Exception as exc:
+                self.ui_call(messagebox.showerror, "AI投資組合", f"匯出AI投資組合失敗：\n{exc}")
+        self._run_in_thread(worker, "export_ai_portfolio")
+
+    def on_select_ai_portfolio(self, event=None):
+        stock_id = self._tree_selected_stock_id(self.ai_portfolio_tree, 1)
+        if stock_id and not self._should_ignore_select_event(stock_id, "AI投資組合"):
+            try:
+                df = getattr(self, "last_ai_portfolio_df", pd.DataFrame())
+                if isinstance(df, pd.DataFrame) and not df.empty and "stock_id" in df.columns:
+                    row_df = df[df["stock_id"].astype(str).map(normalize_stock_id).eq(normalize_stock_id(stock_id))].head(1)
+                    if not row_df.empty:
+                        r = row_df.iloc[0]
+                        detail = (
+                            f"《AI投資組合》\n"
+                            f"股票：{r.get('stock_name','')}（{r.get('stock_id','')}）｜池別：{r.get('portfolio_pool','')}\n"
+                            f"買進區間：{r.get('買進下緣','-')} ～ {r.get('買進上緣','-')}｜停損：{r.get('停損','-')}\n"
+                            f"目標1：{r.get('目標1','-')}｜目標2：{r.get('目標2','-')}｜RR：{r.get('RR','-')}\n"
+                            f"風險旗標：{r.get('風險旗標','-')}｜原因：{r.get('風險原因', r.get('pool_reason','-'))}"
+                        )
+                        self.detail.delete("1.0", "end")
+                        self.detail.insert("end", detail)
+            except Exception:
+                pass
+            self.sync_all_views(stock_id, source="AI投資組合")
 
 
     def build_daily_summary_sheet(self) -> pd.DataFrame:
@@ -12315,7 +11705,8 @@ class AppUI:
     def build_report_usage_sheet(self) -> pd.DataFrame:
         rows = [
             {"報表": "Ranking", "用途": "雷達表，不直接下單。"},
-            {"報表": "Trade_TOP20", "用途": "候選20，進第二層分析。"},
+            {"報表": "Trade_TOP20", "用途": "候選20，進第二層分析。原TOP20保留主流TOP20+起爆TOP20+雙引擎共振，不被AI投資組合取代。"},
+            {"報表": "AI投資組合總表", "用途": "使用者勾選池別、配額、權重後產出的策略組合；獨立於TOP20。"},
             {"報表": "Trade_TOP5", "用途": "主力成立 + 主升成立的主攻池。"},
             {"報表": "Today_Buy", "用途": "只放位置仍正確、可直接執行的主攻股。"},
             {"報表": "Wait_Pullback", "用途": "主流/突破候選，但位置未到，可等待回測。"},
@@ -12350,6 +11741,11 @@ class AppUI:
                     tables["Theme"] = theme
                 if self.last_top20_df is not None and not self.last_top20_df.empty:
                     tables["Trade_TOP20"] = self.last_top20_df
+                ai_tables = getattr(self, "last_ai_portfolio_tables", {}) or {}
+                for _ai_sheet in ["01_AI投資組合總表", "02_市場主流池", "03_未來科技池", "04_營收成長池", "05_價值池", "06_波段攻擊池", "07_老師低接池", "08_ETF防守池", "09_排除風險池", "10_組合設定與查檢表"]:
+                    _ai_df = ai_tables.get(_ai_sheet, pd.DataFrame()) if isinstance(ai_tables, dict) else pd.DataFrame()
+                    if _ai_df is not None and not _ai_df.empty:
+                        tables[_ai_sheet] = _ai_df
                 if self.last_top5_df is not None and not self.last_top5_df.empty:
                     tables["Trade_TOP5"] = self.last_top5_df
                 if getattr(self, "last_today_buy_df", pd.DataFrame()) is not None and not getattr(self, "last_today_buy_df", pd.DataFrame()).empty:
@@ -12463,35 +11859,6 @@ class AppUI:
                 unique_df = getattr(self, "last_unique_decision_df", pd.DataFrame())
                 if unique_df is not None and not unique_df.empty:
                     tables["Unique_Decision"] = self.enrich_price_and_export_fields(unique_df, id_col="stock_id")
-                try:
-                    teacher_source = tables.get("Ranking", self.db.get_latest_ranking())
-                    teacher_source = self.enrich_price_and_export_fields(teacher_source, id_col="stock_id") if teacher_source is not None and not teacher_source.empty else pd.DataFrame()
-                    teacher_cols = [c for c in ["stock_id", "stock_name", "老師燈號", "老師決策", "老師策略", "位階判斷", "兩高不過", "類股輪動", "類股強度", "資金流向分", "相對強弱RS", "老師買點", "老師停損", "老師目標", "老師理由", "現價", "RR", "勝率"] if c in teacher_source.columns]
-                    if teacher_source is not None and not teacher_source.empty and teacher_cols:
-                        teacher_view = teacher_source[teacher_cols].copy()
-                        tables["老師策略_TOP10"] = teacher_view.head(10)
-                        if "老師決策" in teacher_view.columns:
-                            tables["今日可買清單"] = teacher_view[teacher_view["老師決策"].astype(str).isin(["BUY", "LOW BUY", "LOW_BUY"])].copy()
-                            tables["等拉回清單"] = teacher_view[teacher_view["老師決策"].astype(str).str.contains("WAIT|WATCH|拉回", case=False, na=False)].copy()
-                            tables["兩高不過排除清單"] = teacher_view[(teacher_view.get("兩高不過", "").astype(str).isin(["True", "1", "YES", "是"])) | (teacher_view["老師決策"].astype(str).str.contains("AVOID|REDUCE|排除", case=False, na=False))].copy()
-                        tables["低位階翻多清單"] = teacher_view[teacher_view.get("位階判斷", "").astype(str).str.contains("低位階|翻多", na=False)].copy() if "位階判斷" in teacher_view.columns else pd.DataFrame(columns=teacher_cols)
-                        if "類股輪動" in teacher_view.columns:
-                            tables["類股輪動強弱表"] = teacher_view.groupby("類股輪動", dropna=False).size().reset_index(name="檔數")
-                        if "資金流向分" in teacher_view.columns:
-                            tables["資金流入排行"] = teacher_view.sort_values("資金流向分", ascending=False).head(50)
-                        tables["策略公式與欄位來源"] = pd.DataFrame([
-                            {"欄位": "teacher_final_decision", "來源": "services.teacher_strategy_service → teacher_strategy_engine", "原則": "UI/Excel只呈現，不重算"},
-                            {"欄位": "two_high_fail", "來源": "two_high_fail_engine", "原則": "兩高不過不得進今日可買"},
-                            {"欄位": "position_stage", "來源": "position_stage_engine", "原則": "低位階翻多優先觀察/低接"},
-                        ])
-                except Exception as exc:
-                    tables["Teacher_Strategy_Error"] = pd.DataFrame([{"error": str(exc)}])
-                try:
-                    teacher_df_phase3 = self._get_teacher_strategy_source_df(tables.get("Ranking", pd.DataFrame()))
-                    if teacher_df_phase3 is not None and not teacher_df_phase3.empty:
-                        tables.update(self.build_teacher_strategy_export_tables(teacher_df_phase3))
-                except Exception as exc:
-                    tables["Teacher_UI_Phase3_Error"] = pd.DataFrame([{"error": str(exc)}])
                 tables["Daily_Summary"] = self.build_daily_summary_sheet()
                 tables["Summary"] = self.build_daily_summary_sheet()
                 tables["Report_Guide"] = self.build_report_usage_sheet()
@@ -13034,52 +12401,18 @@ class AppUI:
         except Exception:
             pass
 
-    def refresh_all_tables(self, force_full_ranking: bool = False, auto_rebuild: bool = False, startup_light: bool = False):
+    def refresh_all_tables(self, force_full_ranking: bool = False):
         for tree in (self.dashboard_tree, self.sop_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
             for item in tree.get_children():
                 tree.delete(item)
-        for tree_name in ("teacher_market_tree", "teacher_rotation_tree", "teacher_lowbase_tree", "teacher_exclude_tree", "teacher_today_tree"):
-            tree = getattr(self, tree_name, None)
-            if tree is not None:
-                self._clear_tree_safe(tree)
 
-        if not self.ensure_ranking_ready(auto_rebuild=auto_rebuild):
+        if not self.ensure_ranking_ready(auto_rebuild=True):
             price_rows = self.db.get_total_price_rows()
             if price_rows > 0:
                 self.set_status("已有歷史資料，但尚未形成有效排行；請先補足歷史或重建排行。")
             else:
                 self.set_status("目前尚無排行資料，請先初始化、建立歷史，再重建排行。")
             self.show_welcome_message()
-            return
-
-        if startup_light:
-            # V17-P1 STARTUP_REAL_FIX：
-            # 開機/第二次開程式只做「輕量快照載入」，不得呼叫 _filtered_ranking()
-            # 因為 _filtered_ranking() 會進 enrich_price_and_export_fields() → build_display_columns()。
-            # 這是先前 MainThread 卡住與大量 WARNING 的真正來源。
-            try:
-                df = self.db.get_latest_ranking()
-            except Exception:
-                df = pd.DataFrame()
-            if df is None or df.empty:
-                self.set_status("開機快速載入：目前沒有既有排行；請執行每日更新或重建排行。")
-                self.show_welcome_message()
-                return
-            try:
-                df = df.sort_values(["rank_all"]).reset_index(drop=True)
-            except Exception:
-                df = df.reset_index(drop=True)
-            # 只顯示前 200 檔，避免開機一次插入 2000+ TreeView rows 卡住。
-            view_df = df.head(200).copy()
-            try:
-                self._populate_rank_tree(view_df)
-            except Exception as exc:
-                log_warning(f"[STARTUP_REAL_FIX] startup_light populate rank skipped: {exc}")
-            self.set_status(f"開機快速載入完成：排行快照 {len(df)} 檔，先顯示前 {len(view_df)} 檔；未重建 EPS MATRIX / AI TOP20 / 老師策略。")
-            try:
-                self.append_log(f"[STARTUP_REAL_FIX] {STARTUP_REAL_FIX_ID}：開機只讀排行快照，不執行 build_display_columns / EPS MATRIX / AI TOP20。")
-            except Exception:
-                pass
             return
 
         used_full_fallback = False
@@ -13143,33 +12476,15 @@ class AppUI:
                 f"{r['hot_score']:.2f}", r["rotation"]
             ))
 
-        if startup_light:
-            # V17-P0 STARTUP_PERF_GUARD：開機/第二次開程式只載入既有排行與儀表板，
-            # 不在 MainThread 觸發 get_trade_pool / EPS MATRIX / 老師策略強制重建。
-            self.set_status(f"開機快速載入完成，共 {len(df)} 檔｜未重建 EPS MATRIX / AI TOP20 / 老師策略。")
-            try:
-                self.append_log("[STARTUP][LIGHT] 已快速載入既有排行；AI TOP20/老師策略請由按鈕執行或使用快照。")
-            except Exception:
-                pass
-            return
-
-        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-        # refresh_all_tables 只負責刷新 TreeView / 類股 / 題材 / 儀表摘要。
-        # 停用多做段落：不得在 UI refresh 中呼叫 get_trade_pool，否則會觸發 EPS MATRIX DECISION / Teacher / trade_plan 重算。
-        # trade = self.master_trading_engine.get_trade_pool(df)
-        # self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
-        # attack_cnt = len(trade["attack"])
-        # defense_cnt = len(trade["defense"])
-        # self.set_status(
-        #     f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}"
-        # )
-        self.set_status(f"已載入資料，共 {len(df)} 檔｜已停用UI刷新內重型交易池重算。")
+        trade = self.master_trading_engine.get_trade_pool(df)
+        self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
+        attack_cnt = len(trade["attack"])
+        defense_cnt = len(trade["defense"])
+        self.set_status(
+            f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}"
+        )
         if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
             self.refresh_top20_and_order_views()
-        try:
-            self.refresh_teacher_strategy_table(force_rebuild=False)
-        except Exception as exc:
-            log_warning(f"老師策略UI刷新略過：{exc}")
 
     def update_data(self):
         last_date = self.db.get_last_price_date()
@@ -13216,10 +12531,7 @@ class AppUI:
                 rank_count = self.rank_engine.rebuild(progress_cb=rank_progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
                 self.force_show_full_ranking_once = True
                 self.ui_call(self.refresh_filters, True)
-                # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-                # 每日增量完成後不再自動 refresh_all_tables，避免觸發 UI refresh 內重型 get_trade_pool / EPS DECISION / 圖表。
-                # 使用者如需刷新排行畫面，可手動點擊重整或切換頁籤。
-                # self.ui_call(self.refresh_all_tables, True)
+                self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.show_welcome_message)
                 self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
                 self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n基本面特徵 {cache_result.get('feature_rows', 0)} 筆\n排行 {rank_count} 檔\n（行情 + EPS/估值 + 月營收已先寫入本地DB）")
@@ -13256,10 +12568,7 @@ class AppUI:
                 count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
                 self.force_show_full_ranking_once = True
                 self.ui_call(self._reload_rank_tree_after_rebuild, True)
-                # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-                # 快速重建排行完成後只重新載入排行 TreeView，不再呼叫 refresh_all_tables。
-                # refresh_all_tables 會連動 get_trade_pool / EPS MATRIX DECISION，造成重建排行卡住。
-                # self.ui_call(self.refresh_all_tables, True)
+                self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.refresh_classification_summary_ui)
                 self.ui_call(self.finish_task, "重建排行", f"排行已完成，共 {count} 檔")
                 if count <= 0:
@@ -13347,113 +12656,8 @@ class AppUI:
         self.ui_call(self.append_log, f"[V9.5.9-PREFLIGHT-SOFT-BLOCK] 自動同步後外部資料仍未就緒，但不停止 {context}：{final_reason}", "WARNING")
         return 0, final_reason
 
-
-    def _df_to_snapshot_json(self, df: pd.DataFrame) -> str:
-        try:
-            if df is None:
-                df = pd.DataFrame()
-            return df.to_json(orient="split", force_ascii=False, date_format="iso")
-        except Exception:
-            return pd.DataFrame().to_json(orient="split", force_ascii=False)
-
-    def _snapshot_json_to_df(self, text: str) -> pd.DataFrame:
-        try:
-            if not text:
-                return pd.DataFrame()
-            return pd.read_json(io.StringIO(text), orient="split")
-        except Exception:
-            return pd.DataFrame()
-
-    def _top20_snapshot_signature(self, df: pd.DataFrame) -> str:
-        try:
-            ids = df.get("stock_id", pd.Series(dtype=str)).astype(str).head(3000).tolist()
-            payload = "|".join(ids) + "::" + STRATEGY_CONFIG_MANAGER.summary_text()
-            return hashlib.md5(payload.encode("utf-8", errors="ignore")).hexdigest()
-        except Exception:
-            return ""
-
-    def _ensure_ai_top20_snapshot_table(self):
-        with self.db.lock:
-            self.db.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ai_top20_snapshot_json (
-                    snapshot_key TEXT PRIMARY KEY,
-                    trade_date TEXT,
-                    signature TEXT,
-                    created_at TEXT,
-                    payload_json TEXT,
-                    row_count INTEGER
-                )
-                """
-            )
-            self.db.conn.commit()
-
-    def _save_ai_top20_snapshot(self, signature: str):
-        try:
-            self._ensure_ai_top20_snapshot_table()
-            trade_date = datetime.now().strftime("%Y-%m-%d")
-            payload = {
-                "last_top20_df": self._df_to_snapshot_json(self.last_top20_df),
-                "last_candidate_top20_df": self._df_to_snapshot_json(self.last_candidate_top20_df),
-                "last_top5_df": self._df_to_snapshot_json(self.last_top5_df),
-                "last_attack_df": self._df_to_snapshot_json(self.last_attack_df),
-                "last_watch_df": self._df_to_snapshot_json(self.last_watch_df),
-                "last_defense_df": self._df_to_snapshot_json(self.last_defense_df),
-                "last_today_buy_df": self._df_to_snapshot_json(self.last_today_buy_df),
-                "last_wait_df": self._df_to_snapshot_json(self.last_wait_df),
-                "last_order_list_df": self._df_to_snapshot_json(self.last_order_list_df),
-                "last_institutional_plan_df": self._df_to_snapshot_json(self.last_institutional_plan_df),
-                "last_unique_decision_df": self._df_to_snapshot_json(self.last_unique_decision_df),
-                "last_theme_summary_df": self._df_to_snapshot_json(self.last_theme_summary_df),
-            }
-            text = json.dumps(payload, ensure_ascii=False)
-            key = f"{trade_date}:AI_TOP20:{signature}"
-            with self.db.lock:
-                self.db.conn.execute(
-                    """
-                    INSERT OR REPLACE INTO ai_top20_snapshot_json
-                    (snapshot_key, trade_date, signature, created_at, payload_json, row_count)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (key, trade_date, signature, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text, int(len(self.last_top20_df) if self.last_top20_df is not None else 0)),
-                )
-                self.db.conn.commit()
-            log_info(f"[AI TOP20][SNAPSHOT SAVE] key={key} rows={len(self.last_top20_df) if self.last_top20_df is not None else 0}")
-        except Exception as exc:
-            log_warning(f"[AI TOP20][SNAPSHOT SAVE][WARN] {exc}")
-
-    def _load_ai_top20_snapshot(self, signature: str) -> bool:
-        try:
-            self._ensure_ai_top20_snapshot_table()
-            trade_date = datetime.now().strftime("%Y-%m-%d")
-            key = f"{trade_date}:AI_TOP20:{signature}"
-            with self.db.lock:
-                row = self.db.conn.execute(
-                    "SELECT payload_json, created_at, row_count FROM ai_top20_snapshot_json WHERE snapshot_key=?",
-                    (key,),
-                ).fetchone()
-            if not row:
-                return False
-            payload_json, created_at, row_count = row
-            payload = json.loads(payload_json or "{}")
-            for attr, text in payload.items():
-                setattr(self, attr, self._snapshot_json_to_df(text))
-            self.cache_trade_dataframe(self.last_top20_df)
-            self.cache_trade_dataframe(self.last_top5_df)
-            self.cache_trade_dataframe(self.last_attack_df)
-            self.cache_trade_dataframe(self.last_today_buy_df)
-            self.cache_trade_dataframe(self.last_wait_df)
-            self.cache_backtest_dataframe(self.last_top5_df)
-            log_info(f"[AI TOP20][SNAPSHOT LOAD] key={key} rows={row_count} created_at={created_at}")
-            return True
-        except Exception as exc:
-            log_warning(f"[AI TOP20][SNAPSHOT LOAD][WARN] {exc}")
-            return False
-
     def show_top20(self):
-        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-        # AI_TOP20_VIEW 只允許讀取既有 ranking_result / 快照，不允許 auto_rebuild。
-        if not self.ensure_ranking_ready(auto_rebuild=False):
+        if not self.ensure_ranking_ready(auto_rebuild=True):
             return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
         df = self._filtered_ranking()
         if df.empty:
@@ -13467,58 +12671,130 @@ class AppUI:
             except Exception:
                 return messagebox.showwarning("提醒", "目前篩選條件下沒有可用資料")
 
-        signature = self._top20_snapshot_signature(df)
-        if self._load_ai_top20_snapshot(signature):
-            self.clear_log()
-            self.append_log("[AI TOP20][SNAPSHOT LOAD] 命中今日快照，直接載入TOP20；未重跑EPS MATRIX/2080檔AI選股。")
-            self.refresh_top20_and_order_views()
-            self.left_notebook.select(self.tab_top20)
-            self.open_three_windows()
-            self.set_status("AI選股TOP20已由今日快照載入，未重算。")
-            return
+        def worker():
+            try:
+                total = len(df)
+                self.ui_call(self.clear_log)
+                self.ui_call(self.start_task, "AI選股TOP20", total)
 
-        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-        # AI選股TOP20 不得觸發重型 worker / external auto sync / get_trade_pool / EPS MATRIX。
-        # 未命中快照時，直接從既有 ranking_result 取 TOP20 顯示，並保存快照。
-        try:
-            self.clear_log()
-            self.append_log("[AI TOP20][V13-LIGHT] 未命中快照，改用既有 ranking_result 直接產生TOP20；不重跑EPS/Teacher/重排行。")
-            light_df = df.sort_values(["rank_all"]).head(20).copy() if "rank_all" in df.columns else df.head(20).copy()
-            self.last_top20_df = self.enrich_price_and_export_fields(light_df.copy(), id_col="stock_id") if light_df is not None and not light_df.empty else pd.DataFrame()
-            self.last_candidate_top20_df = self.last_top20_df.copy()
-            self.last_top5_df = self.last_top20_df.head(5).copy()
-            self.last_attack_df = pd.DataFrame()
-            self.last_watch_df = pd.DataFrame()
-            self.last_defense_df = pd.DataFrame()
-            self.last_today_buy_df = pd.DataFrame()
-            self.last_wait_df = pd.DataFrame()
-            self.last_order_list_df = pd.DataFrame()
-            self.last_institutional_plan_df = pd.DataFrame()
-            self.last_unique_decision_df = pd.DataFrame()
-            self.last_theme_summary_df = ThemeStrengthEngine.summarize(df) if df is not None and not df.empty else pd.DataFrame()
-            self.cache_trade_dataframe(self.last_top20_df)
-            self.cache_backtest_dataframe(self.last_top5_df)
-            self.refresh_top20_and_order_views()
-            self.left_notebook.select(self.tab_top20)
-            self.open_three_windows()
-            self._save_ai_top20_snapshot(signature)
-            self.set_status(f"AI選股TOP20已用排行快照輕量產生：{len(self.last_top20_df)} 檔。")
-            return
-        except Exception as exc:
-            log_warning(f"[AI TOP20][V13-LIGHT][WARN] {exc}")
-            return messagebox.showerror("錯誤", str(exc))
+                auto_ready, auto_reason = self._ensure_external_data_ready_auto_sync("AI選股TOP20")
+                if int(auto_ready) != 1:
+                    self.ui_call(self.append_log, "[V9.5.9-SOFT-BLOCK] 外部資料自動同步後仍未完整，但不停止AI分析/TOP20；execution_ready僅作資訊欄位。原因：" + str(auto_reason), "WARNING")
+                    self.ui_call(self.set_status, "AI選股TOP20繼續執行；外部資料未完整僅顯示SOFT_BLOCK提示")
 
-        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-        # 以下原本 heavy worker 區塊已整段停用，不刪除原架構，只阻止執行。
-        # 原功能包含：
-        # - _ensure_external_data_ready_auto_sync()
-        # - master_trading_engine.get_trade_pool()
-        # - DecisionLayer.evaluate_dataframe()
-        # - EPS MATRIX DECISION 逐檔
-        # - Teacher/TradePlan/Backtest 重型後處理
-        # 目前 AI TOP20 已在上方用 ranking_result 輕量產生後 return。
-        # self._run_in_thread(worker, "show_top20")
 
+                def progress(idx, total_count, sid):
+                    self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
+
+                trade = self.master_trading_engine.get_trade_pool(
+                    df,
+                    progress_cb=progress,
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                    cancel_cb=lambda: self.cancel_event.is_set(),
+                )
+                market = trade["market"]
+                trade_top20 = trade["trade_top20"]
+                tradable_top20 = trade.get("tradable_top20", pd.DataFrame())
+                self.last_candidate_top20_df = self.enrich_price_and_export_fields(trade_top20.copy(), id_col="stock_id") if trade_top20 is not None and not trade_top20.empty else pd.DataFrame()
+                attack = trade["attack"]
+                watch = trade["watch"]
+                defense = trade["defense"]
+                today_buy = trade["today_buy"]
+                wait_pullback = trade["wait_pullback"]
+                theme_summary = trade["theme_summary"]
+                eliminated = trade.get("eliminated", pd.DataFrame())
+
+                ui_top20_source = trade_top20 if trade_top20 is not None and not trade_top20.empty else tradable_top20
+                self.last_top20_df = self.enrich_price_and_export_fields(ui_top20_source.copy(), id_col="stock_id") if ui_top20_source is not None and not ui_top20_source.empty else pd.DataFrame()
+                self.cache_trade_dataframe(self.last_top20_df)
+                top5 = attack.head(5).copy() if attack is not None and not attack.empty else (trade_top20.head(5).copy() if trade_top20 is not None and not trade_top20.empty else pd.DataFrame())
+                if not top5.empty:
+                    bt_rows = []
+                    for _, rr in top5.iterrows():
+                        bt = self.backtest_engine.estimate_trade_quality(str(rr["stock_id"]))
+                        bt_rows.append(bt)
+                    bt_df = pd.DataFrame(bt_rows)
+                    top5 = pd.concat([top5.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
+                self.last_top5_df = self.enrich_price_and_export_fields(top5.copy(), id_col="stock_id")
+                self.cache_trade_dataframe(self.last_top5_df)
+                self.cache_backtest_dataframe(self.last_top5_df)
+                self.last_attack_df = self.enrich_price_and_export_fields(attack.copy(), id_col="stock_id")
+                self.cache_trade_dataframe(self.last_attack_df)
+                self.last_watch_df = self.enrich_price_and_export_fields(watch.copy(), id_col="stock_id")
+                self.cache_trade_dataframe(self.last_watch_df)
+                self.last_defense_df = self.enrich_price_and_export_fields(defense.copy(), id_col="stock_id")
+                self.cache_trade_dataframe(self.last_defense_df)
+                self.last_theme_summary_df = theme_summary.copy()
+                self.last_today_buy_df = self.enrich_price_and_export_fields(today_buy.copy(), id_col="stock_id")
+                self.cache_trade_dataframe(self.last_today_buy_df)
+                self.last_wait_df = self.enrich_price_and_export_fields(wait_pullback.copy(), id_col="stock_id")
+                self.cache_trade_dataframe(self.last_wait_df)
+                self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df))
+                inst_plan_raw = self.portfolio_engine.build_institutional_plan(self.last_today_buy_df.copy())
+                self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(inst_plan_raw, id_col="代號"))
+                unique_raw = trade.get("unique_decision", pd.DataFrame())
+                if unique_raw is not None and not unique_raw.empty:
+                    self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(REPORT_DECISION_LIMITS["unique_decision"])
+                else:
+                    self.last_unique_decision_df = pd.DataFrame()
+                assert_phase1_report_consistency(
+                    self.last_top20_df,
+                    self.last_attack_df,
+                    self.last_today_buy_df,
+                    self.last_wait_df,
+                    self.last_watch_df,
+                    self.last_unique_decision_df,
+                    self.last_order_list_df,
+                    self.last_institutional_plan_df,
+                )
+
+                self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
+                self.ui_call(self.refresh_top20_and_order_views)
+                self.ui_call(self.left_notebook.select, self.tab_top20)
+                self.ui_call(self.open_three_windows)
+
+                defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
+                eliminated_cnt = len(eliminated) if eliminated is not None else 0
+                lines = [
+                    "《v9.5 EXTERNAL DECISION INTEGRATED 操作版》",
+                    f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
+                    f"市場說明：{market['memo']}",
+                    f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可下單：{len(today_buy)}｜條件預掛：{len(wait_pullback)}｜防守：{defend_cnt}｜淘汰：{eliminated_cnt}",
+                    f"交易門檻：{STRATEGY_CONFIG_MANAGER.summary_text()}",
+                    "操作用途：先看今日可下單，再看條件預掛，沒有進場區就不下單。",
+                    "",
+                    "【TOP20 觀察池 前5檔】",
+                ]
+                if trade_top20.empty:
+                    lines.append("目前無符合條件標的")
+                else:
+                    for i, (_, r) in enumerate(trade_top20.head(REPORT_DECISION_LIMITS["core_attack5"]).iterrows(), start=1):
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
+
+                lines.extend(["", "【今日可下單】"])
+                if today_buy.empty:
+                    lines.append("今日無符合 SOP 的可買名單（允許空白，不為湊數放寬）。")
+                else:
+                    for i, (_, r) in enumerate(today_buy.iterrows(), start=1):
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+
+                lines.extend(["", "【條件預掛】"])
+                if wait_pullback.empty:
+                    lines.append("無條件預掛")
+                else:
+                    for i, (_, r) in enumerate(wait_pullback.iterrows(), start=1):
+                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜條件預掛｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+
+                self.ui_call(self.detail.delete, "1.0", tk.END)
+                self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
+                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：TOP20 {len(trade_top20)}｜今日可下單 {len(today_buy)}｜等待 {len(wait_pullback)}")
+            except OperationCancelled:
+                self.ui_call(self.finish_task, "AI選股TOP20", "AI選股TOP20 已中斷")
+            except Exception as e:
+                traceback.print_exc()
+                self.ui_call(messagebox.showerror, "錯誤", str(e))
+
+        self._run_in_thread(worker, "show_top20")
 
 
     def show_strategy_backtest(self):
@@ -13675,33 +12951,6 @@ class AppUI:
 
 
 
-def run_kpattern_phase1_smoke_test():
-    """Phase 1 最小可跑驗證：確認主程式能呼叫 KPatternService。
-
-    這不是正式型態運算，不會修改任何交易決策、DB、Excel 或 UI 資料。
-    成功標準：console / log 看到 [KPatternService] called successfully 或 fallback 訊息。
-    """
-    try:
-        sample_df = pd.DataFrame()
-        out_df = KPatternService().run(df=sample_df, price_history=None)
-        ok = isinstance(out_df, pd.DataFrame)
-        msg = f"[PHASE1][KPatternService] smoke_test={'ok' if ok else 'unexpected_return'}｜import_status={KPATTERN_SERVICE_IMPORT_STATUS}"
-        print(msg)
-        try:
-            log_info(msg)
-        except Exception:
-            pass
-        return ok
-    except Exception as exc:
-        msg = f"[PHASE1][KPatternService] smoke_test_failed｜{exc}"
-        print(msg)
-        try:
-            log_warning(msg)
-        except Exception:
-            pass
-        return False
-
-
 def bootstrap():
     if BOOTSTRAP_EVENT.is_set():
         db = DBManager(DB_PATH)
@@ -13755,13 +13004,6 @@ def main():
     app = AppUI(root, db)
     app.set_status(init_message)
 
-    # Phase 1：啟動後先做最小接入驗證。
-    # 此測試只驗證 service 呼叫鏈，不改變交易結果。
-    try:
-        run_kpattern_phase1_smoke_test()
-    except Exception as exc:
-        log_warning(f"[PHASE1][KPatternService] smoke test skipped: {exc}")
-
     def _close():
         log_info("application closing")
         db.close()
@@ -13777,5 +13019,4 @@ if __name__ == "__main__":
 
 # V9.5.6 MARGIN_INTEGRATED PATCH MARKER: external_margin + macro_margin_sentiment + DecisionLayer margin_score completed.
 # V9.6.2-R10 MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON MARKER
-# PHASE1 KPATTERN_SERVICE_INTEGRATED MARKER: safe import + smoke test only; no trading logic changed.
 # V9.5.8 DATA_INTEGRITY_PATCH MARKER: market_snapshot proxy blocked; only TWSE MI_INDEX official data can set data_ready=1.
