@@ -1152,6 +1152,21 @@ def _safe_num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Ser
     return pd.Series(dtype="float64")
 
 
+# PREBREAKOUT_FIX_20260523：避免 DataFrame.get(col, 0) 回傳純量 int 後呼叫 fillna() 當機。
+def _safe_numeric_series_for_df(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """Return a numeric Series aligned to df.index even when col is missing.
+
+    Root cause fixed:
+    pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0)
+    will crash when df.get(...) returns scalar int 0 because int has no fillna().
+    """
+    if isinstance(df, pd.DataFrame) and col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").fillna(default)
+    if isinstance(df, pd.DataFrame):
+        return pd.Series(default, index=df.index, dtype="float64")
+    return pd.Series(dtype="float64")
+
+
 def calculate_eps_ttm(price, pe, max_abs_eps: float = 100.0):
     """V9.5.4：以 TWSE BWIBBU_d 的收盤價 / 本益比反推 EPS_TTM。
 
@@ -3178,7 +3193,8 @@ class PreBreakoutIntegratedEngine:
         x=master.copy()
         for df in [price_cnt,eps_cnt,rev_cnt,inst_cnt]:
             if df is not None and not df.empty: x=x.merge(df,on="stock_id",how="left")
-        for c in ["price_history_days","eps_quarter_count","revenue_month_count","institutional_day_count"]: x[c]=pd.to_numeric(x.get(c,0),errors="coerce").fillna(0).astype(int)
+        for c in ["price_history_days","eps_quarter_count","revenue_month_count","institutional_day_count"]:
+            x[c]=_safe_numeric_series_for_df(x,c,0).astype(int)
         def _flag(r):
             gaps=[]
             if r["price_history_days"]<PREBREAKOUT_MIN_PRICE_HISTORY_DAYS: gaps.append("PRICE_HISTORY_LT120")
@@ -3205,9 +3221,10 @@ class PreBreakoutIntegratedEngine:
         x=tech.merge(master,on="stock_id",how="left")
         if qual is not None and not qual.empty: x=x.merge(qual[["stock_id","data_quality_flag","data_gap_reason","revenue_month_count","institutional_day_count","eps_quarter_count"]],on="stock_id",how="left")
         else: x["data_quality_flag"]="MISSING"; x["data_gap_reason"]="QUALITY_TABLE_MISSING"
-        for c in ["compression_score","volume_dry_score","trend_score"]: x[c]=pd.to_numeric(x.get(c,0),errors="coerce").fillna(0)
-        x["smart_money_score"]=np.where(pd.to_numeric(x.get("institutional_day_count",0),errors="coerce").fillna(0)>=3,60,40)
-        x["financial_score"]=np.where(pd.to_numeric(x.get("eps_quarter_count",0),errors="coerce").fillna(0)>=4,60,40)
+        for c in ["compression_score","volume_dry_score","trend_score"]:
+            x[c]=_safe_numeric_series_for_df(x,c,0)
+        x["smart_money_score"]=np.where(_safe_numeric_series_for_df(x,"institutional_day_count",0)>=3,60,40)
+        x["financial_score"]=np.where(_safe_numeric_series_for_df(x,"eps_quarter_count",0)>=4,60,40)
         theme_text=x.get("theme","").fillna("").astype(str)+" "+x.get("sub_theme","").fillna("").astype(str)+" "+x.get("industry","").fillna("").astype(str)
         x["theme_score"]=np.where(theme_text.str.contains("AI|ASIC|CPO|光通訊|矽光|散熱|液冷|電源|CoWoS|ABF",case=False,regex=True),80,50)
         x["prebreakout_total_score"]=(x["compression_score"]*.20+x["volume_dry_score"]*.20+x["trend_score"]*.15+x["smart_money_score"]*.15+x["theme_score"]*.20+x["financial_score"]*.10).round(2)
@@ -3217,7 +3234,7 @@ class PreBreakoutIntegratedEngine:
             if float(r["prebreakout_total_score"])>=PREBREAKOUT_WATCH_SCORE: return "WATCH"
             return "WAIT"
         x["decision"]=x.apply(_decision,axis=1)
-        close=pd.to_numeric(x["close"],errors="coerce").fillna(0); atr=pd.to_numeric(x.get("atr14",0),errors="coerce").fillna(0); trigger=pd.to_numeric(x.get("trigger_price",close),errors="coerce").fillna(close)
+        close=_safe_numeric_series_for_df(x,"close",0); atr=_safe_numeric_series_for_df(x,"atr14",0); trigger=_safe_numeric_series_for_df(x,"trigger_price",0).where(_safe_numeric_series_for_df(x,"trigger_price",0).ne(0), close)
         x["entry_price"]=np.where(x["decision"].isin(["BUY_TRIGGER","WATCH"]),np.maximum(close,trigger).round(2),np.nan); x["stop_loss"]=np.where(x["decision"].isin(["BUY_TRIGGER","WATCH"]),(close-np.maximum(atr*1.5,close*.05)).round(2),np.nan)
         x["target1"]=np.where(x["decision"].isin(["BUY_TRIGGER","WATCH"]),(x["entry_price"]+(x["entry_price"]-x["stop_loss"])*1.5).round(2),np.nan); x["target2"]=np.where(x["decision"].isin(["BUY_TRIGGER","WATCH"]),(x["entry_price"]+(x["entry_price"]-x["stop_loss"])*2.2).round(2),np.nan); x["rr"]=((x["target1"]-x["entry_price"])/(x["entry_price"]-x["stop_loss"]).replace(0,np.nan)).round(2)
         x.loc[(x["decision"].eq("BUY_TRIGGER"))&(x["rr"]<PREBREAKOUT_MIN_RR),"decision"]="WATCH"
