@@ -154,25 +154,6 @@ BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
 APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R10_MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON"
 
-
-# ============================================================
-# PRE-BREAKOUT SOP INTEGRATION PATCH
-# 目的：將「盤後DB建立」與「盤前爆發前股票分析」分離。
-# 盤後：建立/更新歷史資料與 feature cache。
-# 盤前：只讀 feature cache 與 signal table，不重算全市場。
-# ============================================================
-PREBREAKOUT_PATCH_VERSION = "PB_SOP_20260523_R1"
-PREBREAKOUT_MIN_PRICE_HISTORY_DAYS = 250
-PREBREAKOUT_MIN_REVENUE_MONTHS = 24
-PREBREAKOUT_MIN_INSTITUTIONAL_DAYS = 120
-PREBREAKOUT_MIN_EPS_QUARTERS = 8
-PREBREAKOUT_BUY_SCORE = 85.0
-PREBREAKOUT_WATCH_SCORE = 75.0
-PREBREAKOUT_MIN_RR = 1.5
-PREBREAKOUT_DECISIONS = ["WATCH", "BUY_TRIGGER", "SECOND_WAVE_BUY", "WAIT", "AVOID"]
-PREBREAKOUT_DATA_FLAGS = ["OK", "PARTIAL", "EPS_HISTORY_MISSING", "REVENUE_HISTORY_MISSING", "PRICE_HISTORY_LT250", "MISSING"]
-
-
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
 TWSE_OPENAPI_LICENSE_URL = "http://data.gov.tw/license"
@@ -234,6 +215,30 @@ AI_PORTFOLIO_FUTURE_TECH_KEYWORDS = [
     "AI", "AI伺服器", "ASIC", "CPO", "光模組", "光通訊", "矽光子", "散熱", "液冷", "電源", "HVDC",
     "機器人", "Edge", "邊緣", "AI-RAN", "6G", "網通", "資料中心", "半導體", "RISC-V", "先進封裝",
 ]
+
+
+# FIX10-P0：AI投資組合主表/各池報表必備交易計畫欄位。
+# 目的：補齊「買進下緣、買進上緣、停損、目標1、目標2、RR、風險旗標」，
+# 並讓 UI Treeview 可水平/垂直捲動查看完整欄位；TOP20 原雙引擎邏輯不受影響。
+AI_PORTFOLIO_DISPLAY_COLUMNS = [
+    ("portfolio_rank", "排序", 60),
+    ("stock_id", "代號", 80),
+    ("stock_name", "名稱", 120),
+    ("portfolio_pool", "池別", 120),
+    ("portfolio_score", "組合分", 85),
+    ("pool_quota", "配額", 65),
+    ("pool_weight", "權重", 65),
+    ("現價", "現價", 75),
+    ("買進下緣", "買進下緣", 90),
+    ("買進上緣", "買進上緣", 90),
+    ("停損", "停損", 80),
+    ("目標1", "目標1", 80),
+    ("目標2", "目標2", 80),
+    ("RR", "RR", 70),
+    ("風險旗標", "風險旗標", 100),
+    ("pool_reason", "入池原因", 260),
+]
+AI_PORTFOLIO_TRADE_COLUMNS = ["買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標"]
 
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1738,6 +1743,21 @@ DATA_DIR = EXTERNAL_DATA_DIR if (EXTERNAL_DATA_DIR / "stocks_master.csv").exists
 CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
+# PREBREAKOUT_UI_REPORT_PATCH：爆發前交易系統固定報表輸出位置
+PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_UI_REPORT_PATCH_20260523"
+PREBREAKOUT_REPORT_DIR = RUNTIME_DIR / "reports"
+PREBREAKOUT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+PREBREAKOUT_MIN_PRICE_HISTORY_DAYS = 120
+PREBREAKOUT_BUY_SCORE = 85.0
+PREBREAKOUT_WATCH_SCORE = 70.0
+PREBREAKOUT_MIN_RR = 1.5
+
+def get_prebreakout_report_path(date_str: str | None = None) -> Path:
+    """固定輸出：reports/prebreakout_premarket_YYYYMMDD.xlsx。"""
+    d = date_str or datetime.now().strftime("%Y%m%d")
+    PREBREAKOUT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    return PREBREAKOUT_REPORT_DIR / f"prebreakout_premarket_{d}.xlsx"
+
 LEGACY_DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
 DB_PATH = RUNTIME_DIR / "stock_system_v6_2.db"
 LEGACY_DB_PATH_V606 = RUNTIME_DIR / "stock_system_v6_0_6.db"
@@ -2375,249 +2395,77 @@ class DBManager:
             PRIMARY KEY(run_id, stock_id, source_rank)
         )
         """)
-
-        # ============================================================
-        # PRE-BREAKOUT SOP INTEGRATION PATCH：歷史資料 / Feature Cache / Signal 表
-        # 重要原則：external_valuation 只作估值快照；季度 EPS/三率不可放在快照表中硬算。
-        # ============================================================
+        # PREBREAKOUT_UI_REPORT_PATCH：爆發前交易系統歷史資料 / Feature Cache / Signal 資料表
         cur.execute("""
         CREATE TABLE IF NOT EXISTS quarterly_financial_history (
-            stock_id TEXT,
-            fiscal_year INTEGER,
-            quarter INTEGER,
-            fiscal_year_quarter TEXT,
-            western_quarter TEXT,
-            eps REAL,
-            gross_margin REAL,
-            operating_margin REAL,
-            net_margin REAL,
-            cfo REAL,
-            ni REAL,
-            fcf REAL,
-            source_url TEXT,
-            source_date TEXT,
-            update_time TEXT,
+            stock_id TEXT, fiscal_year INTEGER, quarter INTEGER, fiscal_year_quarter TEXT, western_quarter TEXT,
+            eps REAL, gross_margin REAL, operating_margin REAL, net_margin REAL, cfo REAL, ni REAL, fcf REAL,
+            source_url TEXT, source_date TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, fiscal_year, quarter)
         )
         """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS external_revenue_history (
-            stock_id TEXT,
-            revenue_month TEXT,
-            revenue REAL,
-            mom REAL,
-            yoy REAL,
-            cumulative_revenue REAL,
-            cumulative_yoy REAL,
-            source_url TEXT,
-            source_date TEXT,
-            update_time TEXT,
+            stock_id TEXT, revenue_month TEXT, revenue REAL, mom REAL, yoy REAL, cumulative_revenue REAL, cumulative_yoy REAL,
+            source_url TEXT, source_date TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, revenue_month)
         )
         """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS external_institutional_history (
-            stock_id TEXT,
-            trade_date TEXT,
-            foreign_buy_sell REAL,
-            trust_buy_sell REAL,
-            dealer_buy_sell REAL,
-            total_inst REAL,
-            source_url TEXT,
-            source_date TEXT,
-            update_time TEXT,
+            stock_id TEXT, trade_date TEXT, foreign_buy_sell REAL, trust_buy_sell REAL, dealer_buy_sell REAL, total_inst REAL,
+            source_url TEXT, source_date TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, trade_date)
         )
         """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS external_margin_history (
-            stock_id TEXT,
-            trade_date TEXT,
-            margin_balance REAL,
-            short_balance REAL,
-            margin_change REAL,
-            short_change REAL,
-            margin_utilization REAL,
-            retail_heat_score REAL,
-            source_url TEXT,
-            source_date TEXT,
-            update_time TEXT,
+            stock_id TEXT, trade_date TEXT, margin_balance REAL, short_balance REAL, margin_change REAL, short_change REAL,
+            margin_utilization REAL, retail_heat_score REAL, source_url TEXT, source_date TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, trade_date)
         )
         """)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS company_capital_profile (
-            stock_id TEXT PRIMARY KEY,
-            capital REAL,
-            shares_outstanding REAL,
-            market_cap REAL,
-            insider_holding REAL,
-            free_float REAL,
-            source_url TEXT,
-            source_date TEXT,
-            update_time TEXT
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS shareholding_distribution (
-            stock_id TEXT,
-            data_date TEXT,
-            holder_level TEXT,
-            holders_count REAL,
-            shares REAL,
-            ratio REAL,
-            big_holder_ratio REAL,
-            retail_holder_count REAL,
-            source_url TEXT,
-            source_date TEXT,
-            update_time TEXT,
-            PRIMARY KEY(stock_id, data_date, holder_level)
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS theme_map (
-            stock_id TEXT,
-            theme_version TEXT,
-            industry_node TEXT,
-            ai_node TEXT,
-            supply_chain_node TEXT,
-            upstream_event TEXT,
-            confidence_score REAL,
-            maintainer TEXT,
-            update_time TEXT,
-            PRIMARY KEY(stock_id, theme_version)
-        )
-        """)
-        cur.execute("""
         CREATE TABLE IF NOT EXISTS technical_feature_daily (
-            stock_id TEXT,
-            feature_date TEXT,
-            close REAL,
-            volume REAL,
-            vol_ma3 REAL,
-            vol_ma5 REAL,
-            vol_ma20 REAL,
-            ma50 REAL,
-            ma150 REAL,
-            ma200 REAL,
-            ma200_slope REAL,
-            bb_upper REAL,
-            bb_lower REAL,
-            bb_width REAL,
-            bb_width_pct120 REAL,
-            kc_upper REAL,
-            kc_lower REAL,
-            atr14 REAL,
-            atr60 REAL,
-            atr_compression INTEGER DEFAULT 0,
-            squeeze_on INTEGER DEFAULT 0,
-            vdu_days INTEGER DEFAULT 0,
-            obv REAL,
-            high20 REAL,
-            low20 REAL,
-            breakout_trigger INTEGER DEFAULT 0,
-            update_time TEXT,
-            PRIMARY KEY(stock_id, feature_date)
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS smart_money_feature_daily (
-            stock_id TEXT,
-            feature_date TEXT,
-            foreign_5d REAL,
-            trust_5d REAL,
-            inst_20d REAL,
-            institutional_score REAL,
-            margin_change_20d REAL,
-            margin_health_score REAL,
-            holder_concentration_score REAL,
-            data_quality_flag TEXT,
-            data_gap_reason TEXT,
-            update_time TEXT,
+            stock_id TEXT, feature_date TEXT, close REAL, volume REAL, ma50 REAL, ma150 REAL, ma200 REAL, ma200_slope REAL,
+            bb_width REAL, kc_width REAL, atr14 REAL, atr60 REAL, atr_compression REAL, squeeze_on INTEGER,
+            vdu_days INTEGER, volume_dry_score REAL, obv REAL, high20 REAL, breakout_trigger INTEGER, trigger_price REAL,
+            compression_score REAL, trend_score REAL, technical_ready INTEGER DEFAULT 0, update_time TEXT,
             PRIMARY KEY(stock_id, feature_date)
         )
         """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS financial_quality_status (
-            stock_id TEXT,
-            quality_date TEXT,
-            eps_quarter_count INTEGER DEFAULT 0,
-            revenue_month_count INTEGER DEFAULT 0,
-            institutional_day_count INTEGER DEFAULT 0,
-            price_history_day_count INTEGER DEFAULT 0,
-            data_quality_flag TEXT,
-            data_gap_reason TEXT,
-            update_time TEXT,
+            stock_id TEXT, quality_date TEXT, price_history_days INTEGER DEFAULT 0, eps_quarter_count INTEGER DEFAULT 0,
+            revenue_month_count INTEGER DEFAULT 0, institutional_day_count INTEGER DEFAULT 0,
+            data_quality_flag TEXT, data_gap_reason TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, quality_date)
         )
         """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS prebreakout_signal_daily (
-            stock_id TEXT,
-            signal_date TEXT,
-            stock_name TEXT,
-            market TEXT,
-            industry TEXT,
-            theme TEXT,
-            close REAL,
-            compression_score REAL,
-            volume_dry_score REAL,
-            trend_score REAL,
-            smart_money_score REAL,
-            industry_stage_score REAL,
-            supply_chain_score REAL,
-            momentum_score REAL,
-            financial_score REAL,
-            total_score REAL,
-            decision TEXT,
-            entry REAL,
-            stop REAL,
-            target1 REAL,
-            target2 REAL,
-            rr REAL,
-            trigger_price REAL,
-            data_quality_flag TEXT,
-            data_gap_reason TEXT,
-            evidence_json TEXT,
-            update_time TEXT,
+            stock_id TEXT, signal_date TEXT, stock_name TEXT, close REAL, prebreakout_total_score REAL,
+            compression_score REAL, volume_dry_score REAL, trend_score REAL, smart_money_score REAL, financial_score REAL, theme_score REAL,
+            decision TEXT, entry_price REAL, stop_loss REAL, target1 REAL, target2 REAL, rr REAL,
+            data_quality_flag TEXT, data_gap_reason TEXT, evidence_json TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, signal_date)
         )
         """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_plan_prebreakout (
-            stock_id TEXT,
-            plan_date TEXT,
-            stock_name TEXT,
-            decision TEXT,
-            close REAL,
-            entry REAL,
-            stop REAL,
-            target1 REAL,
-            target2 REAL,
-            rr REAL,
-            position_note TEXT,
-            risk_note TEXT,
-            data_quality_flag TEXT,
-            update_time TEXT,
+            stock_id TEXT, plan_date TEXT, stock_name TEXT, decision TEXT, entry_price REAL, stop_loss REAL, target1 REAL, target2 REAL, rr REAL,
+            position_note TEXT, risk_note TEXT, source_signal_date TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, plan_date)
         )
         """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS financial_backfill_log (
-            run_id TEXT,
-            quarter TEXT,
-            rows_count INTEGER,
-            eps_non_null INTEGER,
-            margin_non_null INTEGER,
-            source_url TEXT,
-            status TEXT,
-            missing_reason TEXT,
-            update_time TEXT
-        )
-        """)
-
         self._ensure_external_schema_columns(cur)
         for sql in [
+            "CREATE INDEX IF NOT EXISTS idx_qfh_stock_quarter ON quarterly_financial_history(stock_id, fiscal_year, quarter)",
+            "CREATE INDEX IF NOT EXISTS idx_revenue_history_stock_month ON external_revenue_history(stock_id, revenue_month)",
+            "CREATE INDEX IF NOT EXISTS idx_inst_history_stock_date ON external_institutional_history(stock_id, trade_date)",
+            "CREATE INDEX IF NOT EXISTS idx_margin_history_stock_date ON external_margin_history(stock_id, trade_date)",
+            "CREATE INDEX IF NOT EXISTS idx_technical_feature_date ON technical_feature_daily(feature_date)",
+            "CREATE INDEX IF NOT EXISTS idx_prebreakout_signal_date ON prebreakout_signal_daily(signal_date, decision, prebreakout_total_score)",
             "CREATE INDEX IF NOT EXISTS idx_system_run_log_run_id ON system_run_log(run_id)",
             "CREATE INDEX IF NOT EXISTS idx_system_run_log_event ON system_run_log(event, status)",
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_date ON trade_plan(plan_date)",
@@ -2631,12 +2479,6 @@ class DBManager:
             "CREATE INDEX IF NOT EXISTS idx_financial_feature_stock_date ON financial_feature_daily(stock_id, feature_date)",
             "CREATE INDEX IF NOT EXISTS idx_external_detail_module ON external_source_status_detail(module, source_key, source_date)",
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_gate_state ON trade_plan(trade_allowed, market_gate_state, flow_gate_state, fundamental_gate_state)",
-            "CREATE INDEX IF NOT EXISTS idx_qfh_stock_quarter ON quarterly_financial_history(stock_id, fiscal_year, quarter)",
-            "CREATE INDEX IF NOT EXISTS idx_rev_hist_stock_month ON external_revenue_history(stock_id, revenue_month)",
-            "CREATE INDEX IF NOT EXISTS idx_inst_hist_stock_date ON external_institutional_history(stock_id, trade_date)",
-            "CREATE INDEX IF NOT EXISTS idx_margin_hist_stock_date ON external_margin_history(stock_id, trade_date)",
-            "CREATE INDEX IF NOT EXISTS idx_tech_feature_date ON technical_feature_daily(feature_date)",
-            "CREATE INDEX IF NOT EXISTS idx_prebreakout_signal_date ON prebreakout_signal_daily(signal_date, decision, total_score)",
         ]:
             cur.execute(sql)
 
@@ -3093,7 +2935,7 @@ class DBManager:
                 return pd.DataFrame()
 
     def schema_check_df(self) -> pd.DataFrame:
-        required = ["stocks_master", "price_history", "ranking_result", "system_run_log", "external_data_log", "external_source_status", "market_snapshot", "external_revenue", "external_valuation", "financial_feature_daily", "external_dividend", "external_institutional", "external_margin", "external_event", "macro_module_score", "trade_plan"]
+        required = ["stocks_master", "price_history", "ranking_result", "system_run_log", "external_data_log", "external_source_status", "market_snapshot", "external_revenue", "external_valuation", "financial_feature_daily", "external_dividend", "external_institutional", "external_margin", "external_event", "macro_module_score", "trade_plan", "quarterly_financial_history", "external_revenue_history", "external_institutional_history", "external_margin_history", "technical_feature_daily", "financial_quality_status", "prebreakout_signal_daily", "trade_plan_prebreakout"]
         rows = []
         with self.lock:
             existing = {r[0] for r in self.conn.cursor().execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -3218,326 +3060,224 @@ class DBManager:
             return pd.read_sql_query(q, self.conn)
 
 
-# ============================================================
-# PRE-BREAKOUT SOP INTEGRATION PATCH：盤後DB建立 / 盤前只讀DB分析
-# ============================================================
 
-def normalize_fiscal_quarter(value: str) -> tuple[int | None, int | None, str, str]:
-    """季度格式標準化：支援 115/1、2026Q1、2026-Q1。"""
+def normalize_fiscal_quarter(value) -> tuple[int | None, int | None, str, str]:
+    """統一 114/4、2025Q4、2025-Q4、2025Q04 格式，避免SQL漏抓。"""
     s = str(value or "").strip().upper().replace(" ", "")
-    if not s:
+    if not s or s in ("NAN", "NONE", "<NA>"):
         return None, None, "", ""
-    m = re.match(r"^(\d{2,3})[/-]([1-4])$", s)
+    m = re.match(r"^(\d{2,3})/([1-4])$", s)
     if m:
-        fy = int(m.group(1)); q = int(m.group(2)); western_year = fy + 1911
-        return fy, q, f"{fy}/{q}", f"{western_year}Q{q}"
-    m = re.match(r"^(\d{4})[-/]?Q?([1-4])$", s)
+        fy = int(m.group(1)); q = int(m.group(2)); western = fy + 1911
+        return fy, q, f"{fy}/{q}", f"{western}Q{q}"
+    m = re.match(r"^(\d{4})[-/]?Q0?([1-4])$", s) or re.match(r"^(\d{4})[-/]?([1-4])$", s)
     if m:
-        western_year = int(m.group(1)); q = int(m.group(2)); fy = western_year - 1911
-        return fy, q, f"{fy}/{q}", f"{western_year}Q{q}"
-    return None, None, s, ""
-
-
-def _prebreakout_safe_float(v, default=np.nan):
-    try:
-        if v is None:
-            return default
-        if isinstance(v, str):
-            v = v.replace(',', '').replace('%', '').strip()
-            if v in ('', '-', '--', 'None', 'nan', 'NaN'):
-                return default
-        f = float(v)
-        return f if np.isfinite(f) else default
-    except Exception:
-        return default
+        western = int(m.group(1)); q = int(m.group(2)); fy = western - 1911
+        return fy, q, f"{fy}/{q}", f"{western}Q{q}"
+    return None, None, "", ""
 
 
 class PreBreakoutIntegratedEngine:
-    """爆發前股票偵測整合引擎。
+    """爆發前交易系統：盤後建立Feature/Signal，盤前只讀DB產報表。"""
 
-    使用方式：
-    1) 盤後：engine.run_after_market_db_build() 建立 technical_feature_daily / financial_quality_status / prebreakout_signal_daily。
-    2) 盤前：engine.run_premarket_analysis() 只讀 prebreakout_signal_daily，不重算全市場。
-    """
     def __init__(self, db: DBManager):
         self.db = db
 
-    def _read_sql(self, sql: str, params=None) -> pd.DataFrame:
-        with self.db.lock:
-            try:
-                return pd.read_sql_query(sql, self.db.conn, params=params or [])
-            except Exception as exc:
-                log_warning(f"[PREBREAKOUT] SQL讀取失敗：{exc} | {sql[:120]}")
-                return pd.DataFrame()
+    def _latest_feature_date(self) -> str:
+        try:
+            with self.db.lock:
+                row = self.db.conn.cursor().execute("SELECT MAX(date) FROM price_history").fetchone()
+            if row and row[0]:
+                return str(row[0])
+        except Exception:
+            pass
+        return datetime.now().strftime("%Y-%m-%d")
 
-    def _write_replace_by_date(self, table: str, df: pd.DataFrame, date_col: str, date_value: str):
-        if df is None or df.empty:
-            return 0
+    def _copy_snapshot_to_history_if_needed(self):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self.db.lock:
             cur = self.db.conn.cursor()
-            cur.execute(f"DELETE FROM {table} WHERE {date_col}=?", (date_value,))
-            df.to_sql(table, self.db.conn, if_exists="append", index=False)
+            try:
+                cnt = cur.execute("SELECT COUNT(*) FROM external_revenue_history").fetchone()[0]
+                if int(cnt or 0) == 0:
+                    cur.execute("""
+                        INSERT OR IGNORE INTO external_revenue_history(stock_id,revenue_month,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_date,update_time)
+                        SELECT stock_id,revenue_month,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_date,? FROM external_revenue
+                    """, (now,))
+            except Exception as exc:
+                log_warning(f"[PREBREAKOUT] revenue snapshot copy skipped: {exc}")
+            try:
+                cnt = cur.execute("SELECT COUNT(*) FROM external_institutional_history").fetchone()[0]
+                if int(cnt or 0) == 0:
+                    cur.execute("""
+                        INSERT OR IGNORE INTO external_institutional_history(stock_id,trade_date,foreign_buy_sell,trust_buy_sell,dealer_buy_sell,total_inst,source_date,update_time)
+                        SELECT stock_id,trade_date,foreign_buy_sell,trust_buy_sell,dealer_buy_sell,
+                               COALESCE(foreign_buy_sell,0)+COALESCE(trust_buy_sell,0)+COALESCE(dealer_buy_sell,0),source_date,?
+                        FROM external_institutional
+                    """, (now,))
+            except Exception as exc:
+                log_warning(f"[PREBREAKOUT] institutional snapshot copy skipped: {exc}")
+            try:
+                cnt = cur.execute("SELECT COUNT(*) FROM external_margin_history").fetchone()[0]
+                if int(cnt or 0) == 0:
+                    cur.execute("""
+                        INSERT OR IGNORE INTO external_margin_history(stock_id,trade_date,margin_balance,short_balance,margin_change,short_change,margin_utilization,retail_heat_score,source_date,update_time)
+                        SELECT stock_id,trade_date,margin_balance,short_balance,margin_change,short_change,margin_utilization,retail_heat_score,source_date,?
+                        FROM external_margin
+                    """, (now,))
+            except Exception as exc:
+                log_warning(f"[PREBREAKOUT] margin snapshot copy skipped: {exc}")
             self.db.conn.commit()
-        return len(df)
 
-    def build_technical_feature_daily(self, feature_date: str | None = None) -> pd.DataFrame:
-        feature_date = feature_date or self._read_sql("SELECT MAX(date) AS d FROM price_history").get("d", pd.Series([""])).iloc[0]
-        if not feature_date:
-            feature_date = datetime.now().strftime("%Y-%m-%d")
-        price = self._read_sql("SELECT stock_id,date,open,high,low,close,volume,turnover FROM price_history ORDER BY stock_id,date")
-        if price.empty:
-            return pd.DataFrame()
-        price["stock_id"] = price["stock_id"].astype(str).map(normalize_stock_id)
-        for c in ["open", "high", "low", "close", "volume", "turnover"]:
+    def build_technical_feature_daily(self, feature_date: str | None = None, log_cb=None) -> int:
+        feature_date = feature_date or self._latest_feature_date()
+        with self.db.lock:
+            price = pd.read_sql_query("SELECT stock_id,date,open,high,low,close,volume,turnover FROM price_history ORDER BY stock_id,date", self.db.conn)
+        if price is None or price.empty:
+            raise RuntimeError("price_history 無資料，請先執行歷史資料建立。")
+        for c in ["open", "high", "low", "close", "volume"]:
             price[c] = pd.to_numeric(price[c], errors="coerce")
-        price = price.dropna(subset=["stock_id", "date", "close"]).copy()
-        rows = []
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for sid, g in price.groupby("stock_id"):
-            g = g.sort_values("date").tail(max(PREBREAKOUT_MIN_PRICE_HISTORY_DAYS, 260)).copy()
-            if len(g) < 30:
-                continue
-            close = g["close"].astype(float)
-            high = g["high"].fillna(close).astype(float)
-            low = g["low"].fillna(close).astype(float)
-            vol = g["volume"].fillna(0).astype(float)
-            ma50 = close.rolling(50, min_periods=1).mean()
-            ma150 = close.rolling(150, min_periods=1).mean()
-            ma200 = close.rolling(200, min_periods=1).mean()
-            ma200_slope = ma200.diff(20)
-            mid = close.rolling(20, min_periods=5).mean()
-            std = close.rolling(20, min_periods=5).std()
-            bb_upper = mid + 2 * std
-            bb_lower = mid - 2 * std
-            bb_width = (bb_upper - bb_lower) / mid.replace(0, np.nan)
-            bb_width_rank = bb_width.rolling(120, min_periods=20).rank(pct=True)
-            prev_close = close.shift(1)
-            tr = pd.concat([(high-low).abs(), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
-            atr14 = tr.rolling(14, min_periods=1).mean()
-            atr60 = tr.rolling(60, min_periods=1).mean()
-            kc_mid = mid
-            kc_upper = kc_mid + 1.5 * atr14
-            kc_lower = kc_mid - 1.5 * atr14
-            squeeze_on = ((bb_upper < kc_upper) & (bb_lower > kc_lower)).astype(int)
-            vol_ma3 = vol.rolling(3, min_periods=1).mean()
-            vol_ma5 = vol.rolling(5, min_periods=1).mean()
-            vol_ma20 = vol.rolling(20, min_periods=1).mean()
-            vdu = (vol_ma3 < (vol_ma20 * 0.75)).astype(int)
-            vdu_days = int(vdu.tail(10).sum())
-            obv = (np.sign(close.diff().fillna(0)) * vol).cumsum()
-            high20 = high.shift(1).rolling(20, min_periods=5).max()
-            low20 = low.shift(1).rolling(20, min_periods=5).min()
-            breakout_trigger = int((close.iloc[-1] > (high20.iloc[-1] if pd.notna(high20.iloc[-1]) else np.inf)) and (vol.iloc[-1] > (vol_ma5.iloc[-1] * 1.8 if pd.notna(vol_ma5.iloc[-1]) else np.inf)))
-            rows.append({
-                "stock_id": sid, "feature_date": str(g["date"].iloc[-1]), "close": float(close.iloc[-1]), "volume": float(vol.iloc[-1]),
-                "vol_ma3": float(vol_ma3.iloc[-1]), "vol_ma5": float(vol_ma5.iloc[-1]), "vol_ma20": float(vol_ma20.iloc[-1]),
-                "ma50": float(ma50.iloc[-1]), "ma150": float(ma150.iloc[-1]), "ma200": float(ma200.iloc[-1]), "ma200_slope": float(ma200_slope.iloc[-1]) if pd.notna(ma200_slope.iloc[-1]) else np.nan,
-                "bb_upper": float(bb_upper.iloc[-1]) if pd.notna(bb_upper.iloc[-1]) else np.nan,
-                "bb_lower": float(bb_lower.iloc[-1]) if pd.notna(bb_lower.iloc[-1]) else np.nan,
-                "bb_width": float(bb_width.iloc[-1]) if pd.notna(bb_width.iloc[-1]) else np.nan,
-                "bb_width_pct120": float(bb_width_rank.iloc[-1]) if pd.notna(bb_width_rank.iloc[-1]) else np.nan,
-                "kc_upper": float(kc_upper.iloc[-1]) if pd.notna(kc_upper.iloc[-1]) else np.nan,
-                "kc_lower": float(kc_lower.iloc[-1]) if pd.notna(kc_lower.iloc[-1]) else np.nan,
-                "atr14": float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else np.nan,
-                "atr60": float(atr60.iloc[-1]) if pd.notna(atr60.iloc[-1]) else np.nan,
-                "atr_compression": int(pd.notna(atr14.iloc[-1]) and pd.notna(atr60.iloc[-1]) and atr14.iloc[-1] < atr60.iloc[-1] * 0.5),
-                "squeeze_on": int(squeeze_on.iloc[-1]), "vdu_days": vdu_days,
-                "obv": float(obv.iloc[-1]) if pd.notna(obv.iloc[-1]) else np.nan,
-                "high20": float(high20.iloc[-1]) if pd.notna(high20.iloc[-1]) else np.nan,
-                "low20": float(low20.iloc[-1]) if pd.notna(low20.iloc[-1]) else np.nan,
-                "breakout_trigger": breakout_trigger,
-                "update_time": now,
-            })
-        out = pd.DataFrame(rows)
-        if not out.empty:
-            self._write_replace_by_date("technical_feature_daily", out, "feature_date", str(out["feature_date"].max()))
-            log_info(f"[PREBREAKOUT][TECH_FEATURE] rows={len(out)} feature_date={out['feature_date'].max()}")
-        return out
+        rows=[]; total=int(price["stock_id"].nunique())
+        for idx,(sid,g) in enumerate(price.groupby("stock_id"), start=1):
+            g=g.dropna(subset=["close"]).sort_values("date").tail(260).copy()
+            if g.empty: continue
+            close=g["close"].astype(float); high=g["high"].fillna(close).astype(float); low=g["low"].fillna(close).astype(float); volume=g["volume"].fillna(0).astype(float)
+            ma20=close.rolling(20,min_periods=5).mean(); ma50=close.rolling(50,min_periods=20).mean(); ma150=close.rolling(150,min_periods=60).mean(); ma200=close.rolling(200,min_periods=80).mean()
+            std20=close.rolling(20,min_periods=10).std(); bb_width=((ma20+2*std20)-(ma20-2*std20))/ma20.replace(0,np.nan)
+            prev_close=close.shift(1); tr=pd.concat([(high-low).abs(),(high-prev_close).abs(),(low-prev_close).abs()],axis=1).max(axis=1)
+            atr14=tr.rolling(14,min_periods=5).mean(); atr60=tr.rolling(60,min_periods=20).mean(); kc_width=(atr14*4)/ma20.replace(0,np.nan)
+            squeeze_on=int(pd.notna(bb_width.iloc[-1]) and pd.notna(kc_width.iloc[-1]) and bb_width.iloc[-1] < kc_width.iloc[-1])
+            vol_ma20=volume.rolling(20,min_periods=5).mean(); vdu=(volume<(vol_ma20*0.65)).astype(int); vdu_days=int(vdu.tail(10).sum())
+            obv=(np.sign(close.diff().fillna(0))*volume).cumsum(); high20=high.rolling(20,min_periods=5).max()
+            last_close=float(close.iloc[-1]); last_high20=float(high20.iloc[-2]) if len(high20)>=2 and pd.notna(high20.iloc[-2]) else float(high20.iloc[-1])
+            breakout_trigger=int(last_close>last_high20 and volume.iloc[-1] > max(float(volume.tail(5).mean())*1.5,1.0))
+            compression_score=50.0
+            if pd.notna(bb_width.iloc[-1]):
+                rw=bb_width.tail(120).dropna()
+                if len(rw)>20:
+                    compression_score=round(max(0,min(100,(1.0-float((rw<=bb_width.iloc[-1]).mean()))*100)),2)
+            volume_dry_score=round(min(100.0, vdu_days*12.0 + (20.0 if volume.iloc[-1] < max(float(vol_ma20.iloc[-1] or 0),1.0) else 0.0)),2)
+            trend_ok=(pd.notna(ma50.iloc[-1]) and pd.notna(ma150.iloc[-1]) and pd.notna(ma200.iloc[-1]) and last_close>ma50.iloc[-1]>ma150.iloc[-1]>ma200.iloc[-1])
+            ma200_slope=float(ma200.iloc[-1]-ma200.iloc[-20]) if len(ma200.dropna())>=20 and pd.notna(ma200.iloc[-1]) and pd.notna(ma200.iloc[-20]) else np.nan
+            trend_score=90.0 if trend_ok and (not np.isfinite(ma200_slope) or ma200_slope>=0) else (60.0 if pd.notna(ma50.iloc[-1]) and last_close>ma50.iloc[-1] else 30.0)
+            rows.append({"stock_id":str(sid),"feature_date":feature_date,"close":last_close,"volume":float(volume.iloc[-1] or 0),"ma50":float(ma50.iloc[-1]) if pd.notna(ma50.iloc[-1]) else np.nan,"ma150":float(ma150.iloc[-1]) if pd.notna(ma150.iloc[-1]) else np.nan,"ma200":float(ma200.iloc[-1]) if pd.notna(ma200.iloc[-1]) else np.nan,"ma200_slope":ma200_slope,"bb_width":float(bb_width.iloc[-1]) if pd.notna(bb_width.iloc[-1]) else np.nan,"kc_width":float(kc_width.iloc[-1]) if pd.notna(kc_width.iloc[-1]) else np.nan,"atr14":float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else np.nan,"atr60":float(atr60.iloc[-1]) if pd.notna(atr60.iloc[-1]) else np.nan,"atr_compression":float(atr14.iloc[-1]/atr60.iloc[-1]) if pd.notna(atr14.iloc[-1]) and pd.notna(atr60.iloc[-1]) and atr60.iloc[-1] else np.nan,"squeeze_on":squeeze_on,"vdu_days":vdu_days,"volume_dry_score":volume_dry_score,"obv":float(obv.iloc[-1]) if pd.notna(obv.iloc[-1]) else np.nan,"high20":last_high20,"breakout_trigger":breakout_trigger,"trigger_price":last_high20,"compression_score":compression_score,"trend_score":trend_score,"technical_ready":1 if len(g)>=PREBREAKOUT_MIN_PRICE_HISTORY_DAYS else 0,"update_time":datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+            if log_cb and (idx%200==0 or idx==total): log_cb(f"[PREBREAKOUT][TECH] {idx}/{total} rows={len(rows)}")
+        out=pd.DataFrame(rows)
+        with self.db.lock:
+            self.db.conn.execute("DELETE FROM technical_feature_daily WHERE feature_date=?",(feature_date,)); out.to_sql("technical_feature_daily", self.db.conn, if_exists="append", index=False); self.db.conn.commit()
+        return int(len(out))
 
-    def build_financial_quality_status(self, quality_date: str | None = None) -> pd.DataFrame:
-        quality_date = quality_date or datetime.now().strftime("%Y-%m-%d")
-        master = self._read_sql("SELECT stock_id FROM stocks_master WHERE is_active=1")
-        if master.empty:
-            return pd.DataFrame()
-        master["stock_id"] = master["stock_id"].astype(str).map(normalize_stock_id)
-        counts = master.copy()
-        def count_table(table, col_expr, alias):
-            q = f"SELECT stock_id, COUNT(DISTINCT {col_expr}) AS {alias} FROM {table} GROUP BY stock_id"
-            return self._read_sql(q)
-        eps = count_table("quarterly_financial_history", "fiscal_year_quarter", "eps_quarter_count")
-        rev = count_table("external_revenue_history", "revenue_month", "revenue_month_count")
-        inst = count_table("external_institutional_history", "trade_date", "institutional_day_count")
-        ph = count_table("price_history", "date", "price_history_day_count")
-        for df in [eps, rev, inst, ph]:
-            if df is not None and not df.empty:
-                df["stock_id"] = df["stock_id"].astype(str).map(normalize_stock_id)
-                counts = counts.merge(df, on="stock_id", how="left")
-        for c in ["eps_quarter_count", "revenue_month_count", "institutional_day_count", "price_history_day_count"]:
-            if c not in counts.columns:
-                counts[c] = 0
-            counts[c] = pd.to_numeric(counts[c], errors="coerce").fillna(0).astype(int)
-        flags=[]; reasons=[]
-        for _, r in counts.iterrows():
-            missing=[]
-            if r["price_history_day_count"] < PREBREAKOUT_MIN_PRICE_HISTORY_DAYS: missing.append("PRICE_HISTORY_LT250")
-            if r["eps_quarter_count"] < PREBREAKOUT_MIN_EPS_QUARTERS: missing.append("EPS_HISTORY_MISSING")
-            if r["revenue_month_count"] < PREBREAKOUT_MIN_REVENUE_MONTHS: missing.append("REVENUE_HISTORY_MISSING")
-            if r["institutional_day_count"] < PREBREAKOUT_MIN_INSTITUTIONAL_DAYS: missing.append("FLOW_HISTORY_PARTIAL")
-            if not missing:
-                flags.append("OK"); reasons.append("")
-            elif r["price_history_day_count"] < PREBREAKOUT_MIN_PRICE_HISTORY_DAYS:
-                flags.append("MISSING"); reasons.append(";".join(missing))
-            else:
-                flags.append("PARTIAL"); reasons.append(";".join(missing))
-        counts["quality_date"] = quality_date
-        counts["data_quality_flag"] = flags
-        counts["data_gap_reason"] = reasons
-        counts["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cols = ["stock_id","quality_date","eps_quarter_count","revenue_month_count","institutional_day_count","price_history_day_count","data_quality_flag","data_gap_reason","update_time"]
-        out = counts[cols]
-        self._write_replace_by_date("financial_quality_status", out, "quality_date", quality_date)
-        log_info(f"[PREBREAKOUT][QUALITY] rows={len(out)} quality_date={quality_date}")
-        return out
+    def build_financial_quality_status(self, quality_date: str | None = None, log_cb=None) -> int:
+        quality_date=quality_date or self._latest_feature_date(); self._copy_snapshot_to_history_if_needed()
+        with self.db.lock:
+            master=pd.read_sql_query("SELECT stock_id FROM stocks_master WHERE is_active=1", self.db.conn)
+            price_cnt=pd.read_sql_query("SELECT stock_id, COUNT(*) price_history_days FROM price_history GROUP BY stock_id", self.db.conn)
+            eps_cnt=pd.read_sql_query("SELECT stock_id, COUNT(*) eps_quarter_count FROM quarterly_financial_history WHERE eps IS NOT NULL GROUP BY stock_id", self.db.conn)
+            rev_cnt=pd.read_sql_query("SELECT stock_id, COUNT(*) revenue_month_count FROM external_revenue_history GROUP BY stock_id", self.db.conn)
+            inst_cnt=pd.read_sql_query("SELECT stock_id, COUNT(*) institutional_day_count FROM external_institutional_history GROUP BY stock_id", self.db.conn)
+        x=master.copy()
+        for df in [price_cnt,eps_cnt,rev_cnt,inst_cnt]:
+            if df is not None and not df.empty: x=x.merge(df,on="stock_id",how="left")
+        for c in ["price_history_days","eps_quarter_count","revenue_month_count","institutional_day_count"]: x[c]=pd.to_numeric(x.get(c,0),errors="coerce").fillna(0).astype(int)
+        def _flag(r):
+            gaps=[]
+            if r["price_history_days"]<PREBREAKOUT_MIN_PRICE_HISTORY_DAYS: gaps.append("PRICE_HISTORY_LT120")
+            if r["eps_quarter_count"]<4: gaps.append("EPS_HISTORY_MISSING")
+            if r["revenue_month_count"]<3: gaps.append("REVENUE_HISTORY_MISSING")
+            if r["institutional_day_count"]<3: gaps.append("FLOW_HISTORY_MISSING")
+            if not gaps: return "OK",""
+            if r["price_history_days"]>=PREBREAKOUT_MIN_PRICE_HISTORY_DAYS and len(gaps)<=2: return "PARTIAL",";".join(gaps)
+            return "MISSING",";".join(gaps)
+        flags=x.apply(_flag,axis=1); x["data_quality_flag"]=[v[0] for v in flags]; x["data_gap_reason"]=[v[1] for v in flags]; x["quality_date"]=quality_date; x["update_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        keep=["stock_id","quality_date","price_history_days","eps_quarter_count","revenue_month_count","institutional_day_count","data_quality_flag","data_gap_reason","update_time"]
+        with self.db.lock:
+            self.db.conn.execute("DELETE FROM financial_quality_status WHERE quality_date=?",(quality_date,)); x[keep].to_sql("financial_quality_status", self.db.conn, if_exists="append", index=False); self.db.conn.commit()
+        if log_cb: log_cb(f"[PREBREAKOUT][QUALITY] rows={len(x)} OK={int((x['data_quality_flag']=='OK').sum())} PARTIAL={int((x['data_quality_flag']=='PARTIAL').sum())} MISSING={int((x['data_quality_flag']=='MISSING').sum())}")
+        return int(len(x))
 
-    def build_prebreakout_signal_daily(self, signal_date: str | None = None) -> pd.DataFrame:
-        signal_date = signal_date or self._read_sql("SELECT MAX(feature_date) AS d FROM technical_feature_daily").get("d", pd.Series([""])).iloc[0]
-        if not signal_date:
-            signal_date = datetime.now().strftime("%Y-%m-%d")
-        tech = self._read_sql("SELECT * FROM technical_feature_daily WHERE feature_date=(SELECT MAX(feature_date) FROM technical_feature_daily)")
-        if tech.empty:
-            return pd.DataFrame()
-        master = self._read_sql("SELECT stock_id,stock_name,market,industry,theme FROM stocks_master")
-        q = self._read_sql("SELECT * FROM financial_quality_status WHERE quality_date=(SELECT MAX(quality_date) FROM financial_quality_status)")
-        fin = self._read_sql("SELECT * FROM financial_feature_daily WHERE feature_date=(SELECT MAX(feature_date) FROM financial_feature_daily)")
-        for df in [tech, master, q, fin]:
-            if df is not None and not df.empty and "stock_id" in df.columns:
-                df["stock_id"] = df["stock_id"].astype(str).map(normalize_stock_id)
-        x = tech.merge(master, on="stock_id", how="left")
-        if not q.empty:
-            x = x.merge(q[["stock_id","data_quality_flag","data_gap_reason"]], on="stock_id", how="left")
-        else:
-            x["data_quality_flag"]="PARTIAL"; x["data_gap_reason"]="QUALITY_STATUS_MISSING"
-        if not fin.empty:
-            use_cols=[c for c in ["stock_id","revenue_eps_score","financial_score","eps_category","matrix_cell"] if c in fin.columns]
-            x=x.merge(fin[use_cols],on="stock_id",how="left")
-        # scores
-        def clamp(v):
-            try: return max(0.0, min(100.0, float(v)))
-            except Exception: return 0.0
-        rows=[]
-        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for _,r in x.iterrows():
-            close=_prebreakout_safe_float(r.get("close"), np.nan)
-            ma50=_prebreakout_safe_float(r.get("ma50"), np.nan); ma150=_prebreakout_safe_float(r.get("ma150"), np.nan); ma200=_prebreakout_safe_float(r.get("ma200"), np.nan)
-            trend_ok = np.isfinite(close) and np.isfinite(ma50) and np.isfinite(ma150) and np.isfinite(ma200) and close>ma50>ma150>ma200 and _prebreakout_safe_float(r.get("ma200_slope"),0)>0
-            trend_score = 100.0 if trend_ok else (55.0 if np.isfinite(close) and np.isfinite(ma200) and close>ma200 else 20.0)
-            bb_pct=_prebreakout_safe_float(r.get("bb_width_pct120"), np.nan)
-            squeeze=int(_prebreakout_safe_float(r.get("squeeze_on"),0) or 0)
-            atr_comp=int(_prebreakout_safe_float(r.get("atr_compression"),0) or 0)
-            compression_score=clamp((100 if squeeze else 0)*0.45 + (100*(1-bb_pct) if np.isfinite(bb_pct) else 40)*0.40 + (100 if atr_comp else 20)*0.15)
-            vdu_days=_prebreakout_safe_float(r.get("vdu_days"),0)
-            volume_dry_score=clamp(min(vdu_days,10)*10)
-            financial_score=clamp(r.get("financial_score", r.get("revenue_eps_score",50)) if pd.notna(r.get("financial_score", np.nan)) else r.get("revenue_eps_score",50))
-            industry_text=f"{r.get('industry','')} {r.get('theme','')} {r.get('stock_name','')}"
-            theme_hit=bool(re.search(r"AI|ASIC|CPO|光通訊|矽光子|CoWoS|ABF|電源|HVDC|液冷|散熱|伺服器", industry_text, re.I))
-            industry_stage_score=85.0 if theme_hit else 50.0
-            supply_chain_score=80.0 if theme_hit else 45.0
-            momentum_score=80.0 if int(_prebreakout_safe_float(r.get("breakout_trigger"),0) or 0)==1 else 50.0
-            smart_money_score=50.0
-            total=round(compression_score*0.20+volume_dry_score*0.20+trend_score*0.15+smart_money_score*0.15+industry_stage_score*0.10+supply_chain_score*0.10+momentum_score*0.05+financial_score*0.05,2)
-            high20=_prebreakout_safe_float(r.get("high20"), np.nan); low20=_prebreakout_safe_float(r.get("low20"), np.nan); atr14=_prebreakout_safe_float(r.get("atr14"), np.nan)
-            entry = high20 if np.isfinite(high20) else close
-            stop = min(low20, close - 1.5*atr14) if np.isfinite(low20) and np.isfinite(atr14) else (close*0.93 if np.isfinite(close) else np.nan)
-            risk = entry-stop if np.isfinite(entry) and np.isfinite(stop) else np.nan
-            target1 = entry + risk*1.5 if np.isfinite(risk) else np.nan
-            target2 = entry + risk*2.5 if np.isfinite(risk) else np.nan
-            rr = (target1-entry)/risk if np.isfinite(risk) and risk>0 else np.nan
-            quality=str(r.get("data_quality_flag") or "PARTIAL")
-            gap=str(r.get("data_gap_reason") or "")
-            trigger=int(_prebreakout_safe_float(r.get("breakout_trigger"),0) or 0)
-            if quality == "MISSING" or not trend_ok:
-                decision="AVOID" if quality=="MISSING" else "WAIT"
-            elif trigger and total>=PREBREAKOUT_BUY_SCORE and np.isfinite(rr) and rr>=PREBREAKOUT_MIN_RR:
-                decision="BUY_TRIGGER"
-            elif total>=PREBREAKOUT_BUY_SCORE and volume_dry_score>=50 and compression_score>=70:
-                decision="SECOND_WAVE_BUY"
-            elif total>=PREBREAKOUT_WATCH_SCORE:
-                decision="WATCH"
-            else:
-                decision="WAIT"
-            evidence={"trend_ok": bool(trend_ok), "squeeze_on": bool(squeeze), "vdu_days": int(vdu_days), "breakout_trigger": bool(trigger), "patch": PREBREAKOUT_PATCH_VERSION}
-            rows.append({
-                "stock_id": r.get("stock_id"), "signal_date": signal_date, "stock_name": r.get("stock_name",""), "market": r.get("market",""), "industry": r.get("industry",""), "theme": r.get("theme",""), "close": close,
-                "compression_score": compression_score, "volume_dry_score": volume_dry_score, "trend_score": trend_score, "smart_money_score": smart_money_score, "industry_stage_score": industry_stage_score, "supply_chain_score": supply_chain_score, "momentum_score": momentum_score, "financial_score": financial_score,
-                "total_score": total, "decision": decision, "entry": entry, "stop": stop, "target1": target1, "target2": target2, "rr": rr, "trigger_price": entry, "data_quality_flag": quality, "data_gap_reason": gap, "evidence_json": json.dumps(evidence, ensure_ascii=False), "update_time": now
-            })
-        out=pd.DataFrame(rows).sort_values(["decision","total_score"], ascending=[True,False])
-        self._write_replace_by_date("prebreakout_signal_daily", out, "signal_date", signal_date)
-        plan=out[out["decision"].isin(["BUY_TRIGGER","SECOND_WAVE_BUY","WATCH"])].copy()
-        if not plan.empty:
-            plan2=pd.DataFrame({"stock_id":plan["stock_id"],"plan_date":signal_date,"stock_name":plan["stock_name"],"decision":plan["decision"],"close":plan["close"],"entry":plan["entry"],"stop":plan["stop"],"target1":plan["target1"],"target2":plan["target2"],"rr":plan["rr"],"position_note":np.where(plan["decision"].eq("WATCH"),"觀察不重倉","符合爆發前SOP，依觸發價執行"),"risk_note":plan["data_gap_reason"],"data_quality_flag":plan["data_quality_flag"],"update_time":now})
-            self._write_replace_by_date("trade_plan_prebreakout", plan2, "plan_date", signal_date)
-        log_info(f"[PREBREAKOUT][SIGNAL] rows={len(out)} signal_date={signal_date}")
-        return out
+    def build_prebreakout_signal_daily(self, signal_date: str | None = None, log_cb=None) -> int:
+        signal_date=signal_date or self._latest_feature_date()
+        with self.db.lock:
+            tech=pd.read_sql_query("SELECT * FROM technical_feature_daily WHERE feature_date=(SELECT MAX(feature_date) FROM technical_feature_daily)", self.db.conn)
+            qual=pd.read_sql_query("SELECT * FROM financial_quality_status WHERE quality_date=(SELECT MAX(quality_date) FROM financial_quality_status)", self.db.conn)
+            master=pd.read_sql_query("SELECT stock_id, stock_name, industry, theme, sub_theme FROM stocks_master WHERE is_active=1", self.db.conn)
+        if tech is None or tech.empty: raise RuntimeError("technical_feature_daily 無資料，請先執行爆發前盤後DB建立。")
+        x=tech.merge(master,on="stock_id",how="left")
+        if qual is not None and not qual.empty: x=x.merge(qual[["stock_id","data_quality_flag","data_gap_reason","revenue_month_count","institutional_day_count","eps_quarter_count"]],on="stock_id",how="left")
+        else: x["data_quality_flag"]="MISSING"; x["data_gap_reason"]="QUALITY_TABLE_MISSING"
+        for c in ["compression_score","volume_dry_score","trend_score"]: x[c]=pd.to_numeric(x.get(c,0),errors="coerce").fillna(0)
+        x["smart_money_score"]=np.where(pd.to_numeric(x.get("institutional_day_count",0),errors="coerce").fillna(0)>=3,60,40)
+        x["financial_score"]=np.where(pd.to_numeric(x.get("eps_quarter_count",0),errors="coerce").fillna(0)>=4,60,40)
+        theme_text=x.get("theme","").fillna("").astype(str)+" "+x.get("sub_theme","").fillna("").astype(str)+" "+x.get("industry","").fillna("").astype(str)
+        x["theme_score"]=np.where(theme_text.str.contains("AI|ASIC|CPO|光通訊|矽光|散熱|液冷|電源|CoWoS|ABF",case=False,regex=True),80,50)
+        x["prebreakout_total_score"]=(x["compression_score"]*.20+x["volume_dry_score"]*.20+x["trend_score"]*.15+x["smart_money_score"]*.15+x["theme_score"]*.20+x["financial_score"]*.10).round(2)
+        def _decision(r):
+            if int(r.get("technical_ready",0) or 0)!=1 or str(r.get("data_quality_flag",''))=="MISSING": return "WAIT"
+            if int(r.get("breakout_trigger",0) or 0)==1 and float(r["prebreakout_total_score"])>=PREBREAKOUT_BUY_SCORE: return "BUY_TRIGGER"
+            if float(r["prebreakout_total_score"])>=PREBREAKOUT_WATCH_SCORE: return "WATCH"
+            return "WAIT"
+        x["decision"]=x.apply(_decision,axis=1)
+        close=pd.to_numeric(x["close"],errors="coerce").fillna(0); atr=pd.to_numeric(x.get("atr14",0),errors="coerce").fillna(0); trigger=pd.to_numeric(x.get("trigger_price",close),errors="coerce").fillna(close)
+        x["entry_price"]=np.where(x["decision"].isin(["BUY_TRIGGER","WATCH"]),np.maximum(close,trigger).round(2),np.nan); x["stop_loss"]=np.where(x["decision"].isin(["BUY_TRIGGER","WATCH"]),(close-np.maximum(atr*1.5,close*.05)).round(2),np.nan)
+        x["target1"]=np.where(x["decision"].isin(["BUY_TRIGGER","WATCH"]),(x["entry_price"]+(x["entry_price"]-x["stop_loss"])*1.5).round(2),np.nan); x["target2"]=np.where(x["decision"].isin(["BUY_TRIGGER","WATCH"]),(x["entry_price"]+(x["entry_price"]-x["stop_loss"])*2.2).round(2),np.nan); x["rr"]=((x["target1"]-x["entry_price"])/(x["entry_price"]-x["stop_loss"]).replace(0,np.nan)).round(2)
+        x.loc[(x["decision"].eq("BUY_TRIGGER"))&(x["rr"]<PREBREAKOUT_MIN_RR),"decision"]="WATCH"
+        x["signal_date"]=signal_date; x["update_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        x["evidence_json"]=x.apply(lambda r: json.dumps({"compression_score":float(r.get("compression_score",0) or 0),"volume_dry_score":float(r.get("volume_dry_score",0) or 0),"trend_score":float(r.get("trend_score",0) or 0),"breakout_trigger":int(r.get("breakout_trigger",0) or 0),"trigger_price":float(r.get("trigger_price",0) or 0),"data_quality_flag":str(r.get("data_quality_flag","")),"data_gap_reason":str(r.get("data_gap_reason",""))},ensure_ascii=False),axis=1)
+        keep=["stock_id","signal_date","stock_name","close","prebreakout_total_score","compression_score","volume_dry_score","trend_score","smart_money_score","financial_score","theme_score","decision","entry_price","stop_loss","target1","target2","rr","data_quality_flag","data_gap_reason","evidence_json","update_time"]
+        out=x[keep].copy()
+        with self.db.lock:
+            self.db.conn.execute("DELETE FROM prebreakout_signal_daily WHERE signal_date=?",(signal_date,)); out.to_sql("prebreakout_signal_daily", self.db.conn, if_exists="append", index=False)
+            self.db.conn.execute("DELETE FROM trade_plan_prebreakout WHERE plan_date=?",(signal_date,))
+            plan=out[out["decision"].isin(["BUY_TRIGGER","WATCH"])].copy()
+            if not plan.empty:
+                plan["plan_date"]=signal_date; plan["position_note"]=np.where(plan["decision"].eq("BUY_TRIGGER"),"突破觸發可小倉/依策略執行","觀察，等量價確認"); plan["risk_note"]="跌破停損或突破失敗降級"; plan["source_signal_date"]=signal_date
+                plan[["stock_id","plan_date","stock_name","decision","entry_price","stop_loss","target1","target2","rr","position_note","risk_note","source_signal_date","update_time"]].to_sql("trade_plan_prebreakout", self.db.conn, if_exists="append", index=False)
+            self.db.conn.commit()
+        if log_cb: log_cb(f"[PREBREAKOUT][SIGNAL] rows={len(out)} decision={out['decision'].value_counts().to_dict()}")
+        return int(len(out))
 
-    def run_after_market_db_build(self, as_of_date: str | None = None) -> dict:
-        """盤後批次：建立 Feature Cache + Signal。"""
-        run_id = self.db.log_system_run(event="prebreakout_after_market_build", status="start", module="prebreakout", message="盤後建立爆發前股票feature cache")
-        t0=time.time()
-        tech=self.build_technical_feature_daily(as_of_date)
-        q=self.build_financial_quality_status(as_of_date or (str(tech["feature_date"].max()) if not tech.empty else None))
-        sig=self.build_prebreakout_signal_daily(as_of_date or (str(tech["feature_date"].max()) if not tech.empty else None))
-        duration=(time.time()-t0)*1000
-        self.db.log_system_run(event="prebreakout_after_market_build", status="ok", module="prebreakout", run_id=run_id, duration_ms=duration, message=f"technical={len(tech)} quality={len(q)} signals={len(sig)}")
-        return {"run_id": run_id, "technical_rows": len(tech), "quality_rows": len(q), "signal_rows": len(sig), "duration_ms": round(duration,2)}
+    def run_after_market_builder(self, log_cb=None) -> dict:
+        run_id=self.db.log_system_run(event="prebreakout_after_market_builder",status="start",message="start",module="prebreakout")
+        feature_date=self._latest_feature_date(); tech=self.build_technical_feature_daily(feature_date,log_cb); quality=self.build_financial_quality_status(feature_date,log_cb); signal=self.build_prebreakout_signal_daily(feature_date,log_cb)
+        self.db.log_system_run(event="prebreakout_after_market_builder",status="ok",message=f"tech={tech}, quality={quality}, signal={signal}",run_id=run_id,module="prebreakout")
+        return {"run_id":run_id,"feature_date":feature_date,"technical_rows":tech,"quality_rows":quality,"signal_rows":signal}
 
-    def run_premarket_analysis(self, signal_date: str | None = None, limit: int = 100) -> pd.DataFrame:
-        """盤前分析：只讀昨晚 signal table，不重算全市場。"""
-        where=""
-        params=[]
-        if signal_date:
-            where="WHERE signal_date=?"; params=[signal_date]
-        q=f"""
-        SELECT * FROM prebreakout_signal_daily
-        {where if where else 'WHERE signal_date=(SELECT MAX(signal_date) FROM prebreakout_signal_daily)'}
-        ORDER BY CASE decision WHEN 'BUY_TRIGGER' THEN 1 WHEN 'SECOND_WAVE_BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'WAIT' THEN 4 ELSE 5 END, total_score DESC
-        LIMIT {int(limit)}
-        """
-        return self._read_sql(q, params)
+    def get_latest_signals(self) -> pd.DataFrame:
+        with self.db.lock:
+            return pd.read_sql_query("""
+                SELECT * FROM prebreakout_signal_daily
+                WHERE signal_date=(SELECT MAX(signal_date) FROM prebreakout_signal_daily)
+                ORDER BY CASE decision WHEN 'BUY_TRIGGER' THEN 1 WHEN 'SECOND_WAVE_BUY' THEN 2 WHEN 'WATCH' THEN 3 ELSE 9 END, prebreakout_total_score DESC
+            """, self.db.conn)
 
-    def export_premarket_excel(self, output_path: str | Path | None = None, limit: int = 200) -> Path:
-        df=self.run_premarket_analysis(limit=limit)
-        output_path=Path(output_path or (RUNTIME_DIR / f"prebreakout_premarket_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"))
-        engine=available_excel_engine()
-        if engine:
-            with pd.ExcelWriter(output_path, engine=engine) as writer:
-                df.to_excel(writer, sheet_name="爆發前候選股", index=False)
-                if not df.empty:
-                    summary=df.groupby("decision").size().reset_index(name="count")
-                    summary.to_excel(writer, sheet_name="決策統計", index=False)
-        else:
-            output_path=output_path.with_suffix(".csv")
-            df.to_csv(output_path, index=False, encoding="utf-8-sig")
-        return output_path
+    def export_premarket_excel(self, output_dir: Path | None = None, log_cb=None) -> Path:
+        output_dir=Path(output_dir or PREBREAKOUT_REPORT_DIR); output_dir.mkdir(parents=True,exist_ok=True); df=self.get_latest_signals()
+        if df is None or df.empty: raise RuntimeError("prebreakout_signal_daily 無資料，請先執行爆發前盤後DB建立。")
+        report_date=str(df["signal_date"].dropna().astype(str).max()).replace("-",""); out_path=output_dir / f"prebreakout_premarket_{report_date}.xlsx"
+        stat=df["decision"].value_counts().reset_index(); stat.columns=["decision","count"]; candidates=df[df["decision"].isin(["BUY_TRIGGER","SECOND_WAVE_BUY","WATCH"])].copy(); gaps=df[df["data_quality_flag"].fillna("").astype(str).ne("OK")][["stock_id","stock_name","data_quality_flag","data_gap_reason"]].copy()
+        out_path,kind=write_table_bundle(out_path.with_suffix(""),{"爆發前候選股": candidates if not candidates.empty else df.head(100),"決策統計": stat,"資料不足清單": gaps,"全部Signal": df},preferred="excel")
+        if log_cb: log_cb(f"[PREBREAKOUT][REPORT] {kind} 已輸出：{out_path}")
+        return Path(out_path)
 
 
-def run_prebreakout_after_market_builder(db_path: Path = DB_PATH) -> dict:
-    db = DBManager(db_path)
+def run_prebreakout_after_market_builder(db: DBManager | None = None, log_cb=None, progress_cb=None) -> dict:
+    close_after=False
+    if db is None:
+        db=DBManager(DB_PATH); db.init_db(); close_after=True
     try:
-        db.init_db()
-        return PreBreakoutIntegratedEngine(db).run_after_market_db_build()
+        return PreBreakoutIntegratedEngine(db).run_after_market_builder(log_cb=log_cb)
     finally:
-        db.close()
+        if close_after: db.close()
 
 
-def run_prebreakout_premarket_analyzer(db_path: Path = DB_PATH, output_path: str | Path | None = None) -> Path:
-    db = DBManager(db_path)
+def run_prebreakout_premarket_analyzer(db: DBManager | None = None, output_dir: Path | None = None, log_cb=None) -> Path:
+    close_after=False
+    if db is None:
+        db=DBManager(DB_PATH); db.init_db(); close_after=True
     try:
-        db.init_db()
-        return PreBreakoutIntegratedEngine(db).export_premarket_excel(output_path=output_path)
+        return PreBreakoutIntegratedEngine(db).export_premarket_excel(output_dir=output_dir or PREBREAKOUT_REPORT_DIR, log_cb=log_cb)
     finally:
-        db.close()
-
+        if close_after: db.close()
 
 class DataEngine:
     def __init__(self, db: DBManager):
@@ -9727,6 +9467,8 @@ class AppUI:
         self.last_unique_decision_df = pd.DataFrame()
         self.last_ai_portfolio_tables = {}
         self.last_ai_portfolio_df = pd.DataFrame()
+        self.last_prebreakout_report_path = None
+        self.last_prebreakout_df = pd.DataFrame()
         self.ai_portfolio_vars = {}
         self.ai_portfolio_quota_vars = {}
         self.ai_portfolio_weight_vars = {}
@@ -9983,6 +9725,9 @@ class AppUI:
             "重建排行",
             "更新分類檔",
             "外部資料監控中心",
+            "爆發前盤後DB建立",
+            "產生爆發前盤前報表",
+            "開啟爆發前報表",
             "同步外部資料",
             "重整外部資料狀態顯示",
             "查看外部原始資料",
@@ -9997,7 +9742,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "AI投資組合", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "AI投資組合", "爆發前報表", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -10006,6 +9751,13 @@ class AppUI:
         self.btn_export_excel.pack(side="left", padx=4)
         self.btn_open_chart = ttk.Button(row2, text="開啟圖表", command=self.open_current_chart)
         self.btn_open_chart.pack(side="left", padx=4)
+        # PREBREAKOUT_UI_REPORT_PATCH：爆發前交易系統三個直接入口
+        self.btn_prebreakout_build = ttk.Button(row2, text="爆發盤後DB", command=self.on_prebreakout_after_market_build)
+        self.btn_prebreakout_build.pack(side="left", padx=4)
+        self.btn_prebreakout_report = ttk.Button(row2, text="爆發盤前報表", command=self.on_prebreakout_premarket_report)
+        self.btn_prebreakout_report.pack(side="left", padx=4)
+        self.btn_prebreakout_open = ttk.Button(row2, text="開啟爆發報表", command=self.on_open_prebreakout_report)
+        self.btn_prebreakout_open.pack(side="left", padx=4)
         self.multi_window_chk = ttk.Checkbutton(row2, text="左主區＋右上分析＋右下圖表/Log", variable=self.multi_window_var)
         self.multi_window_chk.state(["selected", "disabled"])
         self.multi_window_chk.pack(side="left", padx=(8, 2))
@@ -10035,6 +9787,7 @@ class AppUI:
         self.tab_theme = ttk.Frame(self.left_notebook)
         self.tab_top20 = ttk.Frame(self.left_notebook)
         self.tab_ai_portfolio = ttk.Frame(self.left_notebook)
+        self.tab_prebreakout = ttk.Frame(self.left_notebook)
         self.tab_top5 = ttk.Frame(self.left_notebook)
         self.tab_unique = ttk.Frame(self.left_notebook)
         self.tab_order = ttk.Frame(self.left_notebook)
@@ -10050,6 +9803,7 @@ class AppUI:
         self.left_notebook.add(self.tab_theme, text="題材輪動")
         self.left_notebook.add(self.tab_top20, text="強勢候選20")
         self.left_notebook.add(self.tab_ai_portfolio, text="AI投資組合")
+        self.left_notebook.add(self.tab_prebreakout, text="爆發前雷達")
         self.left_notebook.add(self.tab_top5, text="主攻5")
         self.left_notebook.add(self.tab_unique, text="唯一決策")
         self.left_notebook.add(self.tab_order, text="執行下單清單")
@@ -10090,10 +9844,18 @@ class AppUI:
         })
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
+        self._build_prebreakout_tab()
+
         self._build_ai_portfolio_controls()
-        self.ai_portfolio_tree = self._make_tree(self.tab_ai_portfolio, ("rank", "id", "name", "pool", "score", "quota", "weight", "price", "total", "ai", "rr", "reason"), {
-            "rank": "排序", "id": "代號", "name": "名稱", "pool": "池別", "score": "組合分", "quota": "配額", "weight": "權重", "price": "現價", "total": "總分", "ai": "AI分", "rr": "RR", "reason": "入池原因"
-        })
+        # FIX10-P0：AI投資組合表格加入交易計畫欄位，並沿用 _make_tree 內建 x/y scrollbar。
+        _ai_cols = tuple(col for col, _label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS)
+        _ai_headers = {col: label for col, label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS}
+        self.ai_portfolio_tree = self._make_tree(self.tab_ai_portfolio, _ai_cols, _ai_headers)
+        for _col, _label, _width in AI_PORTFOLIO_DISPLAY_COLUMNS:
+            try:
+                self.ai_portfolio_tree.column(_col, width=int(_width), minwidth=max(55, int(_width) - 15), stretch=False)
+            except Exception:
+                pass
         self.ai_portfolio_tree.bind("<<TreeviewSelect>>", self.on_select_ai_portfolio)
 
         self.top5_tree = self._make_tree(self.tab_top5, ("rank", "id", "name", "price", "chg", "chg_pct", "state", "liquidity", "liq_score", "entry", "stop", "target1382", "rr", "win_rate", "backtest", "cagr", "mdd"), {
@@ -10593,6 +10355,81 @@ class AppUI:
                 self.action_var.set("AI選股TOP20")
         self.root.update_idletasks()
 
+
+    def _build_prebreakout_tab(self):
+        """PREBREAKOUT_UI_REPORT_PATCH：爆發前雷達分頁，與TOP20語義分離。"""
+        control = ttk.Frame(self.tab_prebreakout, padding=6)
+        control.pack(fill="x")
+        ttk.Button(control, text="1. 執行爆發前盤後DB建立", command=self.on_prebreakout_after_market_build).pack(side="left", padx=4)
+        ttk.Button(control, text="2. 產生爆發前盤前報表", command=self.on_prebreakout_premarket_report).pack(side="left", padx=4)
+        ttk.Button(control, text="3. 開啟爆發前報表", command=self.on_open_prebreakout_report).pack(side="left", padx=4)
+        self.prebreakout_status_var = tk.StringVar(value=f"報表輸出：{PREBREAKOUT_REPORT_DIR}")
+        ttk.Label(control, textvariable=self.prebreakout_status_var).pack(side="left", padx=12)
+        cols = ("decision", "rank", "id", "name", "score", "close", "entry", "stop", "target1", "target2", "rr", "quality", "gap")
+        headers = {"decision":"決策","rank":"排序","id":"代號","name":"名稱","score":"爆發分","close":"現價","entry":"買點","stop":"停損","target1":"目標1","target2":"目標2","rr":"RR","quality":"資料品質","gap":"缺資料原因"}
+        self.prebreakout_tree = self._make_tree(self.tab_prebreakout, cols, headers)
+        for c,w in {"decision":120,"rank":60,"id":80,"name":120,"score":80,"close":80,"entry":85,"stop":85,"target1":85,"target2":85,"rr":70,"quality":100,"gap":320}.items():
+            try: self.prebreakout_tree.column(c, width=w, minwidth=60, stretch=False)
+            except Exception: pass
+
+    def _refresh_prebreakout_tree(self, df: pd.DataFrame | None = None):
+        try:
+            if df is None: df = PreBreakoutIntegratedEngine(self.db).get_latest_signals()
+            self.last_prebreakout_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            if not hasattr(self, "prebreakout_tree"): return
+            self.prebreakout_tree.delete(*self.prebreakout_tree.get_children())
+            if df is None or df.empty:
+                self.prebreakout_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "", "", "", "", "", "", "", "請先執行爆發前盤後DB建立")); return
+            view = df[df["decision"].astype(str).isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"])].copy()
+            if view.empty: view = df.head(100).copy()
+            view = view.sort_values(["prebreakout_total_score"], ascending=False).head(200).reset_index(drop=True)
+            for i, r in view.iterrows():
+                def fmt(v):
+                    try:
+                        if pd.isna(v): return ""
+                        return f"{float(v):.2f}"
+                    except Exception: return ""
+                self.prebreakout_tree.insert("", "end", values=(str(r.get("decision", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")), fmt(r.get("prebreakout_total_score", "")), fmt(r.get("close", "")), fmt(r.get("entry_price", "")), fmt(r.get("stop_loss", "")), fmt(r.get("target1", "")), fmt(r.get("target2", "")), fmt(r.get("rr", "")), str(r.get("data_quality_flag", "")), str(r.get("data_gap_reason", ""))))
+            if hasattr(self, "prebreakout_status_var"):
+                counts = df["decision"].value_counts().to_dict()
+                self.prebreakout_status_var.set(f"最新Signal：{len(df)}筆｜{counts}｜報表：{self.last_prebreakout_report_path or PREBREAKOUT_REPORT_DIR}")
+        except Exception as exc:
+            self.append_log(f"刷新爆發前雷達失敗：{exc}", "ERROR")
+
+    def on_prebreakout_after_market_build(self):
+        """UI按鈕：執行爆發前盤後DB建立。"""
+        def worker():
+            self.ui_call(self.start_task, "爆發前盤後DB建立", 3)
+            result = run_prebreakout_after_market_builder(db=self.db, log_cb=lambda m: self.ui_call(self.append_log, m))
+            self.ui_call(self.update_task, "爆發前盤後DB建立", 3, 3, success=int(result.get("signal_rows", 0)), item="Signal完成")
+            self.ui_call(self.append_log, f"爆發前盤後DB建立完成｜{result}")
+            df = PreBreakoutIntegratedEngine(self.db).get_latest_signals()
+            self.ui_call(self._refresh_prebreakout_tree, df)
+            self.ui_call(self.finish_task, "爆發前盤後DB建立", f"完成：Signal {int(result.get('signal_rows', 0))} 筆")
+        self._run_in_thread(worker, "prebreakout_after_market_builder")
+
+    def on_prebreakout_premarket_report(self):
+        """UI按鈕：產生 reports/prebreakout_premarket_YYYYMMDD.xlsx。"""
+        def worker():
+            self.ui_call(self.start_task, "爆發前盤前報表", 2)
+            path = run_prebreakout_premarket_analyzer(db=self.db, output_dir=PREBREAKOUT_REPORT_DIR, log_cb=lambda m: self.ui_call(self.append_log, m))
+            self.last_prebreakout_report_path = Path(path)
+            df = PreBreakoutIntegratedEngine(self.db).get_latest_signals()
+            self.ui_call(self._refresh_prebreakout_tree, df)
+            self.ui_call(self.update_task, "爆發前盤前報表", 2, 2, success=len(df) if isinstance(df, pd.DataFrame) else 0, item="Excel完成")
+            self.ui_call(self.append_log, f"爆發前盤前報表已產生：{path}")
+            self.ui_call(messagebox.showinfo, "完成", f"已產生爆發前盤前報表：\n{path}")
+            self.ui_call(self.finish_task, "爆發前盤前報表", f"已產生：{path}")
+        self._run_in_thread(worker, "prebreakout_premarket_report")
+
+    def on_open_prebreakout_report(self):
+        """UI按鈕：開啟最新爆發前報表。"""
+        path = getattr(self, "last_prebreakout_report_path", None) or get_prebreakout_report_path()
+        path = Path(path)
+        if not path.exists():
+            return messagebox.showwarning("找不到報表", f"找不到爆發前報表：\n{path}\n\n請先按『產生爆發前盤前報表』。")
+        open_path(path)
+
     def execute_action(self):
         action = (self.action_var.get() or "").strip()
         mapping = {
@@ -10603,6 +10440,9 @@ class AppUI:
             "重建排行": self.rebuild_ranking,
             "更新分類檔": self.update_classification_book,
             "外部資料監控中心": self.show_external_data_center,
+            "爆發前盤後DB建立": self.on_prebreakout_after_market_build,
+            "產生爆發前盤前報表": self.on_prebreakout_premarket_report,
+            "開啟爆發前報表": self.on_open_prebreakout_report,
             "同步外部資料": self.sync_external_data,
             "重整外部資料狀態顯示": self.refresh_external_data_status,
             "查看外部原始資料": self.export_external_raw_sample,
@@ -11760,6 +11600,7 @@ class AppUI:
                 "TOP20": getattr(self, "last_top20_df", pd.DataFrame()),
                 "TOP5": getattr(self, "last_top5_df", pd.DataFrame()),
                 "AI投資組合": getattr(self, "last_ai_portfolio_df", pd.DataFrame()),
+                "爆發前報表": getattr(self, "last_prebreakout_df", pd.DataFrame()),
                 "今日可下單": getattr(self, "last_today_buy_df", pd.DataFrame()),
                 "等待回測": getattr(self, "last_wait_df", pd.DataFrame()),
                 "條件預掛": getattr(self, "last_wait_df", pd.DataFrame()),
@@ -11898,7 +11739,171 @@ class AppUI:
                 x[c] = np.nan
             x[c] = pd.to_numeric(x[c], errors="coerce")
         x["is_etf_pool"] = x["market"].eq("ETF") | x["stock_id"].str.startswith("00") | x["stock_name"].str.contains("ETF|高股息|債|REIT", case=False, regex=True)
+        # FIX10-P0：AI投資組合需顯示交易計畫欄位，從最新 trade_plan 讀取 entry/stop/target/RR。
+        try:
+            plan = self._ai_portfolio_latest_trade_plan_fields()
+            if plan is not None and not plan.empty:
+                x = x.merge(plan, on="stock_id", how="left", suffixes=("", "_plan"))
+                for _src, _dst in [("stock_name_plan", "stock_name"), ("market_plan", "market"), ("industry_plan", "industry"), ("theme_plan", "theme")]:
+                    if _src in x.columns and _dst in x.columns:
+                        x[_dst] = x[_dst].replace("", pd.NA).fillna(x[_src]).fillna("").astype(str)
+        except Exception as exc:
+            self.append_log(f"[AI_PORTFOLIO] trade_plan交易欄位合併失敗：{exc}", "WARNING")
         return x
+
+    def _ai_portfolio_latest_trade_plan_fields(self) -> pd.DataFrame:
+        """FIX10-P0：取得最新 trade_plan 的買進/停損/目標/RR欄位；只讀快取，不重建TOP20。"""
+        try:
+            q = """
+            SELECT tp.*
+            FROM trade_plan tp
+            JOIN (
+                SELECT MAX(plan_date) AS plan_date
+                FROM trade_plan
+            ) d ON tp.plan_date = d.plan_date
+            """
+            with self.db.lock:
+                plan = pd.read_sql_query(q, self.db.conn)
+        except Exception:
+            return pd.DataFrame()
+        if plan is None or plan.empty or "stock_id" not in plan.columns:
+            return pd.DataFrame()
+        plan = plan.copy()
+        plan["stock_id"] = plan["stock_id"].astype(str).map(normalize_stock_id)
+        if "update_time" in plan.columns:
+            plan = plan.sort_values(["stock_id", "update_time"])
+        plan = plan.drop_duplicates("stock_id", keep="last")
+        keep = [
+            "stock_id", "stock_name", "market", "industry", "theme", "entry_low", "entry_high", "stop_loss",
+            "target_price", "target_1382", "target_1618", "rr", "rr_live", "risk_score", "fail_reason",
+            "block_reason", "execution_block_reason", "decision_reason", "final_trade_decision", "ui_state"
+        ]
+        for c in keep:
+            if c not in plan.columns:
+                plan[c] = np.nan if c not in ["stock_id", "stock_name", "market", "industry", "theme", "fail_reason", "block_reason", "execution_block_reason", "decision_reason", "final_trade_decision", "ui_state"] else ""
+        rename = {
+            "stock_name": "stock_name_plan", "market": "market_plan", "industry": "industry_plan", "theme": "theme_plan",
+            "rr": "rr_plan", "risk_score": "risk_score_plan"
+        }
+        return plan[[c for c in keep if c in plan.columns]].rename(columns=rename)
+
+    def _num_or_nan(self, value) -> float:
+        try:
+            v = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+            return float(v) if pd.notna(v) and np.isfinite(v) else np.nan
+        except Exception:
+            return np.nan
+
+    def _format_ai_portfolio_num(self, value, digits: int = 2):
+        v = self._num_or_nan(value)
+        if not np.isfinite(v) or abs(v) < 1e-12:
+            return "-"
+        return round(float(v), digits)
+
+    def _risk_flag_for_ai_portfolio(self, row: pd.Series, rr_value: float) -> tuple[str, str]:
+        pool = str(row.get("portfolio_pool", ""))
+        signal = str(row.get("signal", ""))
+        action = str(row.get("action", ""))
+        fail_reason = " / ".join([str(row.get(k, "") or "") for k in ["fail_reason", "block_reason", "execution_block_reason"] if str(row.get(k, "") or "").strip()])
+        risk_score = self._num_or_nan(row.get("risk_score", row.get("risk_score_plan", np.nan)))
+        price_dev = self._num_or_nan(row.get("price_deviation", row.get("price_dev", np.nan)))
+        if pool == "排除風險池" or re.search("轉弱|急跌|減碼|觀望|防守|不合格|禁止|AVOID", signal + action + fail_reason, flags=re.I):
+            return "AVOID", fail_reason or "排除風險池或轉弱/減碼訊號"
+        if np.isfinite(rr_value) and rr_value < 1.2:
+            return "HIGH", f"RR偏低({rr_value:.2f})"
+        if np.isfinite(risk_score) and risk_score <= 35:
+            return "HIGH", f"risk_score偏低({risk_score:.2f})"
+        if np.isfinite(price_dev) and abs(price_dev) >= 0.08:
+            return "HIGH", f"乖離偏大({price_dev:.2%})"
+        if np.isfinite(rr_value) and rr_value < 1.5:
+            return "MID", f"RR未達1.5({rr_value:.2f})"
+        return "LOW", "交易欄位無重大風險旗標"
+
+    def _apply_ai_portfolio_trade_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """FIX10-P0：補齊買進下緣/上緣/停損/目標1/目標2/RR/風險旗標。
+        優先使用 trade_plan；缺值時用最新現價建立保守估算，並於風險原因標明。
+        """
+        if df is None:
+            return pd.DataFrame()
+        x = df.copy()
+        if x.empty:
+            for c in AI_PORTFOLIO_TRADE_COLUMNS + ["風險原因"]:
+                x[c] = []
+            return x
+        # 交易欄位來源轉數值
+        for c in ["entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "rr_plan", "現價", "close"]:
+            if c in x.columns:
+                x[c] = pd.to_numeric(x[c], errors="coerce")
+        lows, highs, stops, t1s, t2s, rrs, flags, reasons = [], [], [], [], [], [], [], []
+        for _, row in x.iterrows():
+            close_v = self._num_or_nan(row.get("現價", row.get("close", np.nan)))
+            entry_low = self._num_or_nan(row.get("entry_low", np.nan))
+            entry_high = self._num_or_nan(row.get("entry_high", np.nan))
+            stop_loss = self._num_or_nan(row.get("stop_loss", np.nan))
+            target_1 = self._num_or_nan(row.get("target_price", np.nan))
+            target_2 = self._num_or_nan(row.get("target_1382", np.nan))
+            if not np.isfinite(target_2):
+                target_2 = self._num_or_nan(row.get("target_1618", np.nan))
+            estimated = False
+            if np.isfinite(close_v) and close_v > 0:
+                if not np.isfinite(entry_low) or entry_low <= 0:
+                    entry_low = close_v * 0.98; estimated = True
+                if not np.isfinite(entry_high) or entry_high <= 0:
+                    entry_high = close_v * 1.00; estimated = True
+                if entry_low > entry_high:
+                    entry_low, entry_high = entry_high, entry_low
+                if not np.isfinite(stop_loss) or stop_loss <= 0 or stop_loss >= entry_high:
+                    stop_loss = entry_low * 0.93; estimated = True
+                if not np.isfinite(target_1) or target_1 <= entry_high:
+                    target_1 = entry_high * 1.08; estimated = True
+                if not np.isfinite(target_2) or target_2 <= target_1:
+                    target_2 = entry_high * 1.15; estimated = True
+            rr_value = self._num_or_nan(row.get("rr_live", np.nan))
+            if not np.isfinite(rr_value):
+                rr_value = self._num_or_nan(row.get("rr_plan", row.get("rr", np.nan)))
+            if (not np.isfinite(rr_value) or rr_value <= 0) and all(np.isfinite(v) for v in [entry_high, stop_loss, target_1]) and entry_high > stop_loss:
+                rr_value = (target_1 - entry_high) / max(entry_high - stop_loss, 1e-6)
+            flag, reason = self._risk_flag_for_ai_portfolio(row, rr_value)
+            if estimated:
+                reason = (reason + "；" if reason else "") + "部分交易價位由現價保守推估，需以正式交易計畫覆核"
+            lows.append(self._format_ai_portfolio_num(entry_low))
+            highs.append(self._format_ai_portfolio_num(entry_high))
+            stops.append(self._format_ai_portfolio_num(stop_loss))
+            t1s.append(self._format_ai_portfolio_num(target_1))
+            t2s.append(self._format_ai_portfolio_num(target_2))
+            rrs.append(self._format_ai_portfolio_num(rr_value))
+            flags.append(flag)
+            reasons.append(reason or "-")
+        x["買進下緣"] = lows
+        x["買進上緣"] = highs
+        x["停損"] = stops
+        x["目標1"] = t1s
+        x["目標2"] = t2s
+        x["RR"] = rrs
+        x["風險旗標"] = flags
+        x["風險原因"] = reasons
+        return x
+
+    def _ai_portfolio_display_df(self, df: pd.DataFrame, main: bool = False) -> pd.DataFrame:
+        x = self._apply_ai_portfolio_trade_columns(df)
+        if x is None or x.empty:
+            cols = [c for c, _, _ in AI_PORTFOLIO_DISPLAY_COLUMNS] + ["風險原因", "source_pools", "source_pool_count"]
+            return pd.DataFrame(columns=cols)
+        desired = [c for c, _, _ in AI_PORTFOLIO_DISPLAY_COLUMNS]
+        if main:
+            desired = ["portfolio_rank", "stock_id", "stock_name", "portfolio_pool", "source_pools", "source_pool_count", "portfolio_score", "pool_quota", "pool_weight", "現價", "買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標", "風險原因", "pool_reason", "market", "industry", "theme", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"]
+        else:
+            desired = ["pool_rank", "stock_id", "stock_name", "portfolio_pool", "portfolio_score", "pool_quota", "pool_weight", "現價", "買進下緣", "買進上緣", "停損", "目標1", "目標2", "RR", "風險旗標", "風險原因", "pool_reason", "market", "industry", "theme", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"]
+        for c in desired:
+            if c not in x.columns:
+                x[c] = ""
+        out = x[[c for c in desired if c in x.columns]].copy()
+        # 顯示格式整理：避免 nan 直接進 UI/Excel。
+        out = out.replace([np.inf, -np.inf], np.nan)
+        for c in out.columns:
+            if c not in ["stock_id"]:
+                out[c] = out[c].where(pd.notna(out[c]), "-")
+        return out
 
     def _ai_portfolio_pool_reason(self, pool_name: str) -> str:
         mapping = {
@@ -11943,7 +11948,8 @@ class AppUI:
         }
         out_tables = {}
         combined = []
-        base_cols = [c for c in ["stock_id", "stock_name", "market", "industry", "theme", "現價", "漲跌", "漲跌幅%", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "rr", "signal", "action"] if c in base.columns]
+        # FIX10-P0：報表欄位以「交易計畫欄位」為核心，避免重複 stock_id/stock_name 與 rr nan。
+        base_cols = [c for c in ["market", "industry", "theme", "現價", "漲跌", "漲跌幅%", "total_score", "ai_score", "revenue_yoy", "eps_yoy", "pe", "pb", "dividend_yield", "signal", "action"] if c in base.columns]
         for sheet_name, dfp in pools.items():
             pool_name = sheet_to_pool[sheet_name]
             item = config.get(pool_name, DEFAULT_AI_PORTFOLIO_CONFIG.get(pool_name, {}))
@@ -11959,8 +11965,7 @@ class AppUI:
                 x["portfolio_score"] = (x["total_score"].fillna(0) * 0.45 + x["ai_score"].fillna(0) * 0.35 + x["revenue_eps_score"].fillna(50) * 0.10 + x["volume_score"].fillna(0) * 0.10) * weight
                 x = x.sort_values(["portfolio_score", "total_score", "ai_score"], ascending=False)
                 x["pool_rank"] = range(1, len(x) + 1)
-            display_cols = ["pool_rank", "portfolio_pool", "portfolio_score", "pool_quota", "pool_weight", "pool_reason"] + base_cols
-            out_tables[sheet_name] = x[[c for c in display_cols if c in x.columns]].head(max(50, quota if quota else 20)).copy() if not x.empty else pd.DataFrame(columns=display_cols)
+            out_tables[sheet_name] = self._ai_portfolio_display_df(x.head(max(50, quota if quota else 20)).copy(), main=False) if not x.empty else self._ai_portfolio_display_df(pd.DataFrame(), main=False)
             if enabled and quota > 0 and pool_name != "排除風險池" and not x.empty:
                 combined.append(x.head(quota).copy())
         if combined:
@@ -11971,14 +11976,18 @@ class AppUI:
             combo["portfolio_rank"] = range(1, len(combo) + 1)
         else:
             combo = pd.DataFrame()
-        main_cols = ["portfolio_rank", "stock_id", "stock_name", "portfolio_pool", "source_pools", "source_pool_count", "portfolio_score", "pool_quota", "pool_weight", "pool_reason"] + base_cols
-        out_tables["01_AI投資組合總表"] = combo[[c for c in main_cols if c in combo.columns]].copy() if combo is not None and not combo.empty else pd.DataFrame(columns=main_cols)
+        # FIX10-P0：主表第一張輸出，並補齊買進/停損/目標/RR/風險旗標。
+        main_table = self._ai_portfolio_display_df(combo.copy(), main=True) if combo is not None and not combo.empty else self._ai_portfolio_display_df(pd.DataFrame(), main=True)
+        ordered_tables = {"01_AI投資組合總表": main_table}
+        ordered_tables.update(out_tables)
+        out_tables = ordered_tables
         checklist_rows = []
         for pool_name, item in config.items():
             sheet_name = next((k for k, v in sheet_to_pool.items() if v == pool_name), "")
             checklist_rows.append({
                 "項目": pool_name, "啟用": bool(item.get("enabled", False)), "配額": int(item.get("quota", 0) or 0), "權重": float(item.get("weight", 0) or 0),
                 "候選數": int(len(out_tables.get(sheet_name, pd.DataFrame()))), "說明": self._ai_portfolio_pool_reason(pool_name),
+                "交易欄位": "買進下緣/買進上緣/停損/目標1/目標2/RR/風險旗標",
                 "驗收": "獨立於TOP20；不改寫trade_top20/candidate20/core_attack5"
             })
         out_tables["10_組合設定與查檢表"] = pd.DataFrame(checklist_rows)
@@ -11992,8 +12001,10 @@ class AppUI:
             for _, r in df.iterrows():
                 self.ai_portfolio_tree.insert("", "end", values=(
                     r.get("portfolio_rank", ""), r.get("stock_id", ""), r.get("stock_name", ""), r.get("portfolio_pool", ""),
-                    round(float(r.get("portfolio_score", 0) or 0), 2), r.get("pool_quota", ""), r.get("pool_weight", ""),
-                    r.get("現價", r.get("close", "")), r.get("total_score", ""), r.get("ai_score", ""), r.get("rr", ""), r.get("pool_reason", "")
+                    round(float(pd.to_numeric(pd.Series([r.get("portfolio_score", 0)]), errors="coerce").fillna(0).iloc[0]), 2),
+                    r.get("pool_quota", ""), r.get("pool_weight", ""), r.get("現價", r.get("close", "")),
+                    r.get("買進下緣", ""), r.get("買進上緣", ""), r.get("停損", ""), r.get("目標1", ""),
+                    r.get("目標2", ""), r.get("RR", r.get("rr", "")), r.get("風險旗標", ""), r.get("pool_reason", "")
                 ))
         except Exception as exc:
             self.append_log(f"[AI_PORTFOLIO] UI填表失敗：{exc}", "ERROR")
@@ -12013,8 +12024,8 @@ class AppUI:
                 self.ui_call(self._populate_ai_portfolio_tree, main)
                 self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
                 self.ui_call(self.update_task, "AI投資組合引擎", 2, 3, item=f"組合={len(main)}")
-                self.ui_call(self.finish_task, "AI投資組合引擎", f"AI投資組合完成｜主表 {len(main)} 檔｜TOP20原設計未變動")
-                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 完成：主表={len(main)}｜設定={AI_PORTFOLIO_CONFIG_PATH}")
+                self.ui_call(self.finish_task, "AI投資組合引擎", f"AI投資組合完成｜主表 {len(main)} 檔｜交易欄位已補齊｜TOP20原設計未變動")
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 完成：主表={len(main)}｜交易欄位={AI_PORTFOLIO_TRADE_COLUMNS}｜設定={AI_PORTFOLIO_CONFIG_PATH}")
             except Exception as exc:
                 self.ui_call(self.append_log, f"[AI_PORTFOLIO] 失敗：{exc}", "ERROR")
                 self.ui_call(messagebox.showerror, "AI投資組合", f"AI投資組合引擎失敗：\n{exc}")
@@ -12032,7 +12043,7 @@ class AppUI:
                 self.ui_call(self._populate_ai_portfolio_tree, self.last_ai_portfolio_df)
                 self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
                 self.ui_call(messagebox.showinfo, "AI投資組合", f"AI投資組合報表已輸出（{out_type}）：\n{out_path}")
-                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 報表輸出：{out_path}")
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 報表輸出：{out_path}｜已含買進下緣/買進上緣/停損/目標1/目標2/RR/風險旗標")
                 try:
                     open_path(out_path)
                 except Exception:
@@ -12044,6 +12055,23 @@ class AppUI:
     def on_select_ai_portfolio(self, event=None):
         stock_id = self._tree_selected_stock_id(self.ai_portfolio_tree, 1)
         if stock_id and not self._should_ignore_select_event(stock_id, "AI投資組合"):
+            try:
+                df = getattr(self, "last_ai_portfolio_df", pd.DataFrame())
+                if isinstance(df, pd.DataFrame) and not df.empty and "stock_id" in df.columns:
+                    row_df = df[df["stock_id"].astype(str).map(normalize_stock_id).eq(normalize_stock_id(stock_id))].head(1)
+                    if not row_df.empty:
+                        r = row_df.iloc[0]
+                        detail = (
+                            f"《AI投資組合》\n"
+                            f"股票：{r.get('stock_name','')}（{r.get('stock_id','')}）｜池別：{r.get('portfolio_pool','')}\n"
+                            f"買進區間：{r.get('買進下緣','-')} ～ {r.get('買進上緣','-')}｜停損：{r.get('停損','-')}\n"
+                            f"目標1：{r.get('目標1','-')}｜目標2：{r.get('目標2','-')}｜RR：{r.get('RR','-')}\n"
+                            f"風險旗標：{r.get('風險旗標','-')}｜原因：{r.get('風險原因', r.get('pool_reason','-'))}"
+                        )
+                        self.detail.delete("1.0", "end")
+                        self.detail.insert("end", detail)
+            except Exception:
+                pass
             self.sync_all_views(stock_id, source="AI投資組合")
 
 
