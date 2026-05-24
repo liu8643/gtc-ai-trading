@@ -1759,7 +1759,7 @@ CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
 # PREBREAKOUT_UI_REPORT_PATCH：爆發前交易系統固定報表輸出位置
-PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V6_20260524"
+PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V8_UI_SELECT_SYNC_20260524"
 PREBREAKOUT_REPORT_DIR = RUNTIME_DIR / "reports"
 PREBREAKOUT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 PREBREAKOUT_MIN_PRICE_HISTORY_DAYS = 250
@@ -3149,7 +3149,7 @@ class PreBreakoutIntegratedEngine:
     4. Excel 輸出規則矩陣、候選股、WAIT 池、AVOID/INVALID 池與資料缺口清單。
     """
 
-    RULE_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V6_20260524"
+    RULE_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V8_UI_SELECT_SYNC_20260524"
 
     def __init__(self, db: DBManager):
         self.db = db
@@ -10790,6 +10790,11 @@ class AppUI:
         for c,w in {"decision":120,"rank":60,"id":80,"name":120,"score":80,"close":80,"entry":105,"stop":105,"target1":85,"target2":85,"rr":90,"quality":100,"wait_reason":240,"gap":260,"next_trigger":110,"action":320}.items():
             try: self.prebreakout_tree.column(c, width=w, minwidth=60, stretch=False)
             except Exception: pass
+        # PREBREAKOUT_V8_UI_SELECT_SYNC：爆發前雷達欄位順序為
+        # decision, rank, id, name...，股票代號在 values[2]。
+        # V6/V7 缺少這個 TreeviewSelect 綁定，造成點選左側爆發前候選股時
+        # 右側單股分析/圖表仍停留在上一檔股票。
+        self.prebreakout_tree.bind("<<TreeviewSelect>>", self.on_select_prebreakout)
 
     def _refresh_prebreakout_tree(self, df: pd.DataFrame | None = None):
         """V5：主表只顯示 BUY/WATCH 候選；INVALID/MISSING 不列股票，改顯示摘要與原因。"""
@@ -11122,6 +11127,7 @@ class AppUI:
         for tree, idx in [
             (self.top20_tree, 1),
             (self.top5_tree, 1),
+            (getattr(self, "prebreakout_tree", None), 2),
             (self.order_tree, 1),
             (self.inst_tree, 1),
             (self.backtest_tree, 1),
@@ -11164,6 +11170,7 @@ class AppUI:
             for tree, idx in [
                 (self.top20_tree, 1),
                 (self.top5_tree, 1),
+                (getattr(self, "prebreakout_tree", None), 2),
                 (self.order_tree, 1),
                 (self.inst_tree, 1),
                 (self.backtest_tree, 1),
@@ -12517,6 +12524,87 @@ class AppUI:
             except Exception:
                 pass
             self.sync_all_views(stock_id, source="AI投資組合")
+
+
+    def _cache_prebreakout_row_for_selection(self, stock_id: str):
+        """PREBREAKOUT_V8_UI_SELECT_SYNC：把爆發前候選股的交易欄位暫存到 plan_cache。
+
+        目的：點選爆發前雷達時，右側單股分析能立即看到爆發分、買點/觸發價、
+        停損、目標、RR、資料缺口，而不是只顯示上一檔 TOP20 或一般技術分析。
+        """
+        sid = normalize_stock_id(stock_id)
+        if not sid:
+            return None
+        try:
+            df = getattr(self, "last_prebreakout_df", pd.DataFrame())
+            if df is None or df.empty or "stock_id" not in df.columns:
+                df = PreBreakoutIntegratedEngine(self.db).get_latest_signals()
+                self.last_prebreakout_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            if df is None or df.empty or "stock_id" not in df.columns:
+                return None
+            row_df = df[df["stock_id"].astype(str).map(normalize_stock_id).eq(sid)].head(1)
+            if row_df.empty:
+                return None
+            r = row_df.iloc[0].to_dict()
+            payload = {
+                "stock_id": sid,
+                "stock_name": r.get("stock_name", sid),
+                "ui_state": r.get("decision", "WATCH"),
+                "trade_action": r.get("decision", "WATCH"),
+                "trade_type": "爆發前雷達",
+                "source_rank": "PREBREAKOUT",
+                "model_score": r.get("prebreakout_total_score", 0),
+                "prebreakout_total_score": r.get("prebreakout_total_score", 0),
+                "entry_price": r.get("entry_price", r.get("trigger_price", r.get("next_trigger_price", ""))),
+                "entry_zone": str(r.get("entry_price", r.get("trigger_price", r.get("next_trigger_price", "")))),
+                "stop_loss": r.get("stop_loss", ""),
+                "target_price": r.get("target1", ""),
+                "target_1382": r.get("target1", ""),
+                "target_1618": r.get("target2", ""),
+                "rr": r.get("rr", ""),
+                "reason": r.get("suggested_action", ""),
+                "wait_reason": r.get("wait_reason", ""),
+                "data_quality_flag": r.get("data_quality_flag", ""),
+                "data_gap_reason": r.get("data_gap_reason", ""),
+                "risk_flag": r.get("risk_flag", ""),
+                "_cached_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self.plan_cache[sid] = payload
+            return r
+        except Exception as exc:
+            self.append_log(f"爆發前候選快取失敗：{sid}｜{exc}", "WARNING")
+            return None
+
+    def on_select_prebreakout(self, event=None):
+        """PREBREAKOUT_V8_UI_SELECT_SYNC：爆發前雷達點選事件。
+
+        修正重點：V6/V7 雖然有 prebreakout_tree，但未 bind TreeviewSelect，
+        且股票代號欄位在 values[2]；因此點選左側候選股不會同步右側單股分析/圖表。
+        """
+        stock_id = self._tree_selected_stock_id(getattr(self, "prebreakout_tree", None), 2)
+        stock_id = normalize_stock_id(stock_id) if stock_id else ""
+        if not stock_id or not re.fullmatch(r"\d{4,5}", stock_id):
+            return
+        if self._should_ignore_select_event(stock_id, "爆發前雷達"):
+            return
+        r = self._cache_prebreakout_row_for_selection(stock_id)
+        try:
+            if r is not None:
+                detail = (
+                    f"《爆發前雷達》\n"
+                    f"股票：{r.get('stock_name','')}（{r.get('stock_id','')}）｜決策：{r.get('decision','')}｜爆發分：{r.get('prebreakout_total_score','')}\n"
+                    f"買點/觸發價：{r.get('entry_price', r.get('trigger_price', r.get('next_trigger_price','')))}｜停損：{r.get('stop_loss','')}｜目標1：{r.get('target1','')}｜目標2：{r.get('target2','')}｜RR：{r.get('rr','')}\n"
+                    f"資料品質：{r.get('data_quality_flag','')}｜風險：{r.get('risk_flag','')}\n"
+                    f"原因：{r.get('wait_reason','') or r.get('suggested_action','')}\n"
+                    f"資料缺口：{r.get('data_gap_reason','')}\n"
+                    f"\n正在同步右側分析與圖表..."
+                )
+                self.detail.delete("1.0", tk.END)
+                self.detail.insert("1.0", detail)
+        except Exception:
+            pass
+        self.append_log(f"爆發前雷達點選：{stock_id}｜同步右側分析/圖表")
+        self.sync_all_views(stock_id, source="爆發前雷達")
 
 
     def build_daily_summary_sheet(self) -> pd.DataFrame:
