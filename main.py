@@ -1759,7 +1759,7 @@ CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
 # PREBREAKOUT_UI_REPORT_PATCH：爆發前交易系統固定報表輸出位置
-PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_V9_REPORT_QUALITY_GATE_20260524"
+PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_V10_REPORT_UI_EXPORT_FIX_20260524"
 PREBREAKOUT_REPORT_DIR = RUNTIME_DIR / "reports"
 PREBREAKOUT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 PREBREAKOUT_MIN_PRICE_HISTORY_DAYS = 250
@@ -3148,7 +3148,7 @@ def normalize_fiscal_quarter(value) -> tuple[int | None, int | None, str, str]:
 
 
 class PreBreakoutIntegratedEngine:
-    """V6 爆發前完整規則引擎：依 Word 規格實作多層 Gate + 多因子 Score + Trigger + RiskTradePlan。
+    """V10 爆發前完整規則引擎：依 Word 規格實作多層 Gate + 多因子 Score + Trigger + RiskTradePlan。
 
     設計原則：
     1. 資料缺口不硬算、不偽裝成買點；寫入 data_gap_reason / fail_reason。
@@ -3157,7 +3157,7 @@ class PreBreakoutIntegratedEngine:
     4. Excel 輸出規則矩陣、候選股、WAIT 池、AVOID/INVALID 池與資料缺口清單。
     """
 
-    RULE_VERSION = "PREBREAKOUT_V9_REPORT_QUALITY_GATE_20260524"
+    RULE_VERSION = "PREBREAKOUT_V10_REPORT_UI_EXPORT_FIX_20260524"
 
     def __init__(self, db: DBManager):
         self.db = db
@@ -3184,7 +3184,7 @@ class PreBreakoutIntegratedEngine:
                         SELECT stock_id,revenue_month,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_date,? FROM external_revenue
                     """, (now,))
             except Exception as exc:
-                log_warning(f"[PREBREAKOUT][V6] revenue snapshot copy skipped: {exc}")
+                log_warning(f"[PREBREAKOUT][V10] revenue snapshot copy skipped: {exc}")
             try:
                 cnt = cur.execute("SELECT COUNT(*) FROM external_institutional_history").fetchone()[0]
                 if int(cnt or 0) == 0:
@@ -3195,7 +3195,7 @@ class PreBreakoutIntegratedEngine:
                         FROM external_institutional
                     """, (now,))
             except Exception as exc:
-                log_warning(f"[PREBREAKOUT][V6] institutional snapshot copy skipped: {exc}")
+                log_warning(f"[PREBREAKOUT][V10] institutional snapshot copy skipped: {exc}")
             try:
                 cnt = cur.execute("SELECT COUNT(*) FROM external_margin_history").fetchone()[0]
                 if int(cnt or 0) == 0:
@@ -3205,7 +3205,7 @@ class PreBreakoutIntegratedEngine:
                         FROM external_margin
                     """, (now,))
             except Exception as exc:
-                log_warning(f"[PREBREAKOUT][V6] margin snapshot copy skipped: {exc}")
+                log_warning(f"[PREBREAKOUT][V10] margin snapshot copy skipped: {exc}")
             self.db.conn.commit()
 
     @staticmethod
@@ -3362,14 +3362,14 @@ class PreBreakoutIntegratedEngine:
                 "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
             if log_cb and (idx % 200 == 0 or idx == total):
-                log_cb(f"[PREBREAKOUT][V6][TECH] {idx}/{total} rows={len(rows)}")
+                log_cb(f"[PREBREAKOUT][V10][TECH] {idx}/{total} rows={len(rows)}")
         out = pd.DataFrame(rows)
         with self.db.lock:
             self.db.conn.execute("DELETE FROM technical_feature_daily WHERE feature_date=?", (feature_date,))
             out.to_sql("technical_feature_daily", self.db.conn, if_exists="append", index=False)
             self.db.conn.commit()
         if log_cb:
-            log_cb(f"[PREBREAKOUT][V6][TECH] rows={len(out)} min_history={PREBREAKOUT_MIN_PRICE_HISTORY_DAYS} rule={self.RULE_VERSION}")
+            log_cb(f"[PREBREAKOUT][V10][TECH] rows={len(out)} min_history={PREBREAKOUT_MIN_PRICE_HISTORY_DAYS} rule={self.RULE_VERSION}")
         return int(len(out))
 
     def build_financial_quality_status(self, quality_date: str | None = None, log_cb=None) -> int:
@@ -3415,7 +3415,7 @@ class PreBreakoutIntegratedEngine:
             x[keep].to_sql("financial_quality_status", self.db.conn, if_exists="append", index=False)
             self.db.conn.commit()
         if log_cb:
-            log_cb(f"[PREBREAKOUT][V6][QUALITY] rows={len(x)} OK={int((x['data_quality_flag']=='OK').sum())} PARTIAL={int((x['data_quality_flag']=='PARTIAL').sum())} MISSING={int((x['data_quality_flag']=='MISSING').sum())}")
+            log_cb(f"[PREBREAKOUT][V10][QUALITY] rows={len(x)} OK={int((x['data_quality_flag']=='OK').sum())} PARTIAL={int((x['data_quality_flag']=='PARTIAL').sum())} MISSING={int((x['data_quality_flag']=='MISSING').sum())}")
         return int(len(x))
 
     def _latest_by_stock(self, table: str, order_col: str, cols: list[str]) -> pd.DataFrame:
@@ -3489,7 +3489,7 @@ class PreBreakoutIntegratedEngine:
         # 第二波分數：已有第一波/回測不破/接近前高者加權。
         x["second_wave_score"] = np.where(_safe_numeric_series_for_df(x, "second_wave_signal", 0).astype(int).eq(1), 88, 45)
         x["fundamental_acceleration_score"] = (x["eps_acceleration_score"]*0.30 + x["margin_triple_up_score"]*0.20 + x["cashflow_quality_score"]*0.15 + x["revenue_acceleration_score"]*0.25 + x["backlog_proxy_score"]*0.10).round(2)
-        # V9：financial_score 不可空白。若 EPS/營收/三率資料不足，明確標示 proxy，不再讓報表核心欄位空白。
+        # V10：financial_score 不可空白。若 EPS/營收/三率資料不足，明確標示 proxy，不再讓報表核心欄位空白。
         x["financial_score"] = pd.to_numeric(x["fundamental_acceleration_score"], errors="coerce").fillna(40).round(2)
         x["financial_score_source"] = np.where(
             (_safe_numeric_series_for_df(x, "eps_quarter_count", 0) >= 4) & (_safe_numeric_series_for_df(x, "revenue_month_count", 0) >= 12),
@@ -3536,7 +3536,7 @@ class PreBreakoutIntegratedEngine:
             return ";".join(seen)
         x["data_gap_reason"] = x.apply(_gap_reason, axis=1)
 
-        # V9：缺口分級。交易表與觀察表分流，避免 DATA_GAP_PROXY 被誤認為正式可下單。
+        # V10：缺口分級。交易表與觀察表分流，避免 DATA_GAP_PROXY 被誤認為正式可下單。
         critical_gap_terms = [
             "EPS_HISTORY_MISSING", "REVENUE_HISTORY_LT12", "FLOW_HISTORY_LT5",
             "EPS_ACCELERATION_PROXY_USED", "REVENUE_ACCELERATION_PROXY_USED",
@@ -3665,17 +3665,17 @@ class PreBreakoutIntegratedEngine:
                 plan[["stock_id","plan_date","stock_name","decision","entry_price","stop_loss","target1","target2","rr","position_note","risk_note","source_signal_date","update_time"]].to_sql("trade_plan_prebreakout", self.db.conn, if_exists="append", index=False)
             self.db.conn.commit()
         if log_cb:
-            log_cb(f"[PREBREAKOUT][V6][SIGNAL] rows={len(out)} decision={out['decision'].value_counts().to_dict()}")
-            log_cb(f"[PREBREAKOUT][V6][GAP] top_gap={out['data_gap_reason'].astype(str).value_counts().head(3).to_dict()}")
+            log_cb(f"[PREBREAKOUT][V10][SIGNAL] rows={len(out)} decision={out['decision'].value_counts().to_dict()}")
+            log_cb(f"[PREBREAKOUT][V10][GAP] top_gap={out['data_gap_reason'].astype(str).value_counts().head(3).to_dict()}")
         return int(len(out))
 
     def run_after_market_builder(self, log_cb=None) -> dict:
-        run_id = self.db.log_system_run(event="prebreakout_after_market_builder_v6", status="start", message="start", module="prebreakout")
+        run_id = self.db.log_system_run(event="prebreakout_after_market_builder_v10", status="start", message="start", module="prebreakout")
         feature_date = self._latest_feature_date()
         tech = self.build_technical_feature_daily(feature_date, log_cb)
         quality = self.build_financial_quality_status(feature_date, log_cb)
         signal = self.build_prebreakout_signal_daily(feature_date, log_cb)
-        self.db.log_system_run(event="prebreakout_after_market_builder_v6", status="ok", message=f"tech={tech}, quality={quality}, signal={signal}, rule={self.RULE_VERSION}", run_id=run_id, module="prebreakout")
+        self.db.log_system_run(event="prebreakout_after_market_builder_v10", status="ok", message=f"tech={tech}, quality={quality}, signal={signal}, rule={self.RULE_VERSION}", run_id=run_id, module="prebreakout")
         return {"run_id": run_id, "feature_date": feature_date, "technical_rows": tech, "quality_rows": quality, "signal_rows": signal, "rule_version": self.RULE_VERSION}
 
     def get_latest_signals(self) -> pd.DataFrame:
@@ -3696,7 +3696,7 @@ class PreBreakoutIntegratedEngine:
         report_date = str(df["signal_date"].dropna().astype(str).max()).replace("-", "")
         out_path = output_dir / f"prebreakout_premarket_{report_date}.xlsx"
 
-        # V9：保證核心稽核欄位存在，舊DB/舊資料也能輸出一致欄位。
+        # V10：保證核心稽核欄位存在，舊DB/舊資料也能輸出一致欄位。
         for col, default in [
             ("financial_score", np.nan), ("financial_score_source", ""), ("data_gap_severity", 0),
             ("trade_readiness", ""), ("source_level", ""), ("fallback_reason", ""),
@@ -3707,23 +3707,35 @@ class PreBreakoutIntegratedEngine:
         df["financial_score"] = pd.to_numeric(df["financial_score"], errors="coerce")
         fallback_fin = pd.to_numeric(df.get("fundamental_acceleration_score", np.nan), errors="coerce")
         df["financial_score"] = df["financial_score"].fillna(fallback_fin).fillna(40).round(2)
-        df["financial_score_source"] = df["financial_score_source"].replace("", np.nan).fillna(
-            np.where(df["data_gap_reason"].astype(str).str.contains("PROXY|MISSING|LT", regex=True), "PROXY_FROM_AVAILABLE_DB", "RAW_FINANCIAL_HISTORY")
+        # V10-P0：fillna 不可直接傳入 ndarray，必須轉成 index 對齊的 Series；否則盤前報表匯出會 TypeError。
+        fin_source_fallback = pd.Series(
+            np.where(
+                df["data_gap_reason"].astype(str).str.contains("PROXY|MISSING|LT", regex=True),
+                "PROXY_FROM_AVAILABLE_DB",
+                "RAW_FINANCIAL_HISTORY",
+            ),
+            index=df.index,
         )
+        df["financial_score_source"] = df["financial_score_source"].replace("", np.nan).fillna(fin_source_fallback)
         df["data_gap_severity"] = pd.to_numeric(df["data_gap_severity"], errors="coerce").fillna(0).astype(int)
-        df["trade_readiness"] = df["trade_readiness"].replace("", np.nan).fillna(
+        # V10-P0：np.select 回傳 ndarray，需轉 Series 後才能安全 fillna。
+        trade_readiness_fallback = pd.Series(
             np.select(
                 [
                     df["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY"]) & (df["data_gap_severity"] <= 1),
                     df["decision"].isin(["WATCH", "WATCH_OBSERVE"]),
                     df["decision"].eq("ALERT"),
-                    df["decision"].isin(["AVOID", "FALSE_BREAKOUT"])
+                    df["decision"].isin(["AVOID", "FALSE_BREAKOUT"]),
                 ],
                 ["TRADE_READY", "OBSERVE_ONLY", "ALERT_ONLY", "REJECT"],
-                default="WAIT_ONLY"
-            )
+                default="WAIT_ONLY",
+            ),
+            index=df.index,
         )
-        df["source_level"] = df["source_level"].replace("", np.nan).fillna(np.where(df["data_gap_severity"].eq(0), "raw_verified", "proxy_or_partial"))
+        df["trade_readiness"] = df["trade_readiness"].replace("", np.nan).fillna(trade_readiness_fallback)
+        # V10-P0：source_level fallback 同樣使用 Series，避免 fillna ndarray 錯誤。
+        source_level_fallback = pd.Series(np.where(df["data_gap_severity"].eq(0), "raw_verified", "proxy_or_partial"), index=df.index)
+        df["source_level"] = df["source_level"].replace("", np.nan).fillna(source_level_fallback)
         df["fallback_reason"] = df["fallback_reason"].replace("", np.nan).fillna(df["data_gap_reason"].astype(str))
 
         stat = df["decision"].value_counts(dropna=False).reset_index()
@@ -3762,7 +3774,7 @@ class PreBreakoutIntegratedEngine:
             for term, impact, pri in gap_terms
         ]).sort_values(["priority", "count"], ascending=[True, False])
 
-        # V9：Quality母體 vs Signal母體對帳，避免使用者誤認報表漏資料。
+        # V10：Quality母體 vs Signal母體對帳，避免使用者誤認報表漏資料。
         try:
             with self.db.lock:
                 qual = pd.read_sql_query("SELECT * FROM financial_quality_status WHERE quality_date=(SELECT MAX(quality_date) FROM financial_quality_status)", self.db.conn)
@@ -3817,12 +3829,14 @@ class PreBreakoutIntegratedEngine:
             {"item": "critical_rule", "value": "DATA_GAP_PROXY不得進正式交易表", "note": "P0修正"},
         ])
 
+        formal_trade_count = int(len(formal_trade))
+        observe_candidate_count = int(len(observe_candidates))
         if formal_trade.empty:
             formal_trade = pd.DataFrame([{
                 "狀態": "NO_TRADABLE_CANDIDATE",
                 "說明": "目前沒有 BUY_TRIGGER / SECOND_WAVE_BUY 且 trade_readiness=TRADE_READY 的股票。WATCH_OBSERVE 只可觀察，不可直接下單。",
                 "全部Signal": int(len(df)),
-                "觀察候選": int(len(observe_candidates))
+                "觀察候選": observe_candidate_count
             }])
 
         tables = {
@@ -3843,7 +3857,7 @@ class PreBreakoutIntegratedEngine:
         }
         out_path, kind = write_table_bundle(out_path.with_suffix(""), tables, preferred="excel")
         if log_cb:
-            log_cb(f"[PREBREAKOUT][V9][REPORT] {kind} 已輸出：{out_path}｜正式={len(formal_trade)}｜觀察={len(observe_candidates)}｜all={len(df)}")
+            log_cb(f"[PREBREAKOUT][V10][REPORT] {kind} 已輸出：{out_path}｜正式={formal_trade_count}｜觀察={observe_candidate_count}｜all={len(df)}")
         return Path(out_path)
 
 def run_prebreakout_after_market_builder(db: DBManager | None = None, log_cb=None, progress_cb=None) -> dict:
@@ -10972,8 +10986,16 @@ class AppUI:
                 self.prebreakout_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "", "", "", "", "", "", "", "請先執行爆發前盤後DB建立", "", "", ""))
                 return
 
-            view = df[df["decision"].astype(str).isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"])].copy()
-            view = view.sort_values(["prebreakout_total_score"], ascending=False).head(200).reset_index(drop=True)
+            # V10-P0：UI不可只看正式交易表。V9把資料缺口較高者改為 WATCH_OBSERVE，
+            # 若仍只篩 BUY/SECOND_WAVE/WATCH，畫面會誤顯 NO_CANDIDATE，使用者看不到觀察候選。
+            # 左側主表顯示「可操作 + 觀察候選 + ALERT」，但以 trade_readiness / risk_flag 標明不可直接下單。
+            display_decisions = ["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH", "WATCH_OBSERVE", "ALERT"]
+            view = df[df["decision"].astype(str).isin(display_decisions)].copy()
+            sort_cols = [c for c in ["trade_readiness", "prebreakout_total_score"] if c in view.columns]
+            if "prebreakout_total_score" in view.columns:
+                view = view.sort_values(["prebreakout_total_score"], ascending=False).head(200).reset_index(drop=True)
+            else:
+                view = view.head(200).reset_index(drop=True)
             def fmt(v):
                 try:
                     if pd.isna(v):
@@ -10988,7 +11010,7 @@ class AppUI:
                 top_wait = df.get("wait_reason", pd.Series(dtype=str)).fillna("").astype(str).value_counts().head(3).to_dict()
                 self.prebreakout_tree.insert("", "end", values=(
                     "NO_CANDIDATE", "", "", "", "", "", "", "", "", "", "", "SUMMARY",
-                    f"無 BUY/WATCH，主表不列出 INVALID/MISSING 股票；decision={counts}",
+                    f"無 BUY/WATCH/WATCH_OBSERVE/ALERT，主表不列出 INVALID/MISSING 股票；decision={counts}",
                     f"主要缺口={top_gaps}", "", f"主要原因={top_wait}"
                 ))
             else:
@@ -10997,13 +11019,14 @@ class AppUI:
                         str(r.get("decision", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")),
                         fmt(r.get("prebreakout_total_score", "")), fmt(r.get("close", "")), fmt(r.get("entry_price", "")),
                         fmt(r.get("stop_loss", "")), fmt(r.get("target1", "")), fmt(r.get("target2", "")), fmt(r.get("rr", "")),
-                        str(r.get("data_quality_flag", "")), str(r.get("wait_reason", "")), str(r.get("data_gap_reason", "")),
-                        fmt(r.get("next_trigger_price", "")), str(r.get("suggested_action", ""))
+                        str(r.get("trade_readiness", r.get("data_quality_flag", ""))), str(r.get("wait_reason", "")), str(r.get("data_gap_reason", "")),
+                        fmt(r.get("next_trigger_price", "")), f"{str(r.get('suggested_action', ''))}｜{str(r.get('source_level', ''))}｜{str(r.get('risk_flag', ''))}"
                     ))
             if hasattr(self, "prebreakout_status_var"):
                 counts = df["decision"].astype(str).value_counts().to_dict()
                 qcounts = df.get("data_quality_flag", pd.Series(dtype=str)).fillna("").astype(str).value_counts().to_dict()
-                self.prebreakout_status_var.set(f"最新Signal：{len(df)}筆｜決策{counts}｜品質{qcounts}｜報表：{self.last_prebreakout_report_path or PREBREAKOUT_REPORT_DIR}")
+                readiness_counts = df.get("trade_readiness", pd.Series(dtype=str)).fillna("").astype(str).value_counts().to_dict()
+                self.prebreakout_status_var.set(f"最新Signal：{len(df)}筆｜決策{counts}｜Readiness{readiness_counts}｜品質{qcounts}｜報表：{self.last_prebreakout_report_path or PREBREAKOUT_REPORT_DIR}")
         except Exception as exc:
             self.append_log(f"刷新爆發前雷達失敗：{exc}", "ERROR")
 
