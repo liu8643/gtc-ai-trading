@@ -1759,7 +1759,7 @@ CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
 # PREBREAKOUT_UI_REPORT_PATCH：爆發前交易系統固定報表輸出位置
-PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V8_UI_SELECT_SYNC_20260524"
+PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_V9_REPORT_QUALITY_GATE_20260524"
 PREBREAKOUT_REPORT_DIR = RUNTIME_DIR / "reports"
 PREBREAKOUT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 PREBREAKOUT_MIN_PRICE_HISTORY_DAYS = 250
@@ -2476,7 +2476,10 @@ class DBManager:
             long_base_score REAL, second_wave_score REAL, vcp_score REAL, float_tightness_score REAL,
             chip_concentration_score REAL, ai_theme_score REAL, perception_gap_score REAL,
             momentum_turn_score REAL, fundamental_acceleration_score REAL, risk_flag TEXT,
-            false_breakout_flag INTEGER DEFAULT 0, rule_version TEXT,
+            false_breakout_flag INTEGER DEFAULT 0,
+            financial_score_source TEXT, data_gap_severity INTEGER DEFAULT 0, trade_readiness TEXT,
+            source_level TEXT, fallback_reason TEXT,
+            rule_version TEXT,
             data_quality_flag TEXT, data_gap_reason TEXT, evidence_json TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, signal_date)
         )
@@ -2686,6 +2689,11 @@ class DBManager:
             ("ai_theme_score", "ai_theme_score REAL"), ("perception_gap_score", "perception_gap_score REAL"),
             ("momentum_turn_score", "momentum_turn_score REAL"), ("fundamental_acceleration_score", "fundamental_acceleration_score REAL"),
             ("risk_flag", "risk_flag TEXT DEFAULT ''"), ("false_breakout_flag", "false_breakout_flag INTEGER DEFAULT 0"),
+            ("financial_score_source", "financial_score_source TEXT DEFAULT ''"),
+            ("data_gap_severity", "data_gap_severity INTEGER DEFAULT 0"),
+            ("trade_readiness", "trade_readiness TEXT DEFAULT ''"),
+            ("source_level", "source_level TEXT DEFAULT ''"),
+            ("fallback_reason", "fallback_reason TEXT DEFAULT ''"),
             ("rule_version", "rule_version TEXT DEFAULT ''"),
         ]:
             _add("prebreakout_signal_daily", col, ddl)
@@ -3149,7 +3157,7 @@ class PreBreakoutIntegratedEngine:
     4. Excel 輸出規則矩陣、候選股、WAIT 池、AVOID/INVALID 池與資料缺口清單。
     """
 
-    RULE_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V8_UI_SELECT_SYNC_20260524"
+    RULE_VERSION = "PREBREAKOUT_V9_REPORT_QUALITY_GATE_20260524"
 
     def __init__(self, db: DBManager):
         self.db = db
@@ -3481,6 +3489,13 @@ class PreBreakoutIntegratedEngine:
         # 第二波分數：已有第一波/回測不破/接近前高者加權。
         x["second_wave_score"] = np.where(_safe_numeric_series_for_df(x, "second_wave_signal", 0).astype(int).eq(1), 88, 45)
         x["fundamental_acceleration_score"] = (x["eps_acceleration_score"]*0.30 + x["margin_triple_up_score"]*0.20 + x["cashflow_quality_score"]*0.15 + x["revenue_acceleration_score"]*0.25 + x["backlog_proxy_score"]*0.10).round(2)
+        # V9：financial_score 不可空白。若 EPS/營收/三率資料不足，明確標示 proxy，不再讓報表核心欄位空白。
+        x["financial_score"] = pd.to_numeric(x["fundamental_acceleration_score"], errors="coerce").fillna(40).round(2)
+        x["financial_score_source"] = np.where(
+            (_safe_numeric_series_for_df(x, "eps_quarter_count", 0) >= 4) & (_safe_numeric_series_for_df(x, "revenue_month_count", 0) >= 12),
+            "RAW_FINANCIAL_HISTORY",
+            "PROXY_FROM_AVAILABLE_DB"
+        )
         x["smart_money_score"] = (x["institutional_accumulation_score"]*0.65 + x["chip_concentration_score"]*0.25 + x["float_tightness_score"]*0.10).round(2)
         x["theme_score"] = (x["industry_stage_score"]*0.35 + x["supply_chain_score"]*0.35 + x["ai_theme_score"]*0.20 + x["perception_gap_score"]*0.10).round(2)
         # Word 權重：波動20 / 籌碼壓縮20 / 趨勢15 / 主力15 / 產業10 / 題材10 / 動能5 / 財報5。
@@ -3520,6 +3535,22 @@ class PreBreakoutIntegratedEngine:
                     seen.append(g)
             return ";".join(seen)
         x["data_gap_reason"] = x.apply(_gap_reason, axis=1)
+
+        # V9：缺口分級。交易表與觀察表分流，避免 DATA_GAP_PROXY 被誤認為正式可下單。
+        critical_gap_terms = [
+            "EPS_HISTORY_MISSING", "REVENUE_HISTORY_LT12", "FLOW_HISTORY_LT5",
+            "EPS_ACCELERATION_PROXY_USED", "REVENUE_ACCELERATION_PROXY_USED",
+            "SMART_MONEY_PROXY_USED", "BIG_HOLDER_DATA_MISSING"
+        ]
+        def _gap_severity(reason: str) -> int:
+            s = str(reason or "")
+            if "PRICE_HISTORY_LT120_HARD" in s or "NO_CLOSE_PRICE" in s:
+                return 5
+            return int(sum(1 for term in critical_gap_terms if term in s))
+        x["data_gap_severity"] = x["data_gap_reason"].map(_gap_severity).astype(int)
+        x["source_level"] = np.where(x["data_gap_severity"].eq(0), "raw_verified", "proxy_or_partial")
+        x["fallback_reason"] = np.where(x["data_gap_severity"].eq(0), "", x["data_gap_reason"])
+
         def _base_filter(r):
             hard = []
             warn = []
@@ -3547,23 +3578,34 @@ class PreBreakoutIntegratedEngine:
         ], ["FALSE_BREAKOUT", "BASE_FILTER_FAIL", "DATA_GAP_PROXY"], default="OK")
         def _decision(r):
             score = float(r.get("prebreakout_total_score", 0) or 0)
+            gap_sev = int(r.get("data_gap_severity", 0) or 0)
             if str(r.get("base_filter_status", "")) == "FAIL":
                 return "AVOID"
             if int(r.get("false_breakout_flag", 0) or 0) == 1:
                 return "FALSE_BREAKOUT"
-            if int(r.get("breakout_trigger", 0) or 0) == 1 and score >= PREBREAKOUT_BUY_SCORE:
+            if int(r.get("breakout_trigger", 0) or 0) == 1 and score >= PREBREAKOUT_BUY_SCORE and gap_sev <= 1:
                 return "BUY_TRIGGER"
-            if int(r.get("second_wave_signal", 0) or 0) == 1 and score >= 80:
+            if int(r.get("second_wave_signal", 0) or 0) == 1 and score >= 80 and gap_sev <= 1:
                 return "SECOND_WAVE_BUY"
             if score >= 80:
-                return "WATCH"
+                return "WATCH_OBSERVE" if gap_sev > 1 else "WATCH"
             if score >= 70:
                 return "ALERT"
             return "WAIT"
         x["decision"] = x.apply(_decision, axis=1)
+        x["trade_readiness"] = np.select(
+            [
+                x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY"]) & (x["data_gap_severity"] <= 1),
+                x["decision"].isin(["WATCH", "WATCH_OBSERVE"]),
+                x["decision"].eq("ALERT"),
+                x["decision"].isin(["AVOID", "FALSE_BREAKOUT"])
+            ],
+            ["TRADE_READY", "OBSERVE_ONLY", "ALERT_ONLY", "REJECT"],
+            default="WAIT_ONLY"
+        )
         def _wait_reason(r):
             d = str(r.get("decision", ""))
-            if d in ("BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"):
+            if d in ("BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH", "WATCH_OBSERVE"):
                 return ""
             if d == "FALSE_BREAKOUT":
                 return "突破後跌回平台或跌破突破K，降級觀察"
@@ -3576,20 +3618,20 @@ class PreBreakoutIntegratedEngine:
                 return "SCORE_LT_WATCH"
             return "WAIT_CONFIRM"
         x["wait_reason"] = x.apply(_wait_reason, axis=1)
-        x["entry_price"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"]), np.maximum(close, trigger).round(2), np.nan)
+        x["entry_price"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH", "WATCH_OBSERVE"]), np.maximum(close, trigger).round(2), np.nan)
         # stop 優先 pivot_low，其次 ATR/5% 風控。
         stop_by_atr = (close - np.maximum(atr*1.5, close*.05)).round(2)
         stop_calc = np.where(pivot_low.notna() & (pivot_low < close), np.minimum(pivot_low, stop_by_atr), stop_by_atr)
-        x["stop_loss"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"]), np.round(stop_calc, 2), np.nan)
-        x["target1"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"]), (x["entry_price"] + (x["entry_price"] - x["stop_loss"])*1.5).round(2), np.nan)
-        x["target2"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"]), (x["entry_price"] + (x["entry_price"] - x["stop_loss"])*2.2).round(2), np.nan)
+        x["stop_loss"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH", "WATCH_OBSERVE"]), np.round(stop_calc, 2), np.nan)
+        x["target1"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH", "WATCH_OBSERVE"]), (x["entry_price"] + (x["entry_price"] - x["stop_loss"])*1.5).round(2), np.nan)
+        x["target2"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH", "WATCH_OBSERVE"]), (x["entry_price"] + (x["entry_price"] - x["stop_loss"])*2.2).round(2), np.nan)
         x["rr"] = ((x["target1"] - x["entry_price"]) / (x["entry_price"] - x["stop_loss"]).replace(0, np.nan)).round(2)
         rr_downgrade = (x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY"])) & (x["rr"] < PREBREAKOUT_MIN_RR)
         x.loc[rr_downgrade, "decision"] = "WATCH"
         x.loc[rr_downgrade, "wait_reason"] = "RR_LT_MIN_DOWNGRADE_TO_WATCH"
         x["suggested_action"] = np.select(
-            [x["decision"].eq("BUY_TRIGGER"), x["decision"].eq("SECOND_WAVE_BUY"), x["decision"].eq("WATCH"), x["decision"].eq("ALERT"), x["decision"].eq("FALSE_BREAKOUT"), x["decision"].eq("AVOID")],
-            ["正式突破，可進盤前作戰表，小倉/依策略執行", "第二波主升候選，等再放量確認", "觀察，等待量價確認或突破", "預警，不進主交易表，只追蹤觸發價", "假突破降級，禁止追價", "排除，不列交易表"],
+            [x["decision"].eq("BUY_TRIGGER"), x["decision"].eq("SECOND_WAVE_BUY"), x["decision"].eq("WATCH"), x["decision"].eq("WATCH_OBSERVE"), x["decision"].eq("ALERT"), x["decision"].eq("FALSE_BREAKOUT"), x["decision"].eq("AVOID")],
+            ["正式突破，可進盤前作戰表，小倉/依策略執行", "第二波主升候選，等再放量確認", "觀察，等待量價確認或突破", "觀察候選，但資料缺口偏高，不得直接下單", "預警，不進主交易表，只追蹤觸發價", "假突破降級，禁止追價", "排除，不列交易表"],
             default="等待條件"
         )
         x["signal_date"] = signal_date
@@ -3603,18 +3645,18 @@ class PreBreakoutIntegratedEngine:
             "trigger_price": float(r.get("trigger_price", 0) or 0),
             "data_gap_reason": str(r.get("data_gap_reason", "")),
         }, ensure_ascii=False), axis=1)
-        keep = ["stock_id","signal_date","stock_name","close","prebreakout_total_score","compression_score","volume_dry_score","trend_score","smart_money_score","financial_score","theme_score","decision","entry_price","stop_loss","target1","target2","rr","wait_reason","next_trigger_price","suggested_action","base_filter_status","fail_reason","trigger_price","pivot_low","eps_acceleration_score","margin_triple_up_score","cashflow_quality_score","revenue_acceleration_score","backlog_proxy_score","industry_stage_score","supply_chain_score","volume_anomaly_score","institutional_accumulation_score","long_base_score","second_wave_score","vcp_score","float_tightness_score","chip_concentration_score","ai_theme_score","perception_gap_score","momentum_turn_score","fundamental_acceleration_score","risk_flag","false_breakout_flag","rule_version","data_quality_flag","data_gap_reason","evidence_json","update_time"]
+        keep = ["stock_id","signal_date","stock_name","close","prebreakout_total_score","compression_score","volume_dry_score","trend_score","smart_money_score","financial_score","theme_score","decision","entry_price","stop_loss","target1","target2","rr","wait_reason","next_trigger_price","suggested_action","base_filter_status","fail_reason","trigger_price","pivot_low","eps_acceleration_score","margin_triple_up_score","cashflow_quality_score","revenue_acceleration_score","backlog_proxy_score","industry_stage_score","supply_chain_score","volume_anomaly_score","institutional_accumulation_score","long_base_score","second_wave_score","vcp_score","float_tightness_score","chip_concentration_score","ai_theme_score","perception_gap_score","momentum_turn_score","fundamental_acceleration_score","risk_flag","false_breakout_flag","financial_score_source","data_gap_severity","trade_readiness","source_level","fallback_reason","rule_version","data_quality_flag","data_gap_reason","evidence_json","update_time"]
         # backward naming：momentum_turn_score 來自 momentum_score。
         x["momentum_turn_score"] = x.get("momentum_score", 50)
         for c in keep:
             if c not in x.columns:
-                x[c] = np.nan if c not in ("stock_id","signal_date","stock_name","decision","wait_reason","suggested_action","base_filter_status","fail_reason","risk_flag","rule_version","data_quality_flag","data_gap_reason","evidence_json","update_time") else ""
+                x[c] = np.nan if c not in ("stock_id","signal_date","stock_name","decision","wait_reason","suggested_action","base_filter_status","fail_reason","risk_flag","financial_score_source","trade_readiness","source_level","fallback_reason","rule_version","data_quality_flag","data_gap_reason","evidence_json","update_time") else ""
         out = x[keep].copy()
         with self.db.lock:
             self.db.conn.execute("DELETE FROM prebreakout_signal_daily WHERE signal_date=?", (signal_date,))
             out.to_sql("prebreakout_signal_daily", self.db.conn, if_exists="append", index=False)
             self.db.conn.execute("DELETE FROM trade_plan_prebreakout WHERE plan_date=?", (signal_date,))
-            plan = out[out["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"])].copy()
+            plan = out[(out["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY"])) & (out.get("trade_readiness", "") == "TRADE_READY")].copy()
             if not plan.empty:
                 plan["plan_date"] = signal_date
                 plan["position_note"] = np.where(plan["decision"].eq("BUY_TRIGGER"), "突破觸發可小倉/依策略執行", np.where(plan["decision"].eq("SECOND_WAVE_BUY"), "第二波主升候選，等再放量確認", "觀察，等量價確認"))
@@ -3641,7 +3683,7 @@ class PreBreakoutIntegratedEngine:
             return pd.read_sql_query("""
                 SELECT * FROM prebreakout_signal_daily
                 WHERE signal_date=(SELECT MAX(signal_date) FROM prebreakout_signal_daily)
-                ORDER BY CASE decision WHEN 'BUY_TRIGGER' THEN 1 WHEN 'SECOND_WAVE_BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'ALERT' THEN 4 WHEN 'WAIT' THEN 8 WHEN 'FALSE_BREAKOUT' THEN 9 ELSE 10 END, prebreakout_total_score DESC
+                ORDER BY CASE decision WHEN 'BUY_TRIGGER' THEN 1 WHEN 'SECOND_WAVE_BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'WATCH_OBSERVE' THEN 4 WHEN 'ALERT' THEN 5 WHEN 'WAIT' THEN 8 WHEN 'FALSE_BREAKOUT' THEN 9 ELSE 10 END, prebreakout_total_score DESC
             """, self.db.conn)
 
     def export_premarket_excel(self, output_dir: Path | None = None, log_cb=None) -> Path:
@@ -3650,13 +3692,110 @@ class PreBreakoutIntegratedEngine:
         df = self.get_latest_signals()
         if df is None or df.empty:
             raise RuntimeError("prebreakout_signal_daily 無資料，請先執行爆發前盤後DB建立。")
+
         report_date = str(df["signal_date"].dropna().astype(str).max()).replace("-", "")
         out_path = output_dir / f"prebreakout_premarket_{report_date}.xlsx"
-        stat = df["decision"].value_counts().reset_index(); stat.columns = ["decision", "count"]
-        candidates = df[df["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"])].copy()
-        alert_pool = df[df["decision"].isin(["ALERT", "WAIT"])].copy()
+
+        # V9：保證核心稽核欄位存在，舊DB/舊資料也能輸出一致欄位。
+        for col, default in [
+            ("financial_score", np.nan), ("financial_score_source", ""), ("data_gap_severity", 0),
+            ("trade_readiness", ""), ("source_level", ""), ("fallback_reason", ""),
+            ("data_gap_reason", ""), ("risk_flag", ""), ("decision", "")
+        ]:
+            if col not in df.columns:
+                df[col] = default
+        df["financial_score"] = pd.to_numeric(df["financial_score"], errors="coerce")
+        fallback_fin = pd.to_numeric(df.get("fundamental_acceleration_score", np.nan), errors="coerce")
+        df["financial_score"] = df["financial_score"].fillna(fallback_fin).fillna(40).round(2)
+        df["financial_score_source"] = df["financial_score_source"].replace("", np.nan).fillna(
+            np.where(df["data_gap_reason"].astype(str).str.contains("PROXY|MISSING|LT", regex=True), "PROXY_FROM_AVAILABLE_DB", "RAW_FINANCIAL_HISTORY")
+        )
+        df["data_gap_severity"] = pd.to_numeric(df["data_gap_severity"], errors="coerce").fillna(0).astype(int)
+        df["trade_readiness"] = df["trade_readiness"].replace("", np.nan).fillna(
+            np.select(
+                [
+                    df["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY"]) & (df["data_gap_severity"] <= 1),
+                    df["decision"].isin(["WATCH", "WATCH_OBSERVE"]),
+                    df["decision"].eq("ALERT"),
+                    df["decision"].isin(["AVOID", "FALSE_BREAKOUT"])
+                ],
+                ["TRADE_READY", "OBSERVE_ONLY", "ALERT_ONLY", "REJECT"],
+                default="WAIT_ONLY"
+            )
+        )
+        df["source_level"] = df["source_level"].replace("", np.nan).fillna(np.where(df["data_gap_severity"].eq(0), "raw_verified", "proxy_or_partial"))
+        df["fallback_reason"] = df["fallback_reason"].replace("", np.nan).fillna(df["data_gap_reason"].astype(str))
+
+        stat = df["decision"].value_counts(dropna=False).reset_index()
+        stat.columns = ["decision", "count"]
+        stat["ratio_pct"] = (stat["count"] / max(len(df), 1) * 100).round(2)
+
+        readiness_stat = df["trade_readiness"].value_counts(dropna=False).reset_index()
+        readiness_stat.columns = ["trade_readiness", "count"]
+        readiness_stat["ratio_pct"] = (readiness_stat["count"] / max(len(df), 1) * 100).round(2)
+
+        formal_trade = df[(df["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY"])) & (df["trade_readiness"].eq("TRADE_READY"))].copy()
+        observe_candidates = df[df["decision"].isin(["WATCH", "WATCH_OBSERVE"])].copy()
+        alert_wait_full = df[df["decision"].isin(["ALERT", "WAIT"])].copy()
         avoid_pool = df[df["decision"].isin(["AVOID", "FALSE_BREAKOUT"])].copy()
-        gaps = df[df["data_gap_reason"].fillna("").astype(str).ne("")][["stock_id", "stock_name", "decision", "data_quality_flag", "data_gap_reason", "wait_reason", "suggested_action"]].copy()
+        gaps = df[df["data_gap_reason"].fillna("").astype(str).ne("")][[
+            "stock_id", "stock_name", "decision", "trade_readiness", "data_gap_severity",
+            "data_quality_flag", "data_gap_reason", "financial_score_source",
+            "source_level", "fallback_reason", "wait_reason", "suggested_action"
+        ]].copy()
+
+        def _gap_count(term: str) -> int:
+            return int(df["data_gap_reason"].astype(str).str.contains(term, regex=False).sum())
+        gap_terms = [
+            ("EPS_HISTORY_MISSING", "缺季度EPS歷史，EPS加速度只能用proxy", "P0"),
+            ("REVENUE_HISTORY_LT12", "月營收少於12個月，營收加速度不可靠", "P0"),
+            ("FLOW_HISTORY_LT5", "法人連買資料少於5日，主力吸籌不可靠", "P0"),
+            ("EPS_ACCELERATION_PROXY_USED", "EPS加速度使用替代值", "P0"),
+            ("REVENUE_ACCELERATION_PROXY_USED", "營收加速度使用替代值", "P0"),
+            ("SMART_MONEY_PROXY_USED", "主力分數使用近似資料", "P0"),
+            ("BIG_HOLDER_DATA_MISSING", "缺大戶/股權分散資料", "P0"),
+            ("PRICE_HISTORY_LT250_PARTIAL", "K線歷史少於250日，長週期壓縮不完整", "P2"),
+            ("PRICE_HISTORY_LT120_HARD", "K線歷史少於120日，應硬排除", "P2"),
+        ]
+        gap_summary = pd.DataFrame([
+            {"gap_item": term, "count": _gap_count(term), "signal_pct": round(_gap_count(term) / max(len(df), 1) * 100, 2), "priority": pri, "impact": impact}
+            for term, impact, pri in gap_terms
+        ]).sort_values(["priority", "count"], ascending=[True, False])
+
+        # V9：Quality母體 vs Signal母體對帳，避免使用者誤認報表漏資料。
+        try:
+            with self.db.lock:
+                qual = pd.read_sql_query("SELECT * FROM financial_quality_status WHERE quality_date=(SELECT MAX(quality_date) FROM financial_quality_status)", self.db.conn)
+                ext_status = pd.read_sql_query("SELECT * FROM external_source_status", self.db.conn)
+        except Exception:
+            qual = pd.DataFrame()
+            ext_status = pd.DataFrame()
+        if qual is not None and not qual.empty:
+            q_total = int(len(qual))
+            q_counts = qual["data_quality_flag"].value_counts(dropna=False).to_dict() if "data_quality_flag" in qual.columns else {}
+            signal_ids = set(df["stock_id"].astype(str).tolist())
+            q_signal = qual[qual["stock_id"].astype(str).isin(signal_ids)].copy() if "stock_id" in qual.columns else pd.DataFrame()
+            not_in_signal = qual[~qual["stock_id"].astype(str).isin(signal_ids)].copy() if "stock_id" in qual.columns else pd.DataFrame()
+            coverage_recon = pd.DataFrame([
+                {"item": "Quality rows(stocks_master)", "value": q_total, "note": "financial_quality_status母體"},
+                {"item": "Signal rows(technical_feature_daily)", "value": int(len(df)), "note": "進入prebreakout_signal_daily母體"},
+                {"item": "Quality OK", "value": int(q_counts.get("OK", 0)), "note": "原始品質OK"},
+                {"item": "Quality PARTIAL", "value": int(q_counts.get("PARTIAL", 0)), "note": "可分析但有缺口"},
+                {"item": "Quality MISSING", "value": int(q_counts.get("MISSING", 0)), "note": "嚴重缺口"},
+                {"item": "Quality not in Signal", "value": int(len(not_in_signal)), "note": "多數為價格/技術資料不足或未進入技術特徵"},
+                {"item": "Signal with data gap", "value": int((df["data_gap_reason"].astype(str) != "").sum()), "note": "進Signal後仍需缺口分級"},
+            ])
+            missing_not_signal = not_in_signal.head(500)
+        else:
+            coverage_recon = pd.DataFrame([{"item": "Quality table", "value": 0, "note": "無financial_quality_status資料"}])
+            missing_not_signal = pd.DataFrame()
+
+        if ext_status is None or ext_status.empty:
+            source_status = pd.DataFrame([{"module": "external_source_status", "status": "NO_DATA", "blocking_reason": "無來源狀態資料"}])
+        else:
+            keep_status_cols = [c for c in ["module", "source_name", "source_date", "status", "data_ready", "source_level", "blocking_reason", "rows_count", "last_fetch_time", "request_url"] if c in ext_status.columns]
+            source_status = ext_status[keep_status_cols].copy()
+
         rule_matrix = pd.DataFrame([
             ["波動壓縮", 20, "BB/KC/ATR/Range 收斂", "compression_score"],
             ["籌碼壓縮", 20, "VDU、OBV不破、VCP、量能異常", "volume_dry_score + vcp_score + volume_anomaly_score"],
@@ -3665,24 +3804,47 @@ class PreBreakoutIntegratedEngine:
             ["產業位階", 10, "CPO/ASIC/AI電源/AI伺服器等主線", "industry_stage_score"],
             ["題材供應鏈", 10, "AI真供應鏈與市場認知差", "theme_score"],
             ["動能轉折", 5, "RSI、MACD、Momentum", "momentum_turn_score"],
-            ["財報加速", 5, "EPS、營收、三率、現金流代理", "fundamental_acceleration_score"],
+            ["財報加速", 5, "EPS、營收、三率、現金流代理", "financial_score / fundamental_acceleration_score"],
         ], columns=["模型", "權重", "計算項目", "程式欄位"])
-        if candidates.empty:
-            candidates = pd.DataFrame([{"狀態": "NO_TRADABLE_CANDIDATE", "說明": "目前沒有 BUY_TRIGGER / SECOND_WAVE_BUY / WATCH。請查看 ALERT_WAIT_POOL 與 Data_Gap。", "全部Signal": int(len(df))}])
+
+        summary = pd.DataFrame([
+            {"item": "report_date", "value": report_date, "note": "報表日期"},
+            {"item": "rule_version", "value": self.RULE_VERSION, "note": "爆發前規則版本"},
+            {"item": "all_signal", "value": int(len(df)), "note": "全部進入Signal的股票數"},
+            {"item": "formal_trade_count", "value": int(len(formal_trade)), "note": "正式作戰表，只允許TRADE_READY"},
+            {"item": "observe_candidate_count", "value": int(len(observe_candidates)), "note": "觀察候選，不可直接下單"},
+            {"item": "data_gap_count", "value": int(len(gaps)), "note": "有資料缺口的Signal數"},
+            {"item": "critical_rule", "value": "DATA_GAP_PROXY不得進正式交易表", "note": "P0修正"},
+        ])
+
+        if formal_trade.empty:
+            formal_trade = pd.DataFrame([{
+                "狀態": "NO_TRADABLE_CANDIDATE",
+                "說明": "目前沒有 BUY_TRIGGER / SECOND_WAVE_BUY 且 trade_readiness=TRADE_READY 的股票。WATCH_OBSERVE 只可觀察，不可直接下單。",
+                "全部Signal": int(len(df)),
+                "觀察候選": int(len(observe_candidates))
+            }])
+
         tables = {
-            "01_爆發前候選股": candidates,
-            "02_決策統計": stat,
-            "03_ALERT_WAIT_POOL": alert_pool.head(500),
-            "04_AVOID_FALSE_POOL": avoid_pool.head(500),
-            "05_Data_Gap": gaps.head(1000),
-            "06_規則權重矩陣": rule_matrix,
-            "07_全部Signal": df,
+            "00_Report_Summary": summary,
+            "01_正式作戰表": formal_trade,
+            "02_WATCH觀察候選": observe_candidates,
+            "03_決策統計": stat,
+            "04_Trade_Readiness": readiness_stat,
+            "05_ALERT_WAIT_FULL": alert_wait_full,
+            "06_AVOID_FALSE_POOL": avoid_pool,
+            "07_Data_Gap_Summary": gap_summary,
+            "08_Data_Gap_Full": gaps,
+            "09_Coverage_Recon": coverage_recon,
+            "10_Quality_NotInSignal": missing_not_signal,
+            "11_Source_Status": source_status,
+            "12_規則權重矩陣": rule_matrix,
+            "13_全部Signal": df,
         }
         out_path, kind = write_table_bundle(out_path.with_suffix(""), tables, preferred="excel")
         if log_cb:
-            log_cb(f"[PREBREAKOUT][V6][REPORT] {kind} 已輸出：{out_path}｜候選={len(candidates)}｜all={len(df)}")
+            log_cb(f"[PREBREAKOUT][V9][REPORT] {kind} 已輸出：{out_path}｜正式={len(formal_trade)}｜觀察={len(observe_candidates)}｜all={len(df)}")
         return Path(out_path)
-
 
 def run_prebreakout_after_market_builder(db: DBManager | None = None, log_cb=None, progress_cb=None) -> dict:
     close_after=False
