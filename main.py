@@ -1759,10 +1759,10 @@ CHART_DIR = RUNTIME_DIR / "charts"
 CHART_DIR.mkdir(exist_ok=True)
 
 # PREBREAKOUT_UI_REPORT_PATCH：爆發前交易系統固定報表輸出位置
-PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_UI_REPORT_PATCH_20260523"
+PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V6_20260524"
 PREBREAKOUT_REPORT_DIR = RUNTIME_DIR / "reports"
 PREBREAKOUT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
-PREBREAKOUT_MIN_PRICE_HISTORY_DAYS = 120
+PREBREAKOUT_MIN_PRICE_HISTORY_DAYS = 250
 PREBREAKOUT_BUY_SCORE = 85.0
 PREBREAKOUT_WATCH_SCORE = 70.0
 PREBREAKOUT_MIN_RR = 1.5
@@ -2445,7 +2445,13 @@ class DBManager:
             stock_id TEXT, feature_date TEXT, close REAL, volume REAL, ma50 REAL, ma150 REAL, ma200 REAL, ma200_slope REAL,
             bb_width REAL, kc_width REAL, atr14 REAL, atr60 REAL, atr_compression REAL, squeeze_on INTEGER,
             vdu_days INTEGER, volume_dry_score REAL, obv REAL, high20 REAL, breakout_trigger INTEGER, trigger_price REAL,
-            compression_score REAL, trend_score REAL, technical_ready INTEGER DEFAULT 0, update_time TEXT,
+            compression_score REAL, trend_score REAL, technical_ready INTEGER DEFAULT 0,
+            vol_ma3 REAL, vol_ma5 REAL, vol_ma20 REAL, volume_ratio REAL,
+            rsi14 REAL, macd REAL, macd_signal REAL, macd_hist REAL, momentum_score REAL,
+            bb_width_rank REAL, atr_compression_score REAL, vcp_score REAL, long_base_score REAL,
+            volume_anomaly_score REAL, trend_gate TEXT, second_wave_signal INTEGER DEFAULT 0,
+            false_breakout_signal INTEGER DEFAULT 0, pivot_low REAL, breakout_volume_confirm INTEGER DEFAULT 0,
+            obv_holding_flag INTEGER DEFAULT 0, update_time TEXT,
             PRIMARY KEY(stock_id, feature_date)
         )
         """)
@@ -2463,6 +2469,14 @@ class DBManager:
             compression_score REAL, volume_dry_score REAL, trend_score REAL, smart_money_score REAL, financial_score REAL, theme_score REAL,
             decision TEXT, entry_price REAL, stop_loss REAL, target1 REAL, target2 REAL, rr REAL,
             wait_reason TEXT, next_trigger_price REAL, suggested_action TEXT,
+            base_filter_status TEXT, fail_reason TEXT, trigger_price REAL, pivot_low REAL,
+            eps_acceleration_score REAL, margin_triple_up_score REAL, cashflow_quality_score REAL,
+            revenue_acceleration_score REAL, backlog_proxy_score REAL, industry_stage_score REAL,
+            supply_chain_score REAL, volume_anomaly_score REAL, institutional_accumulation_score REAL,
+            long_base_score REAL, second_wave_score REAL, vcp_score REAL, float_tightness_score REAL,
+            chip_concentration_score REAL, ai_theme_score REAL, perception_gap_score REAL,
+            momentum_turn_score REAL, fundamental_acceleration_score REAL, risk_flag TEXT,
+            false_breakout_flag INTEGER DEFAULT 0, rule_version TEXT,
             data_quality_flag TEXT, data_gap_reason TEXT, evidence_json TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, signal_date)
         )
@@ -2645,11 +2659,34 @@ class DBManager:
         ]:
             _add("financial_feature_daily", col, ddl)
 
-        # PREBREAKOUT_UI_WORKFLOW_V5：補強既有 prebreakout_signal_daily 欄位，避免舊 DB schema 寫入失敗。
+        # PREBREAKOUT_FULL_RULE_ENGINE_V6：補強技術特徵與完整選股規則欄位，避免舊 DB schema 寫入失敗。
+        for col, ddl in [
+            ("vol_ma3", "vol_ma3 REAL"), ("vol_ma5", "vol_ma5 REAL"), ("vol_ma20", "vol_ma20 REAL"), ("volume_ratio", "volume_ratio REAL"),
+            ("rsi14", "rsi14 REAL"), ("macd", "macd REAL"), ("macd_signal", "macd_signal REAL"), ("macd_hist", "macd_hist REAL"),
+            ("momentum_score", "momentum_score REAL"), ("bb_width_rank", "bb_width_rank REAL"), ("atr_compression_score", "atr_compression_score REAL"),
+            ("vcp_score", "vcp_score REAL"), ("long_base_score", "long_base_score REAL"), ("volume_anomaly_score", "volume_anomaly_score REAL"),
+            ("trend_gate", "trend_gate TEXT"), ("second_wave_signal", "second_wave_signal INTEGER DEFAULT 0"), ("false_breakout_signal", "false_breakout_signal INTEGER DEFAULT 0"),
+            ("pivot_low", "pivot_low REAL"), ("breakout_volume_confirm", "breakout_volume_confirm INTEGER DEFAULT 0"), ("obv_holding_flag", "obv_holding_flag INTEGER DEFAULT 0"),
+        ]:
+            _add("technical_feature_daily", col, ddl)
+
         for col, ddl in [
             ("wait_reason", "wait_reason TEXT DEFAULT ''"),
             ("next_trigger_price", "next_trigger_price REAL"),
             ("suggested_action", "suggested_action TEXT DEFAULT ''"),
+            ("base_filter_status", "base_filter_status TEXT DEFAULT ''"), ("fail_reason", "fail_reason TEXT DEFAULT ''"),
+            ("trigger_price", "trigger_price REAL"), ("pivot_low", "pivot_low REAL"),
+            ("eps_acceleration_score", "eps_acceleration_score REAL"), ("margin_triple_up_score", "margin_triple_up_score REAL"),
+            ("cashflow_quality_score", "cashflow_quality_score REAL"), ("revenue_acceleration_score", "revenue_acceleration_score REAL"),
+            ("backlog_proxy_score", "backlog_proxy_score REAL"), ("industry_stage_score", "industry_stage_score REAL"),
+            ("supply_chain_score", "supply_chain_score REAL"), ("volume_anomaly_score", "volume_anomaly_score REAL"),
+            ("institutional_accumulation_score", "institutional_accumulation_score REAL"), ("long_base_score", "long_base_score REAL"),
+            ("second_wave_score", "second_wave_score REAL"), ("vcp_score", "vcp_score REAL"),
+            ("float_tightness_score", "float_tightness_score REAL"), ("chip_concentration_score", "chip_concentration_score REAL"),
+            ("ai_theme_score", "ai_theme_score REAL"), ("perception_gap_score", "perception_gap_score REAL"),
+            ("momentum_turn_score", "momentum_turn_score REAL"), ("fundamental_acceleration_score", "fundamental_acceleration_score REAL"),
+            ("risk_flag", "risk_flag TEXT DEFAULT ''"), ("false_breakout_flag", "false_breakout_flag INTEGER DEFAULT 0"),
+            ("rule_version", "rule_version TEXT DEFAULT ''"),
         ]:
             _add("prebreakout_signal_daily", col, ddl)
 
@@ -3101,8 +3138,18 @@ def normalize_fiscal_quarter(value) -> tuple[int | None, int | None, str, str]:
     return None, None, "", ""
 
 
+
 class PreBreakoutIntegratedEngine:
-    """爆發前交易系統：盤後建立Feature/Signal，盤前只讀DB產報表。"""
+    """V6 爆發前完整規則引擎：依 Word 規格實作多層 Gate + 多因子 Score + Trigger + RiskTradePlan。
+
+    設計原則：
+    1. 資料缺口不硬算、不偽裝成買點；寫入 data_gap_reason / fail_reason。
+    2. 財報/籌碼缺口以降權處理；price_history 不足才硬性排除。
+    3. BUY/WATCH/SECOND_WAVE_BUY 才產生正式交易價；WAIT 只給 next_trigger_price。
+    4. Excel 輸出規則矩陣、候選股、WAIT 池、AVOID/INVALID 池與資料缺口清單。
+    """
+
+    RULE_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V6_20260524"
 
     def __init__(self, db: DBManager):
         self.db = db
@@ -3129,7 +3176,7 @@ class PreBreakoutIntegratedEngine:
                         SELECT stock_id,revenue_month,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_date,? FROM external_revenue
                     """, (now,))
             except Exception as exc:
-                log_warning(f"[PREBREAKOUT] revenue snapshot copy skipped: {exc}")
+                log_warning(f"[PREBREAKOUT][V6] revenue snapshot copy skipped: {exc}")
             try:
                 cnt = cur.execute("SELECT COUNT(*) FROM external_institutional_history").fetchone()[0]
                 if int(cnt or 0) == 0:
@@ -3140,7 +3187,7 @@ class PreBreakoutIntegratedEngine:
                         FROM external_institutional
                     """, (now,))
             except Exception as exc:
-                log_warning(f"[PREBREAKOUT] institutional snapshot copy skipped: {exc}")
+                log_warning(f"[PREBREAKOUT][V6] institutional snapshot copy skipped: {exc}")
             try:
                 cnt = cur.execute("SELECT COUNT(*) FROM external_margin_history").fetchone()[0]
                 if int(cnt or 0) == 0:
@@ -3150,8 +3197,53 @@ class PreBreakoutIntegratedEngine:
                         FROM external_margin
                     """, (now,))
             except Exception as exc:
-                log_warning(f"[PREBREAKOUT] margin snapshot copy skipped: {exc}")
+                log_warning(f"[PREBREAKOUT][V6] margin snapshot copy skipped: {exc}")
             self.db.conn.commit()
+
+    @staticmethod
+    def _score_range(value, low, high, inverse=False) -> float:
+        try:
+            v = float(value)
+            if not np.isfinite(v):
+                return 50.0
+            if high == low:
+                return 50.0
+            s = (v - low) / (high - low) * 100.0
+            s = 100.0 - s if inverse else s
+            return round(max(0.0, min(100.0, s)), 2)
+        except Exception:
+            return 50.0
+
+    @staticmethod
+    def _calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+        delta = close.diff()
+        up = delta.clip(lower=0)
+        down = -delta.clip(upper=0)
+        ma_up = up.ewm(com=period-1, adjust=False).mean()
+        ma_down = down.ewm(com=period-1, adjust=False).mean()
+        rs = ma_up / ma_down.replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def _theme_supply_chain_score(text: str) -> tuple[float, float, float, float, str]:
+        s = str(text or "")
+        theme_patterns = [
+            (r"CPO|光模組|光通訊|矽光", 95, "CPO/光通訊"),
+            (r"ASIC|世芯|創意|IP|RISC", 92, "ASIC/IP"),
+            (r"AI伺服器|伺服器|資料中心|CoWoS|先進封裝", 90, "AI Server"),
+            (r"散熱|液冷|電源|HVDC|電力", 88, "AI Power/Thermal"),
+            (r"半導體|AI|網通", 78, "AI/半導體/網通"),
+        ]
+        best = (50.0, "一般題材")
+        for pat, score, label in theme_patterns:
+            if re.search(pat, s, flags=re.I):
+                best = (float(score), label)
+                break
+        ai_theme = best[0]
+        supply_chain = best[0]
+        industry_stage = min(100.0, best[0] + (5 if best[0] >= 88 else 0))
+        perception_gap = 75.0 if best[0] >= 88 and re.search(r"傳產|電機|電源|網通|光電", s) else 50.0
+        return industry_stage, supply_chain, ai_theme, perception_gap, best[1]
 
     def build_technical_feature_daily(self, feature_date: str | None = None, log_cb=None) -> int:
         feature_date = feature_date or self._latest_feature_date()
@@ -3161,199 +3253,395 @@ class PreBreakoutIntegratedEngine:
             raise RuntimeError("price_history 無資料，請先執行歷史資料建立。")
         for c in ["open", "high", "low", "close", "volume"]:
             price[c] = pd.to_numeric(price[c], errors="coerce")
-        rows=[]; total=int(price["stock_id"].nunique())
-        for idx,(sid,g) in enumerate(price.groupby("stock_id"), start=1):
-            g=g.dropna(subset=["close"]).sort_values("date").tail(260).copy()
-            if g.empty: continue
-            close=g["close"].astype(float); high=g["high"].fillna(close).astype(float); low=g["low"].fillna(close).astype(float); volume=g["volume"].fillna(0).astype(float)
-            ma20=close.rolling(20,min_periods=5).mean(); ma50=close.rolling(50,min_periods=20).mean(); ma150=close.rolling(150,min_periods=60).mean(); ma200=close.rolling(200,min_periods=80).mean()
-            std20=close.rolling(20,min_periods=10).std(); bb_width=((ma20+2*std20)-(ma20-2*std20))/ma20.replace(0,np.nan)
-            prev_close=close.shift(1); tr=pd.concat([(high-low).abs(),(high-prev_close).abs(),(low-prev_close).abs()],axis=1).max(axis=1)
-            atr14=tr.rolling(14,min_periods=5).mean(); atr60=tr.rolling(60,min_periods=20).mean(); kc_width=(atr14*4)/ma20.replace(0,np.nan)
-            squeeze_on=int(pd.notna(bb_width.iloc[-1]) and pd.notna(kc_width.iloc[-1]) and bb_width.iloc[-1] < kc_width.iloc[-1])
-            vol_ma20=volume.rolling(20,min_periods=5).mean(); vdu=(volume<(vol_ma20*0.65)).astype(int); vdu_days=int(vdu.tail(10).sum())
-            obv=(np.sign(close.diff().fillna(0))*volume).cumsum(); high20=high.rolling(20,min_periods=5).max()
-            last_close=float(close.iloc[-1]); last_high20=float(high20.iloc[-2]) if len(high20)>=2 and pd.notna(high20.iloc[-2]) else float(high20.iloc[-1])
-            breakout_trigger=int(last_close>last_high20 and volume.iloc[-1] > max(float(volume.tail(5).mean())*1.5,1.0))
-            compression_score=50.0
-            if pd.notna(bb_width.iloc[-1]):
-                rw=bb_width.tail(120).dropna()
-                if len(rw)>20:
-                    compression_score=round(max(0,min(100,(1.0-float((rw<=bb_width.iloc[-1]).mean()))*100)),2)
-            volume_dry_score=round(min(100.0, vdu_days*12.0 + (20.0 if volume.iloc[-1] < max(float(vol_ma20.iloc[-1] or 0),1.0) else 0.0)),2)
-            trend_ok=(pd.notna(ma50.iloc[-1]) and pd.notna(ma150.iloc[-1]) and pd.notna(ma200.iloc[-1]) and last_close>ma50.iloc[-1]>ma150.iloc[-1]>ma200.iloc[-1])
-            ma200_slope=float(ma200.iloc[-1]-ma200.iloc[-20]) if len(ma200.dropna())>=20 and pd.notna(ma200.iloc[-1]) and pd.notna(ma200.iloc[-20]) else np.nan
-            trend_score=90.0 if trend_ok and (not np.isfinite(ma200_slope) or ma200_slope>=0) else (60.0 if pd.notna(ma50.iloc[-1]) and last_close>ma50.iloc[-1] else 30.0)
-            rows.append({"stock_id":str(sid),"feature_date":feature_date,"close":last_close,"volume":float(volume.iloc[-1] or 0),"ma50":float(ma50.iloc[-1]) if pd.notna(ma50.iloc[-1]) else np.nan,"ma150":float(ma150.iloc[-1]) if pd.notna(ma150.iloc[-1]) else np.nan,"ma200":float(ma200.iloc[-1]) if pd.notna(ma200.iloc[-1]) else np.nan,"ma200_slope":ma200_slope,"bb_width":float(bb_width.iloc[-1]) if pd.notna(bb_width.iloc[-1]) else np.nan,"kc_width":float(kc_width.iloc[-1]) if pd.notna(kc_width.iloc[-1]) else np.nan,"atr14":float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else np.nan,"atr60":float(atr60.iloc[-1]) if pd.notna(atr60.iloc[-1]) else np.nan,"atr_compression":float(atr14.iloc[-1]/atr60.iloc[-1]) if pd.notna(atr14.iloc[-1]) and pd.notna(atr60.iloc[-1]) and atr60.iloc[-1] else np.nan,"squeeze_on":squeeze_on,"vdu_days":vdu_days,"volume_dry_score":volume_dry_score,"obv":float(obv.iloc[-1]) if pd.notna(obv.iloc[-1]) else np.nan,"high20":last_high20,"breakout_trigger":breakout_trigger,"trigger_price":last_high20,"compression_score":compression_score,"trend_score":trend_score,"technical_ready":1 if len(g)>=PREBREAKOUT_MIN_PRICE_HISTORY_DAYS else 0,"update_time":datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-            if log_cb and (idx%200==0 or idx==total): log_cb(f"[PREBREAKOUT][TECH] {idx}/{total} rows={len(rows)}")
-        out=pd.DataFrame(rows)
+        rows = []
+        total = int(price["stock_id"].nunique())
+        for idx, (sid, g) in enumerate(price.groupby("stock_id"), start=1):
+            g = g.dropna(subset=["close"]).sort_values("date").tail(320).copy()
+            if g.empty:
+                continue
+            close = g["close"].astype(float)
+            high = g["high"].fillna(close).astype(float)
+            low = g["low"].fillna(close).astype(float)
+            volume = g["volume"].fillna(0).astype(float)
+            ma20 = close.rolling(20, min_periods=5).mean()
+            ma50 = close.rolling(50, min_periods=20).mean()
+            ma150 = close.rolling(150, min_periods=60).mean()
+            ma200 = close.rolling(200, min_periods=80).mean()
+            std20 = close.rolling(20, min_periods=10).std()
+            bb_width = ((ma20 + 2*std20) - (ma20 - 2*std20)) / ma20.replace(0, np.nan)
+            prev_close = close.shift(1)
+            tr = pd.concat([(high-low).abs(), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+            atr14 = tr.rolling(14, min_periods=5).mean()
+            atr60 = tr.rolling(60, min_periods=20).mean()
+            kc_width = (atr14 * 4) / ma20.replace(0, np.nan)
+            vol_ma3 = volume.rolling(3, min_periods=1).mean()
+            vol_ma5 = volume.rolling(5, min_periods=1).mean()
+            vol_ma20 = volume.rolling(20, min_periods=5).mean()
+            vdu = (volume < (vol_ma20 * 0.65)).astype(int)
+            vdu_days = int(vdu.tail(10).sum())
+            obv = (np.sign(close.diff().fillna(0)) * volume).cumsum()
+            high20 = high.rolling(20, min_periods=5).max()
+            high60 = high.rolling(60, min_periods=20).max()
+            low60 = low.rolling(60, min_periods=20).min()
+            rsi14 = self._calc_rsi(close, 14)
+            ema12 = close.ewm(span=12, adjust=False).mean()
+            ema26 = close.ewm(span=26, adjust=False).mean()
+            macd = ema12 - ema26
+            macd_signal = macd.ewm(span=9, adjust=False).mean()
+            macd_hist = macd - macd_signal
+            last_close = float(close.iloc[-1])
+            last_high20 = float(high20.iloc[-2]) if len(high20) >= 2 and pd.notna(high20.iloc[-2]) else float(high20.iloc[-1])
+            last_vol = float(volume.iloc[-1] or 0)
+            vratio = float(last_vol / max(float(vol_ma5.iloc[-1] or 0), 1.0))
+            breakout_volume_confirm = int(last_vol > max(float(vol_ma5.iloc[-1] or 0) * 1.8, 1.0))
+            breakout_trigger = int(last_close > last_high20 and breakout_volume_confirm == 1)
+            squeeze_on = int(pd.notna(bb_width.iloc[-1]) and pd.notna(kc_width.iloc[-1]) and bb_width.iloc[-1] < kc_width.iloc[-1])
+            rw = bb_width.tail(120).dropna()
+            bb_rank = float((rw <= bb_width.iloc[-1]).mean()) if len(rw) > 20 and pd.notna(bb_width.iloc[-1]) else np.nan
+            compression_score = round(max(0, min(100, (1.0 - bb_rank) * 100)), 2) if np.isfinite(bb_rank) else 50.0
+            atr_ratio = float(atr14.iloc[-1] / atr60.iloc[-1]) if pd.notna(atr14.iloc[-1]) and pd.notna(atr60.iloc[-1]) and atr60.iloc[-1] else np.nan
+            atr_compression_score = round(max(0, min(100, (1.2 - atr_ratio) / 0.7 * 100)), 2) if np.isfinite(atr_ratio) else 50.0
+            volume_dry_score = round(min(100.0, vdu_days * 12.0 + (20.0 if last_vol < max(float(vol_ma20.iloc[-1] or 0), 1.0) else 0.0)), 2)
+            volume_anomaly_score = min(100.0, max(0.0, (vratio / 2.0) * 100.0)) if breakout_trigger else min(75.0, max(20.0, vratio * 40.0))
+            trend_ok = bool(pd.notna(ma50.iloc[-1]) and pd.notna(ma150.iloc[-1]) and pd.notna(ma200.iloc[-1]) and last_close > ma50.iloc[-1] > ma150.iloc[-1] > ma200.iloc[-1])
+            ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-20]) if len(ma200.dropna()) >= 20 and pd.notna(ma200.iloc[-1]) and pd.notna(ma200.iloc[-20]) else np.nan
+            trend_score = 95.0 if trend_ok and (not np.isfinite(ma200_slope) or ma200_slope >= 0) else (65.0 if pd.notna(ma50.iloc[-1]) and last_close > ma50.iloc[-1] else 30.0)
+            trend_gate = "PASS" if trend_score >= 80 else ("PARTIAL" if trend_score >= 60 else "FAIL")
+            low120 = low.tail(120).min() if len(low) >= 20 else low.min()
+            high120 = high.tail(120).max() if len(high) >= 20 else high.max()
+            base_range = (high120 - low120) / max(last_close, 1e-6)
+            long_base_score = round(max(0.0, min(100.0, 100.0 - base_range * 180.0 + (20.0 if last_close > (low120 + (high120-low120)*0.45) else 0.0))), 2)
+            # VCP 以近三段20日區間收斂作近似：波幅遞減則加分。
+            ranges = []
+            for n in [60, 40, 20]:
+                part_h = high.tail(n).max(); part_l = low.tail(n).min()
+                ranges.append(float((part_h - part_l) / max(last_close, 1e-6)))
+            vcp_contract = (ranges[0] >= ranges[1] >= ranges[2]) if all(np.isfinite(r) for r in ranges) else False
+            vcp_score = round(80.0 if vcp_contract else max(30.0, 75.0 - ranges[-1]*160.0), 2)
+            # 第二波近似：20日內曾突破60日高後回測不破20/50MA，再逼近高點。
+            prev60 = high60.shift(1)
+            first_wave = bool(((close > prev60) & (volume > vol_ma20 * 1.5)).tail(45).any()) if len(g) >= 80 else False
+            pullback_hold = bool(pd.notna(ma50.iloc[-1]) and low.tail(15).min() >= ma50.iloc[-1] * 0.96)
+            near_high = bool(np.isfinite(high60.iloc[-1]) and last_close >= float(high60.iloc[-1]) * 0.94)
+            second_wave_signal = int(first_wave and pullback_hold and near_high and not breakout_trigger)
+            pivot_low = float(low.tail(20).min()) if len(low) >= 5 else float(low.min())
+            false_breakout_signal = int(bool(((close.shift(1) > high20.shift(2)) & (close < high20.shift(2))).tail(3).any())) if len(g) > 25 else 0
+            obv_holding_flag = int(len(obv.tail(20).dropna()) > 5 and obv.iloc[-1] >= obv.tail(20).min())
+            momentum_score = round(max(0, min(100, 50 + (float(rsi14.iloc[-1]) - 50 if pd.notna(rsi14.iloc[-1]) else 0) + (20 if macd_hist.iloc[-1] > 0 else -10))), 2)
+            rows.append({
+                "stock_id": str(sid), "feature_date": feature_date, "close": last_close, "volume": last_vol,
+                "ma50": float(ma50.iloc[-1]) if pd.notna(ma50.iloc[-1]) else np.nan,
+                "ma150": float(ma150.iloc[-1]) if pd.notna(ma150.iloc[-1]) else np.nan,
+                "ma200": float(ma200.iloc[-1]) if pd.notna(ma200.iloc[-1]) else np.nan,
+                "ma200_slope": ma200_slope, "bb_width": float(bb_width.iloc[-1]) if pd.notna(bb_width.iloc[-1]) else np.nan,
+                "kc_width": float(kc_width.iloc[-1]) if pd.notna(kc_width.iloc[-1]) else np.nan,
+                "atr14": float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else np.nan,
+                "atr60": float(atr60.iloc[-1]) if pd.notna(atr60.iloc[-1]) else np.nan,
+                "atr_compression": atr_ratio, "squeeze_on": squeeze_on, "vdu_days": vdu_days,
+                "volume_dry_score": volume_dry_score, "obv": float(obv.iloc[-1]) if pd.notna(obv.iloc[-1]) else np.nan,
+                "high20": last_high20, "breakout_trigger": breakout_trigger, "trigger_price": last_high20,
+                "compression_score": compression_score, "trend_score": trend_score, "technical_ready": 1 if len(g) >= 120 else 0,
+                "vol_ma3": float(vol_ma3.iloc[-1]), "vol_ma5": float(vol_ma5.iloc[-1]), "vol_ma20": float(vol_ma20.iloc[-1]) if pd.notna(vol_ma20.iloc[-1]) else np.nan,
+                "volume_ratio": vratio, "rsi14": float(rsi14.iloc[-1]) if pd.notna(rsi14.iloc[-1]) else np.nan,
+                "macd": float(macd.iloc[-1]) if pd.notna(macd.iloc[-1]) else np.nan,
+                "macd_signal": float(macd_signal.iloc[-1]) if pd.notna(macd_signal.iloc[-1]) else np.nan,
+                "macd_hist": float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else np.nan,
+                "momentum_score": momentum_score, "bb_width_rank": float(bb_rank) if np.isfinite(bb_rank) else np.nan,
+                "atr_compression_score": atr_compression_score, "vcp_score": vcp_score, "long_base_score": long_base_score,
+                "volume_anomaly_score": round(float(volume_anomaly_score), 2), "trend_gate": trend_gate,
+                "second_wave_signal": second_wave_signal, "false_breakout_signal": false_breakout_signal,
+                "pivot_low": pivot_low, "breakout_volume_confirm": breakout_volume_confirm, "obv_holding_flag": obv_holding_flag,
+                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            if log_cb and (idx % 200 == 0 or idx == total):
+                log_cb(f"[PREBREAKOUT][V6][TECH] {idx}/{total} rows={len(rows)}")
+        out = pd.DataFrame(rows)
         with self.db.lock:
-            self.db.conn.execute("DELETE FROM technical_feature_daily WHERE feature_date=?",(feature_date,)); out.to_sql("technical_feature_daily", self.db.conn, if_exists="append", index=False); self.db.conn.commit()
+            self.db.conn.execute("DELETE FROM technical_feature_daily WHERE feature_date=?", (feature_date,))
+            out.to_sql("technical_feature_daily", self.db.conn, if_exists="append", index=False)
+            self.db.conn.commit()
+        if log_cb:
+            log_cb(f"[PREBREAKOUT][V6][TECH] rows={len(out)} min_history={PREBREAKOUT_MIN_PRICE_HISTORY_DAYS} rule={self.RULE_VERSION}")
         return int(len(out))
 
     def build_financial_quality_status(self, quality_date: str | None = None, log_cb=None) -> int:
-        quality_date=quality_date or self._latest_feature_date(); self._copy_snapshot_to_history_if_needed()
+        quality_date = quality_date or self._latest_feature_date()
+        self._copy_snapshot_to_history_if_needed()
         with self.db.lock:
-            master=pd.read_sql_query("SELECT stock_id FROM stocks_master WHERE is_active=1", self.db.conn)
-            price_cnt=pd.read_sql_query("SELECT stock_id, COUNT(*) price_history_days FROM price_history GROUP BY stock_id", self.db.conn)
-            eps_cnt=pd.read_sql_query("SELECT stock_id, COUNT(*) eps_quarter_count FROM quarterly_financial_history WHERE eps IS NOT NULL GROUP BY stock_id", self.db.conn)
-            rev_cnt=pd.read_sql_query("SELECT stock_id, COUNT(*) revenue_month_count FROM external_revenue_history GROUP BY stock_id", self.db.conn)
-            inst_cnt=pd.read_sql_query("SELECT stock_id, COUNT(*) institutional_day_count FROM external_institutional_history GROUP BY stock_id", self.db.conn)
-        x=master.copy()
-        for df in [price_cnt,eps_cnt,rev_cnt,inst_cnt]:
-            if df is not None and not df.empty: x=x.merge(df,on="stock_id",how="left")
-        for c in ["price_history_days","eps_quarter_count","revenue_month_count","institutional_day_count"]:
-            x[c]=_safe_numeric_series_for_df(x,c,0).astype(int)
+            master = pd.read_sql_query("SELECT stock_id FROM stocks_master WHERE is_active=1", self.db.conn)
+            price_cnt = pd.read_sql_query("SELECT stock_id, COUNT(*) price_history_days FROM price_history GROUP BY stock_id", self.db.conn)
+            eps_cnt = pd.read_sql_query("SELECT stock_id, COUNT(*) eps_quarter_count FROM quarterly_financial_history WHERE eps IS NOT NULL GROUP BY stock_id", self.db.conn)
+            rev_cnt = pd.read_sql_query("SELECT stock_id, COUNT(*) revenue_month_count FROM external_revenue_history GROUP BY stock_id", self.db.conn)
+            inst_cnt = pd.read_sql_query("SELECT stock_id, COUNT(*) institutional_day_count FROM external_institutional_history GROUP BY stock_id", self.db.conn)
+        x = master.copy()
+        for df in [price_cnt, eps_cnt, rev_cnt, inst_cnt]:
+            if df is not None and not df.empty:
+                x = x.merge(df, on="stock_id", how="left")
+        for c in ["price_history_days", "eps_quarter_count", "revenue_month_count", "institutional_day_count"]:
+            x[c] = _safe_numeric_series_for_df(x, c, 0).astype(int)
         def _flag(r):
-            gaps=[]
-            if r["price_history_days"]<PREBREAKOUT_MIN_PRICE_HISTORY_DAYS: gaps.append("PRICE_HISTORY_LT120")
-            if r["eps_quarter_count"]<4: gaps.append("EPS_HISTORY_MISSING")
-            if r["revenue_month_count"]<3: gaps.append("REVENUE_HISTORY_MISSING")
-            if r["institutional_day_count"]<3: gaps.append("FLOW_HISTORY_MISSING")
-            if not gaps: return "OK",""
-            if r["price_history_days"]>=PREBREAKOUT_MIN_PRICE_HISTORY_DAYS and len(gaps)<=2: return "PARTIAL",";".join(gaps)
-            return "MISSING",";".join(gaps)
-        flags=x.apply(_flag,axis=1); x["data_quality_flag"]=[v[0] for v in flags]; x["data_gap_reason"]=[v[1] for v in flags]; x["quality_date"]=quality_date; x["update_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        keep=["stock_id","quality_date","price_history_days","eps_quarter_count","revenue_month_count","institutional_day_count","data_quality_flag","data_gap_reason","update_time"]
+            gaps = []
+            if r["price_history_days"] < 120:
+                gaps.append("PRICE_HISTORY_LT120_HARD")
+            elif r["price_history_days"] < PREBREAKOUT_MIN_PRICE_HISTORY_DAYS:
+                gaps.append("PRICE_HISTORY_LT250_PARTIAL")
+            if r["eps_quarter_count"] < 4:
+                gaps.append("EPS_HISTORY_MISSING")
+            if r["revenue_month_count"] < 12:
+                gaps.append("REVENUE_HISTORY_LT12")
+            if r["institutional_day_count"] < 5:
+                gaps.append("FLOW_HISTORY_LT5")
+            if not gaps:
+                return "OK", ""
+            if "PRICE_HISTORY_LT120_HARD" in gaps:
+                return "MISSING", ";".join(gaps)
+            return "PARTIAL", ";".join(gaps)
+        flags = x.apply(_flag, axis=1)
+        x["data_quality_flag"] = [v[0] for v in flags]
+        x["data_gap_reason"] = [v[1] for v in flags]
+        x["quality_date"] = quality_date
+        x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        keep = ["stock_id", "quality_date", "price_history_days", "eps_quarter_count", "revenue_month_count", "institutional_day_count", "data_quality_flag", "data_gap_reason", "update_time"]
         with self.db.lock:
-            self.db.conn.execute("DELETE FROM financial_quality_status WHERE quality_date=?",(quality_date,)); x[keep].to_sql("financial_quality_status", self.db.conn, if_exists="append", index=False); self.db.conn.commit()
-        if log_cb: log_cb(f"[PREBREAKOUT][QUALITY] rows={len(x)} OK={int((x['data_quality_flag']=='OK').sum())} PARTIAL={int((x['data_quality_flag']=='PARTIAL').sum())} MISSING={int((x['data_quality_flag']=='MISSING').sum())}")
+            self.db.conn.execute("DELETE FROM financial_quality_status WHERE quality_date=?", (quality_date,))
+            x[keep].to_sql("financial_quality_status", self.db.conn, if_exists="append", index=False)
+            self.db.conn.commit()
+        if log_cb:
+            log_cb(f"[PREBREAKOUT][V6][QUALITY] rows={len(x)} OK={int((x['data_quality_flag']=='OK').sum())} PARTIAL={int((x['data_quality_flag']=='PARTIAL').sum())} MISSING={int((x['data_quality_flag']=='MISSING').sum())}")
         return int(len(x))
 
+    def _latest_by_stock(self, table: str, order_col: str, cols: list[str]) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                q = f"""
+                SELECT t.* FROM {table} t
+                JOIN (SELECT stock_id, MAX({order_col}) AS max_key FROM {table} GROUP BY stock_id) m
+                  ON t.stock_id=m.stock_id AND t.{order_col}=m.max_key
+                """
+                df = pd.read_sql_query(q, self.db.conn)
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = np.nan
+            return df
+        except Exception:
+            return pd.DataFrame(columns=["stock_id"] + cols)
+
     def build_prebreakout_signal_daily(self, signal_date: str | None = None, log_cb=None) -> int:
-        """建立爆發前 Signal。V5 修正：MISSING 不再被偽裝成可交易 WAIT，並補 wait_reason / next_trigger_price。"""
         signal_date = signal_date or self._latest_feature_date()
         with self.db.lock:
             tech = pd.read_sql_query("SELECT * FROM technical_feature_daily WHERE feature_date=(SELECT MAX(feature_date) FROM technical_feature_daily)", self.db.conn)
             qual = pd.read_sql_query("SELECT * FROM financial_quality_status WHERE quality_date=(SELECT MAX(quality_date) FROM financial_quality_status)", self.db.conn)
-            master = pd.read_sql_query("SELECT stock_id, stock_name, industry, theme, sub_theme FROM stocks_master WHERE is_active=1", self.db.conn)
+            master = pd.read_sql_query("SELECT stock_id, stock_name, market, industry, theme, sub_theme FROM stocks_master WHERE is_active=1", self.db.conn)
         if tech is None or tech.empty:
             raise RuntimeError("technical_feature_daily 無資料，請先執行爆發前盤後DB建立。")
-
         x = tech.merge(master, on="stock_id", how="left")
         if qual is not None and not qual.empty:
-            qcols = ["stock_id", "data_quality_flag", "data_gap_reason", "revenue_month_count", "institutional_day_count", "eps_quarter_count"]
+            qcols = ["stock_id", "data_quality_flag", "data_gap_reason", "revenue_month_count", "institutional_day_count", "eps_quarter_count", "price_history_days"]
+            for c in qcols:
+                if c not in qual.columns:
+                    qual[c] = np.nan
             x = x.merge(qual[qcols], on="stock_id", how="left")
         else:
             x["data_quality_flag"] = "MISSING"
             x["data_gap_reason"] = "QUALITY_TABLE_MISSING"
-
-        for c in ["compression_score", "volume_dry_score", "trend_score"]:
+        rev = self._latest_by_stock("external_revenue_history", "revenue_month", ["yoy", "mom", "revenue", "cumulative_yoy"])
+        val = self._latest_by_stock("external_valuation", "data_date", ["eps_ttm", "eps", "roe", "gross_margin", "operating_margin", "pe", "pb"])
+        inst = self._latest_by_stock("external_institutional_history", "trade_date", ["foreign_buy_sell", "trust_buy_sell", "dealer_buy_sell", "total_inst"])
+        margin = self._latest_by_stock("external_margin_history", "trade_date", ["margin_change", "short_change", "margin_utilization", "retail_heat_score"])
+        for df, suffix in [(rev, "_rev"), (val, "_val"), (inst, "_inst"), (margin, "_margin")]:
+            if df is not None and not df.empty and "stock_id" in df.columns:
+                x = x.merge(df, on="stock_id", how="left", suffixes=("", suffix))
+        for c in ["compression_score", "volume_dry_score", "trend_score", "volume_anomaly_score", "long_base_score", "vcp_score", "momentum_score"]:
             x[c] = _safe_numeric_series_for_df(x, c, 0)
-        x["smart_money_score"] = np.where(_safe_numeric_series_for_df(x, "institutional_day_count", 0) >= 3, 60, 40)
-        x["financial_score"] = np.where(_safe_numeric_series_for_df(x, "eps_quarter_count", 0) >= 4, 60, 40)
-        theme_text = x.get("theme", "").fillna("").astype(str) + " " + x.get("sub_theme", "").fillna("").astype(str) + " " + x.get("industry", "").fillna("").astype(str)
-        x["theme_score"] = np.where(theme_text.str.contains("AI|ASIC|CPO|光通訊|矽光|散熱|液冷|電源|CoWoS|ABF", case=False, regex=True), 80, 50)
-        x["prebreakout_total_score"] = (x["compression_score"]*.20 + x["volume_dry_score"]*.20 + x["trend_score"]*.15 + x["smart_money_score"]*.15 + x["theme_score"]*.20 + x["financial_score"]*.10).round(2)
-
+        # Fundamental acceleration proxies: DB有資料就用，沒有就降權但不硬買。
+        eps_ttm = _safe_numeric_series_for_df(x, "eps_ttm", np.nan).fillna(_safe_numeric_series_for_df(x, "eps", np.nan))
+        roe = _safe_numeric_series_for_df(x, "roe", np.nan)
+        gross_margin = _safe_numeric_series_for_df(x, "gross_margin", np.nan)
+        operating_margin = _safe_numeric_series_for_df(x, "operating_margin", np.nan)
+        revenue_yoy = _safe_numeric_series_for_df(x, "yoy", np.nan).fillna(_safe_numeric_series_for_df(x, "cumulative_yoy", np.nan))
+        margin_util = _safe_numeric_series_for_df(x, "margin_utilization", np.nan)
+        total_inst = _safe_numeric_series_for_df(x, "total_inst", 0)
+        margin_change = _safe_numeric_series_for_df(x, "margin_change", 0)
+        short_change = _safe_numeric_series_for_df(x, "short_change", 0)
+        x["eps_acceleration_score"] = np.where(eps_ttm.notna(), np.clip(50 + eps_ttm * 3, 0, 100), 40)
+        x["margin_triple_up_score"] = np.where(gross_margin.notna() | operating_margin.notna(), np.clip(40 + gross_margin.fillna(0)*0.8 + operating_margin.fillna(0)*1.0 + roe.fillna(0)*0.5, 0, 100), 40)
+        x["cashflow_quality_score"] = 50.0  # DB若有 cfo/fcf 時可由 quarterly_financial_history 延伸；目前先明確列為中性。
+        x["revenue_acceleration_score"] = np.where(revenue_yoy.notna(), np.clip(45 + revenue_yoy * 0.7, 0, 100), 40)
+        x["backlog_proxy_score"] = np.where(revenue_yoy.notna(), np.clip(45 + revenue_yoy * 0.4, 0, 85), 45)
+        x["institutional_accumulation_score"] = np.where(total_inst > 0, 75, np.where(total_inst < 0, 35, 50))
+        x["chip_concentration_score"] = np.clip(55 - margin_change/1000 + np.maximum(-short_change, 0)/1000, 20, 90)
+        x["float_tightness_score"] = 50.0  # 無大戶/股本資料時中性；data_gap_reason 會列 BIG_HOLDER_DATA_MISSING。
+        theme_text = (x.get("industry", "").fillna("").astype(str) + " " + x.get("theme", "").fillna("").astype(str) + " " + x.get("sub_theme", "").fillna("").astype(str))
+        theme_scores = theme_text.map(self._theme_supply_chain_score)
+        x["industry_stage_score"] = [v[0] for v in theme_scores]
+        x["supply_chain_score"] = [v[1] for v in theme_scores]
+        x["ai_theme_score"] = [v[2] for v in theme_scores]
+        x["perception_gap_score"] = [v[3] for v in theme_scores]
+        x["theme_supply_chain_node"] = [v[4] for v in theme_scores]
+        # 第二波分數：已有第一波/回測不破/接近前高者加權。
+        x["second_wave_score"] = np.where(_safe_numeric_series_for_df(x, "second_wave_signal", 0).astype(int).eq(1), 88, 45)
+        x["fundamental_acceleration_score"] = (x["eps_acceleration_score"]*0.30 + x["margin_triple_up_score"]*0.20 + x["cashflow_quality_score"]*0.15 + x["revenue_acceleration_score"]*0.25 + x["backlog_proxy_score"]*0.10).round(2)
+        x["smart_money_score"] = (x["institutional_accumulation_score"]*0.65 + x["chip_concentration_score"]*0.25 + x["float_tightness_score"]*0.10).round(2)
+        x["theme_score"] = (x["industry_stage_score"]*0.35 + x["supply_chain_score"]*0.35 + x["ai_theme_score"]*0.20 + x["perception_gap_score"]*0.10).round(2)
+        # Word 權重：波動20 / 籌碼壓縮20 / 趨勢15 / 主力15 / 產業10 / 題材10 / 動能5 / 財報5。
+        x["prebreakout_total_score"] = (
+            x["compression_score"]*0.20 +
+            ((x["volume_dry_score"]*0.55 + x["vcp_score"]*0.25 + x["volume_anomaly_score"]*0.20))*0.20 +
+            x["trend_score"]*0.15 +
+            x["smart_money_score"]*0.15 +
+            x["industry_stage_score"]*0.10 +
+            x["theme_score"]*0.10 +
+            x["momentum_score"]*0.05 +
+            x["fundamental_acceleration_score"]*0.05
+        ).round(2)
         close = _safe_numeric_series_for_df(x, "close", 0)
         atr = _safe_numeric_series_for_df(x, "atr14", 0)
         trigger_raw = _safe_numeric_series_for_df(x, "trigger_price", 0)
         trigger = trigger_raw.where(trigger_raw.ne(0), close)
+        pivot_low = _safe_numeric_series_for_df(x, "pivot_low", np.nan)
         x["next_trigger_price"] = trigger.round(2)
-
-        def _wait_reason(r):
-            quality = str(r.get("data_quality_flag", "") or "").strip()
-            gaps = str(r.get("data_gap_reason", "") or "").strip()
-            score = float(r.get("prebreakout_total_score", 0) or 0)
-            if quality == "MISSING":
-                return "DATA_MISSING:" + (gaps or "UNKNOWN_GAP")
+        x["trigger_price"] = trigger.round(2)
+        x["pivot_low"] = pivot_low.round(2)
+        def _gap_reason(r):
+            gaps = []
+            base = str(r.get("data_gap_reason", "") or "")
+            if base:
+                gaps.extend([g for g in base.split(";") if g])
+            if str(r.get("eps_quarter_count", "") or "") in ("", "nan") or float(r.get("eps_quarter_count", 0) or 0) < 4:
+                gaps.append("EPS_ACCELERATION_PROXY_USED")
+            if float(r.get("revenue_month_count", 0) or 0) < 12:
+                gaps.append("REVENUE_ACCELERATION_PROXY_USED")
+            if float(r.get("institutional_day_count", 0) or 0) < 5:
+                gaps.append("SMART_MONEY_PROXY_USED")
+            gaps.append("BIG_HOLDER_DATA_MISSING")
+            seen=[]
+            for g in gaps:
+                if g and g not in seen:
+                    seen.append(g)
+            return ";".join(seen)
+        x["data_gap_reason"] = x.apply(_gap_reason, axis=1)
+        def _base_filter(r):
+            hard = []
+            warn = []
             if int(r.get("technical_ready", 0) or 0) != 1:
-                return "TECH_HISTORY_NOT_READY"
-            if int(r.get("breakout_trigger", 0) or 0) != 1 and score < PREBREAKOUT_WATCH_SCORE:
-                return "SCORE_LT_WATCH_AND_NO_BREAKOUT"
-            if int(r.get("breakout_trigger", 0) or 0) != 1:
-                return "NO_BREAKOUT_TRIGGER"
-            if score < PREBREAKOUT_BUY_SCORE:
-                return "SCORE_LT_BUY_THRESHOLD"
-            return "WAIT_CONFIRM"
-
+                hard.append("PRICE_HISTORY_LT120_HARD")
+            if float(r.get("close", 0) or 0) <= 0:
+                hard.append("NO_CLOSE_PRICE")
+            if float(r.get("volume", 0) or 0) <= 0:
+                warn.append("NO_VOLUME")
+            if str(r.get("trend_gate", "")) == "FAIL":
+                warn.append("TREND_TEMPLATE_FAIL")
+            if hard:
+                return "FAIL", ";".join(hard + warn)
+            if warn:
+                return "PARTIAL", ";".join(warn)
+            return "PASS", ""
+        bf = x.apply(_base_filter, axis=1)
+        x["base_filter_status"] = [v[0] for v in bf]
+        x["fail_reason"] = [v[1] for v in bf]
+        x["false_breakout_flag"] = _safe_numeric_series_for_df(x, "false_breakout_signal", 0).astype(int)
+        x["risk_flag"] = np.select([
+            x["false_breakout_flag"].eq(1),
+            x["base_filter_status"].eq("FAIL"),
+            x["data_gap_reason"].astype(str).str.contains("PROXY|MISSING|LT", regex=True),
+        ], ["FALSE_BREAKOUT", "BASE_FILTER_FAIL", "DATA_GAP_PROXY"], default="OK")
         def _decision(r):
-            # Data Quality Gate：資料缺失是 INVALID，不得混成可交易 WAIT。
-            if str(r.get("data_quality_flag", "") or "").strip() == "MISSING":
-                return "INVALID"
-            if int(r.get("technical_ready", 0) or 0) != 1:
-                return "INVALID"
-            if int(r.get("breakout_trigger", 0) or 0) == 1 and float(r["prebreakout_total_score"]) >= PREBREAKOUT_BUY_SCORE:
+            score = float(r.get("prebreakout_total_score", 0) or 0)
+            if str(r.get("base_filter_status", "")) == "FAIL":
+                return "AVOID"
+            if int(r.get("false_breakout_flag", 0) or 0) == 1:
+                return "FALSE_BREAKOUT"
+            if int(r.get("breakout_trigger", 0) or 0) == 1 and score >= PREBREAKOUT_BUY_SCORE:
                 return "BUY_TRIGGER"
-            if float(r["prebreakout_total_score"]) >= PREBREAKOUT_WATCH_SCORE:
+            if int(r.get("second_wave_signal", 0) or 0) == 1 and score >= 80:
+                return "SECOND_WAVE_BUY"
+            if score >= 80:
                 return "WATCH"
+            if score >= 70:
+                return "ALERT"
             return "WAIT"
-
         x["decision"] = x.apply(_decision, axis=1)
+        def _wait_reason(r):
+            d = str(r.get("decision", ""))
+            if d in ("BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"):
+                return ""
+            if d == "FALSE_BREAKOUT":
+                return "突破後跌回平台或跌破突破K，降級觀察"
+            if d == "AVOID":
+                return str(r.get("fail_reason", "")) or "BASE_FILTER_FAIL"
+            score = float(r.get("prebreakout_total_score", 0) or 0)
+            if int(r.get("breakout_trigger", 0) or 0) != 1:
+                return f"NO_BREAKOUT_TRIGGER; score={score:.2f}; need_close_gt={float(r.get('next_trigger_price',0) or 0):.2f}"
+            if score < PREBREAKOUT_WATCH_SCORE:
+                return "SCORE_LT_WATCH"
+            return "WAIT_CONFIRM"
         x["wait_reason"] = x.apply(_wait_reason, axis=1)
-        x.loc[x["decision"].isin(["BUY_TRIGGER", "WATCH"]), "wait_reason"] = ""
-        x["suggested_action"] = np.select(
-            [
-                x["decision"].isin(["BUY_TRIGGER", "WATCH"]),
-                x["decision"].eq("INVALID"),
-                x["decision"].eq("WAIT"),
-            ],
-            [
-                "可進入盤前作戰表，人工複查買點/停損/RR",
-                "資料不足或技術歷史不足，不列入主交易表；請先補資料再重建DB",
-                "條件未到，不列入主交易表；只追蹤觸發價與原因",
-            ],
-            default="觀察"
-        )
-
-        x["entry_price"] = np.where(x["decision"].isin(["BUY_TRIGGER", "WATCH"]), np.maximum(close, trigger).round(2), np.nan)
-        x["stop_loss"] = np.where(x["decision"].isin(["BUY_TRIGGER", "WATCH"]), (close - np.maximum(atr*1.5, close*.05)).round(2), np.nan)
-        x["target1"] = np.where(x["decision"].isin(["BUY_TRIGGER", "WATCH"]), (x["entry_price"] + (x["entry_price"] - x["stop_loss"])*1.5).round(2), np.nan)
-        x["target2"] = np.where(x["decision"].isin(["BUY_TRIGGER", "WATCH"]), (x["entry_price"] + (x["entry_price"] - x["stop_loss"])*2.2).round(2), np.nan)
+        x["entry_price"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"]), np.maximum(close, trigger).round(2), np.nan)
+        # stop 優先 pivot_low，其次 ATR/5% 風控。
+        stop_by_atr = (close - np.maximum(atr*1.5, close*.05)).round(2)
+        stop_calc = np.where(pivot_low.notna() & (pivot_low < close), np.minimum(pivot_low, stop_by_atr), stop_by_atr)
+        x["stop_loss"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"]), np.round(stop_calc, 2), np.nan)
+        x["target1"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"]), (x["entry_price"] + (x["entry_price"] - x["stop_loss"])*1.5).round(2), np.nan)
+        x["target2"] = np.where(x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"]), (x["entry_price"] + (x["entry_price"] - x["stop_loss"])*2.2).round(2), np.nan)
         x["rr"] = ((x["target1"] - x["entry_price"]) / (x["entry_price"] - x["stop_loss"]).replace(0, np.nan)).round(2)
-        rr_downgrade = (x["decision"].eq("BUY_TRIGGER")) & (x["rr"] < PREBREAKOUT_MIN_RR)
+        rr_downgrade = (x["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY"])) & (x["rr"] < PREBREAKOUT_MIN_RR)
         x.loc[rr_downgrade, "decision"] = "WATCH"
         x.loc[rr_downgrade, "wait_reason"] = "RR_LT_MIN_DOWNGRADE_TO_WATCH"
-
+        x["suggested_action"] = np.select(
+            [x["decision"].eq("BUY_TRIGGER"), x["decision"].eq("SECOND_WAVE_BUY"), x["decision"].eq("WATCH"), x["decision"].eq("ALERT"), x["decision"].eq("FALSE_BREAKOUT"), x["decision"].eq("AVOID")],
+            ["正式突破，可進盤前作戰表，小倉/依策略執行", "第二波主升候選，等再放量確認", "觀察，等待量價確認或突破", "預警，不進主交易表，只追蹤觸發價", "假突破降級，禁止追價", "排除，不列交易表"],
+            default="等待條件"
+        )
         x["signal_date"] = signal_date
+        x["rule_version"] = self.RULE_VERSION
         x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         x["evidence_json"] = x.apply(lambda r: json.dumps({
-            "compression_score": float(r.get("compression_score", 0) or 0),
-            "volume_dry_score": float(r.get("volume_dry_score", 0) or 0),
-            "trend_score": float(r.get("trend_score", 0) or 0),
-            "breakout_trigger": int(r.get("breakout_trigger", 0) or 0),
-            "trigger_price": float(r.get("trigger_price", 0) or 0),
-            "next_trigger_price": float(r.get("next_trigger_price", 0) or 0),
+            "rule_version": self.RULE_VERSION,
+            "weights": {"compression":20,"volume_chip":20,"trend":15,"smart_money":15,"industry":10,"theme":10,"momentum":5,"fundamental":5},
+            "scores": {k: float(r.get(k, 0) or 0) for k in ["compression_score","volume_dry_score","trend_score","smart_money_score","industry_stage_score","theme_score","momentum_score","fundamental_acceleration_score","second_wave_score","vcp_score"]},
             "decision": str(r.get("decision", "")),
-            "wait_reason": str(r.get("wait_reason", "")),
-            "data_quality_flag": str(r.get("data_quality_flag", "")),
+            "trigger_price": float(r.get("trigger_price", 0) or 0),
             "data_gap_reason": str(r.get("data_gap_reason", "")),
         }, ensure_ascii=False), axis=1)
-
-        keep = ["stock_id", "signal_date", "stock_name", "close", "prebreakout_total_score", "compression_score", "volume_dry_score", "trend_score", "smart_money_score", "financial_score", "theme_score", "decision", "entry_price", "stop_loss", "target1", "target2", "rr", "wait_reason", "next_trigger_price", "suggested_action", "data_quality_flag", "data_gap_reason", "evidence_json", "update_time"]
+        keep = ["stock_id","signal_date","stock_name","close","prebreakout_total_score","compression_score","volume_dry_score","trend_score","smart_money_score","financial_score","theme_score","decision","entry_price","stop_loss","target1","target2","rr","wait_reason","next_trigger_price","suggested_action","base_filter_status","fail_reason","trigger_price","pivot_low","eps_acceleration_score","margin_triple_up_score","cashflow_quality_score","revenue_acceleration_score","backlog_proxy_score","industry_stage_score","supply_chain_score","volume_anomaly_score","institutional_accumulation_score","long_base_score","second_wave_score","vcp_score","float_tightness_score","chip_concentration_score","ai_theme_score","perception_gap_score","momentum_turn_score","fundamental_acceleration_score","risk_flag","false_breakout_flag","rule_version","data_quality_flag","data_gap_reason","evidence_json","update_time"]
+        # backward naming：momentum_turn_score 來自 momentum_score。
+        x["momentum_turn_score"] = x.get("momentum_score", 50)
+        for c in keep:
+            if c not in x.columns:
+                x[c] = np.nan if c not in ("stock_id","signal_date","stock_name","decision","wait_reason","suggested_action","base_filter_status","fail_reason","risk_flag","rule_version","data_quality_flag","data_gap_reason","evidence_json","update_time") else ""
         out = x[keep].copy()
         with self.db.lock:
             self.db.conn.execute("DELETE FROM prebreakout_signal_daily WHERE signal_date=?", (signal_date,))
             out.to_sql("prebreakout_signal_daily", self.db.conn, if_exists="append", index=False)
             self.db.conn.execute("DELETE FROM trade_plan_prebreakout WHERE plan_date=?", (signal_date,))
-            plan = out[out["decision"].isin(["BUY_TRIGGER", "WATCH"])].copy()
+            plan = out[out["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"])].copy()
             if not plan.empty:
                 plan["plan_date"] = signal_date
-                plan["position_note"] = np.where(plan["decision"].eq("BUY_TRIGGER"), "突破觸發可小倉/依策略執行", "觀察，等量價確認")
-                plan["risk_note"] = "跌破停損或突破失敗降級"
+                plan["position_note"] = np.where(plan["decision"].eq("BUY_TRIGGER"), "突破觸發可小倉/依策略執行", np.where(plan["decision"].eq("SECOND_WAVE_BUY"), "第二波主升候選，等再放量確認", "觀察，等量價確認"))
+                plan["risk_note"] = "跌破停損、跌破突破K低點或假突破即降級"
                 plan["source_signal_date"] = signal_date
-                plan[["stock_id", "plan_date", "stock_name", "decision", "entry_price", "stop_loss", "target1", "target2", "rr", "position_note", "risk_note", "source_signal_date", "update_time"]].to_sql("trade_plan_prebreakout", self.db.conn, if_exists="append", index=False)
+                plan[["stock_id","plan_date","stock_name","decision","entry_price","stop_loss","target1","target2","rr","position_note","risk_note","source_signal_date","update_time"]].to_sql("trade_plan_prebreakout", self.db.conn, if_exists="append", index=False)
             self.db.conn.commit()
         if log_cb:
-            log_cb(f"[PREBREAKOUT][SIGNAL] rows={len(out)} decision={out['decision'].value_counts().to_dict()}")
-            if "INVALID" in out["decision"].value_counts().to_dict():
-                top_gap = out.loc[out["decision"].eq("INVALID"), "data_gap_reason"].astype(str).value_counts().head(3).to_dict()
-                log_cb(f"[PREBREAKOUT][QUALITY_GAP] INVALID_TOP_GAP={top_gap}")
+            log_cb(f"[PREBREAKOUT][V6][SIGNAL] rows={len(out)} decision={out['decision'].value_counts().to_dict()}")
+            log_cb(f"[PREBREAKOUT][V6][GAP] top_gap={out['data_gap_reason'].astype(str).value_counts().head(3).to_dict()}")
         return int(len(out))
 
     def run_after_market_builder(self, log_cb=None) -> dict:
-        run_id=self.db.log_system_run(event="prebreakout_after_market_builder",status="start",message="start",module="prebreakout")
-        feature_date=self._latest_feature_date(); tech=self.build_technical_feature_daily(feature_date,log_cb); quality=self.build_financial_quality_status(feature_date,log_cb); signal=self.build_prebreakout_signal_daily(feature_date,log_cb)
-        self.db.log_system_run(event="prebreakout_after_market_builder",status="ok",message=f"tech={tech}, quality={quality}, signal={signal}",run_id=run_id,module="prebreakout")
-        return {"run_id":run_id,"feature_date":feature_date,"technical_rows":tech,"quality_rows":quality,"signal_rows":signal}
+        run_id = self.db.log_system_run(event="prebreakout_after_market_builder_v6", status="start", message="start", module="prebreakout")
+        feature_date = self._latest_feature_date()
+        tech = self.build_technical_feature_daily(feature_date, log_cb)
+        quality = self.build_financial_quality_status(feature_date, log_cb)
+        signal = self.build_prebreakout_signal_daily(feature_date, log_cb)
+        self.db.log_system_run(event="prebreakout_after_market_builder_v6", status="ok", message=f"tech={tech}, quality={quality}, signal={signal}, rule={self.RULE_VERSION}", run_id=run_id, module="prebreakout")
+        return {"run_id": run_id, "feature_date": feature_date, "technical_rows": tech, "quality_rows": quality, "signal_rows": signal, "rule_version": self.RULE_VERSION}
 
     def get_latest_signals(self) -> pd.DataFrame:
         with self.db.lock:
             return pd.read_sql_query("""
                 SELECT * FROM prebreakout_signal_daily
                 WHERE signal_date=(SELECT MAX(signal_date) FROM prebreakout_signal_daily)
-                ORDER BY CASE decision WHEN 'BUY_TRIGGER' THEN 1 WHEN 'SECOND_WAVE_BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'WAIT' THEN 8 ELSE 9 END, prebreakout_total_score DESC
+                ORDER BY CASE decision WHEN 'BUY_TRIGGER' THEN 1 WHEN 'SECOND_WAVE_BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'ALERT' THEN 4 WHEN 'WAIT' THEN 8 WHEN 'FALSE_BREAKOUT' THEN 9 ELSE 10 END, prebreakout_total_score DESC
             """, self.db.conn)
 
     def export_premarket_excel(self, output_dir: Path | None = None, log_cb=None) -> Path:
@@ -3364,30 +3652,35 @@ class PreBreakoutIntegratedEngine:
             raise RuntimeError("prebreakout_signal_daily 無資料，請先執行爆發前盤後DB建立。")
         report_date = str(df["signal_date"].dropna().astype(str).max()).replace("-", "")
         out_path = output_dir / f"prebreakout_premarket_{report_date}.xlsx"
-        stat = df["decision"].value_counts().reset_index()
-        stat.columns = ["decision", "count"]
+        stat = df["decision"].value_counts().reset_index(); stat.columns = ["decision", "count"]
         candidates = df[df["decision"].isin(["BUY_TRIGGER", "SECOND_WAVE_BUY", "WATCH"])].copy()
-        wait_pool = df[df["decision"].eq("WAIT")].copy()
-        invalid_pool = df[df["decision"].eq("INVALID")].copy()
-        gaps = df[df["data_quality_flag"].fillna("").astype(str).ne("OK")][["stock_id", "stock_name", "data_quality_flag", "data_gap_reason", "wait_reason", "suggested_action"]].copy()
-        empty_note = pd.DataFrame([{
-            "狀態": "NO_TRADABLE_CANDIDATE",
-            "說明": "目前沒有 BUY_TRIGGER/WATCH，因此主交易表不得列出 INVALID/MISSING 股票。請查看 WAIT原因池與資料不足清單。",
-            "全部Signal": int(len(df)),
-            "可交易候選": int(len(candidates)),
-            "INVALID": int(len(invalid_pool)),
-            "WAIT": int(len(wait_pool)),
-        }])
+        alert_pool = df[df["decision"].isin(["ALERT", "WAIT"])].copy()
+        avoid_pool = df[df["decision"].isin(["AVOID", "FALSE_BREAKOUT"])].copy()
+        gaps = df[df["data_gap_reason"].fillna("").astype(str).ne("")][["stock_id", "stock_name", "decision", "data_quality_flag", "data_gap_reason", "wait_reason", "suggested_action"]].copy()
+        rule_matrix = pd.DataFrame([
+            ["波動壓縮", 20, "BB/KC/ATR/Range 收斂", "compression_score"],
+            ["籌碼壓縮", 20, "VDU、OBV不破、VCP、量能異常", "volume_dry_score + vcp_score + volume_anomaly_score"],
+            ["趨勢結構", 15, "Price > MA50 > MA150 > MA200，MA200斜率", "trend_score"],
+            ["主力吸籌", 15, "法人買賣超、融資/融券、浮額代理", "smart_money_score"],
+            ["產業位階", 10, "CPO/ASIC/AI電源/AI伺服器等主線", "industry_stage_score"],
+            ["題材供應鏈", 10, "AI真供應鏈與市場認知差", "theme_score"],
+            ["動能轉折", 5, "RSI、MACD、Momentum", "momentum_turn_score"],
+            ["財報加速", 5, "EPS、營收、三率、現金流代理", "fundamental_acceleration_score"],
+        ], columns=["模型", "權重", "計算項目", "程式欄位"])
+        if candidates.empty:
+            candidates = pd.DataFrame([{"狀態": "NO_TRADABLE_CANDIDATE", "說明": "目前沒有 BUY_TRIGGER / SECOND_WAVE_BUY / WATCH。請查看 ALERT_WAIT_POOL 與 Data_Gap。", "全部Signal": int(len(df))}])
         tables = {
-            "爆發前候選股": candidates if not candidates.empty else empty_note,
-            "決策統計": stat,
-            "WAIT原因池": wait_pool.head(300),
-            "資料不足清單": gaps.head(500),
-            "全部Signal": df,
+            "01_爆發前候選股": candidates,
+            "02_決策統計": stat,
+            "03_ALERT_WAIT_POOL": alert_pool.head(500),
+            "04_AVOID_FALSE_POOL": avoid_pool.head(500),
+            "05_Data_Gap": gaps.head(1000),
+            "06_規則權重矩陣": rule_matrix,
+            "07_全部Signal": df,
         }
         out_path, kind = write_table_bundle(out_path.with_suffix(""), tables, preferred="excel")
         if log_cb:
-            log_cb(f"[PREBREAKOUT][REPORT] {kind} 已輸出：{out_path}｜候選={len(candidates)}｜INVALID={len(invalid_pool)}｜WAIT={len(wait_pool)}")
+            log_cb(f"[PREBREAKOUT][V6][REPORT] {kind} 已輸出：{out_path}｜候選={len(candidates)}｜all={len(df)}")
         return Path(out_path)
 
 
