@@ -3704,87 +3704,71 @@ def run_prebreakout_premarket_analyzer(db: DBManager | None = None, output_dir: 
         if close_after: db.close()
 
 
-
-# HIGH_GROWTH_EPS_REVENUE_PATCH_20260529：高成長EPS業績成長新增功能
-# V3：升級為 HighGrowthEPSEngine，可由 UI 選擇追蹤 Q1 / Q1+Q2 / Q1~Q4，不再固定只看 Q1。
+# HIGH_GROWTH_EPS_ENGINE_V4_20260529：高成長EPS加速度追蹤系統
 # 功能定位：獨立新增，不改變 TOP20 / 爆發前雷達 / 今日可下單原有語義。
+# V4 架構：RevenueAccelerationEngine -> EPSForecastEngine -> HighGrowthEPSEngine
 HIGH_GROWTH_REPORT_DIR = RUNTIME_DIR / "reports"
 HIGH_GROWTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 HIGH_GROWTH_MIN_YOY = 30.0
-HIGH_GROWTH_TARGET_YEAR = 2026
 HIGH_GROWTH_BASE_YEAR = 2025
-HIGH_GROWTH_DEFAULT_TRACK_QUARTERS = ["2026Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V3_TRACKING_QUARTERS_20260529"
+HIGH_GROWTH_TRACK_YEAR = 2026
+HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_QUARTER_TRACKING_FORECAST_20260529"
 
-# 依原始規格 Q1 對應 2/3/4 月營收；後續季度採同一種「三個月接續追蹤」邏輯。
-# Q2=5/6/7、Q3=8/9/10、Q4=11/12/隔年1月。若公司採不同營收觀察窗，可日後改成設定檔。
-HIGH_GROWTH_REVENUE_MONTHS_BY_QUARTER = {
-    "2026Q1": ["202602", "202603", "202604"],
-    "2026Q2": ["202605", "202606", "202607"],
-    "2026Q3": ["202608", "202609", "202610"],
-    "2026Q4": ["202611", "202612", "202701"],
+# 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
+HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
+    "Q1": ["202602", "202603", "202604"],
+    "Q2": ["202605", "202606", "202607"],
+    "Q3": ["202608", "202609", "202610"],
+    "Q4": ["202611", "202612", "202701"],
 }
 
 
-def get_high_growth_report_path(date_str: str | None = None) -> Path:
+def get_high_growth_report_path(date_str: str | None = None, quarters: list[str] | None = None) -> Path:
     d = date_str or datetime.now().strftime("%Y%m%d")
+    qtag = "".join(quarters or HIGH_GROWTH_DEFAULT_QUARTERS) or "Q1"
     HIGH_GROWTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    return HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_revenue_{d}.xlsx"
+    return HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_engine_v4_{qtag}_{d}.xlsx"
 
 
-class HighGrowthEPSEngine:
-    """高成長 EPS 加速度追蹤引擎。
+def normalize_high_growth_quarters(quarters=None) -> list[str]:
+    if quarters is None:
+        return list(HIGH_GROWTH_DEFAULT_QUARTERS)
+    if isinstance(quarters, str):
+        raw = re.split(r"[,/|;\s]+", quarters.strip().upper())
+    else:
+        raw = [str(q).strip().upper() for q in quarters]
+    out = []
+    for q in raw:
+        if not q:
+            continue
+        q = q.replace("季度", "").replace("第", "").replace("季", "")
+        if q in ("1", "一"):
+            q = "Q1"
+        elif q in ("2", "二"):
+            q = "Q2"
+        elif q in ("3", "三"):
+            q = "Q3"
+        elif q in ("4", "四"):
+            q = "Q4"
+        if q in HIGH_GROWTH_QUARTER_REVENUE_MONTHS and q not in out:
+            out.append(q)
+    return out or list(HIGH_GROWTH_DEFAULT_QUARTERS)
 
-    核心公式：
-    1. EPS 爆發 Gate：選定季度累計 EPS > 2025 全年 EPS。
-       - 只選 Q1：2026Q1 EPS > 2025全年EPS。
-       - 選 Q1+Q2：2026H1 EPS = Q1+Q2 > 2025全年EPS。
-       - 選 Q1~Q4：2026全年累計 EPS > 2025全年EPS。
-    2. 營收 Gate：所選季度對應月營收 YoY 均 >= min_yoy，且每個季度內呈階梯式走高。
-    3. 加速度追蹤：若追蹤2季以上，額外標示 EPS 連續性 / 加速度，不強制取代原 Gate。
-    4. 缺資料不得標示為嚴格通過，只能列代理候選或資料不足。
-    """
 
-    def __init__(self, db: DBManager, min_yoy: float = HIGH_GROWTH_MIN_YOY, track_quarters: list[str] | None = None, target_year: int = HIGH_GROWTH_TARGET_YEAR, base_year: int = HIGH_GROWTH_BASE_YEAR):
+class RevenueAccelerationEngine:
+    """月營收加速度引擎：以所選季度對應月份檢查 YoY 暴增與階梯式月月走高。"""
+
+    def __init__(self, db: DBManager, min_yoy: float = HIGH_GROWTH_MIN_YOY):
         self.db = db
         self.min_yoy = float(min_yoy)
-        self.target_year = int(target_year)
-        self.base_year = int(base_year)
-        self.track_quarters = self._normalize_track_quarters(track_quarters)
-        self.required_months = self._required_months_for_quarters(self.track_quarters)
-
-    def _normalize_track_quarters(self, quarters: list[str] | None) -> list[str]:
-        raw = quarters or HIGH_GROWTH_DEFAULT_TRACK_QUARTERS
-        out = []
-        for q in raw:
-            s = str(q or "").strip().upper().replace(" ", "")
-            if not s:
-                continue
-            if re.fullmatch(r"Q[1-4]", s):
-                s = f"{self.target_year}{s}"
-            s = s.replace("-", "")
-            m = re.match(r"^(\d{4})/?Q?([1-4])$", s)
-            if m:
-                token = f"{int(m.group(1))}Q{int(m.group(2))}"
-                if token not in out:
-                    out.append(token)
-        if not out:
-            out = list(HIGH_GROWTH_DEFAULT_TRACK_QUARTERS)
-        return sorted(out, key=lambda x: int(x[-1]))
-
-    @staticmethod
-    def _required_months_for_quarters(quarters: list[str]) -> list[str]:
-        months = []
-        for q in quarters:
-            for m in HIGH_GROWTH_REVENUE_MONTHS_BY_QUARTER.get(q, []):
-                if m not in months:
-                    months.append(m)
-        return months
 
     def _table_exists(self, table_name: str) -> bool:
         try:
             with self.db.lock:
-                row = self.db.conn.cursor().execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
+                row = self.db.conn.cursor().execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+                ).fetchone()
             return row is not None
         except Exception:
             return False
@@ -3794,8 +3778,281 @@ class HighGrowthEPSEngine:
             with self.db.lock:
                 return pd.read_sql_query(sql, self.db.conn, params=params or [])
         except Exception as exc:
-            log_warning(f"[HIGH_GROWTH_V3] SQL讀取失敗：{exc}｜SQL={sql[:120]}")
+            log_warning(f"[RevenueAccelerationEngine] SQL讀取失敗：{exc}｜SQL={sql[:120]}")
             return pd.DataFrame()
+
+    @staticmethod
+    def normalize_month(value) -> str:
+        s = str(value or "").strip().replace("-", "").replace("/", "")
+        if not s or s.lower() in ("nan", "none", "null"):
+            return ""
+        m = re.search(r"(\d{3,4})(\d{2})", s)
+        if not m:
+            return ""
+        y = int(m.group(1)); mm = int(m.group(2))
+        if mm < 1 or mm > 12:
+            return ""
+        if y < 1000:
+            y += 1911
+        return f"{y:04d}{mm:02d}"
+
+    def required_months(self, quarters=None) -> list[str]:
+        months = []
+        for q in normalize_high_growth_quarters(quarters):
+            for m in HIGH_GROWTH_QUARTER_REVENUE_MONTHS.get(q, []):
+                if m not in months:
+                    months.append(m)
+        return months
+
+    def load_monthly_revenue(self, quarters=None) -> pd.DataFrame:
+        months = self.required_months(quarters)
+        parts = []
+        for table, priority in [("external_revenue_history", 1), ("external_revenue", 2)]:
+            if not self._table_exists(table):
+                continue
+            df = self._read_sql(f"SELECT stock_id, revenue_month, revenue, mom, yoy, cumulative_revenue, cumulative_yoy, source_date, update_time FROM {table}")
+            if df is None or df.empty:
+                continue
+            df = df.copy()
+            df["stock_id"] = df["stock_id"].map(normalize_stock_id)
+            df["revenue_month_norm"] = df["revenue_month"].map(self.normalize_month)
+            df["revenue"] = pd.to_numeric(df.get("revenue"), errors="coerce")
+            df["yoy"] = pd.to_numeric(df.get("yoy"), errors="coerce")
+            df["mom"] = pd.to_numeric(df.get("mom"), errors="coerce")
+            df["source_table"] = table
+            df["_priority"] = priority
+            df = df[df["revenue_month_norm"].isin(months)].copy()
+            parts.append(df)
+        if not parts:
+            return pd.DataFrame(columns=["stock_id", "revenue_month_norm", "revenue", "yoy", "mom", "source_table"])
+        x = pd.concat(parts, ignore_index=True)
+        x = x.sort_values(["stock_id", "revenue_month_norm", "_priority"], ascending=[True, True, True])
+        x = x.drop_duplicates(["stock_id", "revenue_month_norm"], keep="first")
+        return x.drop(columns=["_priority"], errors="ignore")
+
+    def build_revenue_features(self, master: pd.DataFrame, quarters=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+        quarters = normalize_high_growth_quarters(quarters)
+        months = self.required_months(quarters)
+        rev = self.load_monthly_revenue(quarters)
+        base = master[["stock_id"]].drop_duplicates().copy() if master is not None and not master.empty else pd.DataFrame(columns=["stock_id"])
+        if base.empty:
+            return base, rev
+        for m in months:
+            mdf = rev[rev["revenue_month_norm"].eq(m)][["stock_id", "revenue", "yoy", "mom", "source_table"]].copy() if not rev.empty else pd.DataFrame(columns=["stock_id", "revenue", "yoy", "mom", "source_table"])
+            mdf = mdf.rename(columns={"revenue": f"rev_{m}", "yoy": f"yoy_{m}", "mom": f"mom_{m}", "source_table": f"rev_source_{m}"})
+            base = base.merge(mdf, on="stock_id", how="left")
+        yoy_cols = [f"yoy_{m}" for m in months]
+        rev_cols = [f"rev_{m}" for m in months]
+        for c in yoy_cols + rev_cols:
+            if c not in base.columns:
+                base[c] = np.nan
+            base[c] = pd.to_numeric(base[c], errors="coerce")
+        base["selected_quarters"] = "+".join(quarters)
+        base["selected_revenue_months"] = ",".join(months)
+        base["revenue_month_count_required"] = len(months)
+        base["revenue_month_count_hit"] = base[rev_cols].notna().sum(axis=1) if rev_cols else 0
+        base["avg_revenue_yoy"] = base[yoy_cols].mean(axis=1, skipna=True) if yoy_cols else np.nan
+        base["min_revenue_yoy"] = base[yoy_cols].min(axis=1, skipna=True) if yoy_cols else np.nan
+        base["revenue_yoy_gate"] = base[yoy_cols].ge(self.min_yoy).all(axis=1) if yoy_cols else False
+        base["revenue_complete_gate"] = base["revenue_month_count_hit"].eq(base["revenue_month_count_required"])
+        if len(rev_cols) >= 2:
+            base["revenue_stair_gate"] = True
+            for left, right in zip(rev_cols[:-1], rev_cols[1:]):
+                base["revenue_stair_gate"] = base["revenue_stair_gate"] & (base[right] > base[left])
+        else:
+            base["revenue_stair_gate"] = False
+        base["revenue_strict_gate"] = base["revenue_complete_gate"] & base["revenue_yoy_gate"] & base["revenue_stair_gate"]
+        base["revenue_acceleration_score"] = np.clip(40 + base["avg_revenue_yoy"].fillna(0) * 0.6 + base["revenue_month_count_hit"] * 3, 0, 100).round(2)
+        base["revenue_data_quality"] = np.where(base["revenue_strict_gate"], "STRICT", np.where(base["revenue_month_count_hit"] > 0, "PARTIAL_OR_PROXY", "MISSING"))
+        return base, rev
+
+
+class EPSForecastEngine:
+    """EPS 實績/預測引擎：讀正式季度EPS，缺資料時以營收加速度做預測，不把預測誤標為嚴格通過。"""
+
+    def __init__(self, db: DBManager, base_year: int = HIGH_GROWTH_BASE_YEAR, track_year: int = HIGH_GROWTH_TRACK_YEAR):
+        self.db = db
+        self.base_year = int(base_year)
+        self.track_year = int(track_year)
+        self.ensure_schema()
+
+    def _table_exists(self, table_name: str) -> bool:
+        try:
+            with self.db.lock:
+                row = self.db.conn.cursor().execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+                ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
+    def _read_sql(self, sql: str, params=None) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                return pd.read_sql_query(sql, self.db.conn, params=params or [])
+        except Exception as exc:
+            log_warning(f"[EPSForecastEngine] SQL讀取失敗：{exc}｜SQL={sql[:120]}")
+            return pd.DataFrame()
+
+    def ensure_schema(self):
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS annual_eps_history (
+                    stock_id TEXT,
+                    fiscal_year INTEGER,
+                    eps_full_year REAL,
+                    source_type TEXT,
+                    source_url TEXT,
+                    source_date TEXT,
+                    update_time TEXT,
+                    PRIMARY KEY(stock_id, fiscal_year)
+                )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_annual_eps_history_stock_year ON annual_eps_history(stock_id, fiscal_year)")
+                self.db.conn.commit()
+        except Exception as exc:
+            log_warning(f"[EPSForecastEngine] annual_eps_history schema建立失敗：{exc}")
+
+    @staticmethod
+    def normalize_quarter_token(value) -> str:
+        s = str(value or "").strip().upper().replace(" ", "")
+        if not s or s in ("NAN", "NONE", "NULL", "<NA>"):
+            return ""
+        s = s.replace("年第", "Q").replace("季", "").replace("-", "").replace("_", "")
+        m = re.match(r"^(\d{2,3})/?Q?0?([1-4])$", s)
+        if m:
+            y = int(m.group(1)); q = int(m.group(2))
+            if y < 1000:
+                y += 1911
+            return f"{y}Q{q}"
+        m = re.match(r"^(\d{4})/?Q?0?([1-4])$", s)
+        if m:
+            return f"{int(m.group(1))}Q{int(m.group(2))}"
+        return s
+
+    def load_base_annual_eps(self) -> pd.DataFrame:
+        parts = []
+        if self._table_exists("annual_eps_history"):
+            df = self._read_sql("SELECT stock_id, eps_full_year AS base_annual_eps, 'annual_eps_history' AS base_eps_source, source_date FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", [self.base_year])
+            parts.append(df)
+        if self._table_exists("quarterly_financial_history"):
+            qdf = self._read_sql("SELECT stock_id, fiscal_year, quarter, eps, source_date FROM quarterly_financial_history WHERE eps IS NOT NULL")
+            if qdf is not None and not qdf.empty:
+                fy = pd.to_numeric(qdf.get("fiscal_year"), errors="coerce")
+                q = pd.to_numeric(qdf.get("quarter"), errors="coerce")
+                mask = ((fy == self.base_year) | (fy == self.base_year - 1911)) & q.isin([1, 2, 3, 4])
+                qdf = qdf.loc[mask].copy()
+                if not qdf.empty:
+                    cnt = qdf.groupby("stock_id")["eps"].count().reset_index(name="quarter_count")
+                    s = qdf.groupby("stock_id", as_index=False)["eps"].sum().rename(columns={"eps": "base_annual_eps"})
+                    s = s.merge(cnt, on="stock_id", how="left")
+                    s = s[s["quarter_count"].ge(4)].copy()
+                    s["base_eps_source"] = "quarterly_financial_history_sum4"
+                    s["source_date"] = ""
+                    parts.append(s[["stock_id", "base_annual_eps", "base_eps_source", "source_date"]])
+        if self._table_exists("external_valuation"):
+            vdf = self._read_sql("SELECT stock_id, eps, fiscal_year_quarter, source_date, data_date FROM external_valuation WHERE eps IS NOT NULL")
+            if vdf is not None and not vdf.empty:
+                token = vdf.get("fiscal_year_quarter", "").map(self.normalize_quarter_token)
+                vdf = vdf[token.eq(f"{self.base_year}Q4")].copy()
+                if not vdf.empty:
+                    vdf["base_annual_eps"] = pd.to_numeric(vdf["eps"], errors="coerce")
+                    vdf["base_eps_source"] = "external_valuation_proxy_q4"
+                    parts.append(vdf[["stock_id", "base_annual_eps", "base_eps_source", "source_date"]])
+        parts = [p for p in parts if p is not None and not p.empty]
+        if not parts:
+            return pd.DataFrame(columns=["stock_id", "base_annual_eps", "base_eps_source", "base_eps_quality"])
+        x = pd.concat(parts, ignore_index=True)
+        x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+        x["base_annual_eps"] = pd.to_numeric(x["base_annual_eps"], errors="coerce")
+        x = x.dropna(subset=["stock_id", "base_annual_eps"])
+        x["base_eps_quality"] = np.where(x["base_eps_source"].isin(["annual_eps_history", "quarterly_financial_history_sum4"]), "STRICT", "PROXY_CONFIRM_REQUIRED")
+        x["_priority"] = x["base_eps_source"].map({"annual_eps_history": 1, "quarterly_financial_history_sum4": 2, "external_valuation_proxy_q4": 3}).fillna(9)
+        return x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first").drop(columns=["_priority"], errors="ignore")
+
+    def load_actual_eps_by_quarter(self, quarters=None) -> pd.DataFrame:
+        quarters = normalize_high_growth_quarters(quarters)
+        q_numbers = [int(q[-1]) for q in quarters]
+        if not self._table_exists("quarterly_financial_history"):
+            return pd.DataFrame(columns=["stock_id"])
+        df = self._read_sql("SELECT stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, source_date FROM quarterly_financial_history WHERE eps IS NOT NULL")
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["stock_id"])
+        df = df.copy()
+        df["stock_id"] = df["stock_id"].map(normalize_stock_id)
+        fy = pd.to_numeric(df.get("fiscal_year"), errors="coerce")
+        qn = pd.to_numeric(df.get("quarter"), errors="coerce")
+        token1 = df.get("western_quarter", "").map(self.normalize_quarter_token) if "western_quarter" in df.columns else pd.Series("", index=df.index)
+        token2 = df.get("fiscal_year_quarter", "").map(self.normalize_quarter_token) if "fiscal_year_quarter" in df.columns else pd.Series("", index=df.index)
+        mask = (((fy == self.track_year) | (fy == self.track_year - 1911)) & qn.isin(q_numbers))
+        for q in quarters:
+            mask = mask | token1.eq(f"{self.track_year}{q}") | token2.eq(f"{self.track_year}{q}")
+        df = df.loc[mask].copy()
+        if df.empty:
+            return pd.DataFrame(columns=["stock_id"])
+        df["quarter_norm"] = np.where(qn.notna(), "Q" + qn.astype("Int64").astype(str), token1.str[-2:])
+        df["eps"] = pd.to_numeric(df["eps"], errors="coerce")
+        pivot = df.pivot_table(index="stock_id", columns="quarter_norm", values="eps", aggfunc="last").reset_index()
+        for q in quarters:
+            if q not in pivot.columns:
+                pivot[q] = np.nan
+            pivot[f"eps_{self.track_year}_{q.lower()}"] = pivot[q]
+        eps_cols = [f"eps_{self.track_year}_{q.lower()}" for q in quarters]
+        pivot["actual_eps_cumulative"] = pivot[eps_cols].sum(axis=1, min_count=len(eps_cols))
+        pivot["actual_eps_quarter_count_hit"] = pivot[eps_cols].notna().sum(axis=1)
+        pivot["actual_eps_quarter_count_required"] = len(quarters)
+        pivot["actual_eps_complete_gate"] = pivot["actual_eps_quarter_count_hit"].eq(len(quarters))
+        pivot["actual_eps_source"] = "quarterly_financial_history"
+        return pivot[["stock_id"] + eps_cols + ["actual_eps_cumulative", "actual_eps_quarter_count_hit", "actual_eps_quarter_count_required", "actual_eps_complete_gate", "actual_eps_source"]]
+
+    def build_eps_features(self, master: pd.DataFrame, revenue_features: pd.DataFrame, quarters=None) -> pd.DataFrame:
+        quarters = normalize_high_growth_quarters(quarters)
+        base = master[["stock_id"]].drop_duplicates().copy() if master is not None and not master.empty else pd.DataFrame(columns=["stock_id"])
+        if base.empty:
+            return base
+        base_eps = self.load_base_annual_eps()
+        actual = self.load_actual_eps_by_quarter(quarters)
+        x = base.merge(base_eps, on="stock_id", how="left").merge(actual, on="stock_id", how="left")
+        if revenue_features is not None and not revenue_features.empty:
+            keep = [c for c in ["stock_id", "avg_revenue_yoy", "min_revenue_yoy", "revenue_acceleration_score", "revenue_month_count_hit", "revenue_month_count_required"] if c in revenue_features.columns]
+            x = x.merge(revenue_features[keep], on="stock_id", how="left")
+        q_count = len(quarters)
+        x["base_annual_eps"] = pd.to_numeric(x.get("base_annual_eps"), errors="coerce")
+        x["actual_eps_cumulative"] = pd.to_numeric(x.get("actual_eps_cumulative"), errors="coerce")
+        # 預測：以去年平均季度EPS為基準，乘上營收YoY成長倍率，並加入保守折減，避免營收高成長誤判EPS。
+        avg_yoy = pd.to_numeric(x.get("avg_revenue_yoy"), errors="coerce")
+        base_quarter_eps = x["base_annual_eps"] / 4.0 * q_count
+        yoy_factor = 1.0 + (avg_yoy.fillna(0) / 100.0) * 0.55
+        x["forecast_eps_cumulative"] = (base_quarter_eps * yoy_factor).round(4)
+        x.loc[x["base_annual_eps"].isna() | avg_yoy.isna(), "forecast_eps_cumulative"] = np.nan
+        actual_complete = x["actual_eps_complete_gate"].fillna(False).astype(bool) if "actual_eps_complete_gate" in x.columns else pd.Series(False, index=x.index)
+        base_quality_strict = x["base_eps_quality"].fillna("").astype(str).eq("STRICT") if "base_eps_quality" in x.columns else pd.Series(False, index=x.index)
+        x["eps_cumulative_used"] = x["actual_eps_cumulative"].where(actual_complete, x["forecast_eps_cumulative"])
+        x["eps_source_used"] = np.where(actual_complete, "ACTUAL_QUARTERLY_EPS", "FORECAST_FROM_REVENUE")
+        x["eps_data_quality"] = np.where(actual_complete & base_quality_strict, "STRICT", np.where(x["eps_cumulative_used"].notna(), "FORECAST_OR_PROXY", "MISSING"))
+        x["eps_ratio"] = x["eps_cumulative_used"] / x["base_annual_eps"].replace(0, np.nan)
+        x["eps_gate"] = x["eps_ratio"] > 1.0
+        return x
+
+
+class HighGrowthEPSEngine:
+    """高成長EPS主引擎：整合營收加速度、EPS預測/實績與技術風險分層。"""
+
+    def __init__(self, db: DBManager, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID"):
+        self.db = db
+        self.tracking_quarters = normalize_high_growth_quarters(tracking_quarters)
+        self.min_yoy = float(min_yoy)
+        self.mode = str(mode or "HYBRID").upper()
+        self.revenue_engine = RevenueAccelerationEngine(db, min_yoy=self.min_yoy)
+        self.eps_engine = EPSForecastEngine(db)
+
+    def _table_exists(self, table_name: str) -> bool:
+        return self.revenue_engine._table_exists(table_name)
+
+    def _read_sql(self, sql: str, params=None) -> pd.DataFrame:
+        return self.revenue_engine._read_sql(sql, params=params)
 
     def _table_count(self, table_name: str) -> int:
         if not self._table_exists(table_name):
@@ -3816,88 +4073,29 @@ class HighGrowthEPSEngine:
         except Exception:
             return []
 
-    @staticmethod
-    def _normalize_month(value) -> str:
-        s = str(value or "").strip().replace("-", "").replace("/", "")
-        if not s or s.lower() in ("nan", "none", "null"):
-            return ""
-        m = re.search(r"(\d{3,4})(\d{2})", s)
-        if not m:
-            return ""
-        y = int(m.group(1)); mm = int(m.group(2))
-        if mm < 1 or mm > 12:
-            return ""
-        if y < 1000:
-            y += 1911
-        return f"{y:04d}{mm:02d}"
-
-    @staticmethod
-    def _normalize_quarter_token(value) -> str:
-        s = str(value or "").strip().upper().replace(" ", "")
-        if not s or s in ("NAN", "NONE", "NULL", "<NA>"):
-            return ""
-        s = s.replace("年第", "Q").replace("季", "").replace("-", "").replace("_", "")
-        m = re.match(r"^(\d{2,3})/?Q?0?([1-4])$", s)
-        if m:
-            y = int(m.group(1)); q = int(m.group(2))
-            if y < 1000:
-                y += 1911
-            return f"{y}Q{q}"
-        m = re.match(r"^(\d{4})/?Q?0?([1-4])$", s)
-        if m:
-            return f"{int(m.group(1))}Q{int(m.group(2))}"
-        m = re.match(r"^(\d{4})Q0?([1-4])$", s)
-        if m:
-            return f"{int(m.group(1))}Q{int(m.group(2))}"
-        return s
-
     def inspect_db_assets(self) -> pd.DataFrame:
         rows = []
-        date_cols = {
-            "external_valuation": ["data_date", "fiscal_year_quarter", "source_date"],
-            "quarterly_financial_history": ["fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter"],
-            "annual_eps_history": ["fiscal_year", "source_date"],
-            "external_revenue": ["revenue_month", "source_date"],
-            "external_revenue_history": ["revenue_month", "source_date"],
-            "technical_feature_daily": ["feature_date"],
-            "market_snapshot": ["snapshot_date"],
-            "stocks_master": ["update_date"],
-        }
-        for table in ["stocks_master", "external_valuation", "quarterly_financial_history", "annual_eps_history", "external_revenue", "external_revenue_history", "technical_feature_daily", "market_snapshot"]:
+        tables = ["stocks_master", "external_revenue", "external_revenue_history", "external_valuation", "financial_feature_daily", "quarterly_financial_history", "annual_eps_history", "technical_feature_daily", "market_snapshot"]
+        for table in tables:
             exists = self._table_exists(table)
             cols = self._table_cols(table)
             count = self._table_count(table)
-            coverage = []
-            if exists:
-                for col in date_cols.get(table, []):
-                    if col in cols:
-                        df = self._read_sql(f"SELECT MIN({col}) AS min_v, MAX({col}) AS max_v, COUNT(DISTINCT {col}) AS distinct_v FROM {table}")
-                        if df is not None and not df.empty:
-                            coverage.append(f"{col}: {df.iloc[0].get('min_v')} ~ {df.iloc[0].get('max_v')} / distinct={df.iloc[0].get('distinct_v')}")
             rows.append({
                 "資料表": table,
                 "是否存在": "YES" if exists else "NO",
                 "筆數": count,
                 "主要欄位": ", ".join(cols[:18]) + (" ..." if len(cols) > 18 else ""),
-                "日期/月別覆蓋": " | ".join(coverage),
-                "本功能用途": self._table_usage_note(table),
-                "V3追蹤季度需求": ",".join(self.track_quarters),
-                "V3營收月份需求": ",".join(self.required_months),
+                "V4用途": {
+                    "external_revenue": "月營收最新/備援來源",
+                    "external_revenue_history": "月營收歷史首選來源，用於季度營收階梯與YoY Gate",
+                    "external_valuation": "EPS proxy，不可當嚴格季EPS",
+                    "financial_feature_daily": "既有EPS矩陣/每日特徵，不等於正式季EPS",
+                    "quarterly_financial_history": "正式季度EPS首選來源",
+                    "annual_eps_history": "正式年度EPS首選來源；V4已可自動建表但需資料寫入",
+                }.get(table, "輔助/基本資料"),
+                "判定": "可用" if exists and count > 0 else ("有表但目前無資料" if exists else "缺表，V4會補schema或需新增資料管線"),
             })
         return pd.DataFrame(rows)
-
-    @staticmethod
-    def _table_usage_note(table: str) -> str:
-        return {
-            "stocks_master": "股名、產業、市場、ETF排除",
-            "external_valuation": "季度EPS代理來源；可支援多季，但需確認 eps 是否為單季EPS",
-            "quarterly_financial_history": "首選季度EPS資料；支援Q1~Q4接續追蹤",
-            "annual_eps_history": "首選2025全年EPS資料；若無則需新增",
-            "external_revenue": "月營收最新表；若只保留最新月，無法做多季完整階梯驗證",
-            "external_revenue_history": "首選月營收歷史；支援所選季度對應月份階梯式驗證",
-            "technical_feature_daily": "投資分層與風險控管，不取代基本面Gate",
-            "market_snapshot": "現價與均線備援",
-        }.get(table, "")
 
     def _load_master(self) -> pd.DataFrame:
         df = self._read_sql("SELECT stock_id, stock_name, market, industry, theme, sub_theme, is_etf FROM stocks_master WHERE COALESCE(is_active,1)=1")
@@ -3908,363 +4106,148 @@ class HighGrowthEPSEngine:
         df["is_etf"] = pd.to_numeric(df.get("is_etf", 0), errors="coerce").fillna(0).astype(int)
         return df.drop_duplicates("stock_id", keep="first")
 
-    def _load_target_eps_quarters(self) -> pd.DataFrame:
-        parts = []
-        if self._table_exists("quarterly_financial_history"):
-            q = """
-            SELECT stock_id, eps, 'quarterly_financial_history' AS eps_source,
-                   fiscal_year, quarter, fiscal_year_quarter, western_quarter, source_date
-            FROM quarterly_financial_history
-            WHERE eps IS NOT NULL
-            """
-            qdf = self._read_sql(q)
-            if qdf is not None and not qdf.empty:
-                fy_num = pd.to_numeric(qdf.get("fiscal_year"), errors="coerce")
-                q_num = pd.to_numeric(qdf.get("quarter"), errors="coerce")
-                token1 = qdf.get("western_quarter", "").map(self._normalize_quarter_token) if "western_quarter" in qdf.columns else pd.Series("", index=qdf.index)
-                token2 = qdf.get("fiscal_year_quarter", "").map(self._normalize_quarter_token) if "fiscal_year_quarter" in qdf.columns else pd.Series("", index=qdf.index)
-                token_by_cols = [f"{self.target_year}Q{int(q)}" if pd.notna(q) and int(q) in [1,2,3,4] and (int(fy) in [self.target_year, self.target_year-1911]) else "" for fy, q in zip(fy_num, q_num)]
-                qdf["quarter_token"] = pd.Series(token_by_cols, index=qdf.index).replace("", pd.NA).fillna(token1.replace("", pd.NA)).fillna(token2.replace("", pd.NA)).fillna("")
-                parts.append(qdf[qdf["quarter_token"].isin(self.track_quarters)].copy())
-        if self._table_exists("external_valuation"):
-            q = """
-            SELECT stock_id, eps, 'external_valuation_proxy' AS eps_source,
-                   NULL AS fiscal_year, NULL AS quarter, fiscal_year_quarter, fiscal_year_quarter AS western_quarter, source_date, data_date
-            FROM external_valuation
-            WHERE eps IS NOT NULL
-            """
-            vdf = self._read_sql(q)
-            if vdf is not None and not vdf.empty:
-                vdf["quarter_token"] = vdf.get("fiscal_year_quarter", "").map(self._normalize_quarter_token)
-                parts.append(vdf[vdf["quarter_token"].isin(self.track_quarters)].copy())
-        parts = [p for p in parts if p is not None and not p.empty]
-        if not parts:
-            cols = ["stock_id", "eps_selected_sum", "eps_quarters_present", "eps_quarters_required", "eps_sequence", "eps_selected_quality", "eps_selected_source"] + [f"eps_{q.lower()}" for q in self.track_quarters]
-            return pd.DataFrame(columns=cols)
-        raw = pd.concat(parts, ignore_index=True).copy()
-        raw["stock_id"] = raw["stock_id"].map(normalize_stock_id)
-        raw["eps"] = pd.to_numeric(raw["eps"], errors="coerce")
-        raw = raw.dropna(subset=["stock_id", "eps", "quarter_token"])
-        raw["eps_quality"] = np.where(raw["eps_source"].eq("quarterly_financial_history"), "STRICT", "PROXY_CONFIRM_REQUIRED")
-        raw["_priority"] = np.where(raw["eps_source"].eq("quarterly_financial_history"), 1, 2)
-        raw["_source_sort"] = pd.to_datetime(raw.get("source_date"), errors="coerce")
-        raw = raw.sort_values(["stock_id", "quarter_token", "_priority", "_source_sort"], ascending=[True, True, True, False]).drop_duplicates(["stock_id", "quarter_token"], keep="first")
-        piv = raw.pivot(index="stock_id", columns="quarter_token", values="eps")
-        piv = piv.rename(columns={q: f"eps_{q.lower()}" for q in self.track_quarters})
-        source = raw.groupby("stock_id")["eps_source"].agg(lambda s: ",".join(sorted(set(map(str, s))))).to_frame("eps_selected_source")
-        quality = raw.groupby("stock_id")["eps_quality"].agg(lambda s: "STRICT" if all(v == "STRICT" for v in s) else "PROXY_CONFIRM_REQUIRED").to_frame("eps_selected_quality")
-        out = piv.join(source, how="outer").join(quality, how="outer").reset_index()
-        eps_cols = [f"eps_{q.lower()}" for q in self.track_quarters]
-        for c in eps_cols:
-            if c not in out.columns:
-                out[c] = np.nan
-        out["eps_selected_sum"] = out[eps_cols].sum(axis=1, min_count=1)
-        out["eps_quarters_present"] = out[eps_cols].notna().sum(axis=1)
-        out["eps_quarters_required"] = len(self.track_quarters)
-        out["eps_sequence"] = out[eps_cols].apply(lambda r: " > ".join(["NA" if pd.isna(v) else f"{float(v):.2f}" for v in r.tolist()]), axis=1)
-        if len(eps_cols) >= 2:
-            out["eps_acceleration_gate"] = out[eps_cols].apply(lambda r: all(pd.notna(r.iloc[i]) and pd.notna(r.iloc[i-1]) and r.iloc[i] > r.iloc[i-1] for i in range(1, len(r))), axis=1)
-            out["eps_continuity_gate"] = out[eps_cols].apply(lambda r: all(pd.notna(r.iloc[i]) and r.iloc[i] > 0 for i in range(len(r))), axis=1)
-        else:
-            out["eps_acceleration_gate"] = True
-            out["eps_continuity_gate"] = out[eps_cols[0]].notna() & (out[eps_cols[0]] > 0)
-        return out
-
-    def _load_annual_eps_base(self) -> pd.DataFrame:
-        parts = []
-        roc_year = self.base_year - 1911
-        if self._table_exists("annual_eps_history"):
-            q = f"""
-            SELECT stock_id, annual_eps AS eps_base_full, 'annual_eps_history' AS eps_base_source, source_date
-            FROM annual_eps_history
-            WHERE fiscal_year IN ({self.base_year},{roc_year}) AND annual_eps IS NOT NULL
-            """
-            parts.append(self._read_sql(q))
-        if self._table_exists("quarterly_financial_history"):
-            q = """
-            SELECT stock_id, eps, fiscal_year, quarter, fiscal_year_quarter, western_quarter, source_date
-            FROM quarterly_financial_history
-            WHERE eps IS NOT NULL
-            """
-            qdf = self._read_sql(q)
-            if qdf is not None and not qdf.empty:
-                fy_num = pd.to_numeric(qdf.get("fiscal_year"), errors="coerce")
-                q_num = pd.to_numeric(qdf.get("quarter"), errors="coerce")
-                token1 = qdf.get("western_quarter", "").map(self._normalize_quarter_token) if "western_quarter" in qdf.columns else pd.Series("", index=qdf.index)
-                token2 = qdf.get("fiscal_year_quarter", "").map(self._normalize_quarter_token) if "fiscal_year_quarter" in qdf.columns else pd.Series("", index=qdf.index)
-                base_tokens = [f"{self.base_year}Q{i}" for i in [1,2,3,4]]
-                mask = (((fy_num == self.base_year) | (fy_num == roc_year)) & q_num.isin([1,2,3,4])) | token1.isin(base_tokens) | token2.isin(base_tokens)
-                tmp = qdf.loc[mask].copy()
-                if not tmp.empty:
-                    tmp["eps"] = pd.to_numeric(tmp["eps"], errors="coerce")
-                    agg = tmp.groupby("stock_id", as_index=False).agg(eps_base_full=("eps", "sum"), q_count=("eps", "count"), source_date=("source_date", "max"))
-                    agg = agg[agg["q_count"] >= 4].copy()
-                    agg["eps_base_source"] = "quarterly_financial_history_sum4q"
-                    parts.append(agg[["stock_id", "eps_base_full", "eps_base_source", "source_date"]])
-        if self._table_exists("external_valuation"):
-            q = """
-            SELECT stock_id, eps AS eps_base_full, 'external_valuation_base_q4_proxy' AS eps_base_source, source_date, fiscal_year_quarter, data_date
-            FROM external_valuation
-            WHERE eps IS NOT NULL
-            """
-            vdf = self._read_sql(q)
-            if vdf is not None and not vdf.empty:
-                token = vdf.get("fiscal_year_quarter", "").map(self._normalize_quarter_token)
-                parts.append(vdf.loc[token.eq(f"{self.base_year}Q4")].copy())
-        parts = [p for p in parts if p is not None and not p.empty]
-        if not parts:
-            return pd.DataFrame(columns=["stock_id", "eps_base_full", "eps_base_source", "eps_base_quality"])
-        x = pd.concat(parts, ignore_index=True).copy()
-        x["stock_id"] = x["stock_id"].map(normalize_stock_id)
-        x["eps_base_full"] = pd.to_numeric(x["eps_base_full"], errors="coerce")
-        x = x.dropna(subset=["stock_id", "eps_base_full"])
-        strict_sources = ["annual_eps_history", "quarterly_financial_history_sum4q"]
-        x["eps_base_quality"] = np.where(x["eps_base_source"].isin(strict_sources), "STRICT", "PROXY_CONFIRM_REQUIRED")
-        prio = {"annual_eps_history": 1, "quarterly_financial_history_sum4q": 2, "external_valuation_base_q4_proxy": 3}
-        x["_priority"] = x["eps_base_source"].map(prio).fillna(9)
-        x["_source_sort"] = pd.to_datetime(x.get("source_date"), errors="coerce")
-        return x.sort_values(["stock_id", "_priority", "_source_sort"], ascending=[True, True, False]).drop_duplicates("stock_id", keep="first").drop(columns=["_priority", "_source_sort"], errors="ignore")
-
-    def _load_monthly_revenue(self) -> pd.DataFrame:
-        parts = []
-        for table, prio in [("external_revenue_history", 1), ("external_revenue", 2)]:
-            if self._table_exists(table):
-                cols = self._table_cols(table)
-                if all(c in cols for c in ["stock_id", "revenue_month", "revenue", "yoy"]):
-                    df = self._read_sql(f"SELECT stock_id, revenue_month, revenue, yoy, mom, source_date, '{table}' AS revenue_source, {prio} AS source_priority FROM {table}")
-                    if df is not None and not df.empty:
-                        parts.append(df)
-        if not parts:
+    def _load_technical_layer(self) -> pd.DataFrame:
+        if not self._table_exists("technical_feature_daily"):
             return pd.DataFrame(columns=["stock_id"])
-        raw = pd.concat(parts, ignore_index=True).copy()
-        raw["stock_id"] = raw["stock_id"].map(normalize_stock_id)
-        raw["month_norm"] = raw["revenue_month"].map(self._normalize_month)
-        raw = raw[raw["month_norm"].isin(self.required_months)].copy()
-        raw["revenue"] = pd.to_numeric(raw["revenue"], errors="coerce")
-        raw["yoy"] = pd.to_numeric(raw["yoy"], errors="coerce")
-        raw["mom"] = pd.to_numeric(raw.get("mom", np.nan), errors="coerce")
-        raw = raw.dropna(subset=["stock_id", "month_norm"])
-        raw = raw.sort_values(["stock_id", "month_norm", "source_priority"]).drop_duplicates(["stock_id", "month_norm"], keep="first")
-        if raw.empty:
-            return pd.DataFrame(columns=["stock_id"])
-        piv_rev = raw.pivot(index="stock_id", columns="month_norm", values="revenue").rename(columns={m: f"rev_{m}" for m in self.required_months})
-        piv_yoy = raw.pivot(index="stock_id", columns="month_norm", values="yoy").rename(columns={m: f"yoy_{m}" for m in self.required_months})
-        src = raw.groupby("stock_id")["revenue_source"].agg(lambda s: ",".join(sorted(set(map(str, s))))).to_frame("revenue_source")
-        out = piv_rev.join(piv_yoy, how="outer").join(src, how="outer").reset_index()
-        for m in self.required_months:
-            for prefix in ["rev", "yoy"]:
-                c = f"{prefix}_{m}"
-                if c not in out.columns:
-                    out[c] = np.nan
-        rev_cols = [f"rev_{m}" for m in self.required_months]
-        yoy_cols = [f"yoy_{m}" for m in self.required_months]
-        out["rev_months_present"] = out[rev_cols].notna().sum(axis=1) if rev_cols else 0
-        out["yoy_months_present"] = out[yoy_cols].notna().sum(axis=1) if yoy_cols else 0
-        # 每一個季度內獨立檢查階梯式月月走高。
-        q_results = []
-        for q in self.track_quarters:
-            months = [m for m in HIGH_GROWTH_REVENUE_MONTHS_BY_QUARTER.get(q, []) if m in self.required_months]
-            cols = [f"rev_{m}" for m in months]
-            yoyq = [f"yoy_{m}" for m in months]
-            if len(cols) >= 2:
-                stair = out[cols].apply(lambda r: all(pd.notna(r.iloc[i]) and pd.notna(r.iloc[i-1]) and r.iloc[i] > r.iloc[i-1] for i in range(1, len(r))), axis=1)
-                yoy_ok = out[yoyq].apply(lambda r: all(pd.notna(v) and v >= self.min_yoy for v in r), axis=1)
-            else:
-                stair = pd.Series(False, index=out.index)
-                yoy_ok = pd.Series(False, index=out.index)
-            out[f"rev_stair_gate_{q}"] = stair
-            out[f"rev_yoy_gate_{q}"] = yoy_ok
-            q_results.append((stair, yoy_ok))
-        if q_results:
-            out["rev_stair_gate"] = pd.concat([s for s, _ in q_results], axis=1).all(axis=1)
-            out["rev_yoy_gate"] = pd.concat([y for _, y in q_results], axis=1).all(axis=1)
-        else:
-            out["rev_stair_gate"] = False
-            out["rev_yoy_gate"] = False
-        return out
+        q = """
+        SELECT t.stock_id, t.close, t.rsi14, t.macd_hist, t.trend_score, t.volume_ratio, t.feature_date
+        FROM technical_feature_daily t
+        JOIN (SELECT stock_id, MAX(feature_date) AS max_date FROM technical_feature_daily GROUP BY stock_id) m
+        ON t.stock_id=m.stock_id AND t.feature_date=m.max_date
+        """
+        return self._read_sql(q)
 
-    def _load_latest_technical(self) -> pd.DataFrame:
-        if self._table_exists("technical_feature_daily"):
-            q = """
-            SELECT t.stock_id, t.feature_date, t.close, t.volume, t.rsi14, t.macd, t.macd_signal, t.macd_hist,
-                   t.trend_score, t.volume_ratio, t.ma50, t.ma200, t.atr14
-            FROM technical_feature_daily t
-            JOIN (SELECT stock_id, MAX(feature_date) AS max_date FROM technical_feature_daily GROUP BY stock_id) m
-              ON t.stock_id=m.stock_id AND t.feature_date=m.max_date
-            """
-            df = self._read_sql(q)
-            if df is not None and not df.empty:
-                df["stock_id"] = df["stock_id"].map(normalize_stock_id)
-                return df.drop_duplicates("stock_id", keep="last")
-        return pd.DataFrame(columns=["stock_id", "close", "volume", "rsi14", "macd_hist", "trend_score", "volume_ratio"])
+    def _gap_reason(self, r) -> str:
+        gaps = []
+        if str(r.get("base_eps_quality", "")) not in ("STRICT",):
+            gaps.append("2025全年EPS非正式來源或缺資料")
+        if str(r.get("eps_data_quality", "")) != "STRICT":
+            gaps.append("所選季度EPS非完整正式季報，使用預測/代理或缺資料")
+        if not bool(r.get("revenue_complete_gate", False)):
+            gaps.append("所選季度對應月營收資料不完整")
+        if not bool(r.get("revenue_yoy_gate", False)):
+            gaps.append(f"營收YoY未全數達{self.min_yoy:.0f}%")
+        if not bool(r.get("revenue_stair_gate", False)):
+            gaps.append("營收未形成月月走高階梯")
+        if not bool(r.get("eps_gate", False)):
+            gaps.append("累計/預估EPS未大於去年全年EPS")
+        return "；".join(gaps) if gaps else ""
 
-    def _tracking_stage_label(self) -> str:
-        qn = len(self.track_quarters)
-        return {1: "Q1爆發起點", 2: "H1接續驗證", 3: "Q3主升浪確認", 4: "全年延續擴張"}.get(qn, "自訂季度追蹤")
-
-    def build_screening_df(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def build_screening_df(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         master = self._load_master()
-        epsq = self._load_target_eps_quarters()
-        fy = self._load_annual_eps_base()
-        rev = self._load_monthly_revenue()
-        tech = self._load_latest_technical()
-        x = master.copy()
-        for df in [epsq, fy, rev, tech]:
-            if df is not None and not df.empty and "stock_id" in df.columns:
-                x = x.merge(df, on="stock_id", how="left")
-        if x.empty:
-            return x, self.inspect_db_assets()
-        for c in ["eps_selected_sum", "eps_base_full", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio"]:
-            if c not in x.columns:
-                x[c] = np.nan
-            x[c] = pd.to_numeric(x[c], errors="coerce")
-        for m in self.required_months:
-            for prefix in ["rev", "yoy"]:
-                c = f"{prefix}_{m}"
-                if c not in x.columns:
-                    x[c] = np.nan
-                x[c] = pd.to_numeric(x[c], errors="coerce")
-        eps_cols = [f"eps_{q.lower()}" for q in self.track_quarters]
-        for c in eps_cols:
-            if c not in x.columns:
-                x[c] = np.nan
-            x[c] = pd.to_numeric(x[c], errors="coerce")
-        x["eps_ratio"] = x["eps_selected_sum"] / x["eps_base_full"].replace(0, np.nan)
-        x["eps_gate"] = x["eps_selected_sum"].notna() & x["eps_base_full"].notna() & (x["eps_selected_sum"] > x["eps_base_full"])
-        x["eps_data_quality"] = np.where((x.get("eps_selected_quality", "") == "STRICT") & (x.get("eps_base_quality", "") == "STRICT") & (x.get("eps_quarters_present", 0).fillna(0) >= len(self.track_quarters)), "STRICT", "PROXY_OR_MISSING")
-        x["revenue_data_quality"] = np.where((x.get("rev_months_present", 0).fillna(0) >= len(self.required_months)) & (x.get("yoy_months_present", 0).fillna(0) >= len(self.required_months)), "STRICT", "MISSING_MONTHS")
-        x["rev_yoy_gate"] = x.get("rev_yoy_gate", False).fillna(False).astype(bool) if isinstance(x.get("rev_yoy_gate", False), pd.Series) else False
-        x["rev_stair_gate"] = x.get("rev_stair_gate", False).fillna(False).astype(bool) if isinstance(x.get("rev_stair_gate", False), pd.Series) else False
-        x["rev_gate"] = x["rev_yoy_gate"] & x["rev_stair_gate"]
-        x["strict_pass"] = x["eps_gate"] & x["rev_gate"] & x["eps_data_quality"].eq("STRICT") & x["revenue_data_quality"].eq("STRICT") & (x["is_etf"].fillna(0).astype(int) == 0)
-        last_month = self.required_months[-1] if self.required_months else ""
-        latest_rev_ok = (x.get(f"yoy_{last_month}", pd.Series(np.nan, index=x.index)) >= self.min_yoy) | x.get(f"rev_{last_month}", pd.Series(np.nan, index=x.index)).notna() if last_month else False
-        x["proxy_pass"] = x["eps_gate"].fillna(False) & latest_rev_ok & ~x["strict_pass"] & (x["is_etf"].fillna(0).astype(int) == 0)
-        x["追蹤季度"] = ",".join(self.track_quarters)
-        x["追蹤階段"] = self._tracking_stage_label()
-        x["營收觀察月份"] = ",".join(self.required_months)
-        x["eps_acceleration_gate"] = x.get("eps_acceleration_gate", False).fillna(False).astype(bool) if isinstance(x.get("eps_acceleration_gate", False), pd.Series) else False
-        x["eps_continuity_gate"] = x.get("eps_continuity_gate", False).fillna(False).astype(bool) if isinstance(x.get("eps_continuity_gate", False), pd.Series) else False
-        def _gap(r):
-            gaps = []
-            for q in self.track_quarters:
-                if pd.isna(r.get(f"eps_{q.lower()}")):
-                    gaps.append(f"缺{q} EPS")
-            if pd.isna(r.get("eps_base_full")):
-                gaps.append(f"缺{self.base_year}全年EPS")
-            if str(r.get("eps_data_quality")) != "STRICT":
-                gaps.append("EPS來源非完整嚴格")
-            for m in self.required_months:
-                if pd.isna(r.get(f"rev_{m}")): gaps.append(f"缺{m}營收")
-                if pd.isna(r.get(f"yoy_{m}")): gaps.append(f"缺{m}YoY")
-            if not bool(r.get("eps_gate", False)): gaps.append("EPS累計Gate未通過")
-            if not bool(r.get("rev_yoy_gate", False)): gaps.append("YoY暴增Gate未通過")
-            if not bool(r.get("rev_stair_gate", False)): gaps.append("營收階梯Gate未通過")
-            if len(self.track_quarters) >= 2 and not bool(r.get("eps_continuity_gate", False)): gaps.append("EPS接續性不足/缺資料")
-            return "；".join(dict.fromkeys(gaps))
-        x["資料缺口/未通過原因"] = x.apply(_gap, axis=1)
-        x["基本面狀態"] = np.select([x["strict_pass"], x["proxy_pass"]], ["嚴格通過", "代理候選"], default="未通過/資料不足")
+        if master.empty:
+            return pd.DataFrame(), self.inspect_db_assets(), pd.DataFrame(), pd.DataFrame()
+        master = master[master["is_etf"].ne(1)].copy()
+        rev_features, rev_raw = self.revenue_engine.build_revenue_features(master, self.tracking_quarters)
+        eps_features = self.eps_engine.build_eps_features(master, rev_features, self.tracking_quarters)
+        tech = self._load_technical_layer()
+        x = master.merge(rev_features, on="stock_id", how="left").merge(eps_features, on="stock_id", how="left", suffixes=("", "_eps"))
+        if tech is not None and not tech.empty:
+            x = x.merge(tech, on="stock_id", how="left")
+        # 嚴格通過：正式EPS + 完整營收Gate + EPS倍數>1。
+        x["strict_pass"] = x["eps_gate"].fillna(False) & x["revenue_strict_gate"].fillna(False) & x["eps_data_quality"].eq("STRICT")
+        # 預測候選：尚未有正式季EPS，但月營收/預測已出現足夠強度。
+        x["forecast_candidate"] = (~x["strict_pass"]) & x["eps_gate"].fillna(False) & x["revenue_yoy_gate"].fillna(False) & x["revenue_month_count_hit"].fillna(0).ge(1)
+        # 代理候選：保留舊語義，方便UI/下載相容。
+        x["proxy_pass"] = x["forecast_candidate"]
+        x["資料缺口/未通過原因"] = x.apply(self._gap_reason, axis=1)
+        x["基本面狀態"] = np.select([x["strict_pass"], x["forecast_candidate"]], ["嚴格通過", "預測候選"], default="未通過/資料不足")
         x["投資分層"] = np.select([
-            x["strict_pass"] & x["eps_acceleration_gate"] & (x["trend_score"] >= 75) & (x["rsi14"] <= 75),
-            x["strict_pass"] & x["eps_continuity_gate"],
+            x["strict_pass"] & pd.to_numeric(x.get("trend_score"), errors="coerce").fillna(0).ge(75) & pd.to_numeric(x.get("rsi14"), errors="coerce").fillna(0).le(75),
             x["strict_pass"],
-            x["proxy_pass"],
-        ], ["核心觀察/加速度主升", "基本面核心/接續驗證", "基本面核心/等技術確認", "資料補齊前僅觀察"], default="排除或補資料")
+            x["forecast_candidate"],
+        ], ["核心觀察/可進技術驗證", "基本面核心/等技術確認", "財報公布前黑馬追蹤"], default="排除或補資料")
         x["風險旗標"] = np.select([
-            x["rsi14"] > 80,
-            x["trend_score"].notna() & (x["trend_score"] < 50),
+            pd.to_numeric(x.get("rsi14"), errors="coerce").fillna(0).gt(80),
+            pd.to_numeric(x.get("trend_score"), errors="coerce").fillna(100).lt(50),
             x["eps_data_quality"].ne("STRICT") | x["revenue_data_quality"].ne("STRICT"),
-            (len(self.track_quarters) >= 2) & ~x["eps_continuity_gate"],
-        ], ["RSI過熱", "趨勢偏弱", "資料不足不可嚴格通過", "EPS接續性不足"], default="OK")
+        ], ["RSI過熱", "趨勢偏弱", "資料不足不可嚴格通過"], default="OK")
         x["建議動作"] = np.select([
-            x["strict_pass"] & x["eps_acceleration_gate"] & x["風險旗標"].eq("OK"),
             x["strict_pass"] & x["風險旗標"].eq("OK"),
             x["strict_pass"],
-            x["proxy_pass"],
-        ], ["列入核心追蹤，等待價量確認", "列入投資規劃，等待技術確認", "列核心清單但需控管風險", "補齊接續季度EPS/營收後再升級"], default="不列入本策略")
+            x["forecast_candidate"],
+        ], ["列入投資規劃，等待價量確認", "列核心清單但需控管風險", "列入黑馬追蹤，等正式EPS驗證"], default="不列入本策略")
+        x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
-        order_cols = [
-            "stock_id", "stock_name", "market", "industry", "theme", "基本面狀態", "投資分層", "追蹤階段", "追蹤季度", "營收觀察月份",
-            "eps_selected_sum", "eps_base_full", "eps_ratio", "eps_sequence", "eps_selected_source", "eps_base_source",
-        ] + eps_cols + [
-            "eps_gate", "eps_acceleration_gate", "eps_continuity_gate", "rev_yoy_gate", "rev_stair_gate", "strict_pass", "proxy_pass",
-            "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"
-        ]
-        for m in self.required_months:
-            order_cols.extend([f"rev_{m}", f"yoy_{m}"])
+        months = self.revenue_engine.required_months(self.tracking_quarters)
+        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "eps_cumulative_used", "actual_eps_cumulative", "forecast_eps_cumulative", "eps_ratio", "eps_source_used", "base_eps_source", "eps_data_quality", "base_eps_quality"]
+        for m in months:
+            order_cols += [f"rev_{m}", f"yoy_{m}"]
+        order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "strict_pass", "forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
         for c in order_cols:
             if c not in x.columns:
-                x[c] = ""
+                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "eps_cumulative_used", "eps_ratio") else ""
         x = x[order_cols].copy()
-        x = x.sort_values(["strict_pass", "proxy_pass", "eps_ratio", "trend_score"], ascending=[False, False, False, False], na_position="last")
-        return x, self.inspect_db_assets()
+        x = x.sort_values(["strict_pass", "forecast_candidate", "eps_ratio", "avg_revenue_yoy", "trend_score"], ascending=[False, False, False, False, False], na_position="last")
+        return x, self.inspect_db_assets(), rev_raw, eps_features
 
     def export_report(self, output_dir: Path | None = None, log_cb=None) -> Path:
         output_dir = Path(output_dir or HIGH_GROWTH_REPORT_DIR)
         output_dir.mkdir(parents=True, exist_ok=True)
-        df, assets = self.build_screening_df()
-        report_date = datetime.now().strftime("%Y%m%d")
-        q_label = "_".join([q[-2:] for q in self.track_quarters])
-        out_path = output_dir / f"high_growth_eps_revenue_{report_date}_{q_label}.xlsx"
+        df, assets, rev_raw, eps_features = self.build_screening_df()
+        out_path = get_high_growth_report_path(datetime.now().strftime("%Y%m%d"), self.tracking_quarters)
+        if output_dir:
+            out_path = Path(output_dir) / out_path.name
         strict_df = df[df["基本面狀態"].eq("嚴格通過")].copy() if not df.empty else pd.DataFrame()
-        proxy_df = df[df["基本面狀態"].eq("代理候選")].copy() if not df.empty else pd.DataFrame()
-        fail_df = df[~df["基本面狀態"].isin(["嚴格通過", "代理候選"])].copy() if not df.empty else pd.DataFrame()
+        forecast_df = df[df["基本面狀態"].eq("預測候選")].copy() if not df.empty else pd.DataFrame()
+        fail_df = df[~df["基本面狀態"].isin(["嚴格通過", "預測候選"])].copy() if not df.empty else pd.DataFrame()
         summary = pd.DataFrame([
-            {"項目": "功能定位", "內容": "HighGrowthEPSEngine：高成長EPS加速度追蹤；可選Q1/Q2/Q3/Q4，不改動TOP20/爆發前雷達/今日可下單"},
-            {"項目": "追蹤季度", "內容": ",".join(self.track_quarters)},
-            {"項目": "營收觀察月份", "內容": ",".join(self.required_months)},
-            {"項目": "EPS Gate", "內容": f"所選季度累計EPS > {self.base_year}全年EPS"},
-            {"項目": "營收 Gate", "內容": f"所選季度對應月份 YoY >= {self.min_yoy:.0f}% 且每季內月營收階梯式走高"},
+            {"項目": "V4架構", "內容": "RevenueAccelerationEngine → EPSForecastEngine → HighGrowthEPSEngine"},
+            {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
+            {"項目": "對應營收月份", "內容": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
+            {"項目": "嚴格條件", "內容": "正式季度累計EPS > 2025全年EPS，且營收YoY全數達標並月月走高"},
+            {"項目": "預測候選條件", "內容": "正式季EPS尚未完整時，以月營收加速度預估EPS；只能列預測候選，不得列嚴格通過"},
+            {"項目": "YoY門檻", "內容": self.min_yoy},
             {"項目": "嚴格通過筆數", "內容": int(len(strict_df))},
-            {"項目": "代理候選筆數", "內容": int(len(proxy_df))},
+            {"項目": "預測候選筆數", "內容": int(len(forecast_df))},
             {"項目": "未通過/資料不足筆數", "內容": int(len(fail_df))},
-            {"項目": "嚴格聲明", "內容": "缺任一所選季度EPS或營收月份，不得標示為嚴格通過；代理資料只能列代理候選"},
-            {"項目": "V3修正", "內容": "固定Q1篩選器升級為季度追蹤引擎；UI可勾選Q1~Q4；Excel輸出追蹤季度/營收觀察月份/EPS接續性"},
             {"項目": "輸出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            {"項目": "規則版本", "內容": HIGH_GROWTH_RULE_VERSION},
         ])
         rules = pd.DataFrame([
-            {"步驟": "Step1", "模組": "TRACK_QUARTER_SELECTOR", "邏輯": "UI勾選Q1~Q4，預設Q1；傳入HighGrowthEPSEngine(track_quarters=...)", "驗收": "報表摘要顯示追蹤季度"},
-            {"步驟": "Step2", "模組": "EPS_SELECTED_SUM", "邏輯": "讀quarterly_financial_history首選；external_valuation為proxy；計算所選季度EPS累計", "驗收": "eps_selected_sum與eps_sequence可追溯"},
-            {"步驟": "Step3", "模組": "EPS_BASE", "邏輯": "2025全年EPS首選annual_eps_history；備援2025四季加總；再備援2025Q4 proxy", "驗收": "eps_base_full非空且來源標示"},
-            {"步驟": "Step4", "模組": "REVENUE_WINDOW", "邏輯": "Q1=2/3/4；Q2=5/6/7；Q3=8/9/10；Q4=11/12/隔年1月", "驗收": "營收觀察月份與UI季度一致"},
-            {"步驟": "Step5", "模組": "STRICT_GATE", "邏輯": "eps_selected_sum > eps_base_full AND 營收YoY Gate AND 營收階梯Gate AND 資料品質STRICT", "驗收": "strict_pass=True才列嚴格通過"},
-            {"步驟": "Step6", "模組": "ACCELERATION_LAYER", "邏輯": "多季追蹤時標示eps_acceleration_gate與eps_continuity_gate", "驗收": "投資分層與風險旗標可辨識接續性"},
+            {"序號": 1, "模組": "RevenueAccelerationEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "可依Q1~Q4動態取得對應月營收與YoY"},
+            {"序號": 2, "模組": "EPSForecastEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "優先讀正式季EPS與年度EPS；缺資料才預測"},
+            {"序號": 3, "模組": "HighGrowthEPSEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "輸出嚴格通過/預測候選/資料不足三層結果"},
+            {"序號": 4, "模組": "UI", "新增/修改": "修改", "程式位置": "_build_highgrowth_tab / on_highgrowth_report", "驗收點": "可勾選Q1/Q2/Q3/Q4並產生對應報表"},
+            {"序號": 5, "模組": "DB Schema", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_schema", "驗收點": "缺 annual_eps_history 時自動建表"},
         ])
         if strict_df.empty:
-            strict_df = pd.DataFrame([{"狀態": "NO_STRICT_PASS", "說明": "目前DB未找到完整符合所選季度嚴格條件的個股，請查看代理候選與資料缺口。"}])
-        if proxy_df.empty:
-            proxy_df = pd.DataFrame([{"狀態": "NO_PROXY_CANDIDATE", "說明": "目前沒有代理候選。"}])
+            strict_df = pd.DataFrame([{"狀態": "NO_STRICT_PASS", "說明": "目前DB沒有完整符合嚴格條件的個股。"}])
+        if forecast_df.empty:
+            forecast_df = pd.DataFrame([{"狀態": "NO_FORECAST_CANDIDATE", "說明": "目前沒有預測候選。"}])
         tables = {
             "00_結論摘要": summary,
             "01_DB可用性盤點": assets,
             "02_嚴格通過名單": strict_df,
-            "03_代理候選與觀察": proxy_df.head(300),
+            "03_預測候選黑馬池": forecast_df.head(500),
             "04_不通過與資料缺口": fail_df.head(1000),
-            "05_SQL邏輯與驗收規則": rules,
-            "06_全部篩選明細": df.head(3000),
+            "05_營收明細來源": rev_raw.head(5000) if rev_raw is not None else pd.DataFrame(),
+            "06_EPS特徵中繼": eps_features.head(5000) if eps_features is not None else pd.DataFrame(),
+            "07_修改查檢表": rules,
+            "08_全部結果": df.head(5000),
         }
         out_path, kind = write_table_bundle(out_path.with_suffix(""), tables, preferred="excel")
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V3] 報表輸出：{out_path}｜quarters={','.join(self.track_quarters)}｜strict={0 if '狀態' in strict_df.columns else len(strict_df)}｜proxy={0 if '狀態' in proxy_df.columns else len(proxy_df)}｜rule={HIGH_GROWTH_RULE_VERSION}")
+            log_cb(f"[HIGH_GROWTH_V4] 報表輸出：{out_path}｜quarters={'+'.join(self.tracking_quarters)}｜strict={len(strict_df)}｜forecast={len(forecast_df)}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
-        df, _ = self.build_screening_df()
+        df, _, _, _ = self.build_screening_df()
         if df is None or df.empty:
             return pd.DataFrame()
         return df.head(int(limit)).copy()
 
 
-# 舊名稱相容：避免原UI或外部呼叫尚使用 HighGrowthEpsRevenueEngine 時失效。
+# Backward compatible alias：舊UI/舊功能名稱仍可使用，但底層已升級到V4。
 HighGrowthEpsRevenueEngine = HighGrowthEPSEngine
 
 
-def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: Path | None = None, log_cb=None, track_quarters: list[str] | None = None, min_yoy: float = HIGH_GROWTH_MIN_YOY) -> Path:
+def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: Path | None = None, log_cb=None, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID") -> Path:
     close_after = False
     if db is None:
         db = DBManager(DB_PATH); db.init_db(); close_after = True
     try:
-        return HighGrowthEPSEngine(db, min_yoy=min_yoy, track_quarters=track_quarters).export_report(output_dir=output_dir or HIGH_GROWTH_REPORT_DIR, log_cb=log_cb)
+        return HighGrowthEPSEngine(db, tracking_quarters=tracking_quarters, min_yoy=min_yoy, mode=mode).export_report(output_dir=output_dir or HIGH_GROWTH_REPORT_DIR, log_cb=log_cb)
     finally:
         if close_after:
             db.close()
@@ -11349,31 +11332,46 @@ class AppUI:
 
 
 
+    def _selected_highgrowth_quarters(self) -> list[str]:
+        try:
+            selected = []
+            for q in ["Q1", "Q2", "Q3", "Q4"]:
+                var = getattr(self, f"highgrowth_{q.lower()}_var", None)
+                if var is not None and bool(var.get()):
+                    selected.append(q)
+            return normalize_high_growth_quarters(selected)
+        except Exception:
+            return list(HIGH_GROWTH_DEFAULT_QUARTERS)
+
     def _build_highgrowth_tab(self):
-        """HIGH_GROWTH_EPS_REVENUE_PATCH：高成長EPS業績成長分頁。"""
+        """HIGH_GROWTH_EPS_ENGINE_V4：高成長EPS加速度分頁，可選Q1~Q4追蹤。"""
         control = ttk.Frame(self.tab_highgrowth, padding=6)
         control.pack(fill="x")
-        ttk.Button(control, text="① 產生高成長EPS報表", command=self.on_highgrowth_report).pack(side="left", padx=4)
+        ttk.Button(control, text="① 產生高成長EPS V4報表", command=self.on_highgrowth_report).pack(side="left", padx=4)
         ttk.Button(control, text="② 開啟高成長EPS報表", command=self.on_open_highgrowth_report).pack(side="left", padx=4)
-        ttk.Label(control, text="追蹤季度:").pack(side="left", padx=(14, 2))
-        self.highgrowth_quarter_vars = {
-            "2026Q1": tk.BooleanVar(value=True),
-            "2026Q2": tk.BooleanVar(value=False),
-            "2026Q3": tk.BooleanVar(value=False),
-            "2026Q4": tk.BooleanVar(value=False),
-        }
-        for _q, _var in self.highgrowth_quarter_vars.items():
-            ttk.Checkbutton(control, text=_q[-2:], variable=_var).pack(side="left", padx=2)
-        self.highgrowth_status_var = tk.StringVar(value=f"報表輸出：{HIGH_GROWTH_REPORT_DIR}")
+        ttk.Label(control, text="追蹤季度").pack(side="left", padx=(12, 2))
+        self.highgrowth_q1_var = tk.BooleanVar(value=True)
+        self.highgrowth_q2_var = tk.BooleanVar(value=False)
+        self.highgrowth_q3_var = tk.BooleanVar(value=False)
+        self.highgrowth_q4_var = tk.BooleanVar(value=False)
+        for q, var in [("Q1", self.highgrowth_q1_var), ("Q2", self.highgrowth_q2_var), ("Q3", self.highgrowth_q3_var), ("Q4", self.highgrowth_q4_var)]:
+            ttk.Checkbutton(control, text=q, variable=var).pack(side="left", padx=2)
+        ttk.Label(control, text="模式").pack(side="left", padx=(10, 2))
+        self.highgrowth_mode_var = tk.StringVar(value="HYBRID")
+        mode_cb = ttk.Combobox(control, textvariable=self.highgrowth_mode_var, width=16, state="readonly")
+        mode_cb["values"] = ["HYBRID", "STRICT_ACTUAL_ONLY", "FORECAST_PROXY"]
+        mode_cb.pack(side="left", padx=2)
+        self.highgrowth_status_var = tk.StringVar(value=f"V4報表輸出：{HIGH_GROWTH_REPORT_DIR}")
         ttk.Label(control, textvariable=self.highgrowth_status_var).pack(side="left", padx=12)
-        cols = ("status", "rank", "id", "name", "industry", "stage", "quarters", "eps_sum", "eps_base", "eps_ratio", "eps_seq", "rev_months", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
+        cols = ("status", "rank", "id", "name", "industry", "quarters", "eps_used", "eps_2025", "eps_ratio", "eps_source", "avg_yoy", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
         headers = {
-            "status":"狀態", "rank":"排序", "id":"代號", "name":"名稱", "industry":"產業",
-            "stage":"追蹤階段", "quarters":"季度", "eps_sum":"所選EPS累計", "eps_base":"2025全年EPS", "eps_ratio":"EPS倍數", "eps_seq":"EPS序列",
-            "rev_months":"營收月份", "rev_stair":"營收階梯", "close":"現價", "rsi":"RSI", "trend":"趨勢分", "risk":"風險", "action":"建議動作", "gap":"資料缺口/原因"
+            "status":"狀態", "rank":"排序", "id":"代號", "name":"名稱", "industry":"產業", "quarters":"季度",
+            "eps_used":"累計/預估EPS", "eps_2025":"2025全年EPS", "eps_ratio":"EPS倍數", "eps_source":"EPS來源",
+            "avg_yoy":"平均YoY", "rev_hit":"營收月數", "rev_stair":"營收階梯", "close":"現價", "rsi":"RSI", "trend":"趨勢分",
+            "risk":"風險", "action":"建議動作", "gap":"資料缺口/原因"
         }
         self.highgrowth_tree = self._make_tree(self.tab_highgrowth, cols, headers)
-        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":120,"stage":120,"quarters":120,"eps_sum":105,"eps_base":105,"eps_ratio":80,"eps_seq":150,"rev_months":140,"rev_stair":90,"close":80,"rsi":70,"trend":80,"risk":130,"action":240,"gap":420}
+        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":120,"quarters":80,"eps_used":105,"eps_2025":105,"eps_ratio":80,"eps_source":150,"avg_yoy":90,"rev_hit":85,"rev_stair":90,"close":80,"rsi":70,"trend":80,"risk":140,"action":250,"gap":420}
         for c, w in widths.items():
             try:
                 self.highgrowth_tree.column(c, width=w, minwidth=55, stretch=False)
@@ -11382,14 +11380,15 @@ class AppUI:
 
     def _refresh_highgrowth_tree(self, df: pd.DataFrame | None = None):
         try:
+            quarters = self._selected_highgrowth_quarters()
             if df is None:
-                df = HighGrowthEPSEngine(self.db, track_quarters=self._get_highgrowth_selected_quarters()).get_latest_view()
+                df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()).get_latest_view()
             self.last_highgrowth_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
             if not hasattr(self, "highgrowth_tree"):
                 return
             self.highgrowth_tree.delete(*self.highgrowth_tree.get_children())
             if df is None or df.empty:
-                self.highgrowth_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "請先產生高成長EPS報表"))
+                self.highgrowth_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "+".join(quarters), "", "", "", "", "", "", "", "", "", "", "", "", "請先產生高成長EPS報表"))
                 return
             def fmt(v):
                 try:
@@ -11397,52 +11396,47 @@ class AppUI:
                     return f"{float(v):.2f}"
                 except Exception:
                     return str(v or "")
-            sort_cols = [c for c in ["strict_pass", "proxy_pass", "eps_ratio", "trend_score"] if c in df.columns]
-            view = df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last").head(200).reset_index(drop=True) if sort_cols else df.head(200).reset_index(drop=True)
+            sort_cols = [c for c in ["strict_pass", "forecast_candidate", "eps_ratio", "avg_revenue_yoy"] if c in df.columns]
+            view = df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last").head(250).reset_index(drop=True) if sort_cols else df.head(250).reset_index(drop=True)
             for i, r in view.iterrows():
-                rev_stair = "PASS" if bool(r.get("rev_stair_gate", False)) else "FAIL/NA"
+                rev_stair = "PASS" if bool(r.get("revenue_stair_gate", False)) else "FAIL/NA"
+                rev_hit = f"{int(float(r.get('revenue_month_count_hit', 0) or 0))}/{int(float(r.get('revenue_month_count_required', 0) or 0))}"
                 self.highgrowth_tree.insert("", "end", values=(
-                    str(r.get("基本面狀態", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")), str(r.get("industry", "")),
-                    str(r.get("追蹤階段", "")), str(r.get("追蹤季度", "")), fmt(r.get("eps_selected_sum", "")), fmt(r.get("eps_base_full", "")), fmt(r.get("eps_ratio", "")),
-                    str(r.get("eps_sequence", "")), str(r.get("營收觀察月份", "")), rev_stair,
-                    fmt(r.get("close", "")), fmt(r.get("rsi14", "")), fmt(r.get("trend_score", "")),
+                    str(r.get("基本面狀態", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")), str(r.get("industry", "")), str(r.get("追蹤季度", "+".join(quarters))),
+                    fmt(r.get("eps_cumulative_used", "")), fmt(r.get("base_annual_eps", "")), fmt(r.get("eps_ratio", "")), str(r.get("eps_source_used", "")),
+                    fmt(r.get("avg_revenue_yoy", "")), rev_hit, rev_stair, fmt(r.get("close", "")), fmt(r.get("rsi14", "")), fmt(r.get("trend_score", "")),
                     str(r.get("風險旗標", "")), str(r.get("建議動作", "")), str(r.get("資料缺口/未通過原因", ""))
                 ))
             if hasattr(self, "highgrowth_status_var"):
                 counts = df.get("基本面狀態", pd.Series(dtype=str)).fillna("").astype(str).value_counts().to_dict()
-                self.highgrowth_status_var.set(f"最新篩選：{len(df)}筆｜狀態{counts}｜季度={self._get_highgrowth_selected_quarters()}｜報表：{getattr(self, 'last_highgrowth_report_path', HIGH_GROWTH_REPORT_DIR)}")
+                self.highgrowth_status_var.set(f"V4最新篩選：{len(df)}筆｜季度={'+'.join(quarters)}｜狀態{counts}｜報表：{self.last_highgrowth_report_path or HIGH_GROWTH_REPORT_DIR}")
         except Exception as exc:
-            self.append_log(f"刷新高成長EPS表失敗：{exc}", "ERROR")
-
-    def _get_highgrowth_selected_quarters(self):
-        try:
-            selected = [q for q, var in getattr(self, "highgrowth_quarter_vars", {}).items() if bool(var.get())]
-            return selected or list(HIGH_GROWTH_DEFAULT_TRACK_QUARTERS)
-        except Exception:
-            return list(HIGH_GROWTH_DEFAULT_TRACK_QUARTERS)
+            self.append_log(f"刷新高成長EPS V4表失敗：{exc}", "ERROR")
 
     def on_highgrowth_report(self):
-        """UI按鈕：產生高成長EPS業績成長報表。"""
+        """UI按鈕：產生高成長EPS加速度V4報表。"""
+        quarters = self._selected_highgrowth_quarters()
+        mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
         def worker():
-            quarters = self._get_highgrowth_selected_quarters()
-            self.ui_call(self.start_task, "高成長EPS報表", 3)
-            self.ui_call(self.update_task, "高成長EPS報表", 1, 3, item=f"讀取EPS與營收資料｜季度={quarters}")
-            path = run_high_growth_eps_revenue_report(db=self.db, output_dir=HIGH_GROWTH_REPORT_DIR, log_cb=lambda m: self.ui_call(self.append_log, m), track_quarters=quarters)
+            self.ui_call(self.start_task, "高成長EPS V4報表", 3)
+            self.ui_call(self.update_task, "高成長EPS V4報表", 1, 3, item=f"讀取EPS與營收資料｜季度={'+'.join(quarters)}")
+            path = run_high_growth_eps_revenue_report(db=self.db, output_dir=HIGH_GROWTH_REPORT_DIR, log_cb=lambda m: self.ui_call(self.append_log, m), tracking_quarters=quarters, mode=mode)
             self.last_highgrowth_report_path = Path(path)
-            self.ui_call(self.update_task, "高成長EPS報表", 2, 3, item="刷新UI表格")
-            df = HighGrowthEPSEngine(self.db, track_quarters=quarters).get_latest_view()
+            self.ui_call(self.update_task, "高成長EPS V4報表", 2, 3, item="刷新UI表格")
+            df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=mode).get_latest_view()
             self.ui_call(self._refresh_highgrowth_tree, df)
-            self.ui_call(self.update_task, "高成長EPS報表", 3, 3, success=len(df) if isinstance(df, pd.DataFrame) else 0, item="Excel完成")
-            self.ui_call(self.append_log, f"高成長EPS報表已產生：{path}")
-            self.ui_call(messagebox.showinfo, "完成", f"已產生高成長EPS報表：\n{path}")
-            self.ui_call(self.finish_task, "高成長EPS報表", f"已產生：{path}")
-        self._run_in_thread(worker, "high_growth_eps_report")
+            self.ui_call(self.update_task, "高成長EPS V4報表", 3, 3, success=len(df) if isinstance(df, pd.DataFrame) else 0, item="Excel完成")
+            self.ui_call(self.append_log, f"高成長EPS V4報表已產生：{path}")
+            self.ui_call(messagebox.showinfo, "完成", f"已產生高成長EPS V4報表：\n{path}")
+            self.ui_call(self.finish_task, "高成長EPS V4報表", f"已產生：{path}")
+        self._run_in_thread(worker, "high_growth_eps_v4_report")
 
     def on_open_highgrowth_report(self):
-        path = getattr(self, "last_highgrowth_report_path", None) or get_high_growth_report_path()
+        quarters = self._selected_highgrowth_quarters()
+        path = getattr(self, "last_highgrowth_report_path", None) or get_high_growth_report_path(quarters=quarters)
         path = Path(path)
         if not path.exists():
-            return messagebox.showwarning("找不到報表", f"找不到高成長EPS報表：\n{path}\n\n請先按『① 產生高成長EPS報表』。")
+            return messagebox.showwarning("找不到報表", f"找不到高成長EPS V4報表：\n{path}\n\n請先按『① 產生高成長EPS V4報表』。")
         open_path(path)
 
     def _build_prebreakout_tab(self):
@@ -12756,7 +12750,7 @@ class AppUI:
                     "條件預掛": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
                     "執行下單清單": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "組合交易計畫": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
-                    "高成長EPS報表": ["stock_id", "stock_name", "基本面狀態", "投資分層", "eps_2026_q1", "eps_2025_full", "eps_ratio", "yoy_202602", "yoy_202603", "yoy_202604", "strict_pass", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因"],
+                    "高成長EPS報表": ["stock_id", "stock_name", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "eps_cumulative_used", "actual_eps_cumulative", "forecast_eps_cumulative", "eps_ratio", "eps_source_used", "avg_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "strict_pass", "forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因"],
                     "唯一決策": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "market", "industry", "theme", "ui_state", "entry_zone", "stop_loss", "target_price", "rr", "win_rate", "decision", "final_trade_decision"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                     "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
