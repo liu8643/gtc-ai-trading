@@ -3713,7 +3713,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V5_1_DISCLOSURE_AND_PARSE_FIX_20260529"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V5_2_STDLIB_HTML_PARSER_FIX_20260530"
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -3728,7 +3728,7 @@ def get_high_growth_report_path(date_str: str | None = None, quarters: list[str]
     d = date_str or datetime.now().strftime("%Y%m%d")
     qtag = "".join(quarters or HIGH_GROWTH_DEFAULT_QUARTERS) or "Q1"
     HIGH_GROWTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    return HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_engine_v4_{qtag}_{d}.xlsx"
+    return HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_engine_v5_2_{qtag}_{d}.xlsx"
 
 
 def normalize_high_growth_quarters(quarters=None) -> list[str]:
@@ -3755,6 +3755,149 @@ def normalize_high_growth_quarters(quarters=None) -> list[str]:
             out.append(q)
     return out or list(HIGH_GROWTH_DEFAULT_QUARTERS)
 
+
+
+# HIGH_GROWTH_EPS_ENGINE_V5_2：不依賴 lxml / bs4 的 MOPS HTML 表格解析器。
+# 真因修正：EXE / 沙盒環境常缺 lxml，pandas.read_html 即使 HTTP 200 也會失敗。
+# 本解析器只使用 Python 標準庫 html.parser，並保留 pandas.read_html 作為可用時的第一選項。
+def _hg_clean_cell_text(v) -> str:
+    s = re.sub(r"\s+", " ", str(v or "").replace("\xa0", " ")).strip()
+    return s.replace("（", "(").replace("）", ")").replace("％", "%")
+
+
+def _hg_pick_header_row(rows: list[list[str]], required_any: list[str] | None = None) -> int:
+    required_any = required_any or ["公司代號", "股票代號", "證券代號"]
+    best_idx, best_score = 0, -1
+    for i, row in enumerate(rows[:12]):
+        joined = "".join(_hg_clean_cell_text(c) for c in row)
+        score = 0
+        if any(k in joined for k in required_any):
+            score += 20
+        if any(k in joined for k in ["公司名稱", "公司簡稱", "證券名稱"]):
+            score += 8
+        if any(k in joined for k in ["當月營收", "本月營收", "營業收入", "每股盈餘", "基本每股盈餘"]):
+            score += 12
+        if len([c for c in row if _hg_clean_cell_text(c)]) >= 3:
+            score += 2
+        if score > best_score:
+            best_idx, best_score = i, score
+    return best_idx
+
+
+class _HighGrowthHTMLTableParser:
+    def __init__(self):
+        from html.parser import HTMLParser
+
+        class Parser(HTMLParser):
+            def __init__(self, outer):
+                super().__init__(convert_charrefs=True)
+                self.outer = outer
+                self.in_table = 0
+                self.in_row = False
+                self.in_cell = False
+                self.cell_text = []
+                self.row = []
+
+            def handle_starttag(self, tag, attrs):
+                tag = tag.lower()
+                if tag == "table":
+                    self.in_table += 1
+                    if self.in_table == 1:
+                        self.outer.current = []
+                elif self.in_table and tag == "tr":
+                    self.in_row = True
+                    self.row = []
+                elif self.in_table and tag in ("td", "th"):
+                    self.in_cell = True
+                    self.cell_text = []
+                elif self.in_cell and tag == "br":
+                    self.cell_text.append(" ")
+
+            def handle_endtag(self, tag):
+                tag = tag.lower()
+                if tag in ("td", "th") and self.in_table and self.in_cell:
+                    self.row.append(_hg_clean_cell_text("".join(self.cell_text)))
+                    self.cell_text = []
+                    self.in_cell = False
+                elif tag == "tr" and self.in_table and self.in_row:
+                    if any(_hg_clean_cell_text(c) for c in self.row):
+                        self.outer.current.append(self.row)
+                    self.row = []
+                    self.in_row = False
+                elif tag == "table" and self.in_table:
+                    if self.in_table == 1 and self.outer.current:
+                        self.outer.tables.append(self.outer.current)
+                    self.in_table -= 1
+
+            def handle_data(self, data):
+                if self.in_cell:
+                    self.cell_text.append(data)
+
+        self.Parser = Parser
+        self.tables = []
+        self.current = []
+
+    def parse(self, html: str) -> list[list[list[str]]]:
+        parser = self.Parser(self)
+        parser.feed(html or "")
+        parser.close()
+        return self.tables
+
+
+def _hg_rows_to_dataframe(rows: list[list[str]], kind: str = "generic") -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    width = max(len(r) for r in rows)
+    fixed = [list(r) + [""] * (width - len(r)) for r in rows]
+    hidx = _hg_pick_header_row(fixed)
+    header = [_hg_clean_cell_text(c) or f"col_{i+1}" for i, c in enumerate(fixed[hidx])]
+    # 若上一列也是表頭群組，合併上一列表頭文字，改善多層表頭欄名辨識。
+    if hidx > 0:
+        prev = [_hg_clean_cell_text(c) for c in fixed[hidx - 1]]
+        if any(prev) and not any(re.fullmatch(r"\d{4,5}", _hg_clean_cell_text(c)) for c in prev):
+            merged = []
+            for p, h in zip(prev, header):
+                if p and h and p not in h:
+                    merged.append(p + h)
+                else:
+                    merged.append(h or p)
+            header = merged
+    data = fixed[hidx + 1:]
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data, columns=_coerce_unique_columns(header) if '_coerce_unique_columns' in globals() else header)
+    # 移除重複表頭列與空列。
+    joined_headers = "".join(header)
+    keep_rows = []
+    for _, r in df.iterrows():
+        vals = [_hg_clean_cell_text(v) for v in r.tolist()]
+        joined = "".join(vals)
+        if not joined:
+            keep_rows.append(False)
+        elif joined == joined_headers or ("公司代號" in joined and ("當月營收" in joined or "每股盈餘" in joined)):
+            keep_rows.append(False)
+        else:
+            keep_rows.append(True)
+    return df.loc[keep_rows].reset_index(drop=True) if keep_rows else df
+
+
+def _hg_safe_read_html_tables(html: str, source_label: str = "MOPS") -> tuple[list[pd.DataFrame], str]:
+    """Return (tables, parser_used). Never raises for missing lxml/bs4."""
+    html = html or ""
+    try:
+        tables = pd.read_html(io.StringIO(html))
+        if tables:
+            return tables, "pandas.read_html"
+    except Exception as exc:
+        log_warning(f"[HIGH_GROWTH_V5.2] pandas.read_html unavailable for {source_label}: {exc}; fallback=stdlib_html_parser")
+    try:
+        raw_tables = _HighGrowthHTMLTableParser().parse(html)
+        dfs = [_hg_rows_to_dataframe(t) for t in raw_tables]
+        dfs = [d for d in dfs if d is not None and not d.empty]
+        return dfs, "stdlib_html_parser"
+    except Exception as exc:
+        log_warning(f"[HIGH_GROWTH_V5.2] stdlib html parser failed for {source_label}: {exc}")
+        return [], "parse_failed"
 
 
 
@@ -3913,9 +4056,10 @@ class RevenueCollectorEngine:
             if re.search(r'查無資料|無符合|尚無|資料不存在|無資料', html):
                 status.update({'status': 'NOT_DISCLOSED', 'message': 'MOPS回覆無資料/尚未公告'})
                 return pd.DataFrame(), status
-            tables = pd.read_html(io.StringIO(html))
+            tables, parser_used = _hg_safe_read_html_tables(html, source_label=f'RevenueCollectorEngine {month_yyyymm} {market_type}')
+            status['parser'] = parser_used
             if not tables:
-                status.update({'status': 'PARSE_EMPTY', 'message': 'pd.read_html無表格'})
+                status.update({'status': 'PARSE_EMPTY', 'message': f'{parser_used}無表格'})
                 return pd.DataFrame(), status
         except Exception as exc:
             status['message'] = str(exc)
@@ -4180,9 +4324,10 @@ class EPSActualCollectorEngine:
             if re.search(r'查無資料|無符合|尚無|資料不存在|無資料', html):
                 status.update({'status': 'NOT_DISCLOSED', 'message': 'MOPS回覆無資料/尚未公告'})
                 return pd.DataFrame(), status
-            tables = pd.read_html(io.StringIO(html))
+            tables, parser_used = _hg_safe_read_html_tables(html, source_label=f'EPSActualCollectorEngine {fiscal_year}Q{quarter} {market_type}')
+            status['parser'] = parser_used
             if not tables:
-                status.update({'status': 'PARSE_EMPTY', 'message': 'pd.read_html無表格'})
+                status.update({'status': 'PARSE_EMPTY', 'message': f'{parser_used}無表格'})
                 return pd.DataFrame(), status
             df = self._parse_eps_tables(tables, fiscal_year, int(quarter), source_url)
             if df.empty:
@@ -4729,14 +4874,18 @@ class HighGrowthEPSEngine:
         x["proxy_pass"] = x["forecast_candidate"]
         x["資料缺口/未通過原因"] = x.apply(self._gap_reason, axis=1)
         x["基本面狀態"] = np.select([x["strict_pass"], x["forecast_candidate"]], ["嚴格通過", "預測候選"], default="未通過/資料不足")
+        # V5.2 修正：technical_feature_daily 可能尚未建立或沒有 trend_score/rsi14。
+        # 不可再用 pd.to_numeric(x.get("trend_score"))，因為缺欄時會取得 scalar np.nan，導致 .fillna() 當機。
+        trend_score_s = _safe_numeric_series_for_df(x, "trend_score", 0)
+        rsi14_s = _safe_numeric_series_for_df(x, "rsi14", 0)
         x["投資分層"] = np.select([
-            x["strict_pass"] & pd.to_numeric(x.get("trend_score"), errors="coerce").fillna(0).ge(75) & pd.to_numeric(x.get("rsi14"), errors="coerce").fillna(0).le(75),
+            x["strict_pass"] & trend_score_s.ge(75) & rsi14_s.le(75),
             x["strict_pass"],
             x["forecast_candidate"],
         ], ["核心觀察/可進技術驗證", "基本面核心/等技術確認", "財報公布前黑馬追蹤"], default="排除或補資料")
         x["風險旗標"] = np.select([
-            pd.to_numeric(x.get("rsi14"), errors="coerce").fillna(0).gt(80),
-            pd.to_numeric(x.get("trend_score"), errors="coerce").fillna(100).lt(50),
+            rsi14_s.gt(80),
+            trend_score_s.fillna(100).lt(50),
             x["eps_data_quality"].ne("STRICT") | x["revenue_data_quality"].ne("STRICT"),
         ], ["RSI過熱", "趨勢偏弱", "資料不足不可嚴格通過"], default="OK")
         x["建議動作"] = np.select([
@@ -4816,7 +4965,7 @@ class HighGrowthEPSEngine:
         }
         out_path, kind = write_table_bundle(out_path.with_suffix(""), tables, preferred="excel")
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V5.1] 報表輸出：{out_path}｜quarters={'+'.join(self.tracking_quarters)}｜mode={self.mode}｜strict={strict_count_real}｜forecast={forecast_count_real}｜fail={fail_count_real}")
+            log_cb(f"[HIGH_GROWTH_V5.2] 報表輸出：{out_path}｜quarters={'+'.join(self.tracking_quarters)}｜mode={self.mode}｜strict={strict_count_real}｜forecast={forecast_count_real}｜fail={fail_count_real}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
