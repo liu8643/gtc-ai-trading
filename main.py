@@ -3704,16 +3704,16 @@ def run_prebreakout_premarket_analyzer(db: DBManager | None = None, output_dir: 
         if close_after: db.close()
 
 
-# HIGH_GROWTH_EPS_ENGINE_V5_6_20260530：高成長EPS三層判斷系統
+# HIGH_GROWTH_EPS_ENGINE_V5_3_20260530：高成長EPS加速度追蹤系統
 # 功能定位：獨立新增，不改變 TOP20 / 爆發前雷達 / 今日可下單原有語義。
-# V5.6 架構：RevenueAccelerationEngine -> EPSForecastEngine -> HighGrowthEPSEngine
+# V5.4 架構：RevenueAccelerationEngine -> EPSForecastEngine -> HighGrowthEPSEngine
 HIGH_GROWTH_REPORT_DIR = RUNTIME_DIR / "reports"
 HIGH_GROWTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V5_7_THREE_LAYER_FORECAST_PARTIAL_FIX_20260530"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V5_8_EPS_TTM_SOURCE_SEPARATION_FIX_20260530"
 HIGH_GROWTH_YOY_ABNORMAL_CAP = 1000.0
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
@@ -3729,7 +3729,7 @@ def get_high_growth_report_path(date_str: str | None = None, quarters: list[str]
     d = date_str or datetime.now().strftime("%Y%m%d")
     qtag = "".join(quarters or HIGH_GROWTH_DEFAULT_QUARTERS) or "Q1"
     HIGH_GROWTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    return HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_engine_v5_6_{qtag}_{d}.xlsx"
+    return HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_engine_v5_8_{qtag}_{d}.xlsx"
 
 
 def normalize_high_growth_quarters(quarters=None) -> list[str]:
@@ -3890,78 +3890,16 @@ def _hg_safe_read_html_tables(html: str, source_label: str = "MOPS") -> tuple[li
         if tables:
             return tables, "pandas.read_html"
     except Exception as exc:
-        log_warning(f"[HIGH_GROWTH_V5.6] pandas.read_html unavailable for {source_label}: {exc}; fallback=stdlib_html_parser")
+        log_warning(f"[HIGH_GROWTH_V5.4] pandas.read_html unavailable for {source_label}: {exc}; fallback=stdlib_html_parser")
     try:
         raw_tables = _HighGrowthHTMLTableParser().parse(html)
         dfs = [_hg_rows_to_dataframe(t) for t in raw_tables]
         dfs = [d for d in dfs if d is not None and not d.empty]
         return dfs, "stdlib_html_parser"
     except Exception as exc:
-        log_warning(f"[HIGH_GROWTH_V5.6] stdlib html parser failed for {source_label}: {exc}")
+        log_warning(f"[HIGH_GROWTH_V5.4] stdlib html parser failed for {source_label}: {exc}")
         return [], "parse_failed"
 
-
-
-HIGH_GROWTH_MOPS_SLEEP_SECONDS = float(os.getenv("HIGH_GROWTH_MOPS_SLEEP_SECONDS", "3.0") or "3.0")
-HIGH_GROWTH_MOPS_TIMEOUT_SECONDS = float(os.getenv("HIGH_GROWTH_MOPS_TIMEOUT_SECONDS", "60") or "60")
-HIGH_GROWTH_MOPS_LAST_REQUEST_AT = 0.0
-HIGH_GROWTH_MOPS_LOCK = threading.RLock()
-HIGH_GROWTH_MOPS_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-]
-
-
-def _hg_mops_security_blocked(text_or_html: str) -> bool:
-    s = str(text_or_html or "")
-    return bool(re.search(r"FOR SECURITY REASONS|安全性考量|PAGE CAN NOT BE ACCESSED|THE PAGE CANNOT BE ACCESSED", s, flags=re.I))
-
-
-def _hg_mops_headers(referer: str, ajax: bool = True, user_agent_index: int = 0) -> dict:
-    ua = HIGH_GROWTH_MOPS_USER_AGENTS[int(user_agent_index) % len(HIGH_GROWTH_MOPS_USER_AGENTS)]
-    h = {
-        "User-Agent": ua,
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": referer,
-        "Origin": "https://mops.twse.com.tw",
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    if ajax:
-        h.update({
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        })
-    return h
-
-
-def _hg_mops_throttle():
-    global HIGH_GROWTH_MOPS_LAST_REQUEST_AT
-    sleep_s = max(0.0, float(HIGH_GROWTH_MOPS_SLEEP_SECONDS or 0.0))
-    if sleep_s <= 0:
-        return
-    with HIGH_GROWTH_MOPS_LOCK:
-        now = time.time()
-        wait = sleep_s - (now - float(HIGH_GROWTH_MOPS_LAST_REQUEST_AT or 0.0))
-        if wait > 0:
-            time.sleep(wait)
-        HIGH_GROWTH_MOPS_LAST_REQUEST_AT = time.time()
-
-
-def _hg_new_mops_session(referer: str) -> requests.Session:
-    s = requests.Session()
-    # 先造訪首頁與功能頁，讓 MOPS 建立必要 cookie/session；若失敗，不阻斷，後續 POST 會回報狀態。
-    warm_headers = _hg_mops_headers(referer, ajax=False)
-    for warm_url in ("https://mops.twse.com.tw/mops/#/web/home", referer):
-        try:
-            _hg_mops_throttle()
-            s.get(warm_url, headers=warm_headers, timeout=min(20, HIGH_GROWTH_MOPS_TIMEOUT_SECONDS))
-        except Exception:
-            pass
-    return s
 
 
 class RevenueCollectorEngine:
@@ -3998,7 +3936,7 @@ class RevenueCollectorEngine:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_hg_rev_hist_month ON external_revenue_history(revenue_month, stock_id)")
                 self.db.conn.commit()
         except Exception as exc:
-            log_warning(f"[RevenueCollectorEngine][V5.6] schema建立失敗：{exc}")
+            log_warning(f"[RevenueCollectorEngine][V5.4] schema建立失敗：{exc}")
 
     @staticmethod
     def _num(v):
@@ -4105,37 +4043,17 @@ class RevenueCollectorEngine:
 
     def _fetch_historical_month(self, month_yyyymm: str, market_type: str) -> tuple[pd.DataFrame, dict]:
         roc_y, mm = self._roc_year_month(month_yyyymm)
-        mm2 = f"{int(mm):02d}"
-        # V5.6：MOPS ajax_t21sc04 必須用 POST + session/cookie + 雙位數月份；直接 GET/裸 URL 會被安全機制擋。
         payload = {
-            'encodeURIComponent': '1',
-            'step': '1',
-            'firstin': 'true',
-            'off': '1',
-            'isNew': 'false',
-            'TYPEK': market_type,
-            'year': str(roc_y),
-            'month': mm2,
+            'encodeURIComponent': '1', 'step': '1', 'firstin': '1', 'off': '1',
+            'TYPEK': market_type, 'year': str(roc_y), 'month': str(mm),
         }
-        referer = 'https://mops.twse.com.tw/mops/web/t21sc04_ifrs'
-        request_url = f"{self.HIST_URL}?TYPEK={market_type}&year={roc_y}&month={mm2}&method=POST"
-        status = {
-            'module': 'RevenueCollectorEngine', 'source': 'MOPS_ajax_t21sc04_POST',
-            'month': month_yyyymm, 'market_type': market_type, 'status': 'HTTP_FAIL',
-            'rows': 0, 'message': '', 'payload_year': str(roc_y), 'payload_month': mm2,
-            'request_url': request_url,
-        }
+        request_url = f"{self.HIST_URL}?TYPEK={market_type}&year={roc_y}&month={mm}"
+        status = {'module': 'RevenueCollectorEngine', 'source': 'MOPS_ajax_t21sc04', 'month': month_yyyymm, 'market_type': market_type, 'status': 'HTTP_FAIL', 'rows': 0, 'message': ''}
         try:
-            session = _hg_new_mops_session(referer)
-            headers = _hg_mops_headers(referer, ajax=True, user_agent_index=int(mm) + len(str(market_type)))
-            _hg_mops_throttle()
-            resp = session.post(self.HIST_URL, data=payload, timeout=HIGH_GROWTH_MOPS_TIMEOUT_SECONDS, headers=headers)
+            resp = requests.post(self.HIST_URL, data=payload, timeout=45, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://mops.twse.com.tw/mops/web/t21sc04_ifrs'})
             status['http_status'] = str(getattr(resp, 'status_code', ''))
-            html = resp.text or ''
-            if _hg_mops_security_blocked(html):
-                status.update({'status': 'SECURITY_BLOCKED', 'message': 'MOPS安全機制阻擋；請降低頻率或改用本機/瀏覽器session後重試'})
-                return pd.DataFrame(), status
             resp.raise_for_status()
+            html = resp.text or ''
             if re.search(r'查無資料|無符合|尚無|資料不存在|無資料', html):
                 status.update({'status': 'NOT_DISCLOSED', 'message': 'MOPS回覆無資料/尚未公告'})
                 return pd.DataFrame(), status
@@ -4146,7 +4064,7 @@ class RevenueCollectorEngine:
                 return pd.DataFrame(), status
         except Exception as exc:
             status['message'] = str(exc)
-            log_warning(f"[RevenueCollectorEngine][V5.6] MOPS歷史月營收抓取失敗 month={month_yyyymm} type={market_type}：{exc}")
+            log_warning(f"[RevenueCollectorEngine][V5.4] MOPS歷史月營收抓取失敗 month={month_yyyymm} type={market_type}：{exc}")
             return pd.DataFrame(), status
         parts = []
         for t in tables:
@@ -4162,7 +4080,7 @@ class RevenueCollectorEngine:
 
 
     def _fetch_static_nas_month(self, month_yyyymm: str, market_type: str) -> tuple[pd.DataFrame, dict]:
-        """V5.6：MOPS 月營收歷史靜態 NAS 備援。
+        """V5.4：MOPS 月營收歷史靜態 NAS 備援。
 
         真因：ajax_t21sc04 在部分 EXE/網路環境會 HTTP 200 但回空頁或無 table，
         導致 202602/202603 無法補齊。MOPS 同步保留 nas/t21 靜態頁，歷史月份應優先用
@@ -4220,7 +4138,7 @@ class RevenueCollectorEngine:
             except Exception as exc:
                 status['message'] = str(exc)
                 last_status = status
-                log_warning(f"[RevenueCollectorEngine][V5.6] NAS歷史月營收抓取失敗 month={month_yyyymm} type={market_type}：{exc}")
+                log_warning(f"[RevenueCollectorEngine][V5.4] NAS歷史月營收抓取失敗 month={month_yyyymm} type={market_type}：{exc}")
         return pd.DataFrame(), (last_status or {'module': 'RevenueCollectorEngine', 'source': 'MOPS_NAS_t21sc03_static', 'month': month_yyyymm, 'market_type': market_type, 'status': 'HTTP_FAIL', 'rows': 0, 'message': 'unknown'})
 
     def _fetch_latest_opendata(self, required_months: list[str]) -> tuple[pd.DataFrame, list[dict]]:
@@ -4253,7 +4171,7 @@ class RevenueCollectorEngine:
                     parts.append(df)
             except Exception as exc:
                 st['message'] = str(exc)
-                log_warning(f"[RevenueCollectorEngine][V5.6] MOPS OpenData月營收抓取失敗 url={url}：{exc}")
+                log_warning(f"[RevenueCollectorEngine][V5.4] MOPS OpenData月營收抓取失敗 url={url}：{exc}")
             statuses.append(st)
         out = pd.concat(parts, ignore_index=True).drop_duplicates(['stock_id', 'revenue_month'], keep='last') if parts else pd.DataFrame()
         return out, statuses
@@ -4277,7 +4195,7 @@ class RevenueCollectorEngine:
                 self.db.conn.commit()
             return int(len(x))
         except Exception as exc:
-            log_warning(f"[RevenueCollectorEngine][V5.6] 月營收寫入DB失敗：{exc}")
+            log_warning(f"[RevenueCollectorEngine][V5.4] 月營收寫入DB失敗：{exc}")
             return 0
 
     def collect_required_months(self, quarters=None, log_cb=None) -> dict:
@@ -4290,8 +4208,8 @@ class RevenueCollectorEngine:
                 if not df.empty:
                     all_parts.append(df)
                     continue
-                # V5.7：ajax HTTP 200 但無表格/欄位時，改走 MOPS NAS 靜態歷史頁補抓。
-                if st.get('status') in ('PARSE_EMPTY', 'HTTP_FAIL', 'SECURITY_BLOCKED'):
+                # V5.4：ajax HTTP 200 但無表格/欄位時，改走 MOPS NAS 靜態歷史頁補抓。
+                if st.get('status') in ('PARSE_EMPTY', 'HTTP_FAIL'):
                     df2, st2 = self._fetch_static_nas_month(m, market_type)
                     status_rows.append(st2)
                     if not df2.empty:
@@ -4304,11 +4222,11 @@ class RevenueCollectorEngine:
         rows = self._upsert(out)
         hit_months = sorted(out['revenue_month'].dropna().astype(str).unique().tolist()) if not out.empty else []
         miss_months = [m for m in months if m not in hit_months]
-        msg = f"[HIGH_GROWTH_DATA_FIX][RevenueCollectorEngine][V5.6] required={','.join(months)} hit={','.join(hit_months)} missing={','.join(miss_months)} rows={rows} status={pd.DataFrame(status_rows)['status'].value_counts().to_dict() if status_rows else {}}"
+        msg = f"[HIGH_GROWTH_DATA_FIX][RevenueCollectorEngine][V5.4] required={','.join(months)} hit={','.join(hit_months)} missing={','.join(miss_months)} rows={rows} status={pd.DataFrame(status_rows)['status'].value_counts().to_dict() if status_rows else {}}"
         log_info(msg)
         if log_cb:
             log_cb(msg)
-        return {'module': 'RevenueCollectorEngine', 'version': 'V5.6', 'required_months': months, 'hit_months': hit_months, 'missing_months': miss_months, 'rows': rows, 'status_rows': status_rows}
+        return {'module': 'RevenueCollectorEngine', 'version': 'V5.4', 'required_months': months, 'hit_months': hit_months, 'missing_months': miss_months, 'rows': rows, 'status_rows': status_rows}
 
 
 class EPSActualCollectorEngine:
@@ -4350,7 +4268,7 @@ class EPSActualCollectorEngine:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_hg_annual_eps_year ON annual_eps_history(fiscal_year, stock_id)")
                 self.db.conn.commit()
         except Exception as exc:
-            log_warning(f"[EPSActualCollectorEngine][V5.6] schema建立失敗：{exc}")
+            log_warning(f"[EPSActualCollectorEngine][V5.4] schema建立失敗：{exc}")
 
     @staticmethod
     def _num(v):
@@ -4462,40 +4380,18 @@ class EPSActualCollectorEngine:
         return out.drop_duplicates(['stock_id', 'fiscal_year', 'quarter'], keep='last') if not out.empty else out
 
     def _fetch_mops_summary_eps(self, fiscal_year: int, quarter: int, market_type: str) -> tuple[pd.DataFrame, dict]:
-        status = {
-            'module': 'EPSActualCollectorEngine', 'source': 'MOPS_ajax_t163sb04_POST',
-            'fiscal_year': int(fiscal_year), 'quarter': int(quarter), 'market_type': market_type,
-            'status': 'HTTP_FAIL', 'rows': 0, 'message': ''
-        }
+        status = {'module': 'EPSActualCollectorEngine', 'source': 'MOPS_ajax_t163sb04', 'fiscal_year': int(fiscal_year), 'quarter': int(quarter), 'market_type': market_type, 'status': 'HTTP_FAIL', 'rows': 0, 'message': ''}
         if self._is_not_yet_disclosed(fiscal_year, quarter):
             status.update({'status': 'NOT_YET_DISCLOSED', 'message': f'尚未到一般公告期限 {self._disclosure_deadline(fiscal_year, quarter).strftime("%Y-%m-%d")}'})
             return pd.DataFrame(), status
         roc_year = fiscal_year - 1911 if fiscal_year >= 1911 else fiscal_year
-        season = f'{int(quarter):02d}'
-        payload = {
-            'encodeURIComponent': '1',
-            'step': '1',
-            'firstin': 'true',
-            'off': '1',
-            'isNew': 'false',
-            'TYPEK': market_type,
-            'year': str(roc_year),
-            'season': season,
-        }
-        referer = 'https://mops.twse.com.tw/mops/web/t163sb04'
-        source_url = f"{self.SUMMARY_URL}?TYPEK={market_type}&year={roc_year}&season={season}&method=POST"
-        status.update({'payload_year': str(roc_year), 'payload_season': season, 'request_url': source_url})
+        payload = {'encodeURIComponent': '1', 'step': '1', 'firstin': '1', 'off': '1', 'TYPEK': market_type, 'year': str(roc_year), 'season': f'0{int(quarter)}'}
+        source_url = f"{self.SUMMARY_URL}?TYPEK={market_type}&year={roc_year}&season=0{int(quarter)}"
         try:
-            session = _hg_new_mops_session(referer)
-            headers = _hg_mops_headers(referer, ajax=True, user_agent_index=int(quarter) + len(str(market_type)))
-            _hg_mops_throttle()
-            resp = session.post(self.SUMMARY_URL, data=payload, timeout=HIGH_GROWTH_MOPS_TIMEOUT_SECONDS, headers=headers)
+            resp = requests.post(self.SUMMARY_URL, data=payload, timeout=60, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://mops.twse.com.tw/mops/web/t163sb04'})
             status['http_status'] = str(getattr(resp, 'status_code', ''))
-            html = resp.text or ''
-            if _hg_mops_security_blocked(html):
-                status.update({'status': 'SECURITY_BLOCKED', 'message': 'MOPS安全機制阻擋；請降低頻率或改用本機/瀏覽器session後重試'})
-                return pd.DataFrame(), status
             resp.raise_for_status()
+            html = resp.text or ''
             if re.search(r'查無資料|無符合|尚無|資料不存在|無資料', html):
                 status.update({'status': 'NOT_DISCLOSED', 'message': 'MOPS回覆無資料/尚未公告'})
                 return pd.DataFrame(), status
@@ -4512,7 +4408,7 @@ class EPSActualCollectorEngine:
             return df, status
         except Exception as exc:
             status['message'] = str(exc)
-            log_warning(f"[EPSActualCollectorEngine][V5.6] MOPS EPS抓取失敗 year={fiscal_year} q={quarter} type={market_type}：{exc}")
+            log_warning(f"[EPSActualCollectorEngine][V5.4] MOPS EPS抓取失敗 year={fiscal_year} q={quarter} type={market_type}：{exc}")
             return pd.DataFrame(), status
 
     @staticmethod
@@ -4566,7 +4462,7 @@ class EPSActualCollectorEngine:
                 self.db.conn.commit()
             return int(len(x))
         except Exception as exc:
-            log_warning(f"[EPSActualCollectorEngine][V5.6] 季EPS寫入DB失敗：{exc}")
+            log_warning(f"[EPSActualCollectorEngine][V5.4] 季EPS寫入DB失敗：{exc}")
             return 0
 
     def rebuild_annual_from_quarterly(self, fiscal_year: int | None = None) -> int:
@@ -4594,7 +4490,7 @@ class EPSActualCollectorEngine:
                 self.db.conn.commit()
             return int(len(x))
         except Exception as exc:
-            log_warning(f"[EPSActualCollectorEngine][V5.6] 年EPS彙總失敗：{exc}")
+            log_warning(f"[EPSActualCollectorEngine][V5.4] 年EPS彙總失敗：{exc}")
             return 0
 
     def collect_required_eps(self, quarters=None, log_cb=None) -> dict:
@@ -4617,49 +4513,11 @@ class EPSActualCollectorEngine:
             tmp = out[['fiscal_year', 'quarter']].drop_duplicates().sort_values(['fiscal_year', 'quarter'])
             hit_quarters = [f"{int(r.fiscal_year)}Q{int(r.quarter)}" for r in tmp.itertuples(index=False)]
         status_counts = pd.DataFrame(status_rows)['status'].value_counts().to_dict() if status_rows else {}
-        msg = f"[HIGH_GROWTH_DATA_FIX][EPSActualCollectorEngine][V5.6] target={fetch_targets} hit={','.join(hit_quarters)} quarterly_rows={q_rows} annual_rows={annual_rows} status={status_counts}"
+        msg = f"[HIGH_GROWTH_DATA_FIX][EPSActualCollectorEngine][V5.4] target={fetch_targets} hit={','.join(hit_quarters)} quarterly_rows={q_rows} annual_rows={annual_rows} status={status_counts}"
         log_info(msg)
         if log_cb:
             log_cb(msg)
-        return {'module': 'EPSActualCollectorEngine', 'version': 'V5.6', 'target_quarters': [f"{fy}Q{q}" for fy, q in fetch_targets], 'hit_quarters': hit_quarters, 'quarterly_rows': q_rows, 'annual_rows': annual_rows, 'status_rows': status_rows}
-
-
-
-def high_growth_mops_live_probe() -> dict:
-    """V5.6：實際 POST 連線診斷，不寫 DB。
-
-    回傳 ajax_t21sc04 月營收與 ajax_t163sb04 EPS 的 HTTP/安全阻擋/表格狀態，
-    方便在使用者本機確認 MOPS 是否可依設計要求回應。
-    """
-    result = {'version': HIGH_GROWTH_RULE_VERSION, 'probe_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'items': []}
-    tests = [
-        ('revenue', 'https://mops.twse.com.tw/mops/web/ajax_t21sc04', 'https://mops.twse.com.tw/mops/web/t21sc04_ifrs', {'encodeURIComponent':'1','step':'1','firstin':'true','off':'1','isNew':'false','TYPEK':'sii','year':'115','month':'04'}),
-        ('eps', 'https://mops.twse.com.tw/mops/web/ajax_t163sb04', 'https://mops.twse.com.tw/mops/web/t163sb04', {'encodeURIComponent':'1','step':'1','firstin':'true','off':'1','isNew':'false','TYPEK':'sii','year':'114','season':'04'}),
-    ]
-    for name, url, referer, payload in tests:
-        item = {'name': name, 'url': url, 'payload': dict(payload), 'status': 'HTTP_FAIL', 'http_status': '', 'message': ''}
-        try:
-            session = _hg_new_mops_session(referer)
-            _hg_mops_throttle()
-            resp = session.post(url, data=payload, timeout=HIGH_GROWTH_MOPS_TIMEOUT_SECONDS, headers=_hg_mops_headers(referer, ajax=True))
-            item['http_status'] = str(getattr(resp, 'status_code', ''))
-            html = resp.text or ''
-            if _hg_mops_security_blocked(html):
-                item['status'] = 'SECURITY_BLOCKED'
-                item['message'] = 'MOPS security block page returned'
-            elif re.search(r'查無資料|無符合|尚無|資料不存在|無資料', html):
-                item['status'] = 'NOT_DISCLOSED'
-                item['message'] = 'MOPS returned no-data text'
-            else:
-                tables, parser_used = _hg_safe_read_html_tables(html, source_label=f'live_probe_{name}')
-                item['parser'] = parser_used
-                item['table_count'] = len(tables)
-                item['status'] = 'FETCH_OK' if tables else 'PARSE_EMPTY'
-                item['message'] = 'OK' if tables else 'No table parsed'
-        except Exception as exc:
-            item['message'] = str(exc)
-        result['items'].append(item)
-    return result
+        return {'module': 'EPSActualCollectorEngine', 'version': 'V5.4', 'target_quarters': [f"{fy}Q{q}" for fy, q in fetch_targets], 'hit_quarters': hit_quarters, 'quarterly_rows': q_rows, 'annual_rows': annual_rows, 'status_rows': status_rows}
 
 
 class RevenueAccelerationEngine:
@@ -4757,32 +4615,25 @@ class RevenueAccelerationEngine:
         base["selected_revenue_months"] = ",".join(months)
         base["revenue_month_count_required"] = len(months)
         base["revenue_month_count_hit"] = base[rev_cols].notna().sum(axis=1) if rev_cols else 0
-        # V5.7 防呆：營收資料未完整時，不可計算平均YoY、不可以此推估EPS。
-        # 原V5.2/V5.7的錯誤是 Q1 只命中 202604 一個月，仍產生 avg_yoy 與 FORECAST_EPS_FROM_REVENUE，
+        # V5.4 防呆：營收資料未完整時，不可計算平均YoY、不可以此推估EPS。
+        # 原V5.2/V5.4的錯誤是 Q1 只命中 202604 一個月，仍產生 avg_yoy 與 FORECAST_FROM_REVENUE，
         # 造成 UI 出現「營收月數0/0但平均YoY有值」與異常巨大YoY排序。
         base["revenue_complete_gate"] = base["revenue_month_count_hit"].eq(base["revenue_month_count_required"])
         if yoy_cols:
             yoy_valid_matrix = base[yoy_cols].apply(pd.to_numeric, errors="coerce")
             base["revenue_yoy_count_hit"] = yoy_valid_matrix.notna().sum(axis=1)
             base["revenue_yoy_abnormal_gate"] = yoy_valid_matrix.abs().gt(HIGH_GROWTH_YOY_ABNORMAL_CAP).any(axis=1)
-            # V5.7：正式預估與低信心預估分流。
-            # - STRICT：營收與YoY皆 3/3 完整。
-            # - PARTIAL：營收/YoY 命中 1/3 或 2/3，也要允許預估，但只能標示低/中信心追蹤，不可誤當強通過。
-            base["revenue_yoy_available_gate"] = base["revenue_yoy_count_hit"].gt(0) & (~base["revenue_yoy_abnormal_gate"])
             base["revenue_yoy_valid_gate"] = base["revenue_complete_gate"] & base["revenue_yoy_count_hit"].eq(len(yoy_cols)) & (~base["revenue_yoy_abnormal_gate"])
-            base["avg_revenue_yoy"] = yoy_valid_matrix.where(base["revenue_yoy_available_gate"], np.nan).mean(axis=1, skipna=True)
-            base["min_revenue_yoy"] = yoy_valid_matrix.where(base["revenue_yoy_available_gate"], np.nan).min(axis=1, skipna=True)
+            base["avg_revenue_yoy"] = yoy_valid_matrix.where(base["revenue_yoy_valid_gate"], np.nan).mean(axis=1, skipna=True)
+            base["min_revenue_yoy"] = yoy_valid_matrix.where(base["revenue_yoy_valid_gate"], np.nan).min(axis=1, skipna=True)
             base["revenue_yoy_gate"] = base["revenue_yoy_valid_gate"] & yoy_valid_matrix.ge(self.min_yoy).all(axis=1)
-            base["revenue_yoy_partial_gate"] = base["revenue_yoy_available_gate"] & base["min_revenue_yoy"].ge(self.min_yoy)
         else:
             base["revenue_yoy_count_hit"] = 0
             base["revenue_yoy_abnormal_gate"] = False
-            base["revenue_yoy_available_gate"] = False
             base["revenue_yoy_valid_gate"] = False
             base["avg_revenue_yoy"] = np.nan
             base["min_revenue_yoy"] = np.nan
             base["revenue_yoy_gate"] = False
-            base["revenue_yoy_partial_gate"] = False
         if len(rev_cols) >= 2:
             stair = pd.Series(True, index=base.index)
             for left, right in zip(rev_cols[:-1], rev_cols[1:]):
@@ -4790,26 +4641,23 @@ class RevenueAccelerationEngine:
             base["revenue_stair_gate"] = base["revenue_complete_gate"] & stair
         else:
             base["revenue_stair_gate"] = False
-        base["revenue_forecast_strict_eligible"] = base["revenue_complete_gate"] & base["revenue_yoy_valid_gate"] & base["revenue_yoy_gate"] & base["revenue_stair_gate"]
-        base["revenue_forecast_partial_eligible"] = (
-            base["revenue_month_count_hit"].between(1, base["revenue_month_count_required"].sub(1))
-            & base["revenue_yoy_partial_gate"].fillna(False)
-        )
-        # 相容舊欄位：代表「可做任何預估」，但 strict_pass 仍只允許 revenue_strict_gate。
-        base["revenue_forecast_eligible"] = base["revenue_forecast_strict_eligible"] | base["revenue_forecast_partial_eligible"]
-        base["revenue_strict_gate"] = base["revenue_forecast_strict_eligible"]
-        base["revenue_partial_gate"] = base["revenue_forecast_partial_eligible"]
+        base["revenue_forecast_eligible"] = base["revenue_complete_gate"] & base["revenue_yoy_valid_gate"] & base["revenue_yoy_gate"] & base["revenue_stair_gate"]
+        base["revenue_strict_gate"] = base["revenue_forecast_eligible"]
         base["revenue_acceleration_score"] = np.where(base["revenue_forecast_eligible"], np.clip(40 + base["avg_revenue_yoy"].fillna(0) * 0.6 + base["revenue_month_count_hit"] * 3, 0, 100), 0).round(2)
-        base["revenue_data_quality"] = np.select(
-            [base["revenue_strict_gate"], base["revenue_partial_gate"], base["revenue_yoy_abnormal_gate"], base["revenue_month_count_hit"].gt(0)],
-            ["STRICT", "PARTIAL", "YOY_ABNORMAL", "INCOMPLETE"],
-            default="MISSING"
-        )
+        base["revenue_data_quality"] = np.select([base["revenue_strict_gate"], base["revenue_yoy_abnormal_gate"], base["revenue_month_count_hit"].gt(0)], ["STRICT", "YOY_ABNORMAL", "INCOMPLETE"], default="MISSING")
         return base, rev
 
 
 class EPSForecastEngine:
-    """EPS 實績/預測引擎：讀正式季度EPS，缺資料時以營收加速度做預測，不把預測誤標為嚴格通過。"""
+    """V5.8 EPS 實績/預測引擎：年度EPS、季度EPS、EPS_TTM 必須分層，不再把 EPS_TTM 當成年度EPS。
+
+    正確資料層級：
+    1) ACTUAL_QUARTERLY_EPS：quarterly_financial_history 正式單季/累計EPS。
+    2) REBUILD_FROM_TTM：若有 EPS_TTM + 前一完整年度EPS + 去年同期季EPS，才可反推單季EPS。
+    3) FORECAST_FROM_REVENUE：正式EPS不足時，營收月份完整且YoY有效才做營收推估。
+    4) EPS_TTM_PROXY_ONLY：DB 有 eps_ttm / pe proxy，可作估值與觀察，不可當嚴格通過，也不可直接視為年度EPS。
+    5) DATA_INSUFFICIENT：上述皆不可用。
+    """
 
     def __init__(self, db: DBManager, base_year: int = HIGH_GROWTH_BASE_YEAR, track_year: int = HIGH_GROWTH_TRACK_YEAR):
         self.db = db
@@ -4832,7 +4680,7 @@ class EPSForecastEngine:
             with self.db.lock:
                 return pd.read_sql_query(sql, self.db.conn, params=params or [])
         except Exception as exc:
-            log_warning(f"[EPSForecastEngine] SQL讀取失敗：{exc}｜SQL={sql[:120]}")
+            log_warning(f"[EPSForecastEngine][V5.8] SQL讀取失敗：{exc}｜SQL={sql[:160]}")
             return pd.DataFrame()
 
     def ensure_schema(self):
@@ -4854,7 +4702,7 @@ class EPSForecastEngine:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_annual_eps_history_stock_year ON annual_eps_history(stock_id, fiscal_year)")
                 self.db.conn.commit()
         except Exception as exc:
-            log_warning(f"[EPSForecastEngine] annual_eps_history schema建立失敗：{exc}")
+            log_warning(f"[EPSForecastEngine][V5.8] annual_eps_history schema建立失敗：{exc}")
 
     @staticmethod
     def normalize_quarter_token(value) -> str:
@@ -4874,9 +4722,13 @@ class EPSForecastEngine:
         return s
 
     def load_base_annual_eps(self) -> pd.DataFrame:
+        """讀前一年度全年EPS。EPS_TTM不可直接混充為年度EPS。"""
         parts = []
         if self._table_exists("annual_eps_history"):
-            df = self._read_sql("SELECT stock_id, eps_full_year AS base_annual_eps, 'annual_eps_history' AS base_eps_source, source_date FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", [self.base_year])
+            df = self._read_sql(
+                "SELECT stock_id, eps_full_year AS base_annual_eps, 'annual_eps_history' AS base_eps_source, source_date FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
+                [self.base_year]
+            )
             parts.append(df)
         if self._table_exists("quarterly_financial_history"):
             qdf = self._read_sql("SELECT stock_id, fiscal_year, quarter, eps, source_date FROM quarterly_financial_history WHERE eps IS NOT NULL")
@@ -4893,15 +4745,7 @@ class EPSForecastEngine:
                     s["base_eps_source"] = "quarterly_financial_history_sum4"
                     s["source_date"] = ""
                     parts.append(s[["stock_id", "base_annual_eps", "base_eps_source", "source_date"]])
-        if self._table_exists("external_valuation"):
-            vdf = self._read_sql("SELECT stock_id, eps, fiscal_year_quarter, source_date, data_date FROM external_valuation WHERE eps IS NOT NULL")
-            if vdf is not None and not vdf.empty:
-                token = vdf.get("fiscal_year_quarter", "").map(self.normalize_quarter_token)
-                vdf = vdf[token.eq(f"{self.base_year}Q4")].copy()
-                if not vdf.empty:
-                    vdf["base_annual_eps"] = pd.to_numeric(vdf["eps"], errors="coerce")
-                    vdf["base_eps_source"] = "external_valuation_proxy_q4"
-                    parts.append(vdf[["stock_id", "base_annual_eps", "base_eps_source", "source_date"]])
+        # 注意：external_valuation 的 eps/eps_ttm 是估值用近四季EPS或PE反推，不可直接當成 2025 全年EPS。
         parts = [p for p in parts if p is not None and not p.empty]
         if not parts:
             return pd.DataFrame(columns=["stock_id", "base_annual_eps", "base_eps_source", "base_eps_quality"])
@@ -4910,7 +4754,77 @@ class EPSForecastEngine:
         x["base_annual_eps"] = pd.to_numeric(x["base_annual_eps"], errors="coerce")
         x = x.dropna(subset=["stock_id", "base_annual_eps"])
         x["base_eps_quality"] = np.where(x["base_eps_source"].isin(["annual_eps_history", "quarterly_financial_history_sum4"]), "STRICT", "PROXY_CONFIRM_REQUIRED")
-        x["_priority"] = x["base_eps_source"].map({"annual_eps_history": 1, "quarterly_financial_history_sum4": 2, "external_valuation_proxy_q4": 3}).fillna(9)
+        x["_priority"] = x["base_eps_source"].map({"annual_eps_history": 1, "quarterly_financial_history_sum4": 2}).fillna(9)
+        return x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first").drop(columns=["_priority"], errors="ignore")
+
+    def load_current_eps_ttm_proxy(self) -> pd.DataFrame:
+        """盤點 DB 既有 EPS_TTM：external_valuation / financial_feature_daily / ranking_result。
+
+        EPS_TTM 是最近四季累計，能作估值與觀察；若要反推單季EPS，仍需要上一完整年度EPS與去年同期EPS。
+        """
+        parts = []
+        if self._table_exists("external_valuation"):
+            v = self._read_sql("""
+                SELECT stock_id, data_date, fiscal_year_quarter, eps_ttm, eps, pe, close_price, source_date, source_url
+                FROM external_valuation
+                WHERE eps_ttm IS NOT NULL OR eps IS NOT NULL
+            """)
+            if v is not None and not v.empty:
+                v["stock_id"] = v["stock_id"].map(normalize_stock_id)
+                v["eps_ttm_current"] = pd.to_numeric(v.get("eps_ttm"), errors="coerce").fillna(pd.to_numeric(v.get("eps"), errors="coerce"))
+                v = v.dropna(subset=["stock_id", "eps_ttm_current"])
+                if not v.empty:
+                    v["eps_ttm_source"] = "external_valuation_eps_ttm"
+                    v["eps_ttm_quality"] = "TTM_PROXY_FROM_VALUATION"
+                    v["eps_ttm_source_date"] = v.get("source_date", v.get("data_date", ""))
+                    v["eps_ttm_fiscal_year_quarter"] = v.get("fiscal_year_quarter", "")
+                    v["eps_ttm_note"] = "近四季EPS/PE反推，非單季EPS、非固定年度EPS"
+                    v["_priority"] = 1
+                    parts.append(v[["stock_id", "eps_ttm_current", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "eps_ttm_note", "_priority"]])
+        if self._table_exists("financial_feature_daily"):
+            f = self._read_sql("""
+                SELECT f.stock_id, f.feature_date, f.eps_ttm, f.data_quality_flag, f.source_trace_json, f.source_date
+                FROM financial_feature_daily f
+                JOIN (SELECT stock_id, MAX(feature_date) AS feature_date FROM financial_feature_daily GROUP BY stock_id) m
+                  ON f.stock_id=m.stock_id AND f.feature_date=m.feature_date
+                WHERE f.eps_ttm IS NOT NULL
+            """)
+            if f is not None and not f.empty:
+                f["stock_id"] = f["stock_id"].map(normalize_stock_id)
+                f["eps_ttm_current"] = pd.to_numeric(f.get("eps_ttm"), errors="coerce")
+                f = f.dropna(subset=["stock_id", "eps_ttm_current"])
+                if not f.empty:
+                    f["eps_ttm_source"] = "financial_feature_daily_eps_ttm"
+                    f["eps_ttm_quality"] = "TTM_DERIVED_CACHE"
+                    f["eps_ttm_source_date"] = f.get("source_date", f.get("feature_date", ""))
+                    f["eps_ttm_fiscal_year_quarter"] = ""
+                    f["eps_ttm_note"] = f.get("data_quality_flag", "")
+                    f["_priority"] = 2
+                    parts.append(f[["stock_id", "eps_ttm_current", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "eps_ttm_note", "_priority"]])
+        if self._table_exists("ranking_result"):
+            r = self._read_sql("""
+                SELECT r.stock_id, r.date, r.eps_ttm, r.data_quality_flag, r.source_trace_json
+                FROM ranking_result r
+                JOIN (SELECT stock_id, MAX(date) AS date FROM ranking_result GROUP BY stock_id) m
+                  ON r.stock_id=m.stock_id AND r.date=m.date
+                WHERE r.eps_ttm IS NOT NULL
+            """)
+            if r is not None and not r.empty:
+                r["stock_id"] = r["stock_id"].map(normalize_stock_id)
+                r["eps_ttm_current"] = pd.to_numeric(r.get("eps_ttm"), errors="coerce")
+                r = r.dropna(subset=["stock_id", "eps_ttm_current"])
+                if not r.empty:
+                    r["eps_ttm_source"] = "ranking_result_eps_ttm"
+                    r["eps_ttm_quality"] = "TTM_DERIVED_RANKING_CACHE"
+                    r["eps_ttm_source_date"] = r.get("date", "")
+                    r["eps_ttm_fiscal_year_quarter"] = ""
+                    r["eps_ttm_note"] = r.get("data_quality_flag", "")
+                    r["_priority"] = 3
+                    parts.append(r[["stock_id", "eps_ttm_current", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "eps_ttm_note", "_priority"]])
+        if not parts:
+            return pd.DataFrame(columns=["stock_id", "eps_ttm_current", "eps_ttm_source", "eps_ttm_quality"])
+        x = pd.concat(parts, ignore_index=True)
+        x = x[x["stock_id"].astype(str).ne("")].copy()
         return x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first").drop(columns=["_priority"], errors="ignore")
 
     def load_actual_eps_by_quarter(self, quarters=None) -> pd.DataFrame:
@@ -4933,7 +4847,7 @@ class EPSForecastEngine:
         df = df.loc[mask].copy()
         if df.empty:
             return pd.DataFrame(columns=["stock_id"])
-        df["quarter_norm"] = np.where(qn.notna(), "Q" + qn.astype("Int64").astype(str), token1.str[-2:])
+        df["quarter_norm"] = np.where(qn.loc[df.index].notna(), "Q" + qn.loc[df.index].astype("Int64").astype(str), token1.loc[df.index].str[-2:])
         df["eps"] = pd.to_numeric(df["eps"], errors="coerce")
         pivot = df.pivot_table(index="stock_id", columns="quarter_norm", values="eps", aggfunc="last").reset_index()
         for q in quarters:
@@ -4955,66 +4869,42 @@ class EPSForecastEngine:
             return base
         base_eps = self.load_base_annual_eps()
         actual = self.load_actual_eps_by_quarter(quarters)
-        x = base.merge(base_eps, on="stock_id", how="left").merge(actual, on="stock_id", how="left")
+        ttm_proxy = self.load_current_eps_ttm_proxy()
+        x = base.merge(base_eps, on="stock_id", how="left").merge(actual, on="stock_id", how="left").merge(ttm_proxy, on="stock_id", how="left")
         if revenue_features is not None and not revenue_features.empty:
-            keep = [c for c in ["stock_id", "avg_revenue_yoy", "min_revenue_yoy", "revenue_acceleration_score", "revenue_month_count_hit", "revenue_month_count_required", "revenue_yoy_count_hit", "revenue_yoy_abnormal_gate", "revenue_yoy_available_gate", "revenue_yoy_valid_gate", "revenue_yoy_partial_gate", "revenue_forecast_eligible", "revenue_forecast_strict_eligible", "revenue_forecast_partial_eligible", "revenue_partial_gate"] if c in revenue_features.columns]
+            keep = [c for c in ["stock_id", "avg_revenue_yoy", "min_revenue_yoy", "revenue_acceleration_score", "revenue_month_count_hit", "revenue_month_count_required", "revenue_yoy_count_hit", "revenue_yoy_abnormal_gate", "revenue_yoy_valid_gate", "revenue_forecast_eligible"] if c in revenue_features.columns]
             x = x.merge(revenue_features[keep], on="stock_id", how="left")
         q_count = len(quarters)
         x["base_annual_eps"] = pd.to_numeric(x.get("base_annual_eps"), errors="coerce")
         x["actual_eps_cumulative"] = pd.to_numeric(x.get("actual_eps_cumulative"), errors="coerce")
-        # 預測：以去年平均季度EPS為基準，乘上營收YoY成長倍率，並加入保守折減，避免營收高成長誤判EPS。
-        avg_yoy = pd.to_numeric(x.get("avg_revenue_yoy"), errors="coerce")
-        revenue_forecast_strict = x.get("revenue_forecast_strict_eligible", pd.Series(False, index=x.index)).fillna(False).astype(bool)
-        revenue_forecast_partial = x.get("revenue_forecast_partial_eligible", pd.Series(False, index=x.index)).fillna(False).astype(bool)
-        revenue_forecast_eligible = revenue_forecast_strict | revenue_forecast_partial
+        x["eps_ttm_current"] = pd.to_numeric(x.get("eps_ttm_current"), errors="coerce")
+        avg_yoy = _safe_numeric_series_for_df(x, "avg_revenue_yoy", np.nan)
+        revenue_forecast_eligible = x.get("revenue_forecast_eligible", pd.Series(False, index=x.index)).fillna(False).astype(bool)
         base_quarter_eps = x["base_annual_eps"] / 4.0 * q_count
         yoy_factor = 1.0 + (avg_yoy / 100.0) * 0.55
         x["forecast_eps_cumulative"] = (base_quarter_eps * yoy_factor).round(4)
-        # V5.7：預估EPS正式拆成三層，避免把 PARTIAL 直接擋成 DATA_INSUFFICIENT。
-        # ACTUAL_EPS：正式季EPS優先。
-        # FORECAST_EPS_STRICT：營收3/3完整 + YoY有效 + 階梯式走高。
-        # FORECAST_EPS_PARTIAL：營收1/3或2/3也允許估算，但只作LOW/MEDIUM信心追蹤，不可視為嚴格通過。
-        forecast_valid_strict = revenue_forecast_strict & x["base_annual_eps"].notna() & avg_yoy.notna()
-        forecast_valid_partial = revenue_forecast_partial & x["base_annual_eps"].notna() & avg_yoy.notna()
-        forecast_valid = forecast_valid_strict | forecast_valid_partial
+        forecast_valid = revenue_forecast_eligible & x["base_annual_eps"].notna() & avg_yoy.notna()
         x.loc[~forecast_valid, "forecast_eps_cumulative"] = np.nan
         actual_complete = x["actual_eps_complete_gate"].fillna(False).astype(bool) if "actual_eps_complete_gate" in x.columns else pd.Series(False, index=x.index)
         base_quality_strict = x["base_eps_quality"].fillna("").astype(str).eq("STRICT") if "base_eps_quality" in x.columns else pd.Series(False, index=x.index)
-        partial_hit = pd.to_numeric(x.get("revenue_month_count_hit", 0), errors="coerce").fillna(0)
-        x["eps_cumulative_used"] = np.where(
-            actual_complete,
-            x["actual_eps_cumulative"],
-            np.where(forecast_valid, x["forecast_eps_cumulative"], np.nan)
+        ttm_proxy_available = x["eps_ttm_current"].notna()
+        # 目前DB若沒有 base_annual_eps 與去年同期季EPS，不能從 TTM 反推單季；僅標記可用 TTM proxy。
+        x["ttm_rebuild_possible"] = False
+        x["ttm_rebuild_block_reason"] = np.where(
+            ttm_proxy_available,
+            "EPS_TTM存在，但缺2025全年EPS/去年同期季EPS，不能反推單季EPS",
+            "EPS_TTM缺資料"
         )
+        x["eps_cumulative_used"] = np.where(actual_complete, x["actual_eps_cumulative"], np.where(forecast_valid, x["forecast_eps_cumulative"], np.nan))
         x["eps_source_used"] = np.select(
-            [actual_complete, (~actual_complete) & forecast_valid_strict, (~actual_complete) & forecast_valid_partial],
-            ["ACTUAL_EPS", "FORECAST_EPS_STRICT", "FORECAST_EPS_PARTIAL"],
+            [actual_complete, forecast_valid, ttm_proxy_available],
+            ["ACTUAL_QUARTERLY_EPS", "FORECAST_FROM_REVENUE", "EPS_TTM_PROXY_ONLY"],
             default="DATA_INSUFFICIENT"
         )
-        x["eps_decision_layer"] = x["eps_source_used"]
         x["eps_data_quality"] = np.select(
-            [actual_complete & base_quality_strict, (~actual_complete) & forecast_valid_strict, (~actual_complete) & forecast_valid_partial],
-            ["STRICT", "FORECAST_STRICT", "FORECAST_PARTIAL"],
+            [actual_complete & base_quality_strict, forecast_valid, ttm_proxy_available],
+            ["STRICT", "FORECAST_OR_PROXY", "TTM_PROXY_ONLY"],
             default="MISSING"
-        )
-        x["eps_confidence_level"] = np.select(
-            [actual_complete & base_quality_strict, actual_complete, (~actual_complete) & forecast_valid_strict, (~actual_complete) & forecast_valid_partial & partial_hit.ge(2), (~actual_complete) & forecast_valid_partial],
-            ["HIGH", "MEDIUM", "MEDIUM", "MEDIUM", "LOW"],
-            default="LOW"
-        )
-        x["forecast_block_reason"] = ""
-        x.loc[~actual_complete & ~forecast_valid, "forecast_block_reason"] = np.select(
-            [
-                x["base_annual_eps"].isna(),
-                avg_yoy.isna(),
-                ~revenue_forecast_eligible,
-            ],
-            [
-                "BASE_ANNUAL_EPS_MISSING",
-                "AVG_REVENUE_YOY_MISSING",
-                "REVENUE_NOT_STRICT_OR_PARTIAL_ELIGIBLE",
-            ],
-            default="DATA_INSUFFICIENT"
         )
         x["eps_ratio"] = pd.to_numeric(x["eps_cumulative_used"], errors="coerce") / x["base_annual_eps"].replace(0, np.nan)
         x["eps_gate"] = x["eps_ratio"] > 1.0
@@ -5153,26 +5043,19 @@ class HighGrowthEPSEngine:
         # 嚴格通過：正式EPS + 完整營收Gate + EPS倍數>1。
         x["strict_pass"] = x["eps_gate"].fillna(False) & x["revenue_strict_gate"].fillna(False) & x["eps_data_quality"].eq("STRICT")
         # 預測候選：尚未有正式季EPS，但月營收/預測已出現足夠強度。
-        base_forecast_candidate = (~x["strict_pass"]) & x["eps_gate"].fillna(False) & x["eps_source_used"].isin(["FORECAST_EPS_STRICT", "FORECAST_EPS_PARTIAL"])
-        x["partial_forecast_available"] = (~x["strict_pass"]) & x["eps_source_used"].eq("FORECAST_EPS_PARTIAL")
+        base_forecast_candidate = (~x["strict_pass"]) & x["eps_gate"].fillna(False) & x.get("revenue_forecast_eligible", pd.Series(False, index=x.index)).fillna(False) & x["eps_source_used"].eq("FORECAST_FROM_REVENUE")
         # V4.1 修正：mode 參數必須真正控制結果，不可只做 UI 裝飾。
         if self.mode == "STRICT_ACTUAL_ONLY":
             x["forecast_candidate"] = False
-            x["partial_forecast_candidate"] = False
         elif self.mode == "FORECAST_PROXY":
             x["forecast_candidate"] = base_forecast_candidate & x["eps_data_quality"].ne("STRICT")
-            x["partial_forecast_candidate"] = x["partial_forecast_available"]
         else:
             x["forecast_candidate"] = base_forecast_candidate
-            x["partial_forecast_candidate"] = x["partial_forecast_available"]
-        # 代理候選：保留舊語義，方便UI/下載相容；PARTIAL 只代表可追蹤，不代表嚴格通過。
-        x["proxy_pass"] = x["forecast_candidate"] | x["partial_forecast_candidate"]
+        # 代理候選：保留舊語義，方便UI/下載相容。
+        x["ttm_proxy_candidate"] = (~x["strict_pass"]) & (~x["forecast_candidate"]) & x.get("eps_source_used", pd.Series("", index=x.index)).eq("EPS_TTM_PROXY_ONLY")
+        x["proxy_pass"] = x["forecast_candidate"] | x["ttm_proxy_candidate"]
         x["資料缺口/未通過原因"] = x.apply(self._gap_reason, axis=1)
-        x["基本面狀態"] = np.select(
-            [x["strict_pass"], x["forecast_candidate"] & x["eps_source_used"].eq("FORECAST_EPS_STRICT"), x["partial_forecast_candidate"]],
-            ["嚴格通過", "預測候選", "資料不足但可預估"],
-            default="未通過/資料不足"
-        )
+        x["基本面狀態"] = np.select([x["strict_pass"], x["forecast_candidate"], x["ttm_proxy_candidate"]], ["嚴格通過", "預測候選", "TTM代理觀察"], default="未通過/資料不足")
         # V5.2 修正：technical_feature_daily 可能尚未建立或沒有 trend_score/rsi14。
         # 不可再用 pd.to_numeric(x.get("trend_score"))，因為缺欄時會取得 scalar np.nan，導致 .fillna() 當機。
         trend_score_s = _safe_numeric_series_for_df(x, "trend_score", 0)
@@ -5180,9 +5063,9 @@ class HighGrowthEPSEngine:
         x["投資分層"] = np.select([
             x["strict_pass"] & trend_score_s.ge(75) & rsi14_s.le(75),
             x["strict_pass"],
-            x["forecast_candidate"] & x["eps_source_used"].eq("FORECAST_EPS_STRICT"),
-            x["partial_forecast_candidate"],
-        ], ["核心觀察/可進技術驗證", "基本面核心/等技術確認", "財報公布前黑馬追蹤", "資料不足但可預估/低信心追蹤"], default="排除或補資料")
+            x["forecast_candidate"],
+            x["ttm_proxy_candidate"],
+        ], ["核心觀察/可進技術驗證", "基本面核心/等技術確認", "財報公布前黑馬追蹤", "EPS_TTM代理觀察/不可嚴格通過"], default="排除或補資料")
         x["風險旗標"] = np.select([
             rsi14_s.gt(80),
             trend_score_s.fillna(100).lt(50),
@@ -5191,19 +5074,19 @@ class HighGrowthEPSEngine:
         x["建議動作"] = np.select([
             x["strict_pass"] & x["風險旗標"].eq("OK"),
             x["strict_pass"],
-            x["forecast_candidate"] & x["eps_source_used"].eq("FORECAST_EPS_STRICT"),
-            x["partial_forecast_candidate"],
-        ], ["列入投資規劃，等待價量確認", "列核心清單但需控管風險", "列入黑馬追蹤，等正式EPS驗證", "低/中信心追蹤，等營收補齊或正式EPS驗證"], default="不列入本策略")
+            x["forecast_candidate"],
+            x["ttm_proxy_candidate"],
+        ], ["列入投資規劃，等待價量確認", "列核心清單但需控管風險", "列入黑馬追蹤，等正式EPS驗證", "僅列EPS_TTM觀察，不可當正式EPS通過"], default="不列入本策略")
         x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
         months = self.revenue_engine.required_months(self.tracking_quarters)
-        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "eps_cumulative_used", "actual_eps_cumulative", "forecast_eps_cumulative", "eps_ratio", "eps_source_used", "eps_decision_layer", "eps_confidence_level", "forecast_block_reason", "base_eps_source", "eps_data_quality", "base_eps_quality", "revenue_month_count_hit", "revenue_month_count_required", "revenue_yoy_count_hit", "revenue_yoy_abnormal_gate", "revenue_yoy_available_gate", "revenue_yoy_valid_gate", "revenue_yoy_partial_gate", "revenue_forecast_eligible", "revenue_forecast_strict_eligible", "revenue_forecast_partial_eligible", "revenue_partial_gate"]
+        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "eps_ttm_current", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_fiscal_year_quarter", "ttm_rebuild_possible", "ttm_rebuild_block_reason", "eps_cumulative_used", "actual_eps_cumulative", "forecast_eps_cumulative", "eps_ratio", "eps_source_used", "base_eps_source", "eps_data_quality", "base_eps_quality", "revenue_month_count_hit", "revenue_month_count_required", "revenue_yoy_count_hit", "revenue_yoy_abnormal_gate", "revenue_yoy_valid_gate", "revenue_forecast_eligible"]
         for m in months:
             order_cols += [f"rev_{m}", f"yoy_{m}"]
-        order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "strict_pass", "forecast_candidate", "partial_forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
+        order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "strict_pass", "forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
         for c in order_cols:
             if c not in x.columns:
-                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "eps_cumulative_used", "eps_ratio") else ""
+                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "eps_ttm_current", "eps_cumulative_used", "eps_ratio") else ""
         x = x[order_cols].copy()
         x = x.sort_values(["strict_pass", "forecast_candidate", "eps_ratio", "avg_revenue_yoy", "trend_score"], ascending=[False, False, False, False, False], na_position="last")
         return x, self.inspect_db_assets(), rev_raw, eps_features
@@ -5217,28 +5100,29 @@ class HighGrowthEPSEngine:
         if output_dir:
             out_path = Path(output_dir) / out_path.name
         strict_df = df[df["基本面狀態"].eq("嚴格通過")].copy() if not df.empty else pd.DataFrame()
-        forecast_df = df[df["基本面狀態"].isin(["預測候選", "資料不足但可預估"])].copy() if not df.empty else pd.DataFrame()
-        fail_df = df[~df["基本面狀態"].isin(["嚴格通過", "預測候選", "資料不足但可預估"])].copy() if not df.empty else pd.DataFrame()
+        forecast_df = df[df["基本面狀態"].eq("預測候選")].copy() if not df.empty else pd.DataFrame()
+        fail_df = df[~df["基本面狀態"].isin(["嚴格通過", "預測候選", "TTM代理觀察"])].copy() if not df.empty else pd.DataFrame()
+        ttm_proxy_df = df[df["基本面狀態"].eq("TTM代理觀察")].copy() if not df.empty else pd.DataFrame()
         # V4.1 修正：先保存真實筆數，再建立 NO_STRICT_PASS / NO_FORECAST_CANDIDATE 佔位列。
         # 避免 Excel 內為 0，但 log 顯示 strict=1 / forecast=1 的錯誤。
         strict_count_real = int(len(strict_df))
         forecast_count_real = int(len(forecast_df))
         fail_count_real = int(len(fail_df))
         summary = pd.DataFrame([
-            {"項目": "V5.6架構", "內容": "ACTUAL_EPS → FORECAST_EPS_STRICT → FORECAST_EPS_PARTIAL → DATA_INSUFFICIENT；正式EPS優先，營收3/3為STRICT，1/3或2/3為PARTIAL低/中信心追蹤，不可直接當強通過"},
-            {"項目": "資料補齊結果(V5.6含status_rows)", "內容": json.dumps(backfill_results, ensure_ascii=False)},
+            {"項目": "V5.4架構", "內容": "RevenueCollectorEngine(V5.4靜態NAS+Ajax+OpenData三層補抓+有效性防呆) → EPSActualCollectorEngine(V5.4累計轉單季/公告狀態) → RevenueAccelerationEngine → EPSForecastEngine → HighGrowthEPSEngine"},
+            {"項目": "資料補齊結果(V5.4含status_rows)", "內容": json.dumps(backfill_results, ensure_ascii=False)},
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
             {"項目": "嚴格條件", "內容": "正式季度累計EPS > 2025全年EPS，且營收YoY全數達標並月月走高"},
-            {"項目": "預測候選條件", "內容": "正式季EPS抓不到/尚未公告時，營收3/3完整且YoY正常為FORECAST_EPS_STRICT；營收1/3或2/3且可用YoY達標為FORECAST_EPS_PARTIAL，信心LOW/MEDIUM，只列追蹤不當嚴格通過"},
+            {"項目": "預測候選條件", "內容": "正式季EPS尚未完整時，以月營收加速度預估EPS；只能列預測候選，不得列嚴格通過"},
             {"項目": "YoY門檻", "內容": self.min_yoy},
             {"項目": "嚴格通過筆數", "內容": strict_count_real},
             {"項目": "預測候選筆數", "內容": forecast_count_real},
             {"項目": "未通過/資料不足筆數", "內容": fail_count_real},
+            {"項目": "EPS_TTM代理觀察筆數", "內容": int(len(ttm_proxy_df))},
             {"項目": "模式", "內容": self.mode},
             {"項目": "輸出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
             {"項目": "規則版本", "內容": HIGH_GROWTH_RULE_VERSION},
-            {"項目": "RC診斷修正", "內容": "若strict=0且forecast=0，UI不再顯示前300筆未通過股票為候選；改顯示NO_HIGH_GROWTH_EPS_CANDIDATE診斷列"},
         ])
         rules = pd.DataFrame([
             {"序號": 1, "模組": "RevenueCollectorEngine", "新增/修改": "修改", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V5.1區塊", "驗收點": "支援多層表頭flatten、欄名別名、FETCH_OK/PARSE_EMPTY/NOT_DISCLOSED/HTTP_FAIL狀態分類，並寫入 external_revenue / external_revenue_history"},
@@ -5253,6 +5137,8 @@ class HighGrowthEPSEngine:
             strict_df = pd.DataFrame([{"狀態": "NO_STRICT_PASS", "說明": "目前DB沒有完整符合嚴格條件的個股。"}])
         if forecast_df.empty:
             forecast_df = pd.DataFrame([{"狀態": "NO_FORECAST_CANDIDATE", "說明": "目前沒有預測候選。"}])
+        if ttm_proxy_df.empty:
+            ttm_proxy_df = pd.DataFrame([{"狀態": "NO_EPS_TTM_PROXY", "說明": "目前沒有EPS_TTM代理觀察資料。"}])
         status_flat_rows = []
         for br in backfill_results or []:
             for st in br.get('status_rows', []) or []:
@@ -5276,35 +5162,14 @@ class HighGrowthEPSEngine:
         }
         out_path, kind = write_table_bundle(out_path.with_suffix(""), tables, preferred="excel")
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V5.6] 報表輸出：{out_path}｜quarters={'+'.join(self.tracking_quarters)}｜mode={self.mode}｜strict={strict_count_real}｜forecast={forecast_count_real}｜fail={fail_count_real}")
+            log_cb(f"[HIGH_GROWTH_V5.4] 報表輸出：{out_path}｜quarters={'+'.join(self.tracking_quarters)}｜mode={self.mode}｜strict={strict_count_real}｜forecast={forecast_count_real}｜fail={fail_count_real}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
-        """UI 最新視圖防呆。
-
-        V5.6_RC_PATCH：原本在 strict=0 且 forecast=0 時仍直接顯示前 300 筆
-        「未通過/資料不足」股票，容易被誤解成高成長EPS候選清單。
-        修正後：先回傳真正嚴格/預測候選；若沒有候選，回傳診斷列，明確指出
-        DATA_INSUFFICIENT 的原因（MOPS EPS 被擋、營收月份不足、年度EPS缺）。
-        """
-        df, assets, _, _ = self.build_screening_df()
+        df, _, _, _ = self.build_screening_df()
         if df is None or df.empty:
             return pd.DataFrame()
-        candidates = df[df["基本面狀態"].isin(["嚴格通過", "預測候選", "資料不足但可預估"])].copy()
-        if not candidates.empty:
-            return candidates.head(int(limit)).copy()
-        reason_counts = df.get("資料缺口/未通過原因", pd.Series([], dtype=str)).fillna("").astype(str).value_counts().head(5)
-        diag = pd.DataFrame([{
-            "狀態": "NO_HIGH_GROWTH_EPS_CANDIDATE",
-            "說明": "本次沒有嚴格通過、預測候選或資料不足但可預估；請補齊正式EPS與季度對應營收月份，不應把未通過前300筆當成候選名單。",
-            "嚴格通過": int((df["基本面狀態"] == "嚴格通過").sum()),
-            "預測候選": int((df["基本面狀態"] == "預測候選").sum()),
-            "資料不足但可預估": int((df["基本面狀態"] == "資料不足但可預估").sum()),
-            "資料不足": int((df["基本面狀態"] == "未通過/資料不足").sum()),
-            "主要原因TOP1": reason_counts.index[0] if len(reason_counts) else "",
-            "規則版本": HIGH_GROWTH_RULE_VERSION,
-        }])
-        return diag
+        return df.head(int(limit)).copy()
 
 
 # Backward compatible alias：舊UI/舊功能名稱仍可使用，但底層已升級到V4。
@@ -12416,7 +12281,7 @@ class AppUI:
         """HIGH_GROWTH_EPS_ENGINE_V4：高成長EPS加速度分頁，可選Q1~Q4追蹤。"""
         control = ttk.Frame(self.tab_highgrowth, padding=6)
         control.pack(fill="x")
-        ttk.Button(control, text="① 產生高成長EPS V5.7報表", command=self.on_highgrowth_report).pack(side="left", padx=4)
+        ttk.Button(control, text="① 產生高成長EPS V5.4報表", command=self.on_highgrowth_report).pack(side="left", padx=4)
         ttk.Button(control, text="② 開啟高成長EPS報表", command=self.on_open_highgrowth_report).pack(side="left", padx=4)
         ttk.Label(control, text="追蹤季度").pack(side="left", padx=(12, 2))
         self.highgrowth_q1_var = tk.BooleanVar(value=True)
@@ -12430,17 +12295,17 @@ class AppUI:
         mode_cb = ttk.Combobox(control, textvariable=self.highgrowth_mode_var, width=16, state="readonly")
         mode_cb["values"] = ["HYBRID", "STRICT_ACTUAL_ONLY", "FORECAST_PROXY"]
         mode_cb.pack(side="left", padx=2)
-        self.highgrowth_status_var = tk.StringVar(value=f"V5.7報表輸出：{HIGH_GROWTH_REPORT_DIR}")
+        self.highgrowth_status_var = tk.StringVar(value=f"V5.4報表輸出：{HIGH_GROWTH_REPORT_DIR}")
         ttk.Label(control, textvariable=self.highgrowth_status_var).pack(side="left", padx=12)
-        cols = ("status", "rank", "id", "name", "industry", "quarters", "eps_used", "eps_2025", "eps_ratio", "eps_source", "confidence", "avg_yoy", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
+        cols = ("status", "rank", "id", "name", "industry", "quarters", "eps_used", "eps_2025", "eps_ratio", "eps_source", "avg_yoy", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
         headers = {
             "status":"狀態", "rank":"排序", "id":"代號", "name":"名稱", "industry":"產業", "quarters":"季度",
             "eps_used":"累計/預估EPS", "eps_2025":"2025全年EPS", "eps_ratio":"EPS倍數", "eps_source":"EPS來源",
-            "confidence":"信心", "avg_yoy":"平均YoY", "rev_hit":"營收月數", "rev_stair":"營收階梯", "close":"現價", "rsi":"RSI", "trend":"趨勢分",
+            "avg_yoy":"平均YoY", "rev_hit":"營收月數", "rev_stair":"營收階梯", "close":"現價", "rsi":"RSI", "trend":"趨勢分",
             "risk":"風險", "action":"建議動作", "gap":"資料缺口/原因"
         }
         self.highgrowth_tree = self._make_tree(self.tab_highgrowth, cols, headers)
-        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":120,"quarters":80,"eps_used":105,"eps_2025":105,"eps_ratio":80,"eps_source":170,"confidence":75,"avg_yoy":90,"rev_hit":85,"rev_stair":90,"close":80,"rsi":70,"trend":80,"risk":140,"action":250,"gap":420}
+        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":120,"quarters":80,"eps_used":105,"eps_2025":105,"eps_ratio":80,"eps_source":150,"avg_yoy":90,"rev_hit":85,"rev_stair":90,"close":80,"rsi":70,"trend":80,"risk":140,"action":250,"gap":420}
         for c, w in widths.items():
             try:
                 self.highgrowth_tree.column(c, width=w, minwidth=55, stretch=False)
@@ -12457,7 +12322,7 @@ class AppUI:
                 return
             self.highgrowth_tree.delete(*self.highgrowth_tree.get_children())
             if df is None or df.empty:
-                self.highgrowth_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "+".join(quarters), "", "", "", "", "", "", "", "", "", "", "", "", "", "請先產生高成長EPS報表"))
+                self.highgrowth_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "+".join(quarters), "", "", "", "", "", "", "", "", "", "", "", "", "請先產生高成長EPS報表"))
                 return
             def fmt(v):
                 try:
@@ -12472,32 +12337,32 @@ class AppUI:
                 rev_hit = f"{int(float(r.get('revenue_month_count_hit', 0) or 0))}/{int(float(r.get('revenue_month_count_required', 0) or 0))}"
                 self.highgrowth_tree.insert("", "end", values=(
                     str(r.get("基本面狀態", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")), str(r.get("industry", "")), str(r.get("追蹤季度", "+".join(quarters))),
-                    fmt(r.get("eps_cumulative_used", "")), fmt(r.get("base_annual_eps", "")), fmt(r.get("eps_ratio", "")), str(r.get("eps_source_used", "")), str(r.get("eps_confidence_level", "")),
+                    fmt(r.get("eps_cumulative_used", "")), fmt(r.get("base_annual_eps", "")), fmt(r.get("eps_ratio", "")), str(r.get("eps_source_used", "")),
                     fmt(r.get("avg_revenue_yoy", "")), rev_hit, rev_stair, fmt(r.get("close", "")), fmt(r.get("rsi14", "")), fmt(r.get("trend_score", "")),
                     str(r.get("風險旗標", "")), str(r.get("建議動作", "")), str(r.get("資料缺口/未通過原因", ""))
                 ))
             if hasattr(self, "highgrowth_status_var"):
                 counts = df.get("基本面狀態", pd.Series(dtype=str)).fillna("").astype(str).value_counts().to_dict()
-                self.highgrowth_status_var.set(f"V5.7最新篩選：{len(df)}筆｜季度={'+'.join(quarters)}｜狀態{counts}｜報表：{self.last_highgrowth_report_path or HIGH_GROWTH_REPORT_DIR}")
+                self.highgrowth_status_var.set(f"V5.4最新篩選：{len(df)}筆｜季度={'+'.join(quarters)}｜狀態{counts}｜報表：{self.last_highgrowth_report_path or HIGH_GROWTH_REPORT_DIR}")
         except Exception as exc:
-            self.append_log(f"刷新高成長EPS V5.7表失敗：{exc}", "ERROR")
+            self.append_log(f"刷新高成長EPS V5.4表失敗：{exc}", "ERROR")
 
     def on_highgrowth_report(self):
-        """UI按鈕：產生高成長EPS加速度V5.7報表。"""
+        """UI按鈕：產生高成長EPS加速度V5.4報表。"""
         quarters = self._selected_highgrowth_quarters()
         mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
         def worker():
-            self.ui_call(self.start_task, "高成長EPS V5.7報表", 3)
-            self.ui_call(self.update_task, "高成長EPS V5.7報表", 1, 3, item=f"讀取EPS與營收資料｜季度={'+'.join(quarters)}")
+            self.ui_call(self.start_task, "高成長EPS V5.4報表", 3)
+            self.ui_call(self.update_task, "高成長EPS V5.4報表", 1, 3, item=f"讀取EPS與營收資料｜季度={'+'.join(quarters)}")
             path = run_high_growth_eps_revenue_report(db=self.db, output_dir=HIGH_GROWTH_REPORT_DIR, log_cb=lambda m: self.ui_call(self.append_log, m), tracking_quarters=quarters, mode=mode)
             self.last_highgrowth_report_path = Path(path)
-            self.ui_call(self.update_task, "高成長EPS V5.7報表", 2, 3, item="刷新UI表格")
+            self.ui_call(self.update_task, "高成長EPS V5.4報表", 2, 3, item="刷新UI表格")
             df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=mode).get_latest_view()
             self.ui_call(self._refresh_highgrowth_tree, df)
-            self.ui_call(self.update_task, "高成長EPS V5.7報表", 3, 3, success=len(df) if isinstance(df, pd.DataFrame) else 0, item="Excel完成")
-            self.ui_call(self.append_log, f"高成長EPS V5.7報表已產生：{path}")
-            self.ui_call(messagebox.showinfo, "完成", f"已產生高成長EPS V5.7報表：\n{path}")
-            self.ui_call(self.finish_task, "高成長EPS V5.7報表", f"已產生：{path}")
+            self.ui_call(self.update_task, "高成長EPS V5.4報表", 3, 3, success=len(df) if isinstance(df, pd.DataFrame) else 0, item="Excel完成")
+            self.ui_call(self.append_log, f"高成長EPS V5.4報表已產生：{path}")
+            self.ui_call(messagebox.showinfo, "完成", f"已產生高成長EPS V5.4報表：\n{path}")
+            self.ui_call(self.finish_task, "高成長EPS V5.4報表", f"已產生：{path}")
         self._run_in_thread(worker, "high_growth_eps_v5_4_report")
 
     def on_open_highgrowth_report(self):
@@ -12505,7 +12370,7 @@ class AppUI:
         path = getattr(self, "last_highgrowth_report_path", None) or get_high_growth_report_path(quarters=quarters)
         path = Path(path)
         if not path.exists():
-            return messagebox.showwarning("找不到報表", f"找不到高成長EPS V5.7報表：\n{path}\n\n請先按『① 產生高成長EPS V5.7報表』。")
+            return messagebox.showwarning("找不到報表", f"找不到高成長EPS V5.4報表：\n{path}\n\n請先按『① 產生高成長EPS V5.4報表』。")
         open_path(path)
 
     def _build_prebreakout_tab(self):
@@ -13819,7 +13684,7 @@ class AppUI:
                     "條件預掛": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
                     "執行下單清單": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "組合交易計畫": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
-                    "高成長EPS報表": ["stock_id", "stock_name", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "eps_cumulative_used", "actual_eps_cumulative", "forecast_eps_cumulative", "eps_ratio", "eps_source_used", "avg_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "strict_pass", "forecast_candidate", "partial_forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因"],
+                    "高成長EPS報表": ["stock_id", "stock_name", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "eps_cumulative_used", "actual_eps_cumulative", "forecast_eps_cumulative", "eps_ratio", "eps_source_used", "avg_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "strict_pass", "forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因"],
                     "唯一決策": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "market", "industry", "theme", "ui_state", "entry_zone", "stop_loss", "target_price", "rr", "win_rate", "decision", "final_trade_decision"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                     "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
