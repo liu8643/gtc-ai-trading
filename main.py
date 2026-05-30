@@ -34,6 +34,7 @@ import warnings
 import logging
 import json
 import hashlib
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -3713,7 +3714,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_QUARTER_TRACKING_FORECAST_20260529"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_3_TWSE_C05001_ANNUAL_EPS_IMPORT_20260531"
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -3939,11 +3940,176 @@ class EPSForecastEngine:
             return f"{int(m.group(1))}Q{int(m.group(2))}"
         return s
 
+    def _twse_c05001_candidate_paths(self, fiscal_year: int | None = None, quarter: str = "Q4") -> list[Path]:
+        """尋找 TWSE C05001 財報 Excel/ZIP。
+
+        用途：讓 High Growth EPS 引擎可使用使用者已下載的 TWSE
+        Financial Info of Listed Companies Quarterly 檔案。
+        例如：2025Q4_C05001.zip、2025Q4.xlsx、2025Q4.XLS。
+        """
+        fiscal_year = int(fiscal_year or self.base_year)
+        q = str(quarter or "Q4").upper().replace(" ", "")
+        roots = []
+        for p in [RUNTIME_DIR, RUNTIME_DIR / "data", RUNTIME_DIR / "reports", BASE_DIR, BASE_DIR / "data"]:
+            try:
+                if p and Path(p).exists() and Path(p) not in roots:
+                    roots.append(Path(p))
+            except Exception:
+                pass
+        patterns = [
+            f"{fiscal_year}{q}_C05001.zip", f"{fiscal_year}{q}.zip", f"*{fiscal_year}{q}*C05001*.zip",
+            f"{fiscal_year}{q}.xlsx", f"{fiscal_year}{q}.xls", f"*{fiscal_year}{q}*C05001*.xlsx", f"*{fiscal_year}{q}*C05001*.xls",
+            f"*C05001*{fiscal_year}*{q}*.zip", f"*C05001*{fiscal_year}*{q}*.xlsx", f"*C05001*{fiscal_year}*{q}*.xls",
+        ]
+        out = []
+        seen = set()
+        for root in roots:
+            for pat in patterns:
+                try:
+                    for p in root.glob(pat):
+                        if p.is_file():
+                            key = str(p.resolve())
+                            if key not in seen:
+                                seen.add(key); out.append(p)
+                except Exception:
+                    pass
+            # 只向下一層常見資料夾搜尋，避免 UI 執行時掃全碟變慢。
+            for sub in ["twse_q4_conv", "twse_2025q4_xlsx", "twse_c05001", "classification"]:
+                d = root / sub
+                if d.exists():
+                    for pat in patterns:
+                        try:
+                            for p in d.glob(pat):
+                                if p.is_file():
+                                    key = str(p.resolve())
+                                    if key not in seen:
+                                        seen.add(key); out.append(p)
+                        except Exception:
+                            pass
+        return out
+
+    def _materialize_twse_c05001_file(self, path: Path, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
+        """把 TWSE C05001 zip/xls/xlsx 轉成可讀 Excel 路徑。"""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return None
+            suffix = p.suffix.lower()
+            if suffix == ".xlsx":
+                return p
+            work_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{int(fiscal_year or self.base_year)}{str(quarter or 'Q4').upper()}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            if suffix == ".zip":
+                with zipfile.ZipFile(p, "r") as zf:
+                    names = [n for n in zf.namelist() if n.lower().endswith((".xls", ".xlsx"))]
+                    if not names:
+                        return None
+                    # 優先選包含年度季度字樣或 C05001 的檔案。
+                    names = sorted(names, key=lambda n: ("c05001" not in n.lower(), str(fiscal_year or self.base_year) not in n, n.lower()))
+                    name = names[0]
+                    target = work_dir / Path(name).name
+                    if not target.exists() or target.stat().st_size == 0:
+                        target.write_bytes(zf.read(name))
+                    p = target
+                    suffix = p.suffix.lower()
+            if suffix == ".xls":
+                target_xlsx = work_dir / (p.stem + ".xlsx")
+                converted = convert_xls_to_xlsx_force(p, target_xlsx, log_cb=lambda m: log_info(f"[HIGH_GROWTH][C05001] {m}"))
+                return converted if converted is not None and Path(converted).exists() else None
+            return p if suffix == ".xlsx" else None
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][C05001] 檔案轉換失敗：{path}｜{exc}")
+            return None
+
+    def _parse_twse_c05001_eps_xlsx(self, xlsx_path: Path, fiscal_year: int | None = None) -> pd.DataFrame:
+        """解析 TWSE C05001 上市公司季報統計 Excel。
+
+        Q4 檔案的第 14 欄為當年度全年 EPS，第 15 欄為前一年度全年 EPS。
+        注意：本函式只建立年度基準 EPS，不會把 Q4 全年 EPS 誤當 2026Q1。
+        """
+        fiscal_year = int(fiscal_year or self.base_year)
+        try:
+            raw = pd.read_excel(Path(xlsx_path), sheet_name=0, header=None, engine="openpyxl")
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][C05001] Excel讀取失敗：{xlsx_path}｜{exc}")
+            return pd.DataFrame()
+        if raw is None or raw.empty or raw.shape[1] < 15:
+            return pd.DataFrame()
+        x = raw.copy()
+        code = x.iloc[:, 0].astype(str).str.extract(r"(\d{4})", expand=False).fillna("")
+        mask = code.str.fullmatch(r"\d{4}")
+        out = pd.DataFrame({
+            "stock_id": code[mask].map(normalize_stock_id),
+            "stock_name": x.loc[mask, x.columns[1]].astype(str).str.strip(),
+            "operating_revenue_year": pd.to_numeric(x.loc[mask, x.columns[2]], errors="coerce"),
+            "net_income_after_tax_year": pd.to_numeric(x.loc[mask, x.columns[9]], errors="coerce"),
+            "eps_full_year": pd.to_numeric(x.loc[mask, x.columns[13]], errors="coerce"),
+            "eps_prev_year": pd.to_numeric(x.loc[mask, x.columns[14]], errors="coerce"),
+        })
+        out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
+        out = out.dropna(subset=["eps_full_year"])
+        out["fiscal_year"] = fiscal_year
+        out["source_type"] = "TWSE_C05001_Q4_ANNUAL_EPS"
+        out["source_url"] = "https://www.twse.com.tw/en/trading/statistics/index05.html"
+        out["source_date"] = f"{fiscal_year}Q4"
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        out["source_file"] = str(xlsx_path)
+        return out.drop_duplicates(subset=["stock_id", "fiscal_year"], keep="last")
+
+    def ensure_annual_eps_from_twse_c05001(self, fiscal_year: int | None = None, force: bool = False) -> dict:
+        """若 annual_eps_history 缺 2025 全年 EPS，嘗試由 TWSE C05001 Q4 Excel/ZIP 補入。"""
+        fiscal_year = int(fiscal_year or self.base_year)
+        result = {"status": "skip", "rows": 0, "source_file": "", "message": ""}
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                row = cur.execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,)).fetchone()
+                existing = int(row[0] or 0) if row else 0
+            if existing > 0 and not force:
+                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                return result
+            candidates = self._twse_c05001_candidate_paths(fiscal_year, "Q4")
+            if not candidates:
+                result.update({"status": "missing_file", "message": f"找不到 {fiscal_year}Q4_C05001 zip/xls/xlsx"})
+                return result
+            for cand in candidates:
+                xlsx = self._materialize_twse_c05001_file(cand, fiscal_year, "Q4")
+                if xlsx is None:
+                    continue
+                parsed = self._parse_twse_c05001_eps_xlsx(xlsx, fiscal_year)
+                if parsed is None or parsed.empty:
+                    continue
+                write = parsed[["stock_id", "fiscal_year", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].copy()
+                with self.db.lock:
+                    cur = self.db.conn.cursor()
+                    cur.executemany("""
+                        INSERT INTO annual_eps_history(stock_id, fiscal_year, eps_full_year, source_type, source_url, source_date, update_time)
+                        VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                            eps_full_year=excluded.eps_full_year,
+                            source_type=excluded.source_type,
+                            source_url=excluded.source_url,
+                            source_date=excluded.source_date,
+                            update_time=excluded.update_time
+                    """, list(write.itertuples(index=False, name=None)))
+                    self.db.conn.commit()
+                result.update({"status": "imported", "rows": int(len(write)), "source_file": str(xlsx), "message": "已由TWSE C05001 Q4補入2025全年EPS"})
+                log_info(f"[HIGH_GROWTH][C05001] annual_eps_history imported rows={len(write)} file={xlsx}")
+                return result
+            result.update({"status": "parse_failed", "message": f"找到檔案但無法解析：{', '.join(str(p) for p in candidates[:3])}"})
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][C05001] 補入annual_eps_history失敗：{exc}")
+            return result
+
     def load_base_annual_eps(self) -> pd.DataFrame:
         """讀取真正可作為 2025 全年度 EPS 的資料。
 
         注意：EPS_TTM 不在此函式使用，避免把 TTM 誤當年度 EPS。
+        V4.3：若 DB 尚未有 annual_eps_history，會先嘗試使用本機 TWSE C05001 2025Q4 Excel/ZIP 補入。
         """
+        self.ensure_annual_eps_from_twse_c05001(self.base_year, force=False)
         parts = []
         if self._table_exists("annual_eps_history"):
             df = self._read_sql(
@@ -4318,6 +4484,7 @@ class HighGrowthEPSEngine:
         fail_df = df[~df["基本面狀態"].isin(["嚴格通過", "預測候選"])].copy() if not df.empty else pd.DataFrame()
         summary = pd.DataFrame([
             {"項目": "V4架構", "內容": "RevenueAccelerationEngine → EPSForecastEngine → HighGrowthEPSEngine"},
+            {"項目": "V4.3修正", "內容": "自動使用本機TWSE C05001 2025Q4 Excel/ZIP補入 annual_eps_history，作為2025全年EPS基準；不把EPS_TTM誤當全年EPS或Q1 EPS。"},
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
             {"項目": "嚴格條件", "內容": "正式季度累計EPS > 2025全年EPS，且營收YoY全數達標並月月走高"},
@@ -4336,6 +4503,7 @@ class HighGrowthEPSEngine:
             {"序號": 3, "模組": "HighGrowthEPSEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "輸出嚴格通過/預測候選/資料不足三層結果"},
             {"序號": 4, "模組": "UI", "新增/修改": "修改", "程式位置": "_build_highgrowth_tab / on_highgrowth_report", "驗收點": "可勾選Q1/Q2/Q3/Q4並產生對應報表"},
             {"序號": 5, "模組": "DB Schema", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_schema", "驗收點": "缺 annual_eps_history 時自動建表"},
+            {"序號": 6, "模組": "TWSE C05001 Import", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_annual_eps_from_twse_c05001", "驗收點": "可由2025Q4_C05001.zip/xls/xlsx解析每股盈餘114年1-12月並寫入annual_eps_history"},
         ])
         if strict_df.empty:
             strict_df = pd.DataFrame([{"狀態": "NO_STRICT_PASS", "說明": "目前DB沒有完整符合嚴格條件的個股。"}])
