@@ -3714,7 +3714,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_5_MOPS_OFFICIAL_EPS_IMPORT_FIX_20260531"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_6_MOPS_HTML_DEBUG_VALIDATION_FIX_20260531"
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -3987,6 +3987,91 @@ class EPSForecastEngine:
             return np.nan
         return -float(v) if neg else float(v)
 
+    def _mops_eps_cache_dir(self, fiscal_year: int, season: int) -> Path:
+        """MOPS EPS raw HTML/debug cache folder.
+
+        Purpose:
+        1. Let user double-click raw HTML to confirm MOPS returned table fields.
+        2. Keep an audit trail for root-cause analysis when parsing fails.
+        """
+        cache_dir = RUNTIME_DIR / "data" / "mops_eps_html" / f"{int(fiscal_year)}Q{int(season)}"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _save_mops_eps_raw_html(self, html_text: str, fiscal_year: int, season: int, market_type: str, payload: dict, http_status="") -> Path:
+        """Always save raw MOPS ajax HTML for manual browser verification.
+
+        File example:
+        data/mops_eps_html/2026Q1/mops_test_2026Q1_sii.html
+        """
+        cache_dir = self._mops_eps_cache_dir(fiscal_year, season)
+        html_file = cache_dir / f"mops_test_{int(fiscal_year)}Q{int(season)}_{str(market_type).lower()}.html"
+        meta_file = cache_dir / f"mops_test_{int(fiscal_year)}Q{int(season)}_{str(market_type).lower()}.json"
+        html = str(html_text or "")
+        try:
+            html_file.write_text(html, encoding="utf-8")
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS][DEBUG] raw HTML save failed file={html_file}｜{exc}")
+        try:
+            meta = {
+                "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "url": self.MOPS_T163SB04_URL,
+                "referer": self.MOPS_T163SB04_REFERER,
+                "http_status": str(http_status or ""),
+                "fiscal_year": int(fiscal_year),
+                "roc_year": int(self._western_to_roc_year(int(fiscal_year))),
+                "season": int(season),
+                "market_type": str(market_type).lower(),
+                "payload": payload,
+                "html_file": str(html_file),
+                "html_bytes_utf8": len(html.encode("utf-8", errors="ignore")),
+                "contains_company_code": ("公司代號" in html or "公司代碼" in html),
+                "contains_basic_eps": ("基本每股盈餘" in html or "每股盈餘" in html),
+                "manual_check_instruction": "用瀏覽器開啟 html_file，Ctrl+F 搜尋 公司代號 與 基本每股盈餘。",
+            }
+            meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS][DEBUG] meta save failed file={meta_file}｜{exc}")
+        log_info(
+            f"[HIGH_GROWTH][MOPS_EPS][DEBUG] html_saved={html_file} status={http_status} "
+            f"bytes={len(html.encode('utf-8', errors='ignore'))} "
+            f"has_code={('公司代號' in html or '公司代碼' in html)} has_eps={('基本每股盈餘' in html or '每股盈餘' in html)}"
+        )
+        return html_file
+
+    def debug_download_mops_eps_html(self, fiscal_year: int, season, market_type: str = "sii", timeout=(10, 60)) -> Path:
+        """Download and save raw MOPS EPS HTML only; no DB write.
+
+        This is the built-in version of the Google-style test script, but uses
+        the correct MOPS ajax_t163sb04 POST endpoint.
+        """
+        fiscal_year = int(fiscal_year)
+        q = self._season_to_int(season)
+        roc_year = self._western_to_roc_year(fiscal_year)
+        market_type = str(market_type or "sii").lower()
+        payload = {
+            "encodeURIComponent": "1",
+            "step": "1",
+            "firstin": "1",
+            "off": "1",
+            "isQuery": "Y",
+            "TYPEK": market_type,
+            "year": str(roc_year),
+            "season": f"0{q}",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Referer": self.MOPS_T163SB04_REFERER,
+            "Origin": "https://mops.twse.com.tw",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        resp = requests.post(self.MOPS_T163SB04_URL, data=payload, headers=headers, timeout=timeout)
+        try:
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        except Exception:
+            resp.encoding = "utf-8"
+        return self._save_mops_eps_raw_html(resp.text or "", fiscal_year, q, market_type, payload, getattr(resp, "status_code", ""))
+
     def _parse_mops_eps_html(self, html_text: str, fiscal_year: int, season: int, market_type: str) -> pd.DataFrame:
         """解析 MOPS ajax_t163sb04 回傳 HTML 的 EPS 表格。"""
         try:
@@ -4074,15 +4159,14 @@ class EPSForecastEngine:
         except Exception:
             resp.encoding = "utf-8"
         html = resp.text or ""
-        cache_dir = RUNTIME_DIR / "data" / "mops_eps" / f"{fiscal_year}Q{q}"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_file = cache_dir / f"mops_t163sb04_{fiscal_year}Q{q}_{market_type}.html"
-        try:
-            cache_file.write_text(html, encoding="utf-8")
-        except Exception:
-            pass
+        cache_file = self._save_mops_eps_raw_html(html, fiscal_year, q, market_type, payload, http_status)
         df = self._parse_mops_eps_html(html, fiscal_year, q, market_type)
-        log_info(f"[HIGH_GROWTH][MOPS_EPS] POST done year={fiscal_year} season=Q{q} market={market_type} rows={len(df)} cache={cache_file}")
+        if df is None or df.empty:
+            raise RuntimeError(
+                f"MOPS EPS parse failed year={fiscal_year} season=Q{q} market={market_type}; "
+                f"raw_html_saved={cache_file}"
+            )
+        log_info(f"[HIGH_GROWTH][MOPS_EPS] POST done year={fiscal_year} season=Q{q} market={market_type} rows={len(df)} html_saved={cache_file}")
         return df
 
     def load_mops_eps_cumulative_all_markets(self, fiscal_year: int, season, sleep_seconds: float = 5.0) -> pd.DataFrame:
@@ -4216,6 +4300,14 @@ class EPSForecastEngine:
         for q in sorted({int(str(x).upper().replace("Q", "")) for x in quarters if str(x).upper().replace("Q", "").isdigit()}):
             results[f"base_Q{q}"] = self.ensure_quarterly_eps_from_mops(self.base_year, q, force=force)
             results[f"track_Q{q}"] = self.ensure_quarterly_eps_from_mops(self.track_year, q, force=force)
+        try:
+            debug_dir = RUNTIME_DIR / "data" / "mops_eps_html"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            (debug_dir / "mops_eps_ensure_results.json").write_text(
+                json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS][DEBUG] ensure results save failed｜{exc}")
         log_info(f"[HIGH_GROWTH][MOPS_EPS] required official eps ensure results={results}")
         return results
 
