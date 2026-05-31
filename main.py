@@ -3714,7 +3714,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_3_TWSE_C05001_ANNUAL_EPS_IMPORT_20260531"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_4_TWSE_C05001_AUTO_IMPORT_AND_REPORT_COUNT_FIX_20260531"
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -3941,51 +3941,74 @@ class EPSForecastEngine:
         return s
 
     def _twse_c05001_candidate_paths(self, fiscal_year: int | None = None, quarter: str = "Q4") -> list[Path]:
-        """尋找 TWSE C05001 財報 Excel/ZIP。
+        """尋找 TWSE C05001 財報 Excel/ZIP（V4.4 強化版）。
 
-        用途：讓 High Growth EPS 引擎可使用使用者已下載的 TWSE
-        Financial Info of Listed Companies Quarterly 檔案。
-        例如：2025Q4_C05001.zip、2025Q4.xlsx、2025Q4.XLS。
+        V4.3 問題：只找 RUNTIME_DIR/BASE_DIR 附近；EXE 實際執行時，使用者下載的
+        2025Q4_C05001.zip 常在 Downloads/Desktop 或專案上層資料夾，導致 annual_eps_history
+        仍為 0，畫面 2025全年EPS 空白。
         """
         fiscal_year = int(fiscal_year or self.base_year)
         q = str(quarter or "Q4").upper().replace(" ", "")
         roots = []
-        for p in [RUNTIME_DIR, RUNTIME_DIR / "data", RUNTIME_DIR / "reports", BASE_DIR, BASE_DIR / "data"]:
+        def _add_root(p):
             try:
-                if p and Path(p).exists() and Path(p) not in roots:
-                    roots.append(Path(p))
+                pp = Path(p).expanduser().resolve()
+                if pp.exists() and pp not in roots:
+                    roots.append(pp)
             except Exception:
                 pass
+        for p in [RUNTIME_DIR, RUNTIME_DIR / "data", RUNTIME_DIR / "reports", BASE_DIR, BASE_DIR / "data", BASE_DIR / "reports"]:
+            _add_root(p)
+        try:
+            p = Path(RUNTIME_DIR).resolve()
+            for _ in range(3):
+                p = p.parent
+                _add_root(p)
+        except Exception:
+            pass
+        try:
+            home = Path.home()
+            for sub in ["Downloads", "Desktop", "Documents", "OneDrive/Desktop", "OneDrive/Downloads"]:
+                _add_root(home / sub)
+        except Exception:
+            pass
         patterns = [
             f"{fiscal_year}{q}_C05001.zip", f"{fiscal_year}{q}.zip", f"*{fiscal_year}{q}*C05001*.zip",
             f"{fiscal_year}{q}.xlsx", f"{fiscal_year}{q}.xls", f"*{fiscal_year}{q}*C05001*.xlsx", f"*{fiscal_year}{q}*C05001*.xls",
             f"*C05001*{fiscal_year}*{q}*.zip", f"*C05001*{fiscal_year}*{q}*.xlsx", f"*C05001*{fiscal_year}*{q}*.xls",
         ]
-        out = []
-        seen = set()
-        for root in roots:
+        out, seen = [], set()
+        def _collect(root: Path, recursive: bool = False):
             for pat in patterns:
                 try:
-                    for p in root.glob(pat):
-                        if p.is_file():
-                            key = str(p.resolve())
-                            if key not in seen:
-                                seen.add(key); out.append(p)
-                except Exception:
-                    pass
-            # 只向下一層常見資料夾搜尋，避免 UI 執行時掃全碟變慢。
-            for sub in ["twse_q4_conv", "twse_2025q4_xlsx", "twse_c05001", "classification"]:
-                d = root / sub
-                if d.exists():
-                    for pat in patterns:
+                    iterator = root.rglob(pat) if recursive else root.glob(pat)
+                    for p in iterator:
                         try:
-                            for p in d.glob(pat):
-                                if p.is_file():
-                                    key = str(p.resolve())
-                                    if key not in seen:
-                                        seen.add(key); out.append(p)
+                            if p.is_file():
+                                key = str(p.resolve())
+                                if key not in seen:
+                                    seen.add(key); out.append(p)
                         except Exception:
                             pass
+                except Exception:
+                    pass
+        for root in roots:
+            _collect(root, recursive=False)
+            for sub in ["twse_q4_conv", "twse_2025q4_xlsx", "twse_c05001", "classification", "data", "reports"]:
+                d = root / sub
+                if d.exists():
+                    _collect(d, recursive=False)
+        for root in list(roots)[:4]:
+            try:
+                if str(root).lower().endswith(("windows", "program files", "users")):
+                    continue
+                _collect(root, recursive=True)
+            except Exception:
+                pass
+        if out:
+            log_info(f"[HIGH_GROWTH][C05001] local candidates found={len(out)} first={out[0]}")
+        else:
+            log_warning(f"[HIGH_GROWTH][C05001] local candidates not found for {fiscal_year}{q}")
         return out
 
     def _materialize_twse_c05001_file(self, path: Path, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
@@ -4056,6 +4079,67 @@ class EPSForecastEngine:
         out["source_file"] = str(xlsx_path)
         return out.drop_duplicates(subset=["stock_id", "fiscal_year"], keep="last")
 
+    def _download_twse_c05001_from_index(self, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
+        """V4.4：嘗試從 TWSE index05 頁面/靜態路徑下載 C05001 ZIP。"""
+        fiscal_year = int(fiscal_year or self.base_year)
+        q = str(quarter or "Q4").upper().replace(" ", "")
+        from urllib.parse import urljoin
+        out_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{fiscal_year}{q}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        index_urls = [
+            "https://www.twse.com.tw/en/trading/statistics/index05.html",
+            "https://www.twse.com.tw/en/statistics/index/05",
+            "https://wwwc.twse.com.tw/en/trading/statistics/index05.html",
+            "https://wwwc.twse.com.tw/en/statistics/index/05",
+            "https://www.twse.com.tw/zh/trading/statistics/index05.html",
+            "https://wwwc.twse.com.tw/zh/trading/statistics/index05.html",
+        ]
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/en/trading/statistics/index05.html"}
+        candidate_urls = []
+        href_re = re.compile(r'(?:href|src)=["\']([^"\']+)["\']', re.I)
+        for base_url in index_urls:
+            try:
+                resp = requests.get(base_url, timeout=(10, 30), headers=headers)
+                if resp.status_code != 200 or not resp.text:
+                    continue
+                for m in href_re.finditer(resp.text):
+                    u = urljoin(base_url, m.group(1))
+                    low = u.lower()
+                    if (str(fiscal_year).lower() in low and q.lower() in low and ("c05001" in low or "index05" in low) and low.endswith((".zip", ".xls", ".xlsx"))):
+                        candidate_urls.append(u)
+            except Exception as exc:
+                log_warning(f"[HIGH_GROWTH][C05001] index scan fail {base_url}｜{exc}")
+        static_names = [f"{fiscal_year}{q}_C05001.zip", f"{fiscal_year}{q}.zip", f"{fiscal_year}{q}.xls", f"{fiscal_year}{q}.xlsx"]
+        static_bases = [
+            "https://www.twse.com.tw/staticFiles/en/trading/statistics/financialInfo/",
+            "https://www.twse.com.tw/staticFiles/zh/trading/statistics/financialInfo/",
+            "https://www.twse.com.tw/staticFiles/trading/statistics/financialInfo/",
+            "https://www.twse.com.tw/download/en/trading/statistics/financialInfo/",
+            "https://www.twse.com.tw/download/zh/trading/statistics/financialInfo/",
+        ]
+        for b in static_bases:
+            for n in static_names:
+                candidate_urls.append(urljoin(b, n))
+        seen = set()
+        for url in candidate_urls:
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                resp = requests.get(url, timeout=(10, 60), headers=headers)
+                ctype = resp.headers.get("content-type", "")
+                if resp.status_code == 200 and resp.content and len(resp.content) > 1024 and not resp.content[:200].lower().startswith(b"<!doctype html"):
+                    suffix = ".zip" if "zip" in ctype.lower() or url.lower().endswith(".zip") else (".xlsx" if url.lower().endswith(".xlsx") else ".xls")
+                    target = out_dir / (Path(url).name or f"{fiscal_year}{q}_C05001{suffix}")
+                    target.write_bytes(resp.content)
+                    log_info(f"[HIGH_GROWTH][C05001] online download success url={url} file={target} bytes={len(resp.content)}")
+                    return target
+                else:
+                    log_warning(f"[HIGH_GROWTH][C05001] online candidate unavailable status={resp.status_code} bytes={len(resp.content) if resp.content else 0} url={url}")
+            except Exception as exc:
+                log_warning(f"[HIGH_GROWTH][C05001] online download fail url={url}｜{exc}")
+        return None
+
     def ensure_annual_eps_from_twse_c05001(self, fiscal_year: int | None = None, force: bool = False) -> dict:
         """若 annual_eps_history 缺 2025 全年 EPS，嘗試由 TWSE C05001 Q4 Excel/ZIP 補入。"""
         fiscal_year = int(fiscal_year or self.base_year)
@@ -4070,7 +4154,12 @@ class EPSForecastEngine:
                 return result
             candidates = self._twse_c05001_candidate_paths(fiscal_year, "Q4")
             if not candidates:
-                result.update({"status": "missing_file", "message": f"找不到 {fiscal_year}Q4_C05001 zip/xls/xlsx"})
+                online_file = self._download_twse_c05001_from_index(fiscal_year, "Q4")
+                if online_file is not None and Path(online_file).exists():
+                    candidates = [Path(online_file)]
+            if not candidates:
+                result.update({"status": "missing_file", "message": f"找不到 {fiscal_year}Q4_C05001 zip/xls/xlsx，且TWSE線上下載未成功"})
+                log_warning(f"[HIGH_GROWTH][C05001] annual_eps import missing_file fiscal_year={fiscal_year}")
                 return result
             for cand in candidates:
                 xlsx = self._materialize_twse_c05001_file(cand, fiscal_year, "Q4")
@@ -4480,20 +4569,35 @@ class HighGrowthEPSEngine:
         if output_dir:
             out_path = Path(output_dir) / out_path.name
         strict_df = df[df["基本面狀態"].eq("嚴格通過")].copy() if not df.empty else pd.DataFrame()
-        forecast_df = df[df["基本面狀態"].isin(["預測候選", "EPS_TTM追蹤候選"])].copy() if not df.empty else pd.DataFrame()
-        fail_df = df[~df["基本面狀態"].isin(["嚴格通過", "預測候選"])].copy() if not df.empty else pd.DataFrame()
+        forecast_only_df = df[df["基本面狀態"].eq("預測候選")].copy() if not df.empty else pd.DataFrame()
+        ttm_only_df = df[df["基本面狀態"].eq("EPS_TTM追蹤候選")].copy() if not df.empty else pd.DataFrame()
+        forecast_df = pd.concat([forecast_only_df, ttm_only_df], ignore_index=True) if (not forecast_only_df.empty or not ttm_only_df.empty) else pd.DataFrame()
+        fail_df = df[df["基本面狀態"].eq("未通過/資料不足")].copy() if not df.empty else pd.DataFrame()
+        strict_count = int(len(strict_df))
+        forecast_count = int(len(forecast_only_df))
+        ttm_count = int(len(ttm_only_df))
+        fail_count = int(len(fail_df))
+        annual_eps_rows = 0
+        try:
+            if self.eps_engine._table_exists("annual_eps_history"):
+                with self.db.lock:
+                    row = self.db.conn.cursor().execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (self.eps_engine.base_year,)).fetchone()
+                    annual_eps_rows = int(row[0] or 0) if row else 0
+        except Exception:
+            annual_eps_rows = 0
         summary = pd.DataFrame([
             {"項目": "V4架構", "內容": "RevenueAccelerationEngine → EPSForecastEngine → HighGrowthEPSEngine"},
-            {"項目": "V4.3修正", "內容": "自動使用本機TWSE C05001 2025Q4 Excel/ZIP補入 annual_eps_history，作為2025全年EPS基準；不把EPS_TTM誤當全年EPS或Q1 EPS。"},
+            {"項目": "V4.4修正", "內容": "修正V4.3找不到使用者下載檔的問題；擴大本機搜尋、增加TWSE線上下載fallback、修正Log/摘要把placeholder誤算成strict=1與把EPS_TTM候選誤算為forecast。"},
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
             {"項目": "嚴格條件", "內容": "正式季度累計EPS > 2025全年EPS，且營收YoY全數達標並月月走高"},
             {"項目": "預測候選條件", "內容": "正式季EPS尚未完整時，以月營收加速度預估EPS；只能列預測候選，不得列嚴格通過"},
             {"項目": "YoY門檻", "內容": self.min_yoy},
-            {"項目": "嚴格通過筆數", "內容": int(len(strict_df))},
-            {"項目": "預測候選筆數", "內容": int(len(forecast_df))},
-            {"項目": "EPS_TTM追蹤候選筆數", "內容": int((df["基本面狀態"].eq("EPS_TTM追蹤候選")).sum()) if not df.empty else 0},
-            {"項目": "未通過/資料不足筆數", "內容": int(len(fail_df))},
+            {"項目": "嚴格通過筆數", "內容": strict_count},
+            {"項目": "預測候選筆數", "內容": forecast_count},
+            {"項目": "EPS_TTM追蹤候選筆數", "內容": ttm_count},
+            {"項目": "未通過/資料不足筆數", "內容": fail_count},
+            {"項目": "annual_eps_history_2025筆數", "內容": annual_eps_rows},
             {"項目": "輸出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
             {"項目": "規則版本", "內容": HIGH_GROWTH_RULE_VERSION},
         ])
@@ -4522,7 +4626,7 @@ class HighGrowthEPSEngine:
         }
         out_path, kind = write_table_bundle(out_path.with_suffix(""), tables, preferred="excel")
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V4] 報表輸出：{out_path}｜quarters={'+'.join(self.tracking_quarters)}｜strict={len(strict_df)}｜forecast={len(forecast_df)}")
+            log_cb(f"[HIGH_GROWTH_V4] 報表輸出：{out_path}｜quarters={'+'.join(self.tracking_quarters)}｜strict={strict_count}｜forecast={forecast_count}｜ttm_proxy={ttm_count}｜fail={fail_count}｜annual_eps_2025={annual_eps_rows}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
