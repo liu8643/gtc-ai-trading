@@ -21,7 +21,7 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build EXE (Debug Mode)
-        run: pyinstaller --onefile --console main.py
+        run: pyinstaller --onefile --console --hidden-import xlrd --hidden-import openpyxl main.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
