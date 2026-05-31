@@ -3714,7 +3714,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_4_TWSE_C05001_AUTO_IMPORT_AND_REPORT_COUNT_FIX_20260531"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_5_MOPS_OFFICIAL_EPS_IMPORT_FIX_20260531"
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -3869,13 +3869,13 @@ class RevenueAccelerationEngine:
 
 
 class EPSForecastEngine:
-    """EPS 實績/預測引擎（V4.2 回退修正版）。
+    """EPS 實績/預測引擎（V4.5 MOPS 官方 EPS 修正版）。
 
     修正重點：
-    1. 正式年度/季度 EPS 仍為最高優先，但目前 DB 內 annual_eps_history / quarterly_financial_history 為空。
-    2. DB 內可用 EPS 主要來自 EPS_TTM；EPS_TTM 可用於最近四季獲利能力、PE TTM、成長追蹤與候選排序。
-    3. EPS_TTM 不可直接誤標為 2025 全年 EPS 或 2026Q1 單季 EPS；必須明確標示 EPS_TTM_PROXY_ONLY。
-    4. 當正式 EPS 不足時，程式應保留 EPS_TTM 追蹤候選，而不是全部判成 DATA_INSUFFICIENT。
+    1. 正式 EPS 主來源改為 MOPS ajax_t163sb04 POST（綜合損益表彙總報表），不再依賴 TWSE index05 HTML/ZIP 掃描。
+    2. 啟動高成長 EPS 報表時，先自動補入：2026Q1、2025Q1 的正式季度 EPS，以及 2025Q4 的全年 EPS。
+    3. MOPS Q2/Q3/Q4 為累積 EPS；若未來要匯入單季 EPS，必須用本季累積 EPS - 前季累積 EPS，Q1 則可直接作單季 EPS。
+    4. EPS_TTM 仍可用於 TTM 追蹤候選，但不可誤當全年 EPS 或 Q1 EPS。
     """
 
     def __init__(self, db: DBManager, base_year: int = HIGH_GROWTH_BASE_YEAR, track_year: int = HIGH_GROWTH_TRACK_YEAR):
@@ -3939,6 +3939,285 @@ class EPSForecastEngine:
         if m:
             return f"{int(m.group(1))}Q{int(m.group(2))}"
         return s
+
+
+    MOPS_T163SB04_URL = "https://mops.twse.com.tw/mops/web/ajax_t163sb04"
+    MOPS_T163SB04_REFERER = "https://mops.twse.com.tw/mops/web/t163sb04"
+    MOPS_MARKET_TYPES = {"sii": "上市", "otc": "上櫃"}
+
+    @staticmethod
+    def _western_to_roc_year(year: int) -> int:
+        y = int(year)
+        return y - 1911 if y >= 1912 else y
+
+    @staticmethod
+    def _season_to_int(season) -> int:
+        s = str(season or "").upper().replace("Q", "").replace("0", "", 1) if str(season or "").upper().startswith("Q0") else str(season or "").upper().replace("Q", "")
+        try:
+            q = int(s)
+            if q not in (1, 2, 3, 4):
+                raise ValueError
+            return q
+        except Exception:
+            raise ValueError(f"season 必須為 1~4 或 Q1~Q4，目前={season}")
+
+    @staticmethod
+    def _flatten_mops_columns(columns) -> list[str]:
+        out = []
+        for col in list(columns):
+            if isinstance(col, tuple):
+                parts = [str(x).strip() for x in col if str(x).strip() and not str(x).startswith("Unnamed")]
+                name = " ".join(parts)
+            else:
+                name = str(col).strip()
+            name = re.sub(r"\s+", "", name)
+            out.append(name)
+        return out
+
+    @staticmethod
+    def _to_numeric_eps(value):
+        s = str(value or "").strip().replace(",", "")
+        if s in ("", "--", "-", "nan", "NaN", "None", "NULL", "<NA>"):
+            return np.nan
+        # MOPS 常見負數格式可能為 (1.23)。
+        neg = bool(re.fullmatch(r"\(.*\)", s))
+        s = s.strip("()")
+        v = pd.to_numeric(s, errors="coerce")
+        if pd.isna(v):
+            return np.nan
+        return -float(v) if neg else float(v)
+
+    def _parse_mops_eps_html(self, html_text: str, fiscal_year: int, season: int, market_type: str) -> pd.DataFrame:
+        """解析 MOPS ajax_t163sb04 回傳 HTML 的 EPS 表格。"""
+        try:
+            tables = pd.read_html(io.StringIO(str(html_text or "")))
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS] read_html failed year={fiscal_year} season={season} market={market_type}｜{exc}")
+            return pd.DataFrame()
+        target = None
+        for df in tables:
+            if df is None or df.empty:
+                continue
+            x = df.copy()
+            x.columns = self._flatten_mops_columns(x.columns)
+            cols_join = "|".join(str(c) for c in x.columns)
+            if ("公司代號" in cols_join or "公司代碼" in cols_join) and ("基本每股盈餘" in cols_join or "每股盈餘" in cols_join):
+                target = x
+                break
+        if target is None or target.empty:
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS] no EPS table found year={fiscal_year} season={season} market={market_type}")
+            return pd.DataFrame()
+
+        cols = list(target.columns)
+        def _pick_col(keywords, exclude=None):
+            exclude = exclude or []
+            for c in cols:
+                sc = str(c)
+                if all(k in sc for k in keywords) and not any(e in sc for e in exclude):
+                    return c
+            return None
+
+        code_col = _pick_col(["公司代號"]) or _pick_col(["公司代碼"])
+        name_col = _pick_col(["公司名稱"]) or _pick_col(["公司簡稱"])
+        eps_col = _pick_col(["基本每股盈餘"], exclude=["稀釋"]) or _pick_col(["每股盈餘"], exclude=["稀釋"])
+        if code_col is None or eps_col is None:
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS] required columns missing year={fiscal_year} season={season} market={market_type} cols={cols[:20]}")
+            return pd.DataFrame()
+
+        out = pd.DataFrame({
+            "stock_id": target[code_col].astype(str).str.extract(r"(\d{4})", expand=False).fillna("").map(normalize_stock_id),
+            "stock_name": target[name_col].astype(str).str.strip() if name_col in target.columns else "",
+            "eps_cumulative": target[eps_col].map(self._to_numeric_eps),
+        })
+        out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
+        out = out.dropna(subset=["eps_cumulative"])
+        out["fiscal_year"] = int(fiscal_year)
+        out["quarter"] = int(season)
+        out["fiscal_year_quarter"] = f"{int(fiscal_year) - 1911}/{int(season)}"
+        out["western_quarter"] = f"{int(fiscal_year)}Q{int(season)}"
+        out["market_type"] = str(market_type)
+        out["market"] = self.MOPS_MARKET_TYPES.get(str(market_type), str(market_type))
+        out["source_url"] = self.MOPS_T163SB04_URL
+        out["source_date"] = f"{int(fiscal_year)}Q{int(season)}"
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return out.drop_duplicates(subset=["stock_id", "fiscal_year", "quarter"], keep="last")
+
+    def download_mops_eps_cumulative(self, fiscal_year: int, season, market_type: str = "sii", timeout=(10, 60)) -> pd.DataFrame:
+        """正式來源：MOPS 綜合損益表彙總報表 ajax_t163sb04。回傳為累積 EPS。"""
+        fiscal_year = int(fiscal_year)
+        q = self._season_to_int(season)
+        roc_year = self._western_to_roc_year(fiscal_year)
+        market_type = str(market_type or "sii").lower()
+        payload = {
+            "encodeURIComponent": "1",
+            "step": "1",
+            "firstin": "1",
+            "off": "1",
+            "isQuery": "Y",
+            "TYPEK": market_type,
+            "year": str(roc_year),
+            "season": f"0{q}",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Referer": self.MOPS_T163SB04_REFERER,
+            "Origin": "https://mops.twse.com.tw",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        log_info(f"[HIGH_GROWTH][MOPS_EPS] POST start year={fiscal_year} roc={roc_year} season=0{q} market={market_type}")
+        resp = requests.post(self.MOPS_T163SB04_URL, data=payload, headers=headers, timeout=timeout)
+        http_status = getattr(resp, "status_code", "")
+        if http_status != 200:
+            raise RuntimeError(f"MOPS ajax_t163sb04 HTTP {http_status} year={fiscal_year} season={q} market={market_type}")
+        try:
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        except Exception:
+            resp.encoding = "utf-8"
+        html = resp.text or ""
+        cache_dir = RUNTIME_DIR / "data" / "mops_eps" / f"{fiscal_year}Q{q}"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"mops_t163sb04_{fiscal_year}Q{q}_{market_type}.html"
+        try:
+            cache_file.write_text(html, encoding="utf-8")
+        except Exception:
+            pass
+        df = self._parse_mops_eps_html(html, fiscal_year, q, market_type)
+        log_info(f"[HIGH_GROWTH][MOPS_EPS] POST done year={fiscal_year} season=Q{q} market={market_type} rows={len(df)} cache={cache_file}")
+        return df
+
+    def load_mops_eps_cumulative_all_markets(self, fiscal_year: int, season, sleep_seconds: float = 5.0) -> pd.DataFrame:
+        """下載上市+上櫃 MOPS 累積 EPS；兩市場間保留延遲，避免頻繁請求。"""
+        parts = []
+        errors = []
+        for idx, market_type in enumerate(["sii", "otc"]):
+            try:
+                if idx > 0 and sleep_seconds and sleep_seconds > 0:
+                    time.sleep(float(sleep_seconds))
+                df = self.download_mops_eps_cumulative(fiscal_year, season, market_type=market_type)
+                if df is not None and not df.empty:
+                    parts.append(df)
+            except Exception as exc:
+                errors.append(f"{market_type}:{exc}")
+                log_warning(f"[HIGH_GROWTH][MOPS_EPS] download failed year={fiscal_year} season={season} market={market_type}｜{exc}")
+        if not parts:
+            if errors:
+                raise RuntimeError("MOPS EPS download all markets failed: " + " ; ".join(errors))
+            return pd.DataFrame()
+        out = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id", "fiscal_year", "quarter"], keep="last")
+        return out
+
+    def ensure_quarterly_eps_from_mops(self, fiscal_year: int, season, force: bool = False) -> dict:
+        """將 MOPS 累積 EPS 轉成季度 EPS 寫入 quarterly_financial_history。Q1 直接使用；Q2~Q4 以本季累積扣前季累積。"""
+        fiscal_year = int(fiscal_year)
+        q = self._season_to_int(season)
+        result = {"status": "skip", "rows": 0, "message": "", "source": "MOPS_T163SB04"}
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                row = cur.execute("SELECT COUNT(*) FROM quarterly_financial_history WHERE fiscal_year=? AND quarter=? AND eps IS NOT NULL", (fiscal_year, q)).fetchone()
+                existing = int(row[0] or 0) if row else 0
+            if existing > 0 and not force:
+                result.update({"status": "exists", "rows": existing, "message": f"quarterly_financial_history 已有 {fiscal_year}Q{q}"})
+                return result
+            current = self.load_mops_eps_cumulative_all_markets(fiscal_year, q)
+            if current is None or current.empty:
+                result.update({"status": "no_data", "message": f"MOPS無資料 {fiscal_year}Q{q}"})
+                return result
+            current = current.copy()
+            if q == 1:
+                current["eps"] = current["eps_cumulative"]
+            else:
+                prev = self.load_mops_eps_cumulative_all_markets(fiscal_year, q - 1)
+                if prev is None or prev.empty:
+                    result.update({"status": "prev_missing", "rows": 0, "message": f"缺前季累積 EPS，不能反推單季 {fiscal_year}Q{q}"})
+                    return result
+                prev = prev[["stock_id", "eps_cumulative"]].rename(columns={"eps_cumulative": "eps_prev_cumulative"})
+                current = current.merge(prev, on="stock_id", how="left")
+                current["eps"] = current["eps_cumulative"] - current["eps_prev_cumulative"]
+            write = current.dropna(subset=["eps"])[["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "source_url", "source_date", "update_time"]].copy()
+            if write.empty:
+                result.update({"status": "parse_failed", "message": f"MOPS資料無可寫入EPS {fiscal_year}Q{q}"})
+                return result
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.executemany("""
+                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(stock_id, fiscal_year, quarter) DO UPDATE SET
+                        fiscal_year_quarter=excluded.fiscal_year_quarter,
+                        western_quarter=excluded.western_quarter,
+                        eps=excluded.eps,
+                        source_url=excluded.source_url,
+                        source_date=excluded.source_date,
+                        update_time=excluded.update_time
+                """, list(write.itertuples(index=False, name=None)))
+                self.db.conn.commit()
+            result.update({"status": "imported", "rows": int(len(write)), "message": f"MOPS已寫入季度EPS {fiscal_year}Q{q}"})
+            log_info(f"[HIGH_GROWTH][MOPS_EPS] quarterly_financial_history imported year={fiscal_year} q={q} rows={len(write)}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS] ensure_quarterly_eps_from_mops failed year={fiscal_year} q={q}｜{exc}")
+            return result
+
+    def ensure_annual_eps_from_mops(self, fiscal_year: int | None = None, force: bool = False) -> dict:
+        """使用 MOPS Q4 累積 EPS 作為全年 EPS 基準，寫入 annual_eps_history。"""
+        fiscal_year = int(fiscal_year or self.base_year)
+        result = {"status": "skip", "rows": 0, "message": "", "source": "MOPS_T163SB04"}
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                row = cur.execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,)).fetchone()
+                existing = int(row[0] or 0) if row else 0
+            if existing > 0 and not force:
+                result.update({"status": "exists", "rows": existing, "message": f"annual_eps_history 已有 {fiscal_year}"})
+                return result
+            q4 = self.load_mops_eps_cumulative_all_markets(fiscal_year, 4)
+            if q4 is None or q4.empty:
+                result.update({"status": "no_data", "message": f"MOPS無Q4全年資料 {fiscal_year}"})
+                return result
+            q4 = q4.copy()
+            q4["eps_full_year"] = pd.to_numeric(q4["eps_cumulative"], errors="coerce")
+            q4 = q4.dropna(subset=["eps_full_year"])
+            q4["source_type"] = "MOPS_T163SB04_Q4_ANNUAL_EPS"
+            q4["source_date"] = f"{fiscal_year}Q4"
+            q4["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            write = q4[["stock_id", "fiscal_year", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].copy()
+            if write.empty:
+                result.update({"status": "parse_failed", "message": f"MOPS Q4無可寫入年度EPS {fiscal_year}"})
+                return result
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.executemany("""
+                    INSERT INTO annual_eps_history(stock_id, fiscal_year, eps_full_year, source_type, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                        eps_full_year=excluded.eps_full_year,
+                        source_type=excluded.source_type,
+                        source_url=excluded.source_url,
+                        source_date=excluded.source_date,
+                        update_time=excluded.update_time
+                """, list(write.itertuples(index=False, name=None)))
+                self.db.conn.commit()
+            result.update({"status": "imported", "rows": int(len(write)), "message": f"MOPS已寫入全年EPS {fiscal_year}"})
+            log_info(f"[HIGH_GROWTH][MOPS_EPS] annual_eps_history imported fiscal_year={fiscal_year} rows={len(write)}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS] ensure_annual_eps_from_mops failed fiscal_year={fiscal_year}｜{exc}")
+            return result
+
+    def ensure_required_official_eps_from_mops(self, quarters=None, force: bool = False) -> dict:
+        """高成長 EPS 報表前置匯入：基準全年EPS、去年同期Q1、追蹤年Q1。"""
+        quarters = normalize_high_growth_quarters(quarters)
+        results = {}
+        results["base_annual"] = self.ensure_annual_eps_from_mops(self.base_year, force=force)
+        # 去年同期季度 EPS 可供 TTM/同比驗證，不作全年EPS替代。
+        for q in sorted({int(str(x).upper().replace("Q", "")) for x in quarters if str(x).upper().replace("Q", "").isdigit()}):
+            results[f"base_Q{q}"] = self.ensure_quarterly_eps_from_mops(self.base_year, q, force=force)
+            results[f"track_Q{q}"] = self.ensure_quarterly_eps_from_mops(self.track_year, q, force=force)
+        log_info(f"[HIGH_GROWTH][MOPS_EPS] required official eps ensure results={results}")
+        return results
 
     def _twse_c05001_candidate_paths(self, fiscal_year: int | None = None, quarter: str = "Q4") -> list[Path]:
         """尋找 TWSE C05001 財報 Excel/ZIP（V4.4 強化版）。
@@ -4198,7 +4477,10 @@ class EPSForecastEngine:
         注意：EPS_TTM 不在此函式使用，避免把 TTM 誤當年度 EPS。
         V4.3：若 DB 尚未有 annual_eps_history，會先嘗試使用本機 TWSE C05001 2025Q4 Excel/ZIP 補入。
         """
-        self.ensure_annual_eps_from_twse_c05001(self.base_year, force=False)
+        # V4.5：正式年度EPS優先由 MOPS ajax_t163sb04 Q4 累積EPS補入；TWSE C05001 只作備援。
+        mops_result = self.ensure_annual_eps_from_mops(self.base_year, force=False)
+        if str(mops_result.get("status", "")).lower() not in ("exists", "imported"):
+            self.ensure_annual_eps_from_twse_c05001(self.base_year, force=False)
         parts = []
         if self._table_exists("annual_eps_history"):
             df = self._read_sql(
@@ -4253,7 +4535,10 @@ class EPSForecastEngine:
         df = df.loc[mask].copy()
         if df.empty:
             return pd.DataFrame(columns=["stock_id"])
-        df["quarter_norm"] = np.where(qn.notna(), "Q" + qn.astype("Int64").astype(str), token1.str[-2:])
+        # V4.5 修正：mask 後必須重新對齊 quarter/token series，避免長度不一致。
+        qn2 = pd.to_numeric(df.get("quarter"), errors="coerce")
+        token1_2 = df.get("western_quarter", "").map(self.normalize_quarter_token) if "western_quarter" in df.columns else pd.Series("", index=df.index)
+        df["quarter_norm"] = np.where(qn2.notna(), "Q" + qn2.astype("Int64").astype(str), token1_2.str[-2:])
         df["eps"] = pd.to_numeric(df["eps"], errors="coerce")
         pivot = df.pivot_table(index="stock_id", columns="quarter_norm", values="eps", aggfunc="last").reset_index()
         for q in quarters:
@@ -4340,6 +4625,8 @@ class EPSForecastEngine:
         base = master[["stock_id"]].drop_duplicates().copy() if master is not None and not master.empty else pd.DataFrame(columns=["stock_id"])
         if base.empty:
             return base
+        # V4.5：進入EPS特徵前，先確保 MOPS 正式EPS資料已匯入DB。
+        self.ensure_required_official_eps_from_mops(quarters, force=False)
         base_eps = self.load_base_annual_eps()
         actual = self.load_actual_eps_by_quarter(quarters)
         ttm = self.load_eps_ttm_proxy()
@@ -4607,7 +4894,7 @@ class HighGrowthEPSEngine:
             {"序號": 3, "模組": "HighGrowthEPSEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "輸出嚴格通過/預測候選/資料不足三層結果"},
             {"序號": 4, "模組": "UI", "新增/修改": "修改", "程式位置": "_build_highgrowth_tab / on_highgrowth_report", "驗收點": "可勾選Q1/Q2/Q3/Q4並產生對應報表"},
             {"序號": 5, "模組": "DB Schema", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_schema", "驗收點": "缺 annual_eps_history 時自動建表"},
-            {"序號": 6, "模組": "TWSE C05001 Import", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_annual_eps_from_twse_c05001", "驗收點": "可由2025Q4_C05001.zip/xls/xlsx解析每股盈餘114年1-12月並寫入annual_eps_history"},
+            {"序號": 6, "模組": "MOPS Official EPS Import", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_required_official_eps_from_mops", "驗收點": "可由MOPS ajax_t163sb04 POST抓取2026Q1、2025Q1、2025Q4正式EPS並寫入quarterly_financial_history/annual_eps_history"},
         ])
         if strict_df.empty:
             strict_df = pd.DataFrame([{"狀態": "NO_STRICT_PASS", "說明": "目前DB沒有完整符合嚴格條件的個股。"}])
