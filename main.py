@@ -30,6 +30,7 @@ import threading
 import time
 import os
 import subprocess
+import shutil
 import warnings
 import logging
 import json
@@ -2415,7 +2416,8 @@ class DBManager:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS quarterly_financial_history (
             stock_id TEXT, fiscal_year INTEGER, quarter INTEGER, fiscal_year_quarter TEXT, western_quarter TEXT,
-            eps REAL, gross_margin REAL, operating_margin REAL, net_margin REAL, cfo REAL, ni REAL, fcf REAL,
+            eps REAL, eps_cumulative REAL, eps_quarter REAL, eps_prev_cumulative REAL, eps_calc_method TEXT,
+            gross_margin REAL, operating_margin REAL, net_margin REAL, cfo REAL, ni REAL, fcf REAL,
             source_url TEXT, source_date TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, fiscal_year, quarter)
         )
@@ -3869,7 +3871,7 @@ class RevenueAccelerationEngine:
 
 
 class EPSForecastEngine:
-    """EPS 實績/預測引擎（V4.5 MOPS 官方 EPS 修正版）。
+    """EPS 實績/預測引擎（V4.7 官方年度EPS雙來源修正版）。
 
     修正重點：
     1. 正式 EPS 主來源改為 MOPS ajax_t163sb04 POST（綜合損益表彙總報表），不再依賴 TWSE index05 HTML/ZIP 掃描。
@@ -3911,6 +3913,10 @@ class EPSForecastEngine:
                     stock_id TEXT,
                     fiscal_year INTEGER,
                     eps_full_year REAL,
+                    eps_cumulative REAL,
+                    eps_quarter REAL,
+                    eps_prev_cumulative REAL,
+                    eps_calc_method TEXT,
                     source_type TEXT,
                     source_url TEXT,
                     source_date TEXT,
@@ -3919,6 +3925,29 @@ class EPSForecastEngine:
                 )
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_annual_eps_history_stock_year ON annual_eps_history(stock_id, fiscal_year)")
+                # V4.8 EPS_CUMULATIVE_QUARTER_FIX：年度表保留原 eps_full_year，並新增累計/單季欄位作來源追溯。
+                for _col, _ddl in [
+                    ("eps_cumulative", "eps_cumulative REAL"),
+                    ("eps_quarter", "eps_quarter REAL"),
+                    ("eps_prev_cumulative", "eps_prev_cumulative REAL"),
+                    ("eps_calc_method", "eps_calc_method TEXT"),
+                ]:
+                    try:
+                        cur.execute(f"ALTER TABLE annual_eps_history ADD COLUMN {_ddl}")
+                    except Exception:
+                        pass
+                # quarterly_financial_history 必須同時保存官方累計EPS與反推單季EPS。
+                # eps 欄保留相容性，固定等於 eps_quarter，不再把累計值重複加總。
+                for _col, _ddl in [
+                    ("eps_cumulative", "eps_cumulative REAL"),
+                    ("eps_quarter", "eps_quarter REAL"),
+                    ("eps_prev_cumulative", "eps_prev_cumulative REAL"),
+                    ("eps_calc_method", "eps_calc_method TEXT"),
+                ]:
+                    try:
+                        cur.execute(f"ALTER TABLE quarterly_financial_history ADD COLUMN {_ddl}")
+                    except Exception:
+                        pass
                 self.db.conn.commit()
         except Exception as exc:
             log_warning(f"[EPSForecastEngine] annual_eps_history schema建立失敗：{exc}")
@@ -3944,6 +3973,19 @@ class EPSForecastEngine:
     MOPS_T163SB04_URL = "https://mops.twse.com.tw/mops/web/ajax_t163sb04"
     MOPS_T163SB04_REFERER = "https://mops.twse.com.tw/mops/web/t163sb04"
     MOPS_MARKET_TYPES = {"sii": "上市", "otc": "上櫃"}
+
+    # V4.7 OFFICIAL_ANNUAL_EPS_DUAL_SOURCE_FIX：年度EPS正式來源順序
+    # 1) 本地 TWSE C05001 Q4 XLS/ZIP（主流程，使用者已下載到 data/twse_c05001/2025Q4）
+    # 2) TWSE OpenAPI 六大產業別（備援＋交叉驗證）
+    # 3) MOPS HTML（最後官方備援；不得阻塞本地XLS匯入）
+    TWSE_OPENAPI_EPS_ENDPOINTS = {
+        "一般業": "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci",
+        "金融業": "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_basi",
+        "證券期貨業": "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_bd",
+        "金控業": "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_fh",
+        "保險業": "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ins",
+        "異業": "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_mim",
+    }
 
     @staticmethod
     def _western_to_roc_year(year: int) -> int:
@@ -4208,29 +4250,42 @@ class EPSForecastEngine:
                 result.update({"status": "no_data", "message": f"MOPS無資料 {fiscal_year}Q{q}"})
                 return result
             current = current.copy()
+            current["eps_cumulative"] = pd.to_numeric(current.get("eps_cumulative"), errors="coerce")
             if q == 1:
-                current["eps"] = current["eps_cumulative"]
+                # Q1：官方累計EPS就是單季EPS。
+                current["eps_prev_cumulative"] = 0.0
+                current["eps_quarter"] = current["eps_cumulative"]
+                current["eps_calc_method"] = "Q1_CUMULATIVE_EQUALS_QUARTER"
             else:
                 prev = self.load_mops_eps_cumulative_all_markets(fiscal_year, q - 1)
                 if prev is None or prev.empty:
                     result.update({"status": "prev_missing", "rows": 0, "message": f"缺前季累積 EPS，不能反推單季 {fiscal_year}Q{q}"})
                     return result
                 prev = prev[["stock_id", "eps_cumulative"]].rename(columns={"eps_cumulative": "eps_prev_cumulative"})
+                prev["eps_prev_cumulative"] = pd.to_numeric(prev["eps_prev_cumulative"], errors="coerce")
                 current = current.merge(prev, on="stock_id", how="left")
-                current["eps"] = current["eps_cumulative"] - current["eps_prev_cumulative"]
-            write = current.dropna(subset=["eps"])[["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "source_url", "source_date", "update_time"]].copy()
+                # Q2~Q4：單季EPS = 本季累計EPS - 前季累計EPS，禁止把累計值當單季加總。
+                current["eps_quarter"] = current["eps_cumulative"] - current["eps_prev_cumulative"]
+                current["eps_calc_method"] = "CUMULATIVE_DIFF_FROM_PREV_QUARTER"
+            # 相容舊欄位：eps 固定存 eps_quarter。
+            current["eps"] = current["eps_quarter"]
+            write = current.dropna(subset=["eps_quarter"])[["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_url", "source_date", "update_time"]].copy()
             if write.empty:
                 result.update({"status": "parse_failed", "message": f"MOPS資料無可寫入EPS {fiscal_year}Q{q}"})
                 return result
             with self.db.lock:
                 cur = self.db.conn.cursor()
                 cur.executemany("""
-                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, source_url, source_date, update_time)
-                    VALUES(?,?,?,?,?,?,?,?,?)
+                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(stock_id, fiscal_year, quarter) DO UPDATE SET
                         fiscal_year_quarter=excluded.fiscal_year_quarter,
                         western_quarter=excluded.western_quarter,
                         eps=excluded.eps,
+                        eps_cumulative=excluded.eps_cumulative,
+                        eps_quarter=excluded.eps_quarter,
+                        eps_prev_cumulative=excluded.eps_prev_cumulative,
+                        eps_calc_method=excluded.eps_calc_method,
                         source_url=excluded.source_url,
                         source_date=excluded.source_date,
                         update_time=excluded.update_time
@@ -4292,23 +4347,38 @@ class EPSForecastEngine:
             return result
 
     def ensure_required_official_eps_from_mops(self, quarters=None, force: bool = False) -> dict:
-        """高成長 EPS 報表前置匯入：基準全年EPS、去年同期Q1、追蹤年Q1。"""
+        """高成長 EPS 報表前置匯入。
+
+        V4.7修正：base_annual 不再優先跑 MOPS HTML，避免 lxml/HTML空頁造成年度EPS卡住；
+        先用本地 TWSE C05001，再用 TWSE OpenAPI，最後才用 MOPS。
+        季度EPS仍保留MOPS嘗試，但失敗不影響年度EPS進入報表。
+        """
         quarters = normalize_high_growth_quarters(quarters)
         results = {}
-        results["base_annual"] = self.ensure_annual_eps_from_mops(self.base_year, force=force)
-        # 去年同期季度 EPS 可供 TTM/同比驗證，不作全年EPS替代。
+        results["base_annual_c05001"] = self.ensure_annual_eps_from_twse_c05001(self.base_year, force=force)
+        if str(results["base_annual_c05001"].get("status", "")).lower() in ("exists", "imported"):
+            results["base_annual"] = results["base_annual_c05001"]
+        else:
+            results["base_annual_openapi"] = self.ensure_annual_eps_from_twse_openapi(self.base_year, force=force)
+            if str(results["base_annual_openapi"].get("status", "")).lower() in ("exists", "imported"):
+                results["base_annual"] = results["base_annual_openapi"]
+            else:
+                results["base_annual_mops"] = self.ensure_annual_eps_from_mops(self.base_year, force=force)
+                results["base_annual"] = results["base_annual_mops"]
+
+        # 去年同期季度 EPS 可供同比驗證，不作全年EPS替代；錯誤只記錄，不阻塞年度EPS。
         for q in sorted({int(str(x).upper().replace("Q", "")) for x in quarters if str(x).upper().replace("Q", "").isdigit()}):
             results[f"base_Q{q}"] = self.ensure_quarterly_eps_from_mops(self.base_year, q, force=force)
             results[f"track_Q{q}"] = self.ensure_quarterly_eps_from_mops(self.track_year, q, force=force)
         try:
             debug_dir = RUNTIME_DIR / "data" / "mops_eps_html"
             debug_dir.mkdir(parents=True, exist_ok=True)
-            (debug_dir / "mops_eps_ensure_results.json").write_text(
+            (debug_dir / "official_eps_ensure_results_v47.json").write_text(
                 json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         except Exception as exc:
             log_warning(f"[HIGH_GROWTH][MOPS_EPS][DEBUG] ensure results save failed｜{exc}")
-        log_info(f"[HIGH_GROWTH][MOPS_EPS] required official eps ensure results={results}")
+        log_info(f"[HIGH_GROWTH][OFFICIAL_EPS] required official eps ensure results={results}")
         return results
 
     def _twse_c05001_candidate_paths(self, fiscal_year: int | None = None, quarter: str = "Q4") -> list[Path]:
@@ -4344,9 +4414,9 @@ class EPSForecastEngine:
         except Exception:
             pass
         patterns = [
-            f"{fiscal_year}{q}_C05001.zip", f"{fiscal_year}{q}.zip", f"*{fiscal_year}{q}*C05001*.zip",
-            f"{fiscal_year}{q}.xlsx", f"{fiscal_year}{q}.xls", f"*{fiscal_year}{q}*C05001*.xlsx", f"*{fiscal_year}{q}*C05001*.xls",
-            f"*C05001*{fiscal_year}*{q}*.zip", f"*C05001*{fiscal_year}*{q}*.xlsx", f"*C05001*{fiscal_year}*{q}*.xls",
+            f"{fiscal_year}{q}_C05001.zip", f"{fiscal_year}{q}_C05001.ZIP", f"{fiscal_year}{q}.zip", f"{fiscal_year}{q}.ZIP", f"*{fiscal_year}{q}*C05001*.zip", f"*{fiscal_year}{q}*C05001*.ZIP",
+            f"{fiscal_year}{q}.xlsx", f"{fiscal_year}{q}.XLSX", f"{fiscal_year}{q}.xls", f"{fiscal_year}{q}.XLS", f"*{fiscal_year}{q}*C05001*.xlsx", f"*{fiscal_year}{q}*C05001*.XLSX", f"*{fiscal_year}{q}*C05001*.xls", f"*{fiscal_year}{q}*C05001*.XLS",
+            f"*C05001*{fiscal_year}*{q}*.zip", f"*C05001*{fiscal_year}*{q}*.ZIP", f"*C05001*{fiscal_year}*{q}*.xlsx", f"*C05001*{fiscal_year}*{q}*.XLSX", f"*C05001*{fiscal_year}*{q}*.xls", f"*C05001*{fiscal_year}*{q}*.XLS",
         ]
         out, seen = [], set()
         def _collect(root: Path, recursive: bool = False):
@@ -4383,14 +4453,29 @@ class EPSForecastEngine:
         return out
 
     def _materialize_twse_c05001_file(self, path: Path, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
-        """把 TWSE C05001 zip/xls/xlsx 轉成可讀 Excel 路徑。"""
+        """把 TWSE C05001 zip/xls/xlsx materialize 到可讀路徑。
+
+        V4.7修正：
+        - 舊版遇到 .XLS 只嘗試轉成 xlsx；若 packaged EXE 未帶 pywin32 / LibreOffice / xlrd，
+          會直接回傳 None，導致 annual_eps_history 無資料。
+        - 新版即使轉換失敗，也會回傳原始 .XLS，交給 _parse_twse_c05001_eps_xlsx 以多引擎讀取。
+        """
         try:
             p = Path(path)
-            if not p.exists():
+            if not p.exists() or not p.is_file():
                 return None
             suffix = p.suffix.lower()
-            if suffix == ".xlsx":
+            if suffix in (".xlsx", ".xls"):
+                if suffix == ".xls":
+                    work_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{int(fiscal_year or self.base_year)}{str(quarter or 'Q4').upper()}"
+                    work_dir.mkdir(parents=True, exist_ok=True)
+                    target_xlsx = work_dir / (p.stem + ".xlsx")
+                    converted = convert_xls_to_xlsx_force(p, target_xlsx, log_cb=lambda m: log_info(f"[HIGH_GROWTH][C05001] {m}"))
+                    if converted is not None and Path(converted).exists() and Path(converted).stat().st_size > 0:
+                        return Path(converted)
+                    log_warning(f"[HIGH_GROWTH][C05001] xls轉xlsx未成功，改以原始XLS解析：{p}")
                 return p
+
             work_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{int(fiscal_year or self.base_year)}{str(quarter or 'Q4').upper()}"
             work_dir.mkdir(parents=True, exist_ok=True)
             if suffix == ".zip":
@@ -4398,57 +4483,266 @@ class EPSForecastEngine:
                     names = [n for n in zf.namelist() if n.lower().endswith((".xls", ".xlsx"))]
                     if not names:
                         return None
-                    # 優先選包含年度季度字樣或 C05001 的檔案。
                     names = sorted(names, key=lambda n: ("c05001" not in n.lower(), str(fiscal_year or self.base_year) not in n, n.lower()))
                     name = names[0]
                     target = work_dir / Path(name).name
                     if not target.exists() or target.stat().st_size == 0:
                         target.write_bytes(zf.read(name))
-                    p = target
-                    suffix = p.suffix.lower()
-            if suffix == ".xls":
-                target_xlsx = work_dir / (p.stem + ".xlsx")
-                converted = convert_xls_to_xlsx_force(p, target_xlsx, log_cb=lambda m: log_info(f"[HIGH_GROWTH][C05001] {m}"))
-                return converted if converted is not None and Path(converted).exists() else None
-            return p if suffix == ".xlsx" else None
+                    return self._materialize_twse_c05001_file(target, fiscal_year=fiscal_year, quarter=quarter)
+            return None
         except Exception as exc:
-            log_warning(f"[HIGH_GROWTH][C05001] 檔案轉換失敗：{path}｜{exc}")
+            log_warning(f"[HIGH_GROWTH][C05001] 檔案materialize失敗：{path}｜{exc}")
             return None
 
-    def _parse_twse_c05001_eps_xlsx(self, xlsx_path: Path, fiscal_year: int | None = None) -> pd.DataFrame:
-        """解析 TWSE C05001 上市公司季報統計 Excel。
+    def _read_twse_c05001_workbook_raw(self, excel_path: Path) -> tuple[pd.DataFrame, str]:
+        """讀取 C05001 Excel 原始矩陣，支援 xls/xlsx 與指定 sheet=2025Q4。
 
-        Q4 檔案的第 14 欄為當年度全年 EPS，第 15 欄為前一年度全年 EPS。
-        注意：本函式只建立年度基準 EPS，不會把 Q4 全年 EPS 誤當 2026Q1。
+        回傳：(raw_dataframe, sheet_name)
+        """
+        p = Path(excel_path)
+        if not p.exists():
+            raise FileNotFoundError(str(p))
+        suffix = p.suffix.lower()
+        engines = []
+        if suffix == ".xls":
+            engines = ["xlrd", None]
+        elif suffix == ".xlsx":
+            engines = ["openpyxl", None]
+        else:
+            engines = [None]
+        last_error = None
+        for engine in engines:
+            try:
+                xl = pd.ExcelFile(p, engine=engine) if engine else pd.ExcelFile(p)
+                sheet_names = list(xl.sheet_names or [])
+                target_sheet = None
+                for s in sheet_names:
+                    if str(s).strip().upper() == "2025Q4":
+                        target_sheet = s; break
+                if target_sheet is None:
+                    for s in sheet_names:
+                        if "Q4" in str(s).upper():
+                            target_sheet = s; break
+                if target_sheet is None:
+                    target_sheet = sheet_names[0] if sheet_names else 0
+                raw = xl.parse(target_sheet, header=None)
+                return raw, str(target_sheet)
+            except Exception as exc:
+                last_error = exc
+                continue
+        # 最後再嘗試 LibreOffice 轉檔（Windows/EXE若可用也能補救）。
+        try:
+            work_dir = RUNTIME_DIR / "data" / "twse_c05001" / "converted"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            target = work_dir / (p.stem + ".xlsx")
+            converted = convert_xls_to_xlsx_force(p, target, log_cb=lambda m: log_info(f"[HIGH_GROWTH][C05001] {m}"))
+            if converted is not None and Path(converted).exists():
+                xl = pd.ExcelFile(converted, engine="openpyxl")
+                sheet_names = list(xl.sheet_names or [])
+                target_sheet = "2025Q4" if "2025Q4" in sheet_names else (sheet_names[0] if sheet_names else 0)
+                return xl.parse(target_sheet, header=None), str(target_sheet)
+        except Exception as exc:
+            last_error = exc
+        raise RuntimeError(f"C05001 Excel讀取失敗：{p}｜{last_error}")
+
+    def _parse_twse_c05001_eps_xlsx(self, xlsx_path: Path, fiscal_year: int | None = None) -> pd.DataFrame:
+        """解析 TWSE C05001 Q4 年度EPS。
+
+        已實測使用者檔案結構：
+        - Sheet = 2025Q4
+        - A欄 = 股票代號
+        - B欄 = 公司名稱
+        - N欄 = 當年度全年 EPS（114年1-12月 / Jan-Dec 2025）
+        - O欄 = 前一年度全年 EPS（113年1-12月 / Jan-Dec 2024）
+
+        函式名稱保留 _xlsx 以維持舊呼叫相容，但新版可讀 .XLS / .XLSX。
         """
         fiscal_year = int(fiscal_year or self.base_year)
         try:
-            raw = pd.read_excel(Path(xlsx_path), sheet_name=0, header=None, engine="openpyxl")
+            raw, sheet_name = self._read_twse_c05001_workbook_raw(Path(xlsx_path))
         except Exception as exc:
             log_warning(f"[HIGH_GROWTH][C05001] Excel讀取失敗：{xlsx_path}｜{exc}")
             return pd.DataFrame()
         if raw is None or raw.empty or raw.shape[1] < 15:
+            log_warning(f"[HIGH_GROWTH][C05001] Excel內容不足：file={xlsx_path} sheet={sheet_name} shape={getattr(raw, 'shape', None)}")
             return pd.DataFrame()
+
         x = raw.copy()
-        code = x.iloc[:, 0].astype(str).str.extract(r"(\d{4})", expand=False).fillna("")
+        # C05001 固定欄位優先；若未來格式微調，可由 header 關鍵字再修正。
+        code_col_idx, name_col_idx, eps_col_idx, prev_eps_col_idx = 0, 1, 13, 14
+        code = x.iloc[:, code_col_idx].astype(str).str.extract(r"(\d{4})", expand=False).fillna("")
         mask = code.str.fullmatch(r"\d{4}")
+        if int(mask.sum()) == 0:
+            log_warning(f"[HIGH_GROWTH][C05001] 找不到4碼股票代號：file={xlsx_path} sheet={sheet_name}")
+            return pd.DataFrame()
+
         out = pd.DataFrame({
             "stock_id": code[mask].map(normalize_stock_id),
-            "stock_name": x.loc[mask, x.columns[1]].astype(str).str.strip(),
+            "stock_name": x.loc[mask, x.columns[name_col_idx]].astype(str).str.strip(),
             "operating_revenue_year": pd.to_numeric(x.loc[mask, x.columns[2]], errors="coerce"),
             "net_income_after_tax_year": pd.to_numeric(x.loc[mask, x.columns[9]], errors="coerce"),
-            "eps_full_year": pd.to_numeric(x.loc[mask, x.columns[13]], errors="coerce"),
-            "eps_prev_year": pd.to_numeric(x.loc[mask, x.columns[14]], errors="coerce"),
+            "eps_full_year": pd.to_numeric(x.loc[mask, x.columns[eps_col_idx]], errors="coerce"),
+            "eps_prev_year": pd.to_numeric(x.loc[mask, x.columns[prev_eps_col_idx]], errors="coerce"),
         })
         out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
         out = out.dropna(subset=["eps_full_year"])
+        if out.empty:
+            log_warning(f"[HIGH_GROWTH][C05001] N欄年度EPS解析後為空：file={xlsx_path} sheet={sheet_name}")
+            return pd.DataFrame()
         out["fiscal_year"] = fiscal_year
         out["source_type"] = "TWSE_C05001_Q4_ANNUAL_EPS"
         out["source_url"] = "https://www.twse.com.tw/en/trading/statistics/index05.html"
         out["source_date"] = f"{fiscal_year}Q4"
         out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         out["source_file"] = str(xlsx_path)
+        out = out.drop_duplicates(subset=["stock_id", "fiscal_year"], keep="last")
+        log_info(f"[HIGH_GROWTH][C05001] parsed file={xlsx_path} sheet={sheet_name} rows={len(out)} sample={out[['stock_id','eps_full_year']].head(3).to_dict('records')}")
+        return out
+
+    def _write_annual_eps_history(self, df: pd.DataFrame, fiscal_year: int, source_label: str = "") -> int:
+        """統一寫入 annual_eps_history，避免各資料源各寫各的造成欄位不一致。"""
+        if df is None or df.empty:
+            return 0
+        write = df.copy()
+        write["stock_id"] = write["stock_id"].map(normalize_stock_id)
+        write["fiscal_year"] = int(fiscal_year)
+        write["eps_full_year"] = pd.to_numeric(write.get("eps_full_year"), errors="coerce")
+        # V4.8：年度EPS直接使用 Q4 累計EPS，不再由四季累計值相加。
+        # eps_cumulative 保留與 eps_full_year 相同的官方累計年度值；eps_quarter 僅供來源若提供Q4單季時追溯，年度判斷不使用。
+        if "eps_cumulative" not in write.columns:
+            write["eps_cumulative"] = write["eps_full_year"]
+        else:
+            write["eps_cumulative"] = pd.to_numeric(write.get("eps_cumulative"), errors="coerce").fillna(write["eps_full_year"])
+        if "eps_quarter" not in write.columns:
+            write["eps_quarter"] = np.nan
+        else:
+            write["eps_quarter"] = pd.to_numeric(write.get("eps_quarter"), errors="coerce")
+        if "eps_prev_cumulative" not in write.columns:
+            write["eps_prev_cumulative"] = np.nan
+        else:
+            write["eps_prev_cumulative"] = pd.to_numeric(write.get("eps_prev_cumulative"), errors="coerce")
+        if "eps_calc_method" not in write.columns:
+            write["eps_calc_method"] = "Q4_CUMULATIVE_AS_ANNUAL_EPS"
+        for c, default in {
+            "source_type": source_label or "OFFICIAL_ANNUAL_EPS",
+            "source_url": "",
+            "source_date": f"{int(fiscal_year)}Q4",
+            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }.items():
+            if c not in write.columns:
+                write[c] = default
+        write = write.dropna(subset=["stock_id", "eps_full_year"])
+        write = write[write["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)]
+        write = write[["stock_id", "fiscal_year", "eps_full_year", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"]].drop_duplicates(["stock_id", "fiscal_year"], keep="last")
+        if write.empty:
+            return 0
+        with self.db.lock:
+            cur = self.db.conn.cursor()
+            cur.executemany("""
+                INSERT INTO annual_eps_history(stock_id, fiscal_year, eps_full_year, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_date, update_time)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                    eps_full_year=excluded.eps_full_year,
+                    eps_cumulative=excluded.eps_cumulative,
+                    eps_quarter=excluded.eps_quarter,
+                    eps_prev_cumulative=excluded.eps_prev_cumulative,
+                    eps_calc_method=excluded.eps_calc_method,
+                    source_type=excluded.source_type,
+                    source_url=excluded.source_url,
+                    source_date=excluded.source_date,
+                    update_time=excluded.update_time
+            """, list(write.itertuples(index=False, name=None)))
+            self.db.conn.commit()
+        return int(len(write))
+
+    def load_twse_openapi_annual_eps(self, fiscal_year: int | None = None, season: int = 4, timeout=(10, 30)) -> pd.DataFrame:
+        """TWSE OpenAPI 六大產業別備援來源：讀取基本每股盈餘（元）。
+
+        注意：OpenAPI 欄位可能為中文或英文；本函式用多欄位別名匹配。
+        """
+        fiscal_year = int(fiscal_year or self.base_year)
+        parts, errors = [], []
+        for industry_api, url in self.TWSE_OPENAPI_EPS_ENDPOINTS.items():
+            try:
+                resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                data = resp.json()
+                df = pd.DataFrame(data)
+                if df is None or df.empty:
+                    continue
+                df["industry_api"] = industry_api
+                parts.append(df)
+            except Exception as exc:
+                errors.append(f"{industry_api}:{exc}")
+                log_warning(f"[HIGH_GROWTH][TWSE_OPENAPI_EPS] fetch failed source={industry_api} url={url}｜{exc}")
+        if not parts:
+            if errors:
+                raise RuntimeError("TWSE OpenAPI EPS all failed: " + " ; ".join(errors))
+            return pd.DataFrame()
+        raw = pd.concat(parts, ignore_index=True).fillna("")
+        def _find_col(candidates):
+            for cand in candidates:
+                if cand in raw.columns:
+                    return cand
+            # 寬鬆比對：去空白與括號差異
+            norm_map = {re.sub(r"[\s（）()]", "", str(c)): c for c in raw.columns}
+            for cand in candidates:
+                key = re.sub(r"[\s（）()]", "", str(cand))
+                if key in norm_map:
+                    return norm_map[key]
+            return None
+        code_col = _find_col(["公司代號", "Code", "CompanyCode", "SecuritiesCompanyCode"])
+        name_col = _find_col(["公司名稱", "Name", "CompanyName", "公司簡稱"])
+        year_col = _find_col(["年度", "Year"])
+        season_col = _find_col(["季別", "Season", "季度"])
+        eps_col = _find_col(["基本每股盈餘（元）", "基本每股盈餘(元)", "基本每股盈餘", "EarningsPerShare"])
+        missing = [n for n, c in [("stock_id", code_col), ("year", year_col), ("season", season_col), ("eps", eps_col)] if c is None]
+        if missing:
+            raise RuntimeError(f"TWSE OpenAPI EPS欄位不足 missing={missing} actual_cols={list(raw.columns)[:40]}")
+        out = pd.DataFrame({
+            "stock_id": raw[code_col].astype(str).str.extract(r"(\d{4})", expand=False).fillna("").map(normalize_stock_id),
+            "stock_name": raw[name_col].astype(str).str.strip() if name_col in raw.columns else "",
+            "year_raw": raw[year_col],
+            "season_raw": raw[season_col],
+            "eps_full_year": raw[eps_col].map(self._to_numeric_eps),
+            "industry_api": raw.get("industry_api", ""),
+        })
+        year_num = pd.to_numeric(out["year_raw"].astype(str).str.extract(r"(\d{2,4})", expand=False), errors="coerce")
+        # OpenAPI 可能回傳民國年或西元年，統一為西元年。
+        out["fiscal_year"] = np.where(year_num < 1000, year_num + 1911, year_num)
+        out["season"] = pd.to_numeric(out["season_raw"].astype(str).str.extract(r"([1-4])", expand=False), errors="coerce")
+        out = out[(out["fiscal_year"].astype("Int64") == fiscal_year) & (out["season"].astype("Int64") == int(season))].copy()
+        out = out.dropna(subset=["stock_id", "eps_full_year"])
+        out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
+        out["source_type"] = "TWSE_OPENAPI_T187AP06_ANNUAL_EPS"
+        out["source_url"] = " | ".join(self.TWSE_OPENAPI_EPS_ENDPOINTS.values())
+        out["source_date"] = f"{fiscal_year}Q{int(season)}"
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return out.drop_duplicates(subset=["stock_id", "fiscal_year"], keep="last")
+
+    def ensure_annual_eps_from_twse_openapi(self, fiscal_year: int | None = None, force: bool = False) -> dict:
+        fiscal_year = int(fiscal_year or self.base_year)
+        result = {"status": "skip", "rows": 0, "source": "TWSE_OPENAPI_T187AP06", "message": ""}
+        try:
+            with self.db.lock:
+                row = self.db.conn.cursor().execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,)).fetchone()
+                existing = int(row[0] or 0) if row else 0
+            if existing > 0 and not force:
+                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                return result
+            df = self.load_twse_openapi_annual_eps(fiscal_year, season=4)
+            rows = self._write_annual_eps_history(df, fiscal_year, source_label="TWSE_OPENAPI_T187AP06_ANNUAL_EPS")
+            if rows > 0:
+                result.update({"status": "imported", "rows": rows, "message": "已由TWSE OpenAPI補入全年EPS"})
+            else:
+                result.update({"status": "no_data", "rows": 0, "message": "TWSE OpenAPI無可寫入年度EPS"})
+            log_info(f"[HIGH_GROWTH][TWSE_OPENAPI_EPS] annual_eps_history result={result}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][TWSE_OPENAPI_EPS] 補入annual_eps_history失敗：{exc}")
+            return result
 
     def _download_twse_c05001_from_index(self, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
         """V4.4：嘗試從 TWSE index05 頁面/靜態路徑下載 C05001 ZIP。"""
@@ -4512,7 +4806,7 @@ class EPSForecastEngine:
         return None
 
     def ensure_annual_eps_from_twse_c05001(self, fiscal_year: int | None = None, force: bool = False) -> dict:
-        """若 annual_eps_history 缺 2025 全年 EPS，嘗試由 TWSE C05001 Q4 Excel/ZIP 補入。"""
+        """主流程：由本地 TWSE C05001 Q4 Excel/ZIP 補入年度EPS。"""
         fiscal_year = int(fiscal_year or self.base_year)
         result = {"status": "skip", "rows": 0, "source_file": "", "message": ""}
         try:
@@ -4523,6 +4817,7 @@ class EPSForecastEngine:
             if existing > 0 and not force:
                 result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
                 return result
+
             candidates = self._twse_c05001_candidate_paths(fiscal_year, "Q4")
             if not candidates:
                 online_file = self._download_twse_c05001_from_index(fiscal_year, "Q4")
@@ -4532,31 +4827,25 @@ class EPSForecastEngine:
                 result.update({"status": "missing_file", "message": f"找不到 {fiscal_year}Q4_C05001 zip/xls/xlsx，且TWSE線上下載未成功"})
                 log_warning(f"[HIGH_GROWTH][C05001] annual_eps import missing_file fiscal_year={fiscal_year}")
                 return result
+
+            errors = []
             for cand in candidates:
-                xlsx = self._materialize_twse_c05001_file(cand, fiscal_year, "Q4")
-                if xlsx is None:
+                xls_path = self._materialize_twse_c05001_file(cand, fiscal_year, "Q4")
+                if xls_path is None:
+                    errors.append(f"materialize_failed:{cand}")
                     continue
-                parsed = self._parse_twse_c05001_eps_xlsx(xlsx, fiscal_year)
+                parsed = self._parse_twse_c05001_eps_xlsx(xls_path, fiscal_year)
                 if parsed is None or parsed.empty:
+                    errors.append(f"parse_empty:{xls_path}")
                     continue
-                write = parsed[["stock_id", "fiscal_year", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].copy()
-                with self.db.lock:
-                    cur = self.db.conn.cursor()
-                    cur.executemany("""
-                        INSERT INTO annual_eps_history(stock_id, fiscal_year, eps_full_year, source_type, source_url, source_date, update_time)
-                        VALUES(?,?,?,?,?,?,?)
-                        ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
-                            eps_full_year=excluded.eps_full_year,
-                            source_type=excluded.source_type,
-                            source_url=excluded.source_url,
-                            source_date=excluded.source_date,
-                            update_time=excluded.update_time
-                    """, list(write.itertuples(index=False, name=None)))
-                    self.db.conn.commit()
-                result.update({"status": "imported", "rows": int(len(write)), "source_file": str(xlsx), "message": "已由TWSE C05001 Q4補入2025全年EPS"})
-                log_info(f"[HIGH_GROWTH][C05001] annual_eps_history imported rows={len(write)} file={xlsx}")
-                return result
-            result.update({"status": "parse_failed", "message": f"找到檔案但無法解析：{', '.join(str(p) for p in candidates[:3])}"})
+                rows = self._write_annual_eps_history(parsed, fiscal_year, source_label="TWSE_C05001_Q4_ANNUAL_EPS")
+                if rows > 0:
+                    result.update({"status": "imported", "rows": rows, "source_file": str(xls_path), "message": "已由TWSE C05001 Q4補入2025全年EPS"})
+                    log_info(f"[HIGH_GROWTH][C05001] annual_eps_history imported rows={rows} file={xls_path}")
+                    return result
+                errors.append(f"write_zero:{xls_path}")
+            result.update({"status": "parse_failed", "message": f"找到檔案但無法解析/寫入：{'; '.join(errors[:5])}"})
+            log_warning(f"[HIGH_GROWTH][C05001] annual_eps import failed candidates={len(candidates)} errors={errors[:5]}")
             return result
         except Exception as exc:
             result.update({"status": "error", "message": str(exc)})
@@ -4569,31 +4858,34 @@ class EPSForecastEngine:
         注意：EPS_TTM 不在此函式使用，避免把 TTM 誤當年度 EPS。
         V4.3：若 DB 尚未有 annual_eps_history，會先嘗試使用本機 TWSE C05001 2025Q4 Excel/ZIP 補入。
         """
-        # V4.5：正式年度EPS優先由 MOPS ajax_t163sb04 Q4 累積EPS補入；TWSE C05001 只作備援。
-        mops_result = self.ensure_annual_eps_from_mops(self.base_year, force=False)
-        if str(mops_result.get("status", "")).lower() not in ("exists", "imported"):
-            self.ensure_annual_eps_from_twse_c05001(self.base_year, force=False)
+        # V4.7：年度EPS來源順序改為「本地 TWSE C05001 Q4」主流程，OpenAPI備援，MOPS最後備援。
+        c05001_result = self.ensure_annual_eps_from_twse_c05001(self.base_year, force=False)
+        if str(c05001_result.get("status", "")).lower() not in ("exists", "imported"):
+            openapi_result = self.ensure_annual_eps_from_twse_openapi(self.base_year, force=False)
+            if str(openapi_result.get("status", "")).lower() not in ("exists", "imported"):
+                self.ensure_annual_eps_from_mops(self.base_year, force=False)
         parts = []
         if self._table_exists("annual_eps_history"):
             df = self._read_sql(
-                "SELECT stock_id, eps_full_year AS base_annual_eps, 'annual_eps_history' AS base_eps_source, source_date "
+                "SELECT stock_id, eps_full_year AS base_annual_eps, COALESCE(source_type,'annual_eps_history') AS base_eps_source, source_date "
                 "FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
                 [self.base_year],
             )
             parts.append(df)
         if self._table_exists("quarterly_financial_history"):
-            qdf = self._read_sql("SELECT stock_id, fiscal_year, quarter, eps, source_date FROM quarterly_financial_history WHERE eps IS NOT NULL")
+            qdf = self._read_sql("SELECT stock_id, fiscal_year, quarter, eps, eps_quarter, eps_cumulative, source_date FROM quarterly_financial_history WHERE COALESCE(eps_quarter, eps) IS NOT NULL")
             if qdf is not None and not qdf.empty:
                 fy = pd.to_numeric(qdf.get("fiscal_year"), errors="coerce")
                 q = pd.to_numeric(qdf.get("quarter"), errors="coerce")
                 mask = ((fy == self.base_year) | (fy == self.base_year - 1911)) & q.isin([1, 2, 3, 4])
                 qdf = qdf.loc[mask].copy()
                 if not qdf.empty:
-                    cnt = qdf.groupby("stock_id")["eps"].count().reset_index(name="quarter_count")
-                    s = qdf.groupby("stock_id", as_index=False)["eps"].sum().rename(columns={"eps": "base_annual_eps"})
+                    qdf["eps_quarter_used"] = pd.to_numeric(qdf.get("eps_quarter"), errors="coerce").fillna(pd.to_numeric(qdf.get("eps"), errors="coerce"))
+                    cnt = qdf.groupby("stock_id")["eps_quarter_used"].count().reset_index(name="quarter_count")
+                    s = qdf.groupby("stock_id", as_index=False)["eps_quarter_used"].sum().rename(columns={"eps_quarter_used": "base_annual_eps"})
                     s = s.merge(cnt, on="stock_id", how="left")
                     s = s[s["quarter_count"].ge(4)].copy()
-                    s["base_eps_source"] = "quarterly_financial_history_sum4"
+                    s["base_eps_source"] = "quarterly_financial_history_sum4_eps_quarter"
                     s["source_date"] = ""
                     parts.append(s[["stock_id", "base_annual_eps", "base_eps_source", "source_date"]])
         parts = [p for p in parts if p is not None and not p.empty]
@@ -4604,7 +4896,7 @@ class EPSForecastEngine:
         x["base_annual_eps"] = pd.to_numeric(x["base_annual_eps"], errors="coerce")
         x = x.dropna(subset=["stock_id", "base_annual_eps"])
         x["base_eps_quality"] = "STRICT"
-        x["_priority"] = x["base_eps_source"].map({"annual_eps_history": 1, "quarterly_financial_history_sum4": 2}).fillna(9)
+        x["_priority"] = x["base_eps_source"].map({"annual_eps_history": 1, "TWSE_C05001_Q4_ANNUAL_EPS": 1, "TWSE_OPENAPI_T187AP06_ANNUAL_EPS": 1, "MOPS_T163SB04_Q4_ANNUAL_EPS": 1, "quarterly_financial_history_sum4_eps_quarter": 2, "quarterly_financial_history_sum4": 2}).fillna(9)
         return x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first").drop(columns=["_priority"], errors="ignore")
 
     def load_actual_eps_by_quarter(self, quarters=None) -> pd.DataFrame:
@@ -4612,7 +4904,7 @@ class EPSForecastEngine:
         q_numbers = [int(q[-1]) for q in quarters]
         if not self._table_exists("quarterly_financial_history"):
             return pd.DataFrame(columns=["stock_id"])
-        df = self._read_sql("SELECT stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, source_date FROM quarterly_financial_history WHERE eps IS NOT NULL")
+        df = self._read_sql("SELECT stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_date FROM quarterly_financial_history WHERE COALESCE(eps_quarter, eps) IS NOT NULL")
         if df is None or df.empty:
             return pd.DataFrame(columns=["stock_id"])
         df = df.copy()
@@ -4631,8 +4923,11 @@ class EPSForecastEngine:
         qn2 = pd.to_numeric(df.get("quarter"), errors="coerce")
         token1_2 = df.get("western_quarter", "").map(self.normalize_quarter_token) if "western_quarter" in df.columns else pd.Series("", index=df.index)
         df["quarter_norm"] = np.where(qn2.notna(), "Q" + qn2.astype("Int64").astype(str), token1_2.str[-2:])
-        df["eps"] = pd.to_numeric(df["eps"], errors="coerce")
-        pivot = df.pivot_table(index="stock_id", columns="quarter_norm", values="eps", aggfunc="last").reset_index()
+        # V4.8：季度實績一律使用 eps_quarter；若舊DB尚未補欄，才回退 eps。
+        df["eps_quarter"] = pd.to_numeric(df.get("eps_quarter"), errors="coerce")
+        df["eps"] = pd.to_numeric(df.get("eps"), errors="coerce")
+        df["eps_used_quarter"] = df["eps_quarter"].fillna(df["eps"])
+        pivot = df.pivot_table(index="stock_id", columns="quarter_norm", values="eps_used_quarter", aggfunc="last").reset_index()
         for q in quarters:
             if q not in pivot.columns:
                 pivot[q] = np.nan
@@ -4717,7 +5012,7 @@ class EPSForecastEngine:
         base = master[["stock_id"]].drop_duplicates().copy() if master is not None and not master.empty else pd.DataFrame(columns=["stock_id"])
         if base.empty:
             return base
-        # V4.5：進入EPS特徵前，先確保 MOPS 正式EPS資料已匯入DB。
+        # V4.7：進入EPS特徵前，先確保年度EPS以「C05001本地檔優先、OpenAPI備援」匯入DB；季度EPS仍可用MOPS嘗試補齊。
         self.ensure_required_official_eps_from_mops(quarters, force=False)
         base_eps = self.load_base_annual_eps()
         actual = self.load_actual_eps_by_quarter(quarters)
