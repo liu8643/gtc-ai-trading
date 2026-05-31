@@ -4029,6 +4029,28 @@ class EPSForecastEngine:
             return np.nan
         return -float(v) if neg else float(v)
 
+    def _log_c05001_excel_runtime_status(self):
+        """V4.9：啟動C05001匯入前檢查 Excel 讀取依賴。
+
+        目的：
+        1. 明確顯示 EXE 是否內建 xlrd/openpyxl。
+        2. 若 converted 資料夾為空，可從 Log 立即判斷是「轉檔失敗」還是「缺 xlrd」。
+        3. 不再靜默退回 EPS_TTM_PROXY_ONLY。
+        """
+        try:
+            has_xlrd = importlib.util.find_spec("xlrd") is not None
+        except Exception:
+            has_xlrd = False
+        try:
+            has_openpyxl = importlib.util.find_spec("openpyxl") is not None
+        except Exception:
+            has_openpyxl = False
+        try:
+            log_info(f"[HIGH_GROWTH][C05001][RUNTIME] xlrd={has_xlrd} openpyxl={has_openpyxl} runtime={RUNTIME_DIR}")
+        except Exception:
+            pass
+        return {"xlrd": bool(has_xlrd), "openpyxl": bool(has_openpyxl)}
+
     def _mops_eps_cache_dir(self, fiscal_year: int, season: int) -> Path:
         """MOPS EPS raw HTML/debug cache folder.
 
@@ -4455,25 +4477,22 @@ class EPSForecastEngine:
     def _materialize_twse_c05001_file(self, path: Path, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
         """把 TWSE C05001 zip/xls/xlsx materialize 到可讀路徑。
 
-        V4.7修正：
-        - 舊版遇到 .XLS 只嘗試轉成 xlsx；若 packaged EXE 未帶 pywin32 / LibreOffice / xlrd，
-          會直接回傳 None，導致 annual_eps_history 無資料。
-        - 新版即使轉換失敗，也會回傳原始 .XLS，交給 _parse_twse_c05001_eps_xlsx 以多引擎讀取。
+        V4.9 XLS_DIRECT_READ_FIX：
+        - TWSE index05 下載的是 zip，zip 內才是 2025Q4.XLS，這是正常官方格式。
+        - 舊版在 materialize 階段先嘗試把 .XLS 轉成 .XLSX；若 LibreOffice/Excel COM 不可用，
+          converted 資料夾會是空的，使用者容易誤判為未解壓。
+        - 新版 materialize 只負責「ZIP 解壓 / 路徑落地」，遇到 .XLS 直接回傳原始檔，
+          讓 _read_twse_c05001_workbook_raw() 優先以 xlrd 直接讀；轉檔只保留為最後備援。
         """
         try:
             p = Path(path)
             if not p.exists() or not p.is_file():
+                log_warning(f"[HIGH_GROWTH][C05001] materialize path missing: {p}")
                 return None
+
             suffix = p.suffix.lower()
             if suffix in (".xlsx", ".xls"):
-                if suffix == ".xls":
-                    work_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{int(fiscal_year or self.base_year)}{str(quarter or 'Q4').upper()}"
-                    work_dir.mkdir(parents=True, exist_ok=True)
-                    target_xlsx = work_dir / (p.stem + ".xlsx")
-                    converted = convert_xls_to_xlsx_force(p, target_xlsx, log_cb=lambda m: log_info(f"[HIGH_GROWTH][C05001] {m}"))
-                    if converted is not None and Path(converted).exists() and Path(converted).stat().st_size > 0:
-                        return Path(converted)
-                    log_warning(f"[HIGH_GROWTH][C05001] xls轉xlsx未成功，改以原始XLS解析：{p}")
+                log_info(f"[HIGH_GROWTH][C05001] materialized excel file={p} suffix={suffix}")
                 return p
 
             work_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{int(fiscal_year or self.base_year)}{str(quarter or 'Q4').upper()}"
@@ -4482,13 +4501,26 @@ class EPSForecastEngine:
                 with zipfile.ZipFile(p, "r") as zf:
                     names = [n for n in zf.namelist() if n.lower().endswith((".xls", ".xlsx"))]
                     if not names:
+                        log_warning(f"[HIGH_GROWTH][C05001] zip內找不到xls/xlsx：{p} names={zf.namelist()[:10]}")
                         return None
-                    names = sorted(names, key=lambda n: ("c05001" not in n.lower(), str(fiscal_year or self.base_year) not in n, n.lower()))
+                    names = sorted(
+                        names,
+                        key=lambda n: (
+                            str(fiscal_year or self.base_year) not in n,
+                            str(quarter or 'Q4').upper().lower() not in n.lower(),
+                            "c05001" not in n.lower(),
+                            n.lower(),
+                        ),
+                    )
                     name = names[0]
                     target = work_dir / Path(name).name
-                    if not target.exists() or target.stat().st_size == 0:
-                        target.write_bytes(zf.read(name))
+                    data = zf.read(name)
+                    if not target.exists() or target.stat().st_size != len(data):
+                        target.write_bytes(data)
+                    log_info(f"[HIGH_GROWTH][C05001] zip extracted zip={p} member={name} target={target} bytes={len(data)}")
                     return self._materialize_twse_c05001_file(target, fiscal_year=fiscal_year, quarter=quarter)
+
+            log_warning(f"[HIGH_GROWTH][C05001] unsupported materialize suffix={suffix} file={p}")
             return None
         except Exception as exc:
             log_warning(f"[HIGH_GROWTH][C05001] 檔案materialize失敗：{path}｜{exc}")
@@ -4497,53 +4529,80 @@ class EPSForecastEngine:
     def _read_twse_c05001_workbook_raw(self, excel_path: Path) -> tuple[pd.DataFrame, str]:
         """讀取 C05001 Excel 原始矩陣，支援 xls/xlsx 與指定 sheet=2025Q4。
 
-        回傳：(raw_dataframe, sheet_name)
+        V4.9：
+        - .XLS 優先使用 xlrd 直接讀取，這才是 TWSE ZIP 內官方檔案的主流程。
+        - .XLSX 使用 openpyxl。
+        - 若 .XLS 缺 xlrd 或讀取失敗，才嘗試轉檔到 data/twse_c05001/converted。
+        - 每個引擎與轉檔結果都寫入 Log，避免 converted 空白時無法判斷真因。
         """
         p = Path(excel_path)
         if not p.exists():
             raise FileNotFoundError(str(p))
+
         suffix = p.suffix.lower()
-        engines = []
+        dep = self._log_c05001_excel_runtime_status()
+        engines: list[str | None] = []
         if suffix == ".xls":
-            engines = ["xlrd", None]
+            if dep.get("xlrd"):
+                engines.append("xlrd")
+            else:
+                log_warning(f"[HIGH_GROWTH][C05001] .XLS direct read skipped: xlrd not installed file={p}")
+            engines.append(None)
         elif suffix == ".xlsx":
-            engines = ["openpyxl", None]
+            if dep.get("openpyxl"):
+                engines.append("openpyxl")
+            engines.append(None)
         else:
-            engines = [None]
+            engines.append(None)
+
         last_error = None
         for engine in engines:
             try:
+                log_info(f"[HIGH_GROWTH][C05001] try read excel file={p} engine={engine or 'auto'} suffix={suffix}")
                 xl = pd.ExcelFile(p, engine=engine) if engine else pd.ExcelFile(p)
                 sheet_names = list(xl.sheet_names or [])
                 target_sheet = None
-                for s in sheet_names:
-                    if str(s).strip().upper() == "2025Q4":
-                        target_sheet = s; break
+                for sname in sheet_names:
+                    if str(sname).strip().upper() == "2025Q4":
+                        target_sheet = sname
+                        break
                 if target_sheet is None:
-                    for s in sheet_names:
-                        if "Q4" in str(s).upper():
-                            target_sheet = s; break
+                    for sname in sheet_names:
+                        if "Q4" in str(sname).upper():
+                            target_sheet = sname
+                            break
                 if target_sheet is None:
                     target_sheet = sheet_names[0] if sheet_names else 0
                 raw = xl.parse(target_sheet, header=None)
+                log_info(f"[HIGH_GROWTH][C05001] read excel success file={p} engine={engine or 'auto'} sheet={target_sheet} shape={getattr(raw, 'shape', None)}")
                 return raw, str(target_sheet)
             except Exception as exc:
                 last_error = exc
+                log_warning(f"[HIGH_GROWTH][C05001] read excel failed file={p} engine={engine or 'auto'} error={exc}")
                 continue
-        # 最後再嘗試 LibreOffice 轉檔（Windows/EXE若可用也能補救）。
-        try:
-            work_dir = RUNTIME_DIR / "data" / "twse_c05001" / "converted"
-            work_dir.mkdir(parents=True, exist_ok=True)
-            target = work_dir / (p.stem + ".xlsx")
-            converted = convert_xls_to_xlsx_force(p, target, log_cb=lambda m: log_info(f"[HIGH_GROWTH][C05001] {m}"))
-            if converted is not None and Path(converted).exists():
-                xl = pd.ExcelFile(converted, engine="openpyxl")
-                sheet_names = list(xl.sheet_names or [])
-                target_sheet = "2025Q4" if "2025Q4" in sheet_names else (sheet_names[0] if sheet_names else 0)
-                return xl.parse(target_sheet, header=None), str(target_sheet)
-        except Exception as exc:
-            last_error = exc
-        raise RuntimeError(f"C05001 Excel讀取失敗：{p}｜{last_error}")
+
+        # 最後才嘗試 LibreOffice / Excel COM / xlrd-to-xlsx 轉檔；成功才會產出 converted 檔案。
+        if suffix == ".xls":
+            try:
+                work_dir = RUNTIME_DIR / "data" / "twse_c05001" / "converted"
+                work_dir.mkdir(parents=True, exist_ok=True)
+                target = work_dir / (p.stem + ".xlsx")
+                log_info(f"[HIGH_GROWTH][C05001] try convert xls to xlsx file={p} target={target}")
+                converted = convert_xls_to_xlsx_force(p, target, log_cb=lambda m: log_info(f"[HIGH_GROWTH][C05001] {m}"))
+                if converted is not None and Path(converted).exists() and Path(converted).stat().st_size > 0:
+                    log_info(f"[HIGH_GROWTH][C05001] convert success converted={converted} bytes={Path(converted).stat().st_size}")
+                    xl = pd.ExcelFile(converted, engine="openpyxl")
+                    sheet_names = list(xl.sheet_names or [])
+                    target_sheet = "2025Q4" if "2025Q4" in sheet_names else (sheet_names[0] if sheet_names else 0)
+                    raw = xl.parse(target_sheet, header=None)
+                    log_info(f"[HIGH_GROWTH][C05001] read converted success file={converted} sheet={target_sheet} shape={getattr(raw, 'shape', None)}")
+                    return raw, str(target_sheet)
+                log_warning(f"[HIGH_GROWTH][C05001] convert failed or empty converted target={target}")
+            except Exception as exc:
+                last_error = exc
+                log_warning(f"[HIGH_GROWTH][C05001] convert/read converted failed file={p} error={exc}")
+
+        raise RuntimeError(f"C05001 Excel讀取失敗：{p}｜{last_error}｜請確認 requirements.txt 已安裝 xlrd==2.0.1，GitHub Actions PyInstaller 已加入 --hidden-import xlrd")
 
     def _parse_twse_c05001_eps_xlsx(self, xlsx_path: Path, fiscal_year: int | None = None) -> pd.DataFrame:
         """解析 TWSE C05001 Q4 年度EPS。
@@ -4808,6 +4867,7 @@ class EPSForecastEngine:
     def ensure_annual_eps_from_twse_c05001(self, fiscal_year: int | None = None, force: bool = False) -> dict:
         """主流程：由本地 TWSE C05001 Q4 Excel/ZIP 補入年度EPS。"""
         fiscal_year = int(fiscal_year or self.base_year)
+        self._log_c05001_excel_runtime_status()
         result = {"status": "skip", "rows": 0, "source_file": "", "message": ""}
         try:
             with self.db.lock:
