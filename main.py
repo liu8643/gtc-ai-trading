@@ -3716,7 +3716,10 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_6_MOPS_HTML_DEBUG_VALIDATION_FIX_20260531"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_11_Q1_RATIO_OUTPUT_AUDIT_FIX_20260601"
+# V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
+# 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
+HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -5355,16 +5358,39 @@ class EPSForecastEngine:
         x["selected_actual_eps_cumulative"] = x["actual_eps_cumulative"]
 
         denom = x["base_annual_eps"].replace(0, np.nan)
-        x["q1_vs_annual_ratio"] = np.where(
+        # V4.11：分離「原始倍率」與「可作策略判斷倍率」。
+        # 原始倍率用於稽核；策略倍率要求：2025全年EPS為正、絕對值 >= 1，且2026Q1實際EPS為正。
+        # 目的：避免 base_annual_eps 接近 0 或為負數時產生不合理超大倍率，污染排序與Gate。
+        x["q1_vs_annual_ratio_raw"] = np.where(
             x["base_annual_eps"].notna() & x["base_annual_eps"].ne(0),
             x["actual_q1_eps"] / denom,
             np.nan,
         )
-        x["selected_actual_vs_annual_ratio"] = np.where(
+        x["q1_ratio_quality"] = np.select(
+            [
+                x["actual_q1_eps"].isna(),
+                x["base_annual_eps"].isna(),
+                x["base_annual_eps"].le(0),
+                x["base_annual_eps"].abs().lt(HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO),
+                x["actual_q1_eps"].le(0),
+            ],
+            [
+                "Q1_EPS_MISSING",
+                "BASE_ANNUAL_EPS_MISSING",
+                "BASE_ANNUAL_EPS_NON_POSITIVE",
+                "BASE_ANNUAL_EPS_TOO_SMALL",
+                "Q1_EPS_NON_POSITIVE",
+            ],
+            default="OK",
+        )
+        ratio_gate_basis_ok = x["q1_ratio_quality"].eq("OK")
+        x["q1_vs_annual_ratio"] = np.where(ratio_gate_basis_ok, x["q1_vs_annual_ratio_raw"], np.nan)
+        x["selected_actual_vs_annual_ratio_raw"] = np.where(
             x["base_annual_eps"].notna() & x["base_annual_eps"].ne(0),
             x["selected_actual_eps_cumulative"] / denom,
             np.nan,
         )
+        x["selected_actual_vs_annual_ratio"] = np.where(ratio_gate_basis_ok, x["selected_actual_vs_annual_ratio_raw"], np.nan)
         x["forecast_vs_annual_ratio"] = np.where(
             x["base_annual_eps"].notna() & x["base_annual_eps"].ne(0),
             x["forecast_eps_cumulative"] / denom,
@@ -5405,8 +5431,8 @@ class EPSForecastEngine:
         )
         # 新 eps_ratio 定義：正式實際所選季度EPS / 2025全年EPS；Q1時即為 actual_q1_eps/base_annual_eps。
         x["eps_ratio"] = x["selected_actual_vs_annual_ratio"]
-        x["eps_ratio_definition"] = "selected_actual_eps_cumulative/base_annual_eps"
-        x["eps_gate"] = x["eps_ratio"].gt(1.0)
+        x["eps_ratio_definition"] = "selected_actual_eps_cumulative/base_annual_eps；V4.11 gate basis: base_annual_eps>0, abs(base_annual_eps)>=HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO, actual_q1_eps>0"
+        x["eps_gate"] = x["q1_ratio_quality"].eq("OK") & x["eps_ratio"].gt(1.0)
         x["forecast_eps_gate"] = x["forecast_vs_annual_ratio"].gt(1.0)
         x["ttm_vs_annual_gate"] = x["ttm_vs_annual_ratio"].gt(1.0)
         x["eps_ttm_proxy_gate"] = ttm_available
@@ -5576,13 +5602,13 @@ class HighGrowthEPSEngine:
         x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
         months = self.revenue_engine.required_months(self.tracking_quarters)
-        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "selected_actual_vs_annual_ratio", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
+        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
         for m in months:
             order_cols += [f"rev_{m}", f"yoy_{m}"]
         order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_partial_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "strict_pass", "forecast_candidate", "ttm_proxy_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
         for c in order_cols:
             if c not in x.columns:
-                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "selected_actual_vs_annual_ratio", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "avg_revenue_yoy_used") else ""
+                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "avg_revenue_yoy_used") else ""
         x = x[order_cols].copy()
         x = x.sort_values(["strict_pass", "forecast_candidate", "eps_ratio", "avg_revenue_yoy", "trend_score"], ascending=[False, False, False, False, False], na_position="last")
         return x, self.inspect_db_assets(), rev_raw, eps_features
@@ -5603,6 +5629,11 @@ class HighGrowthEPSEngine:
         forecast_count = int(len(forecast_only_df))
         ttm_count = int(len(ttm_only_df))
         fail_count = int(len(fail_df))
+        # V4.11 報表診斷：避免只看空的候選分頁時，誤判 actual_q1_eps / q1_vs_annual_ratio 全空。
+        actual_q1_nonnull = int(pd.to_numeric(df.get("actual_q1_eps"), errors="coerce").notna().sum()) if df is not None and not df.empty and "actual_q1_eps" in df.columns else 0
+        q1_ratio_valid = int(pd.to_numeric(df.get("q1_vs_annual_ratio"), errors="coerce").notna().sum()) if df is not None and not df.empty and "q1_vs_annual_ratio" in df.columns else 0
+        q1_ratio_raw_nonnull = int(pd.to_numeric(df.get("q1_vs_annual_ratio_raw"), errors="coerce").notna().sum()) if df is not None and not df.empty and "q1_vs_annual_ratio_raw" in df.columns else 0
+        q1_quality_counts = df.get("q1_ratio_quality", pd.Series(dtype=str)).astype(str).value_counts().to_dict() if df is not None and not df.empty and "q1_ratio_quality" in df.columns else {}
         annual_eps_rows = 0
         try:
             if self.eps_engine._table_exists("annual_eps_history"):
@@ -5623,6 +5654,10 @@ class HighGrowthEPSEngine:
             {"項目": "預測候選筆數", "內容": forecast_count},
             {"項目": "EPS_TTM追蹤候選筆數", "內容": ttm_count},
             {"項目": "未通過/資料不足筆數", "內容": fail_count},
+            {"項目": "actual_q1_eps非空筆數", "內容": actual_q1_nonnull},
+            {"項目": "q1_vs_annual_ratio有效筆數", "內容": q1_ratio_valid},
+            {"項目": "q1_vs_annual_ratio_raw非空筆數", "內容": q1_ratio_raw_nonnull},
+            {"項目": "q1_ratio_quality分布", "內容": json.dumps(q1_quality_counts, ensure_ascii=False)},
             {"項目": "annual_eps_history_2025筆數", "內容": annual_eps_rows},
             {"項目": "輸出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
             {"項目": "規則版本", "內容": HIGH_GROWTH_RULE_VERSION},
