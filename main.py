@@ -3987,6 +3987,218 @@ class EPSForecastEngine:
         "異業": "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_mim",
     }
 
+    # V4.10 TWSE_TPEX_OPENAPI_QUARTERLY_EPS_FIX：季度 EPS 正式改用 TWSE/TPEx OpenAPI。
+    # 原則：OpenAPI 為最新快照型資料，必須以回傳欄位「年度/季別」驗證，不可假設永遠是 115Q1。
+    TPEX_OPENAPI_EPS_ENDPOINTS = {
+        "一般業": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_ciA",
+        "金融業": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_basiA",
+        "證券期貨業": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_bdA",
+        "金控業": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_fhA",
+        "保險業": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_insA",
+        "異業": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_mimA",
+    }
+
+
+
+    @staticmethod
+    def _pick_first_existing_key(row: dict, candidates: list[str]) -> str | None:
+        keys = set(row.keys()) if isinstance(row, dict) else set()
+        for key in candidates:
+            if key in keys:
+                return key
+        compact = {re.sub(r"\s+", "", str(k)): k for k in keys}
+        for key in candidates:
+            hit = compact.get(re.sub(r"\s+", "", str(key)))
+            if hit is not None:
+                return hit
+        return None
+
+    def _openapi_eps_cache_dir(self, fiscal_year: int, season: int) -> Path:
+        cache_dir = RUNTIME_DIR / "data" / "official_eps_openapi" / f"{int(fiscal_year)}Q{int(season)}"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _save_openapi_eps_raw_json(self, payload, fiscal_year: int, season: int, market: str, source_key: str, request_url: str, http_status="") -> Path:
+        cache_dir = self._openapi_eps_cache_dir(fiscal_year, season)
+        safe_market = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fff-]", "_", str(market or "market"))
+        safe_key = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fff-]", "_", str(source_key or "source"))
+        json_file = cache_dir / f"openapi_eps_{int(fiscal_year)}Q{int(season)}_{safe_market}_{safe_key}.json"
+        meta_file = cache_dir / f"openapi_eps_{int(fiscal_year)}Q{int(season)}_{safe_market}_{safe_key}.meta.json"
+        try:
+            json_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            meta = {
+                "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "request_url": request_url,
+                "http_status": str(http_status or ""),
+                "fiscal_year": int(fiscal_year),
+                "roc_year": int(self._western_to_roc_year(int(fiscal_year))),
+                "season": int(season),
+                "market": str(market or ""),
+                "source_key": str(source_key or ""),
+                "json_file": str(json_file),
+                "record_count": len(payload) if isinstance(payload, list) else None,
+                "validation_rule": "年度/財報年度 must match ROC year and 季別/財報季別 must match quarter before DB upsert",
+            }
+            meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][OPENAPI_EPS][DEBUG] raw json save failed file={json_file}｜{exc}")
+        return json_file
+
+    def _normalize_openapi_payload_to_records(self, payload) -> list[dict]:
+        if isinstance(payload, list):
+            return [x for x in payload if isinstance(x, dict)]
+        if isinstance(payload, dict):
+            for key in ("data", "records", "items", "aaData"):
+                data = payload.get(key)
+                if isinstance(data, list):
+                    if data and isinstance(data[0], dict):
+                        return [x for x in data if isinstance(x, dict)]
+                    return []
+        return []
+
+    def parse_openapi_eps_records(self, payload, fiscal_year: int, season, market: str, source_key: str, source_url: str) -> pd.DataFrame:
+        """Parse TWSE/TPEx t187ap06 OpenAPI records into quarterly_financial_history-ready rows."""
+        fiscal_year = int(fiscal_year)
+        q = self._season_to_int(season)
+        roc_year = str(self._western_to_roc_year(fiscal_year))
+        records = self._normalize_openapi_payload_to_records(payload)
+        if not records:
+            return pd.DataFrame()
+        sample = records[0]
+        code_col = self._pick_first_existing_key(sample, ["公司代號", "公司代碼", "股票代號", "證券代號"])
+        name_col = self._pick_first_existing_key(sample, ["公司名稱", "公司簡稱", "證券名稱", "股票名稱"])
+        year_col = self._pick_first_existing_key(sample, ["年度", "財報年度", "會計年度"])
+        quarter_col = self._pick_first_existing_key(sample, ["季別", "財報季別", "季度"])
+        eps_col = self._pick_first_existing_key(sample, ["基本每股盈餘（元）", "基本每股盈餘(元)", "基本每股盈餘", "基本每股盈餘（元） "])
+        required = {"code_col": code_col, "year_col": year_col, "quarter_col": quarter_col, "eps_col": eps_col}
+        if any(v is None for v in required.values()):
+            log_warning(f"[HIGH_GROWTH][OPENAPI_EPS] required columns missing source={source_key} market={market} cols={list(sample.keys())[:20]} required={required}")
+            return pd.DataFrame()
+        raw = pd.DataFrame(records)
+        raw_year = raw[year_col].astype(str).str.extract(r"(\d{2,4})", expand=False).fillna("")
+        raw_quarter = raw[quarter_col].astype(str).str.extract(r"([1-4])", expand=False).fillna("")
+        mask = raw_year.eq(roc_year) & raw_quarter.eq(str(q))
+        rejected = int((~mask).sum())
+        raw = raw.loc[mask].copy()
+        if raw.empty:
+            log_warning(f"[HIGH_GROWTH][OPENAPI_EPS] no matched rows source={source_key} market={market} fiscal_year={fiscal_year} roc={roc_year} q={q} rejected={rejected}")
+            return pd.DataFrame()
+        out = pd.DataFrame({
+            "stock_id": raw[code_col].astype(str).str.extract(r"(\d{4,5})", expand=False).fillna("").map(normalize_stock_id),
+            "stock_name": raw[name_col].astype(str).str.strip() if name_col in raw.columns else "",
+            "eps_quarter": raw[eps_col].map(self._to_numeric_eps),
+        })
+        out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4,5}", na=False)].copy()
+        out = out.dropna(subset=["eps_quarter"])
+        if out.empty:
+            return pd.DataFrame()
+        out["fiscal_year"] = fiscal_year
+        out["quarter"] = q
+        out["fiscal_year_quarter"] = f"{roc_year}/{q}"
+        out["western_quarter"] = f"{fiscal_year}Q{q}"
+        out["eps"] = out["eps_quarter"]
+        out["eps_cumulative"] = out["eps_quarter"] if q == 1 else np.nan
+        out["eps_prev_cumulative"] = 0.0 if q == 1 else np.nan
+        out["eps_calc_method"] = "OPENAPI_Q1_BASIC_EPS_AS_ACTUAL_QUARTER" if q == 1 else "OPENAPI_BASIC_EPS_AS_OFFICIAL_QUARTER"
+        out["market"] = str(market or "")
+        out["source_url"] = str(source_url or "")
+        out["source_date"] = f"{fiscal_year}Q{q}"
+        out["source_type"] = f"{market}_{source_key}_T187AP06_OPENAPI"
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return out.drop_duplicates(subset=["stock_id", "fiscal_year", "quarter"], keep="last")
+
+    def load_openapi_eps_all_sources(self, fiscal_year: int, season, include_tpex: bool = True, timeout=(10, 30), local_json_map: dict | None = None) -> pd.DataFrame:
+        fiscal_year = int(fiscal_year)
+        q = self._season_to_int(season)
+        source_plan = []
+        for key, url in self.TWSE_OPENAPI_EPS_ENDPOINTS.items():
+            source_plan.append(("上市", key, url))
+        if include_tpex:
+            for key, url in self.TPEX_OPENAPI_EPS_ENDPOINTS.items():
+                source_plan.append(("上櫃", key, url))
+        parts = []
+        errors = []
+        local_json_map = local_json_map or {}
+        for market, source_key, url in source_plan:
+            local_key = f"{market}:{source_key}"
+            try:
+                if local_key in local_json_map and local_json_map[local_key]:
+                    local_path = Path(local_json_map[local_key])
+                    payload = json.loads(local_path.read_text(encoding="utf-8"))
+                    http_status = "local_file"
+                    request_url = str(local_path)
+                else:
+                    resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+                    http_status = getattr(resp, "status_code", "")
+                    if http_status != 200:
+                        raise RuntimeError(f"HTTP {http_status}")
+                    payload = resp.json()
+                    request_url = url
+                self._save_openapi_eps_raw_json(payload, fiscal_year, q, market, source_key, request_url, http_status=http_status)
+                parsed = self.parse_openapi_eps_records(payload, fiscal_year, q, market=market, source_key=source_key, source_url=url)
+                if parsed is not None and not parsed.empty:
+                    parts.append(parsed)
+                    log_info(f"[HIGH_GROWTH][OPENAPI_EPS] parsed market={market} source={source_key} rows={len(parsed)}")
+                else:
+                    log_warning(f"[HIGH_GROWTH][OPENAPI_EPS] parsed empty market={market} source={source_key}")
+            except Exception as exc:
+                errors.append(f"{market}:{source_key}:{exc}")
+                log_warning(f"[HIGH_GROWTH][OPENAPI_EPS] fetch/parse failed market={market} source={source_key} url={url}｜{exc}")
+        if not parts:
+            if errors:
+                raise RuntimeError("OpenAPI EPS all sources failed: " + " ; ".join(errors[:12]))
+            return pd.DataFrame()
+        out = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id", "fiscal_year", "quarter"], keep="last")
+        return out
+
+    def ensure_quarterly_eps_from_openapi(self, fiscal_year: int, season, force: bool = False, include_tpex: bool = True, local_json_map: dict | None = None) -> dict:
+        fiscal_year = int(fiscal_year)
+        q = self._season_to_int(season)
+        result = {"status": "skip", "rows": 0, "message": "", "source": "TWSE_TPEX_T187AP06_OPENAPI"}
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                row = cur.execute("SELECT COUNT(*) FROM quarterly_financial_history WHERE fiscal_year=? AND quarter=? AND eps IS NOT NULL", (fiscal_year, q)).fetchone()
+                existing = int(row[0] or 0) if row else 0
+            if existing > 0 and not force:
+                result.update({"status": "exists", "rows": existing, "message": f"quarterly_financial_history 已有 {fiscal_year}Q{q}"})
+                return result
+            current = self.load_openapi_eps_all_sources(fiscal_year, q, include_tpex=include_tpex, local_json_map=local_json_map)
+            if current is None or current.empty:
+                result.update({"status": "no_data", "message": f"OpenAPI無符合年度季別資料 {fiscal_year}Q{q}"})
+                return result
+            write = current.dropna(subset=["eps_quarter"])[[
+                "stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_url", "source_date", "update_time"
+            ]].copy()
+            if write.empty:
+                result.update({"status": "parse_failed", "message": f"OpenAPI資料無可寫入EPS {fiscal_year}Q{q}"})
+                return result
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.executemany("""
+                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(stock_id, fiscal_year, quarter) DO UPDATE SET
+                        fiscal_year_quarter=excluded.fiscal_year_quarter,
+                        western_quarter=excluded.western_quarter,
+                        eps=excluded.eps,
+                        eps_cumulative=excluded.eps_cumulative,
+                        eps_quarter=excluded.eps_quarter,
+                        eps_prev_cumulative=excluded.eps_prev_cumulative,
+                        eps_calc_method=excluded.eps_calc_method,
+                        source_url=excluded.source_url,
+                        source_date=excluded.source_date,
+                        update_time=excluded.update_time
+                """, list(write.itertuples(index=False, name=None)))
+                self.db.conn.commit()
+            result.update({"status": "imported", "rows": int(len(write)), "message": f"OpenAPI已寫入季度EPS {fiscal_year}Q{q}"})
+            log_info(f"[HIGH_GROWTH][OPENAPI_EPS] quarterly_financial_history imported year={fiscal_year} q={q} rows={len(write)}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][OPENAPI_EPS] ensure_quarterly_eps_from_openapi failed year={fiscal_year} q={q}｜{exc}")
+            return result
+
     @staticmethod
     def _western_to_roc_year(year: int) -> int:
         y = int(year)
@@ -4371,9 +4583,9 @@ class EPSForecastEngine:
     def ensure_required_official_eps_from_mops(self, quarters=None, force: bool = False) -> dict:
         """高成長 EPS 報表前置匯入。
 
-        V4.7修正：base_annual 不再優先跑 MOPS HTML，避免 lxml/HTML空頁造成年度EPS卡住；
-        先用本地 TWSE C05001，再用 TWSE OpenAPI，最後才用 MOPS。
-        季度EPS仍保留MOPS嘗試，但失敗不影響年度EPS進入報表。
+        V4.10 修正：季度 EPS 優先採用 TWSE/TPEx t187ap06 OpenAPI，MOPS HTML 只作官方備援。
+        目的：避免 MOPS HTML/lxml/空頁造成 quarterly_financial_history = 0，導致
+        actual_q1_eps 與 q1_vs_annual_ratio 空白。
         """
         quarters = normalize_high_growth_quarters(quarters)
         results = {}
@@ -4388,18 +4600,32 @@ class EPSForecastEngine:
                 results["base_annual_mops"] = self.ensure_annual_eps_from_mops(self.base_year, force=force)
                 results["base_annual"] = results["base_annual_mops"]
 
-        # 去年同期季度 EPS 可供同比驗證，不作全年EPS替代；錯誤只記錄，不阻塞年度EPS。
         for q in sorted({int(str(x).upper().replace("Q", "")) for x in quarters if str(x).upper().replace("Q", "").isdigit()}):
-            results[f"base_Q{q}"] = self.ensure_quarterly_eps_from_mops(self.base_year, q, force=force)
-            results[f"track_Q{q}"] = self.ensure_quarterly_eps_from_mops(self.track_year, q, force=force)
+            # 去年同期：先 OpenAPI，失敗/無資料才 MOPS，供同比驗證，不作全年EPS替代。
+            base_openapi = self.ensure_quarterly_eps_from_openapi(self.base_year, q, force=force)
+            results[f"base_Q{q}_openapi"] = base_openapi
+            if str(base_openapi.get("status", "")).lower() in ("exists", "imported"):
+                results[f"base_Q{q}"] = base_openapi
+            else:
+                results[f"base_Q{q}_mops"] = self.ensure_quarterly_eps_from_mops(self.base_year, q, force=force)
+                results[f"base_Q{q}"] = results[f"base_Q{q}_mops"]
+
+            # 追蹤年度：Q1 actual EPS 的正式優先來源。
+            track_openapi = self.ensure_quarterly_eps_from_openapi(self.track_year, q, force=force)
+            results[f"track_Q{q}_openapi"] = track_openapi
+            if str(track_openapi.get("status", "")).lower() in ("exists", "imported"):
+                results[f"track_Q{q}"] = track_openapi
+            else:
+                results[f"track_Q{q}_mops"] = self.ensure_quarterly_eps_from_mops(self.track_year, q, force=force)
+                results[f"track_Q{q}"] = results[f"track_Q{q}_mops"]
         try:
-            debug_dir = RUNTIME_DIR / "data" / "mops_eps_html"
+            debug_dir = RUNTIME_DIR / "data" / "official_eps_openapi"
             debug_dir.mkdir(parents=True, exist_ok=True)
-            (debug_dir / "official_eps_ensure_results_v47.json").write_text(
+            (debug_dir / "official_eps_ensure_results_v410.json").write_text(
                 json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         except Exception as exc:
-            log_warning(f"[HIGH_GROWTH][MOPS_EPS][DEBUG] ensure results save failed｜{exc}")
+            log_warning(f"[HIGH_GROWTH][OPENAPI_EPS][DEBUG] ensure results save failed｜{exc}")
         log_info(f"[HIGH_GROWTH][OFFICIAL_EPS] required official eps ensure results={results}")
         return results
 
