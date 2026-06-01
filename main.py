@@ -3716,7 +3716,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_12_LEADING_EPS_FORECAST_SELECTION_FIX_20260601"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_12_R1_PE_PEG_SAFE_FIX_20260602"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -5494,18 +5494,26 @@ class EPSForecastEngine:
             np.nan,
         )
         x["pe_ratio"] = pd.to_numeric(x.get("pe_ratio"), errors="coerce")
-        # 若 external_valuation 沒 PE，但有價格與基準 EPS，則以 price/base_annual_eps 估算。
-        x["pe_ratio"] = x["pe_ratio"].fillna(np.where(
-            pd.to_numeric(x.get("current_price"), errors="coerce").notna() & x["base_annual_eps"].gt(0),
-            pd.to_numeric(x.get("current_price"), errors="coerce") / x["base_annual_eps"],
-            np.nan,
-        ))
+        # V4.12-R1：若 external_valuation 沒 PE，但有價格與基準 EPS，則以 price/base_annual_eps 估算。
+        # 修正重點：不得把 np.where 回傳的 ndarray 直接丟給 Series.fillna(value=...)，
+        # 必須先轉成與 x.index 對齊的 pd.Series，否則 pandas 會拋出
+        # TypeError: "value" parameter must be a scalar, dict or Series, but you passed a "ndarray"。
+        current_price_s = _safe_numeric_series_for_df(x, "current_price", np.nan)
+        base_eps_s = pd.to_numeric(x["base_annual_eps"], errors="coerce")
+        pe_fallback = pd.Series(np.nan, index=x.index, dtype="float64")
+        pe_mask = current_price_s.notna() & base_eps_s.gt(0)
+        pe_fallback.loc[pe_mask] = current_price_s.loc[pe_mask] / base_eps_s.loc[pe_mask]
+        x["pe_ratio"] = x["pe_ratio"].fillna(pe_fallback)
+        x["pe_ratio"] = x["pe_ratio"].replace([np.inf, -np.inf], np.nan)
+
         x["predicted_eps_growth_pct"] = x["eps_acceleration_pct"] * 100.0
-        x["peg_ratio"] = np.where(
+        peg_raw = np.where(
             x["pe_ratio"].gt(0) & x["predicted_eps_growth_pct"].gt(0),
             x["pe_ratio"] / x["predicted_eps_growth_pct"],
             np.nan,
         )
+        # V4.12-R1：同步把 PEG 計算結果轉成 Series，保持 index 對齊與欄位型別一致。
+        x["peg_ratio"] = pd.Series(peg_raw, index=x.index, dtype="float64").replace([np.inf, -np.inf], np.nan)
         x["predicted_q2_eps_score"] = np.select(
             [x["predicted_q2_eps"].ge(5), x["predicted_q2_eps"].ge(3), x["predicted_q2_eps"].ge(1.5), x["predicted_q2_eps"].ge(0.5), x["predicted_q2_eps"].gt(0)],
             [100, 85, 70, 50, 30],
