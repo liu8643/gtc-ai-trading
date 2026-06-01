@@ -3716,10 +3716,22 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_11_Q1_RATIO_OUTPUT_AUDIT_FIX_20260601"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_12_LEADING_EPS_FORECAST_SELECTION_FIX_20260601"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
+
+# V4.12 LEADING_EPS_FORECAST_SELECTION_FIX：選股策略改為「領先預測」而非等待正式 EPS。
+# 核心排序：40% predicted_q2_eps + 25% eps_acceleration + 20% revenue_acceleration + 15% valuation(PE/PEG)。
+# actual_q1_eps 只作驗證/模型誤差，不再作為主排序。
+HIGH_GROWTH_V412_MIN_LEADING_SCORE = 70.0
+HIGH_GROWTH_V412_MIN_REVENUE_HIT = 1
+HIGH_GROWTH_V412_WEIGHTS = {
+    "predicted_q2_eps_score": 0.40,
+    "eps_acceleration_score_v412": 0.25,
+    "revenue_acceleration_score_v412": 0.20,
+    "valuation_score_v412": 0.15,
+}
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -5261,8 +5273,12 @@ class EPSForecastEngine:
                 v["eps_ttm_source"] = "external_valuation.eps_ttm"
                 v["eps_ttm_source_date"] = v.get("data_date", "")
                 v["eps_ttm_fiscal_year_quarter"] = v.get("fiscal_year_quarter", "")
+                # V4.12：同時保留 PE 與收盤價，供領先預測模型做 valuation(PE/PEG) 評分。
+                v["pe_ratio"] = pd.to_numeric(v.get("pe"), errors="coerce")
+                v["current_price"] = pd.to_numeric(v.get("close_price"), errors="coerce")
+                v["valuation_source"] = "external_valuation"
                 v["_priority"] = 1
-                parts.append(v[["stock_id", "current_eps_ttm", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "_priority"]])
+                parts.append(v[["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "_priority"]])
         if self._table_exists("financial_feature_daily"):
             f = self._latest_rows("financial_feature_daily", "feature_date", ["eps_ttm", "revenue_yoy", "revenue_eps_score", "eps_bucket", "rev_bucket", "eps_category", "data_quality_flag", "source_date"])
             if f is not None and not f.empty:
@@ -5270,8 +5286,11 @@ class EPSForecastEngine:
                 f["eps_ttm_source"] = "financial_feature_daily.eps_ttm"
                 f["eps_ttm_source_date"] = f.get("feature_date", "")
                 f["eps_ttm_fiscal_year_quarter"] = ""
+                f["pe_ratio"] = np.nan
+                f["current_price"] = np.nan
+                f["valuation_source"] = ""
                 f["_priority"] = 2
-                parts.append(f[["stock_id", "current_eps_ttm", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "_priority"]])
+                parts.append(f[["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "_priority"]])
         if self._table_exists("ranking_result"):
             r = self._latest_rows("ranking_result", "date", ["eps_ttm", "revenue_yoy", "revenue_eps_score", "eps_bucket", "rev_bucket", "eps_category", "data_quality_flag"])
             if r is not None and not r.empty:
@@ -5279,18 +5298,21 @@ class EPSForecastEngine:
                 r["eps_ttm_source"] = "ranking_result.eps_ttm"
                 r["eps_ttm_source_date"] = r.get("date", "")
                 r["eps_ttm_fiscal_year_quarter"] = ""
+                r["pe_ratio"] = np.nan
+                r["current_price"] = np.nan
+                r["valuation_source"] = ""
                 r["_priority"] = 3
-                parts.append(r[["stock_id", "current_eps_ttm", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "_priority"]])
+                parts.append(r[["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "_priority"]])
         parts = [p for p in parts if p is not None and not p.empty]
         if not parts:
-            return pd.DataFrame(columns=["stock_id", "current_eps_ttm", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_gate"])
+            return pd.DataFrame(columns=["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_gate"])
         x = pd.concat(parts, ignore_index=True)
         x["stock_id"] = x["stock_id"].map(normalize_stock_id)
         x["current_eps_ttm"] = pd.to_numeric(x["current_eps_ttm"], errors="coerce")
         x = x.dropna(subset=["stock_id", "current_eps_ttm"]).copy()
         x = x[x["current_eps_ttm"].gt(0)].copy()
         if x.empty:
-            return pd.DataFrame(columns=["stock_id", "current_eps_ttm", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_gate"])
+            return pd.DataFrame(columns=["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_gate"])
         x["eps_ttm_quality"] = "EPS_TTM_PROXY_ONLY"
         x["eps_ttm_gate"] = x["current_eps_ttm"].gt(0)
         x = x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first")
@@ -5436,6 +5458,106 @@ class EPSForecastEngine:
         x["forecast_eps_gate"] = x["forecast_vs_annual_ratio"].gt(1.0)
         x["ttm_vs_annual_gate"] = x["ttm_vs_annual_ratio"].gt(1.0)
         x["eps_ttm_proxy_gate"] = ttm_available
+
+        # V4.12：領先 EPS 預測模型，不等正式財報公布才選股。
+        # 基礎 EPS：優先使用正數且非小基期的 2025 全年 EPS/4；若不可用，退回 EPS_TTM/4。
+        x["base_quarter_eps_for_prediction"] = np.where(
+            x["base_annual_eps"].notna() & x["base_annual_eps"].ge(HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO),
+            x["base_annual_eps"] / 4.0,
+            np.where(x["current_eps_ttm"].notna() & x["current_eps_ttm"].gt(0), x["current_eps_ttm"] / 4.0, np.nan),
+        )
+        x["prediction_basis"] = np.select(
+            [x["base_annual_eps"].notna() & x["base_annual_eps"].ge(HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO),
+             x["current_eps_ttm"].notna() & x["current_eps_ttm"].gt(0)],
+            ["BASE_ANNUAL_EPS", "EPS_TTM_PROXY"],
+            default="NO_VALID_EPS_BASIS",
+        )
+        growth_factor = 1.0 + (x["avg_revenue_yoy_used"].fillna(0) / 100.0) * 0.55
+        growth_factor = growth_factor.clip(lower=0.20, upper=2.65)
+        x["predicted_q1_eps_model"] = (x["base_quarter_eps_for_prediction"] * growth_factor).round(4)
+        # Q2/Q3 預測使用同一營收加速度因子，並保留保守遞延：Q3 僅在營收動能為正時加速。
+        x["predicted_q2_eps"] = (x["base_quarter_eps_for_prediction"] * growth_factor).round(4)
+        q3_extra_factor = (1.0 + (x["avg_revenue_yoy_used"].fillna(0).clip(lower=0, upper=300) / 100.0) * 0.18).clip(lower=1.0, upper=1.54)
+        x["predicted_q3_eps"] = (x["predicted_q2_eps"] * q3_extra_factor).round(4)
+        x["eps_acceleration"] = (x["predicted_q2_eps"] - x["base_quarter_eps_for_prediction"]).round(4)
+        x["eps_acceleration_pct"] = np.where(
+            x["base_quarter_eps_for_prediction"].abs().ge(0.25),
+            x["eps_acceleration"] / x["base_quarter_eps_for_prediction"].abs(),
+            np.nan,
+        )
+        x["revenue_acceleration"] = x["avg_revenue_yoy_used"]
+        x["prediction_error"] = (x["actual_q1_eps"] - x["predicted_q1_eps_model"]).round(4)
+        x["eps_surprise"] = x["prediction_error"]
+        x["eps_surprise_pct"] = np.where(
+            x["predicted_q1_eps_model"].abs().ge(0.25),
+            x["eps_surprise"] / x["predicted_q1_eps_model"].abs(),
+            np.nan,
+        )
+        x["pe_ratio"] = pd.to_numeric(x.get("pe_ratio"), errors="coerce")
+        # 若 external_valuation 沒 PE，但有價格與基準 EPS，則以 price/base_annual_eps 估算。
+        x["pe_ratio"] = x["pe_ratio"].fillna(np.where(
+            pd.to_numeric(x.get("current_price"), errors="coerce").notna() & x["base_annual_eps"].gt(0),
+            pd.to_numeric(x.get("current_price"), errors="coerce") / x["base_annual_eps"],
+            np.nan,
+        ))
+        x["predicted_eps_growth_pct"] = x["eps_acceleration_pct"] * 100.0
+        x["peg_ratio"] = np.where(
+            x["pe_ratio"].gt(0) & x["predicted_eps_growth_pct"].gt(0),
+            x["pe_ratio"] / x["predicted_eps_growth_pct"],
+            np.nan,
+        )
+        x["predicted_q2_eps_score"] = np.select(
+            [x["predicted_q2_eps"].ge(5), x["predicted_q2_eps"].ge(3), x["predicted_q2_eps"].ge(1.5), x["predicted_q2_eps"].ge(0.5), x["predicted_q2_eps"].gt(0)],
+            [100, 85, 70, 50, 30],
+            default=0,
+        )
+        x["eps_acceleration_score_v412"] = np.select(
+            [x["eps_acceleration"].ge(1.0), x["eps_acceleration"].ge(0.5), x["eps_acceleration"].ge(0.2), x["eps_acceleration"].gt(0)],
+            [100, 80, 60, 45],
+            default=10,
+        )
+        x["revenue_acceleration_score_v412"] = np.clip(40 + x["revenue_acceleration"].fillna(0) * 0.6, 0, 100).round(2)
+        x["pe_score"] = np.select(
+            [x["pe_ratio"].gt(0) & x["pe_ratio"].le(10),
+             x["pe_ratio"].gt(10) & x["pe_ratio"].le(15),
+             x["pe_ratio"].gt(15) & x["pe_ratio"].le(20),
+             x["pe_ratio"].gt(20) & x["pe_ratio"].le(30),
+             x["pe_ratio"].gt(30) & x["pe_ratio"].le(40),
+             x["pe_ratio"].gt(40)],
+            [100, 85, 70, 45, 25, 5],
+            default=50,
+        )
+        x["peg_score"] = np.select(
+            [x["peg_ratio"].gt(0) & x["peg_ratio"].le(0.8),
+             x["peg_ratio"].gt(0.8) & x["peg_ratio"].le(1.2),
+             x["peg_ratio"].gt(1.2) & x["peg_ratio"].le(1.8),
+             x["peg_ratio"].gt(1.8) & x["peg_ratio"].le(2.5),
+             x["peg_ratio"].gt(2.5)],
+            [100, 80, 60, 35, 10],
+            default=50,
+        )
+        x["valuation_score_v412"] = (x["pe_score"] * 0.65 + x["peg_score"] * 0.35).round(2)
+        x["v412_total_score"] = (
+            x["predicted_q2_eps_score"] * HIGH_GROWTH_V412_WEIGHTS["predicted_q2_eps_score"] +
+            x["eps_acceleration_score_v412"] * HIGH_GROWTH_V412_WEIGHTS["eps_acceleration_score_v412"] +
+            x["revenue_acceleration_score_v412"] * HIGH_GROWTH_V412_WEIGHTS["revenue_acceleration_score_v412"] +
+            x["valuation_score_v412"] * HIGH_GROWTH_V412_WEIGHTS["valuation_score_v412"]
+        ).round(2)
+        x["v412_prediction_quality"] = np.select(
+            [x["prediction_basis"].eq("BASE_ANNUAL_EPS") & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1),
+             x["prediction_basis"].eq("EPS_TTM_PROXY") & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1),
+             pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).lt(1),
+             x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
+            ["LEADING_FORECAST_BASE_EPS", "LEADING_FORECAST_TTM_PROXY", "REVENUE_DATA_MISSING", "EPS_BASIS_MISSING"],
+            default="PARTIAL",
+        )
+        x["v412_leading_candidate"] = (
+            x["v412_total_score"].ge(HIGH_GROWTH_V412_MIN_LEADING_SCORE) &
+            x["predicted_q2_eps"].gt(0) &
+            pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(HIGH_GROWTH_V412_MIN_REVENUE_HIT) &
+            x["v412_prediction_quality"].isin(["LEADING_FORECAST_BASE_EPS", "LEADING_FORECAST_TTM_PROXY"])
+        )
+        x["v412_model_definition"] = "40% predicted_q2_eps_score + 25% eps_acceleration_score + 20% revenue_acceleration_score + 15% valuation_score(PE/PEG); actual_q1_eps only validates prediction_error/eps_surprise"
         return x
 
 
@@ -5557,11 +5679,10 @@ class HighGrowthEPSEngine:
         )
 
         # 預測候選：有真正年度EPS基準時，才能用營收推估 EPS。
+        # V4.12：預測候選改由領先預測模型決定，不再用 forecast_vs_annual_ratio > 1 作主篩選。
         x["forecast_candidate"] = (
-            (~x["strict_pass"]) 
-            & x.get("forecast_eps_gate", False).fillna(False)
-            & x["revenue_partial_yoy_gate"].fillna(False)
-            & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1)
+            (~x["strict_pass"])
+            & x.get("v412_leading_candidate", False).fillna(False).astype(bool)
         )
 
         # EPS_TTM 追蹤候選：DB 已有 EPS_TTM，可作最近四季獲利能力與排序追蹤；
@@ -5602,15 +5723,16 @@ class HighGrowthEPSEngine:
         x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
         months = self.revenue_engine.required_months(self.tracking_quarters)
-        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
+        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "eps_surprise_pct", "prediction_basis", "v412_model_definition", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
         for m in months:
             order_cols += [f"rev_{m}", f"yoy_{m}"]
         order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_partial_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "strict_pass", "forecast_candidate", "ttm_proxy_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
         for c in order_cols:
             if c not in x.columns:
-                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "avg_revenue_yoy_used") else ""
+                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "v412_total_score", "prediction_error", "eps_surprise", "eps_surprise_pct", "avg_revenue_yoy_used") else ""
         x = x[order_cols].copy()
-        x = x.sort_values(["strict_pass", "forecast_candidate", "eps_ratio", "avg_revenue_yoy", "trend_score"], ascending=[False, False, False, False, False], na_position="last")
+        # V4.12 主排序：先看領先預測總分，再看 Q2/Q3 EPS、EPS 加速度、營收加速度與估值。
+        x = x.sort_values(["strict_pass", "forecast_candidate", "v412_total_score", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "valuation_score_v412", "trend_score"], ascending=[False, False, False, False, False, False, False, False, False], na_position="last")
         return x, self.inspect_db_assets(), rev_raw, eps_features
 
     def export_report(self, output_dir: Path | None = None, log_cb=None) -> Path:
@@ -5647,7 +5769,7 @@ class HighGrowthEPSEngine:
             {"項目": "V4.4修正", "內容": "修正V4.3找不到使用者下載檔的問題；擴大本機搜尋、增加TWSE線上下載fallback、修正Log/摘要把placeholder誤算成strict=1與把EPS_TTM候選誤算為forecast。"},
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
-            {"項目": "嚴格條件", "內容": "正式季度累計EPS > 2025全年EPS，且營收YoY全數達標並月月走高"},
+            {"項目": "嚴格條件", "內容": "V4.12主策略：40% predicted_q2_eps、25% EPS加速度、20%營收加速度、15%估值(PE/PEG)；actual_q1_eps只作驗證"},
             {"項目": "預測候選條件", "內容": "正式季EPS尚未完整時，以月營收加速度預估EPS；只能列預測候選，不得列嚴格通過"},
             {"項目": "YoY門檻", "內容": self.min_yoy},
             {"項目": "嚴格通過筆數", "內容": strict_count},
@@ -5664,7 +5786,7 @@ class HighGrowthEPSEngine:
         ])
         rules = pd.DataFrame([
             {"序號": 1, "模組": "RevenueAccelerationEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "可依Q1~Q4動態取得對應月營收與YoY"},
-            {"序號": 2, "模組": "EPSForecastEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "優先讀正式季EPS與年度EPS；缺資料才預測"},
+            {"序號": 2, "模組": "EPSForecastEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "V4.12 改為先用營收與估值預測Q2/Q3 EPS；正式EPS只作驗證"},
             {"序號": 3, "模組": "HighGrowthEPSEngine", "新增/修改": "新增", "程式位置": "HIGH_GROWTH_EPS_ENGINE_V4區塊", "驗收點": "輸出嚴格通過/預測候選/資料不足三層結果"},
             {"序號": 4, "模組": "UI", "新增/修改": "修改", "程式位置": "_build_highgrowth_tab / on_highgrowth_report", "驗收點": "可勾選Q1/Q2/Q3/Q4並產生對應報表"},
             {"序號": 5, "模組": "DB Schema", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_schema", "驗收點": "缺 annual_eps_history 時自動建表"},
@@ -12855,7 +12977,7 @@ class AppUI:
                     return f"{float(v):.2f}"
                 except Exception:
                     return str(v or "")
-            sort_cols = [c for c in ["strict_pass", "forecast_candidate", "eps_ratio", "avg_revenue_yoy"] if c in df.columns]
+            sort_cols = [c for c in ["strict_pass", "forecast_candidate", "v412_total_score", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "valuation_score_v412", "trend_score"] if c in df.columns]
             view = df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last").head(250).reset_index(drop=True) if sort_cols else df.head(250).reset_index(drop=True)
             for i, r in view.iterrows():
                 rev_stair = "PASS" if bool(r.get("revenue_stair_gate", False)) else "FAIL/NA"
@@ -14209,7 +14331,7 @@ class AppUI:
                     "條件預掛": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
                     "執行下單清單": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "組合交易計畫": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
-                    "高成長EPS報表": ["stock_id", "stock_name", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "selected_actual_vs_annual_ratio", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "eps_source_used", "avg_revenue_yoy", "avg_revenue_yoy_used", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "strict_pass", "forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因"],
+                    "高成長EPS報表": ["stock_id", "stock_name", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "selected_actual_vs_annual_ratio", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "eps_source_used", "avg_revenue_yoy", "avg_revenue_yoy_used", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "strict_pass", "forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因"],
                     "唯一決策": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "market", "industry", "theme", "ui_state", "entry_zone", "stop_loss", "target_price", "rr", "win_rate", "decision", "final_trade_decision"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                     "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
