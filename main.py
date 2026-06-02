@@ -384,6 +384,12 @@ CLASSIFICATION_DOWNLOAD_SOURCES = {
 BOOTSTRAP_LOCK = threading.Lock()
 BOOTSTRAP_EVENT = threading.Event()
 
+# V4.17 STARTUP_SAFE：UI啟動期間禁止自動下載大型/不穩定官方資料。
+# 政府資料下載改由明確更新流程、排程或HighGrowth DataGuard處理；啟動只使用本地快取/CSV，避免UI未開就卡住或閃退。
+GTC_AUTO_CLASSIFICATION_DOWNLOAD = os.getenv("GTC_AUTO_CLASSIFICATION_DOWNLOAD", "0").strip() == "1"
+GTC_STARTUP_FETCH_UNIVERSE = os.getenv("GTC_STARTUP_FETCH_UNIVERSE", "0").strip() == "1"
+GTC_HEADLESS_TEST = os.getenv("GTC_HEADLESS_TEST", "0").strip() == "1"
+
 def set_classification_log_callback(cb):
     global CLASSIFICATION_LOG_CALLBACK
     CLASSIFICATION_LOG_CALLBACK = cb
@@ -978,6 +984,10 @@ def ensure_classification_book(force_refresh: bool = False, log_cb=None) -> Opti
             if not meta or Path(str(meta.get("path", "")).split(" | ")[0]) != p:
                 _write_classification_meta(_build_classification_meta(p, source="LOCAL", note="discovered existing file"))
             return p
+        # V4.17 STARTUP_SAFE：一般狀態檢查不得因沒有本地分類檔就自動連外下載。
+        # 分類更新按鈕仍會以 force_refresh=True 明確下載。
+        if not GTC_AUTO_CLASSIFICATION_DOWNLOAD:
+            return None
     return download_classification_book(force_refresh=force_refresh, log_cb=log_cb)
 
 def resolve_classification_book() -> Optional[Path]:
@@ -1005,7 +1015,9 @@ def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]
     for p in _classification_csv_candidates_by_market(market):
         if Path(p).exists():
             return Path(p)
-    if market in ("上市", "上櫃"):
+    # V4.17 STARTUP_SAFE：啟動/分類載入預設不自動連外下載，避免UI尚未建立前因DNS/政府站點逾時卡住或閃退。
+    # 若需要強制更新官方分類，請呼叫 download_classification_book(force_refresh=True) 或設定 GTC_AUTO_CLASSIFICATION_DOWNLOAD=1。
+    if market in ("上市", "上櫃") and GTC_AUTO_CLASSIFICATION_DOWNLOAD:
         try:
             downloaded = _download_single_classification_csv(market, force_refresh=False, log_cb=classification_debug_log)
             if downloaded is not None and Path(downloaded).exists():
@@ -2014,6 +2026,16 @@ def fetch_tpex_universe() -> pd.DataFrame:
 
 
 def build_full_market_universe() -> pd.DataFrame:
+    # V4.17 STARTUP_SAFE：預設啟動只讀本地主檔，不先連外抓全市場Universe。
+    # 若要重建官方全市場清單，請設定 GTC_STARTUP_FETCH_UNIVERSE=1 或在專用更新流程執行。
+    if not GTC_STARTUP_FETCH_UNIVERSE:
+        csv_path = resolve_master_csv()
+        if csv_path.exists():
+            try:
+                x = pd.read_csv(csv_path, dtype=str).fillna("")
+                return _normalize_master_df(x, "上市")
+            except Exception as exc:
+                log_warning(f"本地主檔載入失敗，才改走官方Universe：{exc}")
     twse = fetch_twse_universe()
     tpex = fetch_tpex_universe()
     all_df = pd.concat([twse, tpex], ignore_index=True)
@@ -3716,7 +3738,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_16_FULL_SEMANTIC_GATE_VCR_CDC_FIX_20260602"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_17_STARTUP_SAFE_SEMANTIC_GATE_FIX_20260602"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -3918,8 +3940,8 @@ def high_growth_model_definition_text(language: str | None = None) -> str:
 # V4.14：UI高成長EPS欄位固定全中文；英文/雙語只存在於匯出報表檔案。
 UI_HIGH_GROWTH_HEADERS = {
     "status": "狀態", "rank": "排序", "id": "代號", "name": "名稱", "industry": "產業",
-    "quarters": "追蹤季度", "actual_q1_eps": "2026Q1實際EPS", "selection_eps": "選股用EPS", "predicted_q2_eps": "預測Q2 EPS",
-    "predicted_q3_eps": "預測Q3 EPS", "eps_acceleration": "EPS加速度", "revenue_acceleration": "營收加速度",
+    "quarters": "追蹤季度", "actual_q1_eps": "2026Q1實際EPS", "selection_eps": "選股用EPS", "selection_score": "主選股分數",
+    "predicted_q2_eps": "預測Q2 EPS", "predicted_q3_eps": "預測Q3 EPS", "eps_acceleration": "EPS加速度", "revenue_acceleration": "營收加速度",
     "pe_ratio": "本益比", "peg_ratio": "PEG", "v412_total_score": "V4.12總分", "eps_source": "EPS來源",
     "rev_hit": "營收月數", "rev_stair": "營收階梯", "close": "現價", "rsi": "RSI", "trend": "趨勢分",
     "risk": "風險旗標", "action": "建議動作", "gap": "資料缺口/未通過原因",
@@ -3938,7 +3960,7 @@ def get_high_growth_report_path(date_str: str | None = None, quarters: list[str]
     d = date_str or datetime.now().strftime("%Y%m%d")
     qtag = "".join(quarters or HIGH_GROWTH_DEFAULT_QUARTERS) or "Q1"
     HIGH_GROWTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    return HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_engine_v4_16_{qtag}_{d}.xlsx"
+    return HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_engine_v4_17_{qtag}_{d}.xlsx"
 
 def get_high_growth_report_path_by_language(date_str: str | None = None, quarters: list[str] | None = None, language: str = "ZH") -> Path:
     """V4.14：高成長EPS報表固定輸出中文/英文兩份；UI 不受語言參數影響。"""
@@ -6121,7 +6143,7 @@ class HighGrowthEPSEngine:
             annual_eps_rows = 0
         summary = pd.DataFrame([
             {"項目": "主策略", "內容": "領先EPS預測選股：40%預測Q2 EPS + 25%EPS加速度 + 20%營收加速度 + 15%估值"},
-            {"項目": "V4.16修正", "內容": "正式EPS驗證與領先預測選股分離；selection_eps/selection_gate/selection_score作主選股欄位。"},
+            {"項目": "V4.17修正", "內容": "正式EPS驗證與領先預測選股分離；selection_eps/selection_gate/selection_score作主選股欄位。"},
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
             {"項目": "報表語言模式", "內容": "Excel固定輸出中文(ZH)與英文(EN)各一份；UI固定中文"},
@@ -6183,7 +6205,7 @@ class HighGrowthEPSEngine:
             generated_paths.append(Path(final_path))
         out_path = generated_paths[0] if generated_paths else out_path
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V4.16] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading_pass_count={leading_count}｜selection_eps_non_null={selection_eps_nonnull}｜official_verified_count={official_count}｜ttm_proxy={ttm_count}｜fail={fail_count}｜annual_eps_2025={annual_eps_rows}")
+            log_cb(f"[HIGH_GROWTH_V4.17] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading_pass_count={leading_count}｜selection_eps_non_null={selection_eps_nonnull}｜official_verified_count={official_count}｜ttm_proxy={ttm_count}｜fail={fail_count}｜annual_eps_2025={annual_eps_rows}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
@@ -16564,18 +16586,52 @@ def bootstrap():
 
 def main():
     log_info("main start")
-    db, init_message = bootstrap()
-    root = tk.Tk()
-    app = AppUI(root, db)
-    app.set_status(init_message)
+    db = None
+    root = None
+    try:
+        db, init_message = bootstrap()
+        if GTC_HEADLESS_TEST:
+            print("HEADLESS_BOOTSTRAP_OK", init_message)
+            db.close()
+            return
+        root = tk.Tk()
+        app = AppUI(root, db)
+        app.set_status(init_message)
 
-    def _close():
-        log_info("application closing")
-        db.close()
-        root.destroy()
+        def _close():
+            log_info("application closing")
+            try:
+                if db is not None:
+                    db.close()
+            finally:
+                root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", _close)
-    root.mainloop()
+        root.protocol("WM_DELETE_WINDOW", _close)
+        root.mainloop()
+    except Exception as exc:
+        # V4.17 STARTUP_SAFE：不可再無聲閃退；寫入完整trace並盡量用messagebox提示使用者。
+        log_exception("main fatal startup error", exc)
+        crash_path = LOG_DIR / f"startup_crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        try:
+            crash_path.write_text(traceback.format_exc(), encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            if not GTC_HEADLESS_TEST:
+                if root is None:
+                    root = tk.Tk()
+                    root.withdraw()
+                messagebox.showerror("程式啟動失敗", f"主程式啟動失敗，已輸出錯誤記錄：\n{crash_path}\n\n{exc}")
+        except Exception:
+            pass
+        finally:
+            try:
+                if db is not None:
+                    db.close()
+            except Exception:
+                pass
+        if GTC_HEADLESS_TEST:
+            raise
 
 
 if __name__ == "__main__":
