@@ -3959,7 +3959,7 @@ def high_growth_model_definition_text(language: str | None = None) -> str:
 # V4.14：UI高成長EPS欄位固定全中文；英文/雙語只存在於匯出報表檔案。
 UI_HIGH_GROWTH_HEADERS = {
     "status": "狀態", "rank": "排序", "id": "代號", "name": "名稱", "industry": "產業",
-    "quarters": "追蹤季度", "actual_q1_eps": "2026Q1實際EPS", "selection_eps": "選股用EPS", "predicted_q2_eps": "預測Q2 EPS",
+    "quarters": "追蹤季度", "actual_q1_eps": "2026Q1實際EPS", "selection_eps": "選股用EPS", "selection_score": "選股分數", "predicted_q2_eps": "預測Q2 EPS",
     "predicted_q3_eps": "預測Q3 EPS", "eps_acceleration": "EPS加速度", "revenue_acceleration": "營收加速度",
     "pe_ratio": "本益比", "peg_ratio": "PEG", "v412_total_score": "V4.12總分", "eps_source": "EPS來源",
     "rev_hit": "營收月數", "rev_stair": "營收階梯", "close": "現價", "rsi": "RSI", "trend": "趨勢分",
