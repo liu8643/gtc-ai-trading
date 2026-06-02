@@ -3716,7 +3716,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_12_R1_PE_PEG_SAFE_FIX_20260602"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_13_COLUMN_MAPPING_LANGUAGE_FIX_20260602"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -3732,6 +3732,97 @@ HIGH_GROWTH_V412_WEIGHTS = {
     "revenue_acceleration_score_v412": 0.20,
     "valuation_score_v412": 0.15,
 }
+
+# V4.13 COLUMN_MAPPING_LANGUAGE_FIX：統一 UI / Excel / Log 欄位名稱，不改程式內部欄位變數。
+# 支援 ZH / EN / BILINGUAL；預設 BILINGUAL，避免工程欄位與使用者欄位語義不一致。
+REPORT_LANGUAGE = os.getenv("GTC_REPORT_LANGUAGE", "BILINGUAL").strip().upper()
+if REPORT_LANGUAGE not in {"ZH", "EN", "BILINGUAL"}:
+    REPORT_LANGUAGE = "BILINGUAL"
+
+HIGH_GROWTH_COLUMN_MAP = {
+    "stock_id": {"zh": "代號", "en": "Stock ID"},
+    "stock_name": {"zh": "名稱", "en": "Stock Name"},
+    "market": {"zh": "市場", "en": "Market"},
+    "industry": {"zh": "產業", "en": "Industry"},
+    "theme": {"zh": "題材", "en": "Theme"},
+    "追蹤季度": {"zh": "追蹤季度", "en": "Tracking Quarter"},
+    "基本面狀態": {"zh": "基本面狀態", "en": "Fundamental Status"},
+    "投資分層": {"zh": "投資分層", "en": "Investment Tier"},
+    "actual_q1_eps": {"zh": "2026Q1實際EPS", "en": "Actual Q1 EPS"},
+    "predicted_q1_eps_model": {"zh": "模型預測Q1 EPS", "en": "Model Predicted Q1 EPS"},
+    "predicted_q2_eps": {"zh": "預測Q2 EPS", "en": "Predicted Q2 EPS"},
+    "predicted_q3_eps": {"zh": "預測Q3 EPS", "en": "Predicted Q3 EPS"},
+    "eps_acceleration": {"zh": "EPS加速度", "en": "EPS Acceleration"},
+    "eps_acceleration_pct": {"zh": "EPS加速度%", "en": "EPS Acceleration %"},
+    "revenue_acceleration": {"zh": "營收加速度", "en": "Revenue Acceleration"},
+    "prediction_error": {"zh": "預測誤差", "en": "Prediction Error"},
+    "eps_surprise": {"zh": "黑馬指標", "en": "EPS Surprise"},
+    "eps_surprise_pct": {"zh": "黑馬指標%", "en": "EPS Surprise %"},
+    "pe_ratio": {"zh": "本益比", "en": "PE Ratio"},
+    "peg_ratio": {"zh": "PEG", "en": "PEG Ratio"},
+    "pe_score": {"zh": "PE分數", "en": "PE Score"},
+    "peg_score": {"zh": "PEG分數", "en": "PEG Score"},
+    "valuation_score_v412": {"zh": "估值分數", "en": "Valuation Score"},
+    "v412_total_score": {"zh": "V4.12總分", "en": "V4.12 Total Score"},
+    "v412_prediction_quality": {"zh": "預測品質", "en": "Prediction Quality"},
+    "v412_leading_candidate": {"zh": "領先預測候選", "en": "Leading Forecast Candidate"},
+    "v412_model_definition": {"zh": "V4.12模型定義", "en": "V4.12 Model Definition"},
+    "base_annual_eps": {"zh": "2025全年EPS", "en": "Base Annual EPS"},
+    "base_quarter_eps_for_prediction": {"zh": "預測用單季EPS基準", "en": "Quarter EPS Basis"},
+    "prediction_basis": {"zh": "預測基準", "en": "Prediction Basis"},
+    "eps_cumulative_used": {"zh": "累計/預估EPS", "en": "Cumulative/Forecast EPS"},
+    "forecast_eps_cumulative": {"zh": "營收推估累計EPS", "en": "Revenue Forecast Cumulative EPS"},
+    "forecast_eps_cumulative_raw": {"zh": "營收推估累計EPS(原始)", "en": "Raw Revenue Forecast Cumulative EPS"},
+    "q1_vs_annual_ratio": {"zh": "Q1/年EPS", "en": "Q1/Annual EPS"},
+    "q1_vs_annual_ratio_raw": {"zh": "Q1/年EPS(原始)", "en": "Raw Q1/Annual EPS"},
+    "q1_ratio_quality": {"zh": "Q1倍率品質", "en": "Q1 Ratio Quality"},
+    "forecast_vs_annual_ratio": {"zh": "預估/年EPS", "en": "Forecast/Annual EPS"},
+    "ttm_vs_annual_ratio": {"zh": "TTM/年EPS", "en": "TTM/Annual EPS"},
+    "eps_source_used": {"zh": "EPS來源", "en": "EPS Source"},
+    "avg_revenue_yoy": {"zh": "平均YoY", "en": "Average YoY"},
+    "avg_revenue_yoy_used": {"zh": "採用平均YoY", "en": "Used Average YoY"},
+    "revenue_month_count_hit": {"zh": "達標營收月數", "en": "Revenue Hit Months"},
+    "revenue_month_count_required": {"zh": "要求營收月數", "en": "Required Revenue Months"},
+    "revenue_stair_gate": {"zh": "營收階梯", "en": "Revenue Stair Gate"},
+    "close": {"zh": "現價", "en": "Close Price"},
+    "current_price": {"zh": "目前價格", "en": "Current Price"},
+    "rsi14": {"zh": "RSI", "en": "RSI"},
+    "trend_score": {"zh": "趨勢分", "en": "Trend Score"},
+    "風險旗標": {"zh": "風險旗標", "en": "Risk Flag"},
+    "建議動作": {"zh": "建議動作", "en": "Suggested Action"},
+    "資料缺口/未通過原因": {"zh": "資料缺口/未通過原因", "en": "Data Gap / Fail Reason"},
+    "規則版本": {"zh": "規則版本", "en": "Rule Version"},
+}
+
+def high_growth_column_label(key: str, language: str | None = None) -> str:
+    lang = (language or REPORT_LANGUAGE or "BILINGUAL").strip().upper()
+    item = HIGH_GROWTH_COLUMN_MAP.get(str(key))
+    if not item:
+        return str(key)
+    zh = item.get("zh", str(key))
+    en = item.get("en", str(key))
+    if lang == "ZH":
+        return zh
+    if lang == "EN":
+        return en
+    return f"{zh}\n({en})"
+
+def localize_high_growth_dataframe_columns(df: pd.DataFrame, language: str | None = None) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame):
+        return df
+    out = df.copy()
+    out.columns = [high_growth_column_label(c, language) for c in out.columns]
+    return out
+
+def high_growth_model_definition_text(language: str | None = None) -> str:
+    lang = (language or REPORT_LANGUAGE or "BILINGUAL").strip().upper()
+    zh = "40%預測Q2 EPS + 25%EPS加速度 + 20%營收加速度 + 15%估值(PE/PEG)；actual_q1_eps只作預測誤差/黑馬指標驗證"
+    en = "40% Predicted Q2 EPS + 25% EPS Acceleration + 20% Revenue Acceleration + 15% Valuation (PE/PEG); actual_q1_eps is only used to validate prediction_error / EPS Surprise"
+    if lang == "ZH":
+        return zh
+    if lang == "EN":
+        return en
+    return zh + " / " + en
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -5494,26 +5585,25 @@ class EPSForecastEngine:
             np.nan,
         )
         x["pe_ratio"] = pd.to_numeric(x.get("pe_ratio"), errors="coerce")
-        # V4.12-R1：若 external_valuation 沒 PE，但有價格與基準 EPS，則以 price/base_annual_eps 估算。
-        # 修正重點：不得把 np.where 回傳的 ndarray 直接丟給 Series.fillna(value=...)，
-        # 必須先轉成與 x.index 對齊的 pd.Series，否則 pandas 會拋出
-        # TypeError: "value" parameter must be a scalar, dict or Series, but you passed a "ndarray"。
-        current_price_s = _safe_numeric_series_for_df(x, "current_price", np.nan)
-        base_eps_s = pd.to_numeric(x["base_annual_eps"], errors="coerce")
-        pe_fallback = pd.Series(np.nan, index=x.index, dtype="float64")
-        pe_mask = current_price_s.notna() & base_eps_s.gt(0)
-        pe_fallback.loc[pe_mask] = current_price_s.loc[pe_mask] / base_eps_s.loc[pe_mask]
+        # V4.13/R1：若 external_valuation 沒 PE，但有價格與基準 EPS，則以 price/base_annual_eps 估算。
+        # 注意：fillna 不可傳入 np.where 產生的 ndarray；必須轉成同 index 的 Series，避免 UI 報表背景工作中斷。
+        current_price_series = pd.to_numeric(x.get("current_price"), errors="coerce")
+        pe_fallback = pd.Series(
+            np.where(
+                current_price_series.notna() & x["base_annual_eps"].gt(0),
+                current_price_series / x["base_annual_eps"],
+                np.nan,
+            ),
+            index=x.index,
+            dtype="float64",
+        )
         x["pe_ratio"] = x["pe_ratio"].fillna(pe_fallback)
-        x["pe_ratio"] = x["pe_ratio"].replace([np.inf, -np.inf], np.nan)
-
         x["predicted_eps_growth_pct"] = x["eps_acceleration_pct"] * 100.0
-        peg_raw = np.where(
+        x["peg_ratio"] = np.where(
             x["pe_ratio"].gt(0) & x["predicted_eps_growth_pct"].gt(0),
             x["pe_ratio"] / x["predicted_eps_growth_pct"],
             np.nan,
         )
-        # V4.12-R1：同步把 PEG 計算結果轉成 Series，保持 index 對齊與欄位型別一致。
-        x["peg_ratio"] = pd.Series(peg_raw, index=x.index, dtype="float64").replace([np.inf, -np.inf], np.nan)
         x["predicted_q2_eps_score"] = np.select(
             [x["predicted_q2_eps"].ge(5), x["predicted_q2_eps"].ge(3), x["predicted_q2_eps"].ge(1.5), x["predicted_q2_eps"].ge(0.5), x["predicted_q2_eps"].gt(0)],
             [100, 85, 70, 50, 30],
@@ -5565,7 +5655,7 @@ class EPSForecastEngine:
             pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(HIGH_GROWTH_V412_MIN_REVENUE_HIT) &
             x["v412_prediction_quality"].isin(["LEADING_FORECAST_BASE_EPS", "LEADING_FORECAST_TTM_PROXY"])
         )
-        x["v412_model_definition"] = "40% predicted_q2_eps_score + 25% eps_acceleration_score + 20% revenue_acceleration_score + 15% valuation_score(PE/PEG); actual_q1_eps only validates prediction_error/eps_surprise"
+        x["v412_model_definition"] = high_growth_model_definition_text()
         return x
 
 
@@ -5777,7 +5867,9 @@ class HighGrowthEPSEngine:
             {"項目": "V4.4修正", "內容": "修正V4.3找不到使用者下載檔的問題；擴大本機搜尋、增加TWSE線上下載fallback、修正Log/摘要把placeholder誤算成strict=1與把EPS_TTM候選誤算為forecast。"},
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
-            {"項目": "嚴格條件", "內容": "V4.12主策略：40% predicted_q2_eps、25% EPS加速度、20%營收加速度、15%估值(PE/PEG)；actual_q1_eps只作驗證"},
+            {"項目": "嚴格條件", "內容": high_growth_model_definition_text()},
+            {"項目": "報表語言模式", "內容": REPORT_LANGUAGE},
+            {"項目": "欄位命名策略", "內容": "UI / Excel / Log 共用 HIGH_GROWTH_COLUMN_MAP；程式內部欄位變數不改名"},
             {"項目": "預測候選條件", "內容": "正式季EPS尚未完整時，以月營收加速度預估EPS；只能列預測候選，不得列嚴格通過"},
             {"項目": "YoY門檻", "內容": self.min_yoy},
             {"項目": "嚴格通過筆數", "內容": strict_count},
@@ -5799,6 +5891,7 @@ class HighGrowthEPSEngine:
             {"序號": 4, "模組": "UI", "新增/修改": "修改", "程式位置": "_build_highgrowth_tab / on_highgrowth_report", "驗收點": "可勾選Q1/Q2/Q3/Q4並產生對應報表"},
             {"序號": 5, "模組": "DB Schema", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_schema", "驗收點": "缺 annual_eps_history 時自動建表"},
             {"序號": 6, "模組": "MOPS Official EPS Import", "新增/修改": "新增", "程式位置": "EPSForecastEngine.ensure_required_official_eps_from_mops", "驗收點": "可由MOPS ajax_t163sb04 POST抓取2026Q1、2025Q1、2025Q4正式EPS並寫入quarterly_financial_history/annual_eps_history"},
+            {"序號": 7, "模組": "Column Mapping", "新增/修改": "新增", "程式位置": "REPORT_LANGUAGE / HIGH_GROWTH_COLUMN_MAP / high_growth_column_label / localize_high_growth_dataframe_columns", "驗收點": "UI、Excel、Log 使用同一份欄位名稱字典；支援ZH/EN/BILINGUAL；程式內部欄位變數不改名"},
         ])
         if strict_df.empty:
             strict_df = pd.DataFrame([{"狀態": "NO_STRICT_PASS", "說明": "目前DB沒有完整符合嚴格條件的個股。"}])
@@ -5815,9 +5908,11 @@ class HighGrowthEPSEngine:
             "07_修改查檢表": rules,
             "08_全部結果": df.head(5000),
         }
+        # V4.13：輸出前才做欄位顯示名稱轉換，避免破壞程式內部欄位與後續排序/篩選。
+        tables = {name: localize_high_growth_dataframe_columns(tbl) if isinstance(tbl, pd.DataFrame) else tbl for name, tbl in tables.items()}
         out_path, kind = write_table_bundle(out_path.with_suffix(""), tables, preferred="excel")
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V4] 報表輸出：{out_path}｜quarters={'+'.join(self.tracking_quarters)}｜strict={strict_count}｜forecast={forecast_count}｜ttm_proxy={ttm_count}｜fail={fail_count}｜annual_eps_2025={annual_eps_rows}")
+            log_cb(f"[HIGH_GROWTH_V4.13] 報表輸出：{out_path}｜language={REPORT_LANGUAGE}｜model={high_growth_model_definition_text()}｜quarters={'+'.join(self.tracking_quarters)}｜strict={strict_count}｜forecast={forecast_count}｜ttm_proxy={ttm_count}｜fail={fail_count}｜annual_eps_2025={annual_eps_rows}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
@@ -12950,22 +13045,92 @@ class AppUI:
         mode_cb = ttk.Combobox(control, textvariable=self.highgrowth_mode_var, width=16, state="readonly")
         mode_cb["values"] = ["HYBRID", "STRICT_ACTUAL_ONLY", "FORECAST_PROXY"]
         mode_cb.pack(side="left", padx=2)
-        self.highgrowth_status_var = tk.StringVar(value=f"V4報表輸出：{HIGH_GROWTH_REPORT_DIR}")
+        ttk.Label(control, text="語言").pack(side="left", padx=(10, 2))
+        self.highgrowth_language_var = tk.StringVar(value=REPORT_LANGUAGE)
+        lang_cb = ttk.Combobox(control, textvariable=self.highgrowth_language_var, width=12, state="readonly")
+        lang_cb["values"] = ["ZH", "EN", "BILINGUAL"]
+        lang_cb.pack(side="left", padx=2)
+        lang_cb.bind("<<ComboboxSelected>>", lambda e: self._rebuild_highgrowth_tab_headers())
+        self.highgrowth_status_var = tk.StringVar(value=f"V4.13報表輸出：{HIGH_GROWTH_REPORT_DIR}｜語言={REPORT_LANGUAGE}")
         ttk.Label(control, textvariable=self.highgrowth_status_var).pack(side="left", padx=12)
-        cols = ("status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "eps_used", "eps_2025", "q1_ratio", "forecast_ratio", "ttm_ratio", "eps_source", "avg_yoy", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
+        cols = ("status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "pe_ratio", "peg_ratio", "v412_total_score", "eps_source", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
         headers = {
-            "status":"狀態", "rank":"排序", "id":"代號", "name":"名稱", "industry":"產業", "quarters":"季度",
-            "actual_q1_eps":"2026Q1實際EPS", "eps_used":"累計/預估EPS", "eps_2025":"2025全年EPS", "q1_ratio":"Q1/年EPS", "forecast_ratio":"預估/年EPS", "ttm_ratio":"TTM/年EPS", "eps_source":"EPS來源",
-            "avg_yoy":"平均YoY", "rev_hit":"營收月數", "rev_stair":"營收階梯", "close":"現價", "rsi":"RSI", "trend":"趨勢分",
-            "risk":"風險", "action":"建議動作", "gap":"資料缺口/原因"
+            "status": "狀態" if REPORT_LANGUAGE != "EN" else "Status",
+            "rank": "排序" if REPORT_LANGUAGE != "EN" else "Rank",
+            "id": high_growth_column_label("stock_id"),
+            "name": high_growth_column_label("stock_name"),
+            "industry": high_growth_column_label("industry"),
+            "quarters": high_growth_column_label("追蹤季度"),
+            "actual_q1_eps": high_growth_column_label("actual_q1_eps"),
+            "predicted_q2_eps": high_growth_column_label("predicted_q2_eps"),
+            "predicted_q3_eps": high_growth_column_label("predicted_q3_eps"),
+            "eps_acceleration": high_growth_column_label("eps_acceleration"),
+            "revenue_acceleration": high_growth_column_label("revenue_acceleration"),
+            "pe_ratio": high_growth_column_label("pe_ratio"),
+            "peg_ratio": high_growth_column_label("peg_ratio"),
+            "v412_total_score": high_growth_column_label("v412_total_score"),
+            "eps_source": high_growth_column_label("eps_source_used"),
+            "rev_hit": "營收月數 (Revenue Hit/Required)" if REPORT_LANGUAGE == "BILINGUAL" else ("營收月數" if REPORT_LANGUAGE == "ZH" else "Revenue Hit/Required"),
+            "rev_stair": high_growth_column_label("revenue_stair_gate"),
+            "close": high_growth_column_label("close"),
+            "rsi": high_growth_column_label("rsi14"),
+            "trend": high_growth_column_label("trend_score"),
+            "risk": high_growth_column_label("風險旗標"),
+            "action": high_growth_column_label("建議動作"),
+            "gap": high_growth_column_label("資料缺口/未通過原因"),
         }
         self.highgrowth_tree = self._make_tree(self.tab_highgrowth, cols, headers)
-        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":120,"quarters":80,"actual_q1_eps":105,"eps_used":105,"eps_2025":105,"q1_ratio":85,"forecast_ratio":95,"ttm_ratio":85,"eps_source":150,"avg_yoy":90,"rev_hit":85,"rev_stair":90,"close":80,"rsi":70,"trend":80,"risk":140,"action":250,"gap":420}
+        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":130,"quarters":95,"actual_q1_eps":125,"predicted_q2_eps":125,"predicted_q3_eps":125,"eps_acceleration":125,"revenue_acceleration":135,"pe_ratio":90,"peg_ratio":90,"v412_total_score":100,"eps_source":170,"rev_hit":115,"rev_stair":110,"close":80,"rsi":70,"trend":90,"risk":150,"action":270,"gap":440}
         for c, w in widths.items():
             try:
                 self.highgrowth_tree.column(c, width=w, minwidth=55, stretch=False)
             except Exception:
                 pass
+
+    def _rebuild_highgrowth_tab_headers(self):
+        """V4.13：語言切換時同步更新高成長EPS Treeview欄位標題。"""
+        try:
+            global REPORT_LANGUAGE
+            lang = getattr(self, "highgrowth_language_var", tk.StringVar(value=REPORT_LANGUAGE)).get().strip().upper()
+            if lang not in {"ZH", "EN", "BILINGUAL"}:
+                lang = "BILINGUAL"
+            REPORT_LANGUAGE = lang
+            if not hasattr(self, "highgrowth_tree"):
+                return
+            header_map = {
+                "status": "狀態" if REPORT_LANGUAGE != "EN" else "Status",
+                "rank": "排序" if REPORT_LANGUAGE != "EN" else "Rank",
+                "id": high_growth_column_label("stock_id"),
+                "name": high_growth_column_label("stock_name"),
+                "industry": high_growth_column_label("industry"),
+                "quarters": high_growth_column_label("追蹤季度"),
+                "actual_q1_eps": high_growth_column_label("actual_q1_eps"),
+                "predicted_q2_eps": high_growth_column_label("predicted_q2_eps"),
+                "predicted_q3_eps": high_growth_column_label("predicted_q3_eps"),
+                "eps_acceleration": high_growth_column_label("eps_acceleration"),
+                "revenue_acceleration": high_growth_column_label("revenue_acceleration"),
+                "pe_ratio": high_growth_column_label("pe_ratio"),
+                "peg_ratio": high_growth_column_label("peg_ratio"),
+                "v412_total_score": high_growth_column_label("v412_total_score"),
+                "eps_source": high_growth_column_label("eps_source_used"),
+                "rev_hit": "營收月數 (Revenue Hit/Required)" if REPORT_LANGUAGE == "BILINGUAL" else ("營收月數" if REPORT_LANGUAGE == "ZH" else "Revenue Hit/Required"),
+                "rev_stair": high_growth_column_label("revenue_stair_gate"),
+                "close": high_growth_column_label("close"),
+                "rsi": high_growth_column_label("rsi14"),
+                "trend": high_growth_column_label("trend_score"),
+                "risk": high_growth_column_label("風險旗標"),
+                "action": high_growth_column_label("建議動作"),
+                "gap": high_growth_column_label("資料缺口/未通過原因"),
+            }
+            for col, label in header_map.items():
+                try:
+                    self.highgrowth_tree.heading(col, text=label)
+                except Exception:
+                    pass
+            if hasattr(self, "highgrowth_status_var"):
+                self.highgrowth_status_var.set(f"V4.13報表輸出：{HIGH_GROWTH_REPORT_DIR}｜語言={REPORT_LANGUAGE}")
+        except Exception as exc:
+            self.append_log(f"高成長EPS語言欄位更新失敗：{exc}", "ERROR")
 
     def _refresh_highgrowth_tree(self, df: pd.DataFrame | None = None):
         try:
@@ -12992,13 +13157,14 @@ class AppUI:
                 rev_hit = f"{int(float(r.get('revenue_month_count_hit', 0) or 0))}/{int(float(r.get('revenue_month_count_required', 0) or 0))}"
                 self.highgrowth_tree.insert("", "end", values=(
                     str(r.get("基本面狀態", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")), str(r.get("industry", "")), str(r.get("追蹤季度", "+".join(quarters))),
-                    fmt(r.get("actual_q1_eps", "")), fmt(r.get("eps_cumulative_used", "")), fmt(r.get("base_annual_eps", "")), fmt(r.get("q1_vs_annual_ratio", "")), fmt(r.get("forecast_vs_annual_ratio", "")), fmt(r.get("ttm_vs_annual_ratio", "")), str(r.get("eps_source_used", "")),
-                    fmt(r.get("avg_revenue_yoy", "")), rev_hit, rev_stair, fmt(r.get("close", "")), fmt(r.get("rsi14", "")), fmt(r.get("trend_score", "")),
+                    fmt(r.get("actual_q1_eps", "")), fmt(r.get("predicted_q2_eps", "")), fmt(r.get("predicted_q3_eps", "")), fmt(r.get("eps_acceleration", "")), fmt(r.get("revenue_acceleration", "")),
+                    fmt(r.get("pe_ratio", "")), fmt(r.get("peg_ratio", "")), fmt(r.get("v412_total_score", "")), str(r.get("eps_source_used", "")),
+                    rev_hit, rev_stair, fmt(r.get("close", "")), fmt(r.get("rsi14", "")), fmt(r.get("trend_score", "")),
                     str(r.get("風險旗標", "")), str(r.get("建議動作", "")), str(r.get("資料缺口/未通過原因", ""))
                 ))
             if hasattr(self, "highgrowth_status_var"):
                 counts = df.get("基本面狀態", pd.Series(dtype=str)).fillna("").astype(str).value_counts().to_dict()
-                self.highgrowth_status_var.set(f"V4最新篩選：{len(df)}筆｜季度={'+'.join(quarters)}｜狀態{counts}｜報表：{self.last_highgrowth_report_path or HIGH_GROWTH_REPORT_DIR}")
+                self.highgrowth_status_var.set(f"V4.13最新篩選：{len(df)}筆｜季度={'+'.join(quarters)}｜語言={REPORT_LANGUAGE}｜狀態{counts}｜報表：{self.last_highgrowth_report_path or HIGH_GROWTH_REPORT_DIR}")
         except Exception as exc:
             self.append_log(f"刷新高成長EPS V4表失敗：{exc}", "ERROR")
 
@@ -13006,6 +13172,10 @@ class AppUI:
         """UI按鈕：產生高成長EPS加速度V4報表。"""
         quarters = self._selected_highgrowth_quarters()
         mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
+        global REPORT_LANGUAGE
+        REPORT_LANGUAGE = getattr(self, "highgrowth_language_var", tk.StringVar(value=REPORT_LANGUAGE)).get().strip().upper()
+        if REPORT_LANGUAGE not in {"ZH", "EN", "BILINGUAL"}:
+            REPORT_LANGUAGE = "BILINGUAL"
         def worker():
             self.ui_call(self.start_task, "高成長EPS V4報表", 3)
             self.ui_call(self.update_task, "高成長EPS V4報表", 1, 3, item=f"讀取EPS與營收資料｜季度={'+'.join(quarters)}")
