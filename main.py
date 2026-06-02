@@ -384,6 +384,30 @@ CLASSIFICATION_DOWNLOAD_SOURCES = {
 BOOTSTRAP_LOCK = threading.Lock()
 BOOTSTRAP_EVENT = threading.Event()
 
+# V4.16-R1 STARTUP_NO18_FIX：避免啟動或初始化失敗時，把內建18檔示範清單誤當全市場主檔。
+# 若官方Universe/本地主檔不足此門檻，只能作為示範/觀察清單，不得覆蓋 stocks_master。
+MIN_FULL_MARKET_UNIVERSE_ROWS = int(os.getenv("GTC_MIN_FULL_MARKET_UNIVERSE_ROWS", "500"))
+GTC_STARTUP_FETCH_UNIVERSE = os.getenv("GTC_STARTUP_FETCH_UNIVERSE", "1").strip() == "1"
+GTC_AUTO_CLASSIFICATION_DOWNLOAD = os.getenv("GTC_AUTO_CLASSIFICATION_DOWNLOAD", "0").strip() == "1"
+
+def is_full_market_universe(df: pd.DataFrame | None, min_rows: int = MIN_FULL_MARKET_UNIVERSE_ROWS) -> bool:
+    try:
+        return isinstance(df, pd.DataFrame) and len(df) >= int(min_rows) and "stock_id" in df.columns
+    except Exception:
+        return False
+
+def safe_read_master_csv_candidate(csv_path: Path) -> pd.DataFrame:
+    try:
+        if csv_path and Path(csv_path).exists():
+            x = pd.read_csv(csv_path, dtype=str).fillna("")
+            if "stock_id" in x.columns:
+                x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id)
+                x = x[x["stock_id"].astype(str).str.fullmatch(r"\d{4,5}", na=False)].copy()
+            return x
+    except Exception as exc:
+        log_warning(f"讀取主檔候選失敗：{csv_path}｜{exc}")
+    return pd.DataFrame()
+
 def set_classification_log_callback(cb):
     global CLASSIFICATION_LOG_CALLBACK
     CLASSIFICATION_LOG_CALLBACK = cb
@@ -978,6 +1002,9 @@ def ensure_classification_book(force_refresh: bool = False, log_cb=None) -> Opti
             if not meta or Path(str(meta.get("path", "")).split(" | ")[0]) != p:
                 _write_classification_meta(_build_classification_meta(p, source="LOCAL", note="discovered existing file"))
             return p
+        # V4.16-R1：狀態查詢/啟動不可因找不到本地分類檔而自動連外，避免UI卡住或看似閃退。
+        if not GTC_AUTO_CLASSIFICATION_DOWNLOAD:
+            return None
     return download_classification_book(force_refresh=force_refresh, log_cb=log_cb)
 
 def resolve_classification_book() -> Optional[Path]:
@@ -1005,7 +1032,8 @@ def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]
     for p in _classification_csv_candidates_by_market(market):
         if Path(p).exists():
             return Path(p)
-    if market in ("上市", "上櫃"):
+    # V4.16-R1：預設不自動下載分類；只有手動更新或環境變數允許時才連外。
+    if market in ("上市", "上櫃") and GTC_AUTO_CLASSIFICATION_DOWNLOAD:
         try:
             downloaded = _download_single_classification_csv(market, force_refresh=False, log_cb=classification_debug_log)
             if downloaded is not None and Path(downloaded).exists():
@@ -2014,54 +2042,67 @@ def fetch_tpex_universe() -> pd.DataFrame:
 
 
 def build_full_market_universe() -> pd.DataFrame:
-    twse = fetch_twse_universe()
-    tpex = fetch_tpex_universe()
-    all_df = pd.concat([twse, tpex], ignore_index=True)
-    if all_df.empty:
-        csv_path = resolve_master_csv()
-        if csv_path.exists():
-            x = pd.read_csv(csv_path, dtype=str).fillna("")
-            return _normalize_master_df(x, "上市")
-        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+    """建立全市場股票主檔。
 
-    try:
-        csv_path = resolve_master_csv()
-        if csv_path.exists():
-            x = pd.read_csv(csv_path, dtype=str).fillna("")
-            x = _normalize_master_df(x, "上市", persist_classification_summary=False)
-            if x is not None and not x.empty and "stock_id" in x.columns:
-                x["stock_id"] = x["stock_id"].astype(str).str.strip()
-                x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
-                keep_cols = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
-                for c in keep_cols:
-                    if c not in x.columns:
-                        x[c] = ""
-                x = x[keep_cols].drop_duplicates(subset=["stock_id"]).set_index("stock_id")
-                all_df = all_df.drop_duplicates(subset=["stock_id"]).set_index("stock_id")
+    V4.16-R1：修正「股票數只剩18檔」問題。
+    - 啟動/初始化若官方全市場抓取失敗，不得把 DEFAULT_MASTER_CSV 的18檔示範清單寫成全市場。
+    - 只有資料筆數 >= MIN_FULL_MARKET_UNIVERSE_ROWS 才視為全市場主檔。
+    - 若本地主檔不足門檻，只回傳空表，讓UI保持啟動並提示使用者更新，不覆蓋DB。
+    """
+    all_df = pd.DataFrame()
+    if GTC_STARTUP_FETCH_UNIVERSE:
+        twse = fetch_twse_universe()
+        tpex = fetch_tpex_universe()
+        parts = [df for df in [twse, tpex] if isinstance(df, pd.DataFrame) and not df.empty]
+        if parts:
+            all_df = pd.concat(parts, ignore_index=True)
 
-                invalid_text = {"", "未分類", "全市場", "系統掃描"}
-                for col in ["stock_name", "market", "industry", "theme", "sub_theme"]:
-                    if col in x.columns and col in all_df.columns:
-                        valid_mask = ~x[col].astype(str).isin(invalid_text)
-                        valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
-                        if len(valid_ids) > 0:
-                            all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
+    if not all_df.empty and is_full_market_universe(all_df):
+        try:
+            csv_path = resolve_master_csv()
+            if csv_path.exists():
+                x = safe_read_master_csv_candidate(csv_path)
+                # 只有本地主檔本身也像全市場時，才允許覆蓋官方資料欄位；避免18檔示範清單污染全市場。
+                if is_full_market_universe(x):
+                    x = _normalize_master_df(x, "上市", persist_classification_summary=False)
+                    if x is not None and not x.empty and "stock_id" in x.columns:
+                        x["stock_id"] = x["stock_id"].astype(str).str.strip()
+                        x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
+                        keep_cols = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
+                        for c in keep_cols:
+                            if c not in x.columns:
+                                x[c] = ""
+                        x = x[keep_cols].drop_duplicates(subset=["stock_id"]).set_index("stock_id")
+                        all_df = all_df.drop_duplicates(subset=["stock_id"]).set_index("stock_id")
+                        invalid_text = {"", "未分類", "全市場", "系統掃描"}
+                        for col in ["stock_name", "market", "industry", "theme", "sub_theme"]:
+                            if col in x.columns and col in all_df.columns:
+                                valid_mask = ~x[col].astype(str).isin(invalid_text)
+                                valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
+                                if len(valid_ids) > 0:
+                                    all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
+                        for col in ["is_etf", "is_active", "update_date"]:
+                            if col in x.columns and col in all_df.columns:
+                                valid_mask = x[col].astype(str).str.strip().ne("")
+                                valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
+                                if len(valid_ids) > 0:
+                                    all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
+                        all_df = all_df.reset_index()
+                else:
+                    log_warning(f"本地主檔只有 {len(x)} 檔，判定為示範/觀察清單，不覆蓋官方全市場Universe：{csv_path}")
+        except Exception as exc:
+            log_warning(f"主檔覆蓋既有 CSV 時略過：{exc}")
+        if "stock_id" not in all_df.columns:
+            return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+        return all_df.drop_duplicates(subset=["stock_id"]).sort_values(["market", "industry", "stock_id"]).reset_index(drop=True)
 
-                for col in ["is_etf", "is_active", "update_date"]:
-                    if col in x.columns and col in all_df.columns:
-                        valid_mask = x[col].astype(str).str.strip().ne("")
-                        valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
-                        if len(valid_ids) > 0:
-                            all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
-
-                all_df = all_df.reset_index()
-    except Exception as exc:
-        log_warning(f"主檔覆蓋既有 CSV 時略過：{exc}")
-
-    if "stock_id" not in all_df.columns:
-        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
-
-    return all_df.drop_duplicates(subset=["stock_id"]).sort_values(["market", "industry", "stock_id"]).reset_index(drop=True)
+    # 官方抓取失敗時，只接受足夠大的本地主檔；拒絕18檔示範清單。
+    csv_path = resolve_master_csv()
+    x = safe_read_master_csv_candidate(csv_path)
+    if is_full_market_universe(x):
+        return _normalize_master_df(x, "上市")
+    log_warning(f"全市場Universe建立失敗；本地主檔只有 {len(x)} 檔，低於門檻 {MIN_FULL_MARKET_UNIVERSE_ROWS}，不匯入，避免股票池被縮成18檔。")
+    return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
 
 
 
@@ -13215,7 +13256,7 @@ class AppUI:
         cols = ("status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "selection_eps", "selection_score", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "pe_ratio", "peg_ratio", "v412_total_score", "eps_source", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
         headers = dict(UI_HIGH_GROWTH_HEADERS)
         self.highgrowth_tree = self._make_tree(self.tab_highgrowth, cols, headers)
-        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":130,"quarters":95,"actual_q1_eps":125,"selection_eps":110,"predicted_q2_eps":125,"predicted_q3_eps":125,"eps_acceleration":125,"revenue_acceleration":135,"pe_ratio":90,"peg_ratio":90,"v412_total_score":100,"eps_source":170,"rev_hit":115,"rev_stair":110,"close":80,"rsi":70,"trend":90,"risk":150,"action":270,"gap":440}
+        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":130,"quarters":95,"actual_q1_eps":125,"selection_eps":110,"selection_score":100,"predicted_q2_eps":125,"predicted_q3_eps":125,"eps_acceleration":125,"revenue_acceleration":135,"pe_ratio":90,"peg_ratio":90,"v412_total_score":100,"eps_source":170,"rev_hit":115,"rev_stair":110,"close":80,"rsi":70,"trend":90,"risk":150,"action":270,"gap":440}
         for c, w in widths.items():
             try:
                 self.highgrowth_tree.column(c, width=w, minwidth=55, stretch=False)
@@ -13247,7 +13288,9 @@ class AppUI:
                 return
             self.highgrowth_tree.delete(*self.highgrowth_tree.get_children())
             if df is None or df.empty:
-                self.highgrowth_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "+".join(quarters), "", "", "", "", "", "", "", "", "", "", "", "", "請先產生高成長EPS報表"))
+                empty_values = ["NO_DATA", "", "", "", "", "+".join(quarters)] + [""] * (len(self.highgrowth_tree["columns"]) - 6)
+                empty_values[-1] = "請先產生高成長EPS報表"
+                self.highgrowth_tree.insert("", "end", values=tuple(empty_values))
                 return
             def fmt(v):
                 try:
@@ -13262,7 +13305,7 @@ class AppUI:
                 rev_hit = f"{int(float(r.get('revenue_month_count_hit', 0) or 0))}/{int(float(r.get('revenue_month_count_required', 0) or 0))}"
                 self.highgrowth_tree.insert("", "end", values=(
                     str(r.get("基本面狀態", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")), str(r.get("industry", "")), str(r.get("追蹤季度", "+".join(quarters))),
-                    fmt(r.get("actual_q1_eps", "")), fmt(r.get("selection_eps", "")), fmt(r.get("predicted_q2_eps", "")), fmt(r.get("predicted_q3_eps", "")), fmt(r.get("eps_acceleration", "")), fmt(r.get("revenue_acceleration", "")),
+                    fmt(r.get("actual_q1_eps", "")), fmt(r.get("selection_eps", "")), fmt(r.get("selection_score", "")), fmt(r.get("predicted_q2_eps", "")), fmt(r.get("predicted_q3_eps", "")), fmt(r.get("eps_acceleration", "")), fmt(r.get("revenue_acceleration", "")),
                     fmt(r.get("pe_ratio", "")), fmt(r.get("peg_ratio", "")), fmt(r.get("v412_total_score", "")), str(r.get("eps_source_used", "")),
                     rev_hit, rev_stair, fmt(r.get("close", "")), fmt(r.get("rsi14", "")), fmt(r.get("trend_score", "")),
                     str(r.get("風險旗標", "")), str(r.get("建議動作", "")), str(r.get("資料缺口/未通過原因", ""))
@@ -15644,16 +15687,15 @@ class AppUI:
                 self.ui_call(self.start_task, "初始化全市場", 4)
                 self.ui_call(self.update_task, "初始化全市場", 1, 4, item="抓取主檔")
                 universe = build_full_market_universe()
-                if universe is None or universe.empty:
-                    csv_path = resolve_master_csv()
-                    self.db.import_master_csv(csv_path)
+                if not is_full_market_universe(universe):
                     master2 = self.db.get_master()
                     self.ui_call(self.refresh_filters)
                     self.ui_call(self.refresh_all_tables)
                     self.ui_call(self.refresh_classification_summary_ui)
-                    self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
-                    self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master2)} 檔。")
-                    self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master2)} 檔\n\n使用主檔：{csv_path}")
+                    self.ui_call(self.update_task, "初始化全市場", 4, 4, fail=1, item="未取得全市場")
+                    msg = f"全市場抓取失敗或筆數不足（取得 {0 if universe is None else len(universe)} 檔，門檻 {MIN_FULL_MARKET_UNIVERSE_ROWS} 檔）。\n已拒絕匯入18檔示範清單，避免股票池被縮小。\n目前DB主檔：{len(master2)} 檔。"
+                    self.ui_call(self.set_status, msg)
+                    self.ui_call(messagebox.showwarning, "未更新全市場", msg)
                     return
                 self.db.import_master_df(universe)
                 master2 = self.db.get_master()
@@ -16427,28 +16469,31 @@ def bootstrap():
         init_message = "股票主檔已就緒"
         try:
             master = db.get_master()
-            if master.empty:
+            # V4.16-R1：小於門檻的主檔多半是內建18檔示範清單，不能宣稱為全市場。
+            if master.empty or len(master) < MIN_FULL_MARKET_UNIVERSE_ROWS:
+                if not master.empty:
+                    log_warning(f"啟動偵測到股票主檔只有 {len(master)} 檔，低於全市場門檻 {MIN_FULL_MARKET_UNIVERSE_ROWS}；嘗試重建，但不會用18檔示範清單覆蓋。")
                 universe = build_full_market_universe()
-                if universe is not None and not universe.empty:
+                if is_full_market_universe(universe):
                     db.import_master_df(universe)
                     master = db.get_master()
                     init_message = f"已自動建立全市場股票主檔，共 {len(master)} 檔"
+                elif master.empty:
+                    init_message = f"全市場股票主檔尚未建立；官方Universe/本地主檔不足 {MIN_FULL_MARKET_UNIVERSE_ROWS} 檔，已拒絕匯入18檔示範清單，UI仍可啟動。請使用『初始化全市場』或放入完整 stocks_master.csv。"
                 else:
-                    csv_path = resolve_master_csv()
-                    db.import_master_csv(csv_path)
-                    master = db.get_master()
-                    init_message = f"已改用本地主檔，共 {len(master)} 檔 | {csv_path}"
+                    init_message = f"目前股票主檔只有 {len(master)} 檔，低於全市場門檻 {MIN_FULL_MARKET_UNIVERSE_ROWS}；未再用18檔清單覆蓋。請重新初始化全市場。"
             else:
                 init_message = f"股票主檔已載入，共 {len(master)} 檔"
 
-            if db.get_ranking_rows_count() == 0 and db.get_total_price_rows() > 0:
+            if db.get_ranking_rows_count() == 0 and db.get_total_price_rows() > 0 and len(db.get_master()) >= MIN_FULL_MARKET_UNIVERSE_ROWS:
                 rank_count = RankingEngine(db).rebuild()
                 if rank_count > 0:
                     init_message += f"｜已自動重建排行 {rank_count} 檔"
                 else:
                     init_message += "｜已有歷史資料，但目前不足以形成排行"
         except Exception as e:
-            init_message = f"股票主檔初始化失敗：{e}"
+            log_exception("bootstrap 初始化失敗", e)
+            init_message = f"股票主檔初始化失敗：{e}；UI仍嘗試啟動，請檢查Log。"
 
         BOOTSTRAP_EVENT.set()
         log_info(f"bootstrap done｜{init_message}")
@@ -16457,18 +16502,39 @@ def bootstrap():
 
 def main():
     log_info("main start")
-    db, init_message = bootstrap()
-    root = tk.Tk()
-    app = AppUI(root, db)
-    app.set_status(init_message)
+    db = None
+    root = None
+    try:
+        db, init_message = bootstrap()
+        root = tk.Tk()
+        app = AppUI(root, db)
+        app.set_status(init_message)
 
-    def _close():
-        log_info("application closing")
-        db.close()
-        root.destroy()
+        def _close():
+            log_info("application closing")
+            try:
+                db.close()
+            except Exception:
+                pass
+            root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", _close)
-    root.mainloop()
+        root.protocol("WM_DELETE_WINDOW", _close)
+        root.mainloop()
+    except Exception as exc:
+        log_exception("主程式啟動失敗", exc)
+        try:
+            if root is not None:
+                messagebox.showerror("啟動失敗", f"主程式啟動失敗：\n{exc}\n\n請查看 logs/gtc_ai_trading_YYYYMMDD.log")
+            else:
+                print(f"主程式啟動失敗：{exc}", file=sys.stderr)
+        except Exception:
+            pass
+        try:
+            if db is not None:
+                db.close()
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
