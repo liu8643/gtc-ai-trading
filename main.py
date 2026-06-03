@@ -3716,7 +3716,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R2_REPORT_DATA_QUALITY_FIX_20260603"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R2A_BUILD_PY310_FSTRING_FIX_20260603"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -6276,8 +6276,9 @@ class HighGrowthEPSEngine:
             final_path, kind = write_table_bundle(lang_path.with_suffix(""), localized_tables, preferred="excel")
             generated_paths.append(Path(final_path))
         out_path = generated_paths[0] if generated_paths else out_path
+        missing_months_text = missing_required_months or 'NONE'
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V4.15_R1] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_required_months or "NONE"}｜fail={fail_count}")
+            log_cb(f"[HIGH_GROWTH_V4.15_R2A] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
