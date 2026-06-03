@@ -338,17 +338,19 @@ def resolve_master_csv() -> Path:
     return ensure_external_master_csv()
 
 
-# CLASSIFICATION_TPEX_JSON_FALLBACK_FIX_20260604_R2：分類來源改為本機 data/classification 優先；官網只作新版 JSON fallback。
-# 上市使用 TWSE OpenAPI；上櫃/興櫃使用 TPEx OpenAPI；JSON 解析失敗不得再當 CSV 用 cp950/big5 硬讀。
+# CLASSIFICATION_TPEX_JSON_FALLBACK_R2_20260604：分類來源改為本機 data/classification 優先；官網只作新版 OpenAPI JSON fallback。
+# 讀取順序：1) EXE 旁 RUNTIME_DIR/data/classification 2) 程式內 BASE_DIR/data/classification 3) OpenAPI JSON。
+# OpenAPI 失敗僅記錄 warning，不阻斷開機；JSON 解析失敗不再改用 CSV/cp950 硬讀。
 CLASSIFICATION_DOWNLOAD_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 CLASSIFICATION_DOWNLOAD_URL_TWSE = CLASSIFICATION_DOWNLOAD_URL
 CLASSIFICATION_DOWNLOAD_URL_TPEX = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
-CLASSIFICATION_DOWNLOAD_URL_TWSE_R = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_R"
+CLASSIFICATION_DOWNLOAD_URL_TPEX_R = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_R"
 CLASSIFICATION_LEGACY_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
 CLASSIFICATION_CACHE_DIR = EXTERNAL_DATA_DIR / "classification"
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CLASSIFICATION_CACHE_CSV_TWSE = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上市.csv"
 CLASSIFICATION_CACHE_CSV_TPEX = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上櫃.csv"
+CLASSIFICATION_CACHE_CSV_TPEX_R = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_興櫃.csv"
 CLASSIFICATION_CACHE_CSV = CLASSIFICATION_CACHE_CSV_TWSE  # backward compatibility
 CLASSIFICATION_CACHE_XLS = CLASSIFICATION_CACHE_DIR / "台股類股分類.xls"
 CLASSIFICATION_CACHE_XLSX = CLASSIFICATION_CACHE_DIR / "台股類股分類.xlsx"
@@ -370,6 +372,7 @@ CLASSIFICATION_STABILITY_LOCK = threading.RLock()
 CLASSIFICATION_OFFICIAL_CACHE = {
     "上市": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
     "上櫃": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
+    "興櫃": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
     "ALL": {"df": None, "path": "", "mtime": 0.0, "rows": 0},
 }
 CLASSIFICATION_DOWNLOAD_SOURCES = {
@@ -377,16 +380,19 @@ CLASSIFICATION_DOWNLOAD_SOURCES = {
         "url": CLASSIFICATION_DOWNLOAD_URL_TWSE,
         "cache_path": CLASSIFICATION_CACHE_CSV_TWSE,
         "source": "TWSE-OPENAPI-JSON-L",
+        "referer": "https://openapi.twse.com.tw/",
     },
     "上櫃": {
         "url": CLASSIFICATION_DOWNLOAD_URL_TPEX,
         "cache_path": CLASSIFICATION_CACHE_CSV_TPEX,
         "source": "TPEX-OPENAPI-JSON-O",
+        "referer": "https://www.tpex.org.tw/openapi/",
     },
     "興櫃": {
-        "url": CLASSIFICATION_DOWNLOAD_URL_TWSE_R,
-        "cache_path": CLASSIFICATION_CACHE_DIR / "台股官方產業分類_興櫃.csv",
+        "url": CLASSIFICATION_DOWNLOAD_URL_TPEX_R,
+        "cache_path": CLASSIFICATION_CACHE_CSV_TPEX_R,
         "source": "TPEX-OPENAPI-JSON-R",
+        "referer": "https://www.tpex.org.tw/openapi/",
     },
 }
 BOOTSTRAP_LOCK = threading.Lock()
@@ -679,7 +685,7 @@ def safe_read_csv_auto(path: Path) -> pd.DataFrame:
 
 
 def safe_read_json_auto(path: Path) -> pd.DataFrame:
-    """讀取 TWSE/TPEx OpenAPI t187ap03_* JSON 陣列，回傳 dtype=str DataFrame。"""
+    """嚴格讀取官方 OpenAPI JSON 陣列；失敗時不 fallback 到 CSV/cp950。"""
     path = Path(path)
     last_error = None
     for enc in ("utf-8-sig", "utf-8"):
@@ -697,7 +703,7 @@ def safe_read_json_auto(path: Path) -> pd.DataFrame:
 
 
 def safe_read_classification_source(path: Path) -> pd.DataFrame:
-    """分類來源統一入口：本地 CSV / JSON 都可讀，避免新版 OpenAPI JSON 造成舊 CSV parser 失敗。"""
+    """分類來源統一讀取：本機 CSV 走 CSV parser；JSON 來源嚴格走 JSON parser。"""
     path = Path(path)
     if path.suffix.lower() == ".json":
         return safe_read_json_auto(path)
@@ -891,9 +897,10 @@ def convert_xls_to_xlsx_force(src: Path, dst: Path, log_cb=None) -> Optional[Pat
 
 
 def _download_single_classification_csv(market: str, force_refresh: bool = False, log_cb=None) -> Optional[Path]:
-    """新版分類 fallback：使用 OpenAPI JSON，成功後轉存為本機 CSV 快取。
+    """分類 OpenAPI JSON fallback。
 
-    注意：這是分類資料的備援補抓，不作為開機必要條件；失敗時只讓上層記錄 warning。
+    只在本機 data/classification 與 BASE_DIR/data/classification 都找不到時執行。
+    官方 API 正常回傳 JSON；若 JSON 解析失敗，直接視為 fallback 失敗，不再當 CSV/cp950 硬讀。
     """
     market = str(market or "").strip()
     cfg = CLASSIFICATION_DOWNLOAD_SOURCES.get(market)
@@ -911,30 +918,31 @@ def _download_single_classification_csv(market: str, force_refresh: bool = False
             resp = requests.get(
                 cfg["url"],
                 timeout=CLASSIFICATION_DOWNLOAD_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*", "Referer": "https://www.tpex.org.tw/openapi/" if market in ("上櫃", "興櫃") else "https://openapi.twse.com.tw/"}
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json,text/plain,*/*",
+                    "Referer": str(cfg.get("referer") or "https://www.tpex.org.tw/openapi/"),
+                },
             )
             resp.raise_for_status()
-            content = resp.content or b""
-            if len(content) < 128:
-                raise ValueError("下載內容過小，疑似失敗或非有效檔案")
-
-            # 新版 OpenAPI fallback 僅接受 JSON 陣列。
-            # JSON 解析失敗時直接進入 warning/fallback，不再把回應內容當 CSV 用 cp950/big5 硬讀，
-            # 避免 HTML/錯誤頁被誤判成分類資料而污染 ClassificationEngine。
-            content_type = str(resp.headers.get("Content-Type", "") or "").lower()
             text_body = resp.text or ""
-            if not ("json" in content_type or text_body.lstrip().startswith(("[", "{"))):
-                raise ValueError(f"OpenAPI fallback 回傳非 JSON：content_type={content_type or 'unknown'}")
-            data = resp.json()
+            if len(text_body.encode("utf-8", errors="ignore")) < 128:
+                raise ValueError("下載內容過小，疑似失敗或非有效 JSON")
+
+            # 嚴格 JSON：不可把 JSON 解析失敗的內容改用 CSV/cp950 硬讀。
+            try:
+                data = resp.json()
+            except Exception as json_exc:
+                raise RuntimeError(f"OpenAPI 回傳內容不是有效 JSON：{json_exc}")
             if isinstance(data, dict):
                 data = data.get("data") or data.get("records") or data.get("result") or []
             if not isinstance(data, list):
                 raise ValueError("OpenAPI JSON格式不是陣列")
-            probe = pd.DataFrame(data).astype(str).fillna("")
 
+            probe = pd.DataFrame(data).astype(str).fillna("")
             parsed = _extract_official_csv_rows(probe, market=market)
             if parsed is None or parsed.empty:
-                raise RuntimeError(f"{market} OpenAPI資料可讀取，但無可用官方產業資料")
+                raise RuntimeError(f"{market} OpenAPI JSON可讀取，但無可用官方產業資料")
 
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             probe.to_csv(cache_path, index=False, encoding="utf-8-sig")
@@ -971,7 +979,7 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
     if downloaded:
         meta = {
             "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source": "LOCAL-CSV-OR-TWSE-OPENAPI-JSON",
+            "source": "LOCAL-CSV-OR-OPENAPI-JSON",
             "file": ", ".join(Path(p).name for _, p in downloaded),
             "path": " | ".join(str(p) for _, p in downloaded),
             "status": "ok" if len(downloaded) == 2 else "partial",
@@ -984,7 +992,7 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
         CLASSIFICATION_MEMORY_CACHE["meta"] = meta
         CLASSIFICATION_MEMORY_CACHE["market"] = "ALL"
         first_path = downloaded[0][1]
-        note = "已下載官方分類 OpenAPI 並轉存 CSV（上市+上櫃+興櫃）" if len(downloaded) == 3 else f"部分下載成功：{','.join(m for m,_ in downloaded)}"
+        note = "已下載官方分類CSV（上市+上櫃）" if len(downloaded) == 2 else f"部分下載成功：{','.join(m for m,_ in downloaded)}"
         _set_classification_load_info(False, 0, first_path, note)
         return first_path
 
@@ -1038,10 +1046,12 @@ def resolve_classification_book() -> Optional[Path]:
     return ensure_classification_book(force_refresh=False)
 
 def _classification_csv_candidates_by_market(market: str = "ALL") -> list[Path]:
-    """分類本機候選順序（嚴格限制）：
+    """分類本機候選順序（嚴格優先）：
     1) EXE 旁 RUNTIME_DIR/data/classification
     2) 程式內 BASE_DIR/data/classification（PyInstaller _MEIPASS / 開發目錄）
-    3) 其它舊位置不再優先，避免讀到過期 root 檔案
+    3) cache_path（OpenAPI JSON fallback 成功後轉存的 CSV）
+
+    不再優先讀取 RUNTIME_DIR 根目錄或舊 EXTERNAL_DATA_DIR 根目錄，避免過期檔案干擾。
     """
     market = str(market or "ALL").strip()
     name_map = {
@@ -1059,7 +1069,6 @@ def _classification_csv_candidates_by_market(market: str = "ALL") -> list[Path]:
             base_cls / f"{stem}.csv",
             base_cls / f"{stem}.json",
         ]
-        # cache_path 等同 EXTERNAL_DATA_DIR/data/classification，保留以避免未來常數調整造成漏讀。
         cfg = CLASSIFICATION_DOWNLOAD_SOURCES.get(market, {})
         cache_path = cfg.get("cache_path")
         if cache_path:
@@ -13477,6 +13486,8 @@ class AppUI:
         control.pack(fill="x")
         ttk.Button(control, text="① 產生高成長EPS V4報表", command=self.on_highgrowth_report).pack(side="left", padx=4)
         ttk.Button(control, text="② 開啟高成長EPS報表", command=self.on_open_highgrowth_report).pack(side="left", padx=4)
+        # EPS_UI_SCREEN_EXPORT_ONLY_20260603：只匯出目前高成長EPS UI Treeview畫面內容；不觸發啟動流程、不重跑引擎、不覆寫既有 high_growth_eps_engine_v4 報表。
+        ttk.Button(control, text="③ 畫面內容轉成報告", command=self.on_export_highgrowth_screen_report).pack(side="left", padx=4)
         ttk.Label(control, text="追蹤季度").pack(side="left", padx=(12, 2))
         self.highgrowth_q1_var = tk.BooleanVar(value=True)
         self.highgrowth_q2_var = tk.BooleanVar(value=False)
@@ -13552,6 +13563,73 @@ class AppUI:
                 self.highgrowth_status_var.set(f"V4.15最新篩選：{len(df)}筆｜季度={'+'.join(quarters)}｜狀態{counts}｜報表：{self.last_highgrowth_report_path or HIGH_GROWTH_REPORT_DIR}｜另產英文版")
         except Exception as exc:
             self.append_log(f"刷新高成長EPS V4表失敗：{exc}", "ERROR")
+
+    def on_export_highgrowth_screen_report(self):
+        """EPS_UI_SCREEN_EXPORT_ONLY_20260603：只把目前高成長EPS畫面內容輸出成單獨Excel。"""
+        try:
+            if not hasattr(self, "highgrowth_tree"):
+                return messagebox.showwarning("尚未建立畫面", "找不到高成長EPS畫面表格，請先確認高成長EPS分頁已建立。")
+
+            tree = self.highgrowth_tree
+            columns = list(tree["columns"])
+            headers = []
+            for col in columns:
+                try:
+                    title = tree.heading(col, "text")
+                except Exception:
+                    title = ""
+                headers.append(str(title or col))
+
+            rows = []
+            for item in tree.get_children(""):
+                values = list(tree.item(item, "values") or [])
+                if len(values) < len(headers):
+                    values += [""] * (len(headers) - len(values))
+                elif len(values) > len(headers):
+                    values = values[:len(headers)]
+                rows.append(values)
+
+            if not rows:
+                return messagebox.showwarning("沒有畫面資料", "目前高成長EPS畫面沒有可輸出的資料。")
+
+            df = pd.DataFrame(rows, columns=headers)
+            quarters = self._selected_highgrowth_quarters()
+            mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
+            export_dir = HIGH_GROWTH_REPORT_DIR / "ui_screen_reports"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            qtag = "".join(quarters or HIGH_GROWTH_DEFAULT_QUARTERS) or "Q1"
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = export_dir / f"high_growth_eps_ui_screen_report_{qtag}_{ts}.xlsx"
+
+            engine = available_excel_engine()
+            if not engine:
+                raise RuntimeError("目前環境沒有可用Excel輸出引擎（xlsxwriter/openpyxl）。")
+
+            meta = pd.DataFrame([
+                {"項目": "輸出類型", "內容": "高成長EPS UI畫面內容轉成報告"},
+                {"項目": "輸出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                {"項目": "追蹤季度", "內容": "+".join(quarters)},
+                {"項目": "模式", "內容": mode},
+                {"項目": "資料筆數", "內容": len(df)},
+                {"項目": "重要限制", "內容": "本按鍵只匯出目前畫面Treeview內容；不重跑HighGrowthEPSEngine、不下載資料、不改開機流程、不覆寫正式高成長EPS報表。"},
+            ])
+
+            with pd.ExcelWriter(out_path, engine=engine) as writer:
+                meta.to_excel(writer, sheet_name="00_輸出說明", index=False)
+                df.to_excel(writer, sheet_name="01_畫面內容", index=False)
+
+            self.last_highgrowth_screen_report_path = Path(out_path)
+            if hasattr(self, "highgrowth_status_var"):
+                self.highgrowth_status_var.set(f"畫面內容報告已輸出：{out_path}")
+            self.append_log(f"高成長EPS畫面內容報告已輸出：{out_path}")
+            messagebox.showinfo("完成", f"已將目前畫面內容輸出成單獨Excel：\n{out_path}")
+            return Path(out_path)
+        except Exception as exc:
+            try:
+                self.append_log(f"高成長EPS畫面內容報告輸出失敗：{exc}", "ERROR")
+            except Exception:
+                pass
+            return messagebox.showerror("輸出失敗", f"高成長EPS畫面內容報告輸出失敗：\n{exc}")
 
     def on_highgrowth_report(self):
         """UI按鈕：產生高成長EPS加速度V4報表。"""
