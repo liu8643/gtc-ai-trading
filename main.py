@@ -3716,7 +3716,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R2B_UI_EXPORT_ONLY_20260603"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R2A_BUILD_PY310_FSTRING_FIX_20260603"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -3894,8 +3894,7 @@ HIGH_GROWTH_SHEET_MAP = {
     "07_EPS特徵中繼": {"zh": "07_EPS特徵中繼", "en": "07_EPS_Features"},
     "08_修改查檢表": {"zh": "08_修改查檢表", "en": "08_Checklist"},
     "09_Debug原始欄位": {"zh": "09_Debug原始欄位", "en": "09_Debug_Raw_Fields"},
-    "10_全部結果": {"zh": "10_全部結果", "en": "10_All_Results"},    "12_UI畫面輸出": {"zh": "12_UI畫面輸出", "en": "12_UI_Display_Export"},
-
+    "10_全部結果": {"zh": "10_全部結果", "en": "10_All_Results"},
 }
 
 def high_growth_sheet_label(name: str, language: str | None = None) -> str:
@@ -3951,93 +3950,6 @@ UI_HIGH_GROWTH_HEADERS = {
     "rev_hit": "營收月數", "rev_stair": "營收階梯", "close": "現價", "rsi": "RSI", "trend": "趨勢分",
     "risk": "風險旗標", "action": "建議動作", "gap": "資料缺口/未通過原因",
 }
-
-# V4.15-R2B_UI_EXPORT_ONLY：
-# 將 High Growth EPS UI Treeview 目前顯示欄位、排序與前250筆同步輸出到 Excel Sheet。
-# 修改邊界：只服務 High Growth EPS 報表輸出；不改分類、Universe、Bootstrap、startup_init、market_snapshot、TOP20流程。
-def build_high_growth_ui_export_df(df: pd.DataFrame | None, quarters=None, limit: int = 250) -> pd.DataFrame:
-    quarters = normalize_high_growth_quarters(quarters)
-    ui_columns = [
-        "status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "selection_eps",
-        "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration",
-        "pe_ratio", "peg_ratio", "v412_total_score", "eps_source", "rev_hit", "rev_stair",
-        "close", "rsi", "trend", "risk", "action", "gap",
-    ]
-
-    def _fmt(v):
-        try:
-            if pd.isna(v):
-                return ""
-            return round(float(v), 2)
-        except Exception:
-            return str(v or "")
-
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        empty = pd.DataFrame([{
-            "status": "NO_DATA", "rank": "", "id": "", "name": "", "industry": "",
-            "quarters": "+".join(quarters), "actual_q1_eps": "", "selection_eps": "",
-            "predicted_q2_eps": "", "predicted_q3_eps": "", "eps_acceleration": "",
-            "revenue_acceleration": "", "pe_ratio": "", "peg_ratio": "", "v412_total_score": "",
-            "eps_source": "", "rev_hit": "", "rev_stair": "", "close": "", "rsi": "",
-            "trend": "", "risk": "", "action": "", "gap": "請先產生高成長EPS報表",
-        }])
-        empty = empty[ui_columns]
-        empty.columns = [UI_HIGH_GROWTH_HEADERS.get(c, c) for c in empty.columns]
-        return empty
-
-    sort_cols = [
-        c for c in [
-            "strict_pass", "forecast_candidate", "v412_total_score", "selection_eps",
-            "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration",
-            "valuation_score_v412", "trend_score",
-        ] if c in df.columns
-    ]
-    view = df.copy()
-    if sort_cols:
-        view = view.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
-    view = view.head(int(limit or 250)).reset_index(drop=True)
-
-    rows = []
-    for i, r in view.iterrows():
-        try:
-            hit = int(float(r.get("revenue_month_count_hit", 0) or 0))
-        except Exception:
-            hit = 0
-        try:
-            req = int(float(r.get("revenue_month_count_required", 0) or 0))
-        except Exception:
-            req = 0
-        rows.append({
-            "status": str(r.get("基本面狀態", "")),
-            "rank": i + 1,
-            "id": str(r.get("stock_id", "")),
-            "name": str(r.get("stock_name", "")),
-            "industry": str(r.get("industry", "")),
-            "quarters": str(r.get("追蹤季度", "+".join(quarters))),
-            "actual_q1_eps": _fmt(r.get("actual_q1_eps", "")),
-            "selection_eps": _fmt(r.get("selection_eps", "")),
-            "predicted_q2_eps": _fmt(r.get("predicted_q2_eps", "")),
-            "predicted_q3_eps": _fmt(r.get("predicted_q3_eps", "")),
-            "eps_acceleration": _fmt(r.get("eps_acceleration", "")),
-            "revenue_acceleration": _fmt(r.get("revenue_acceleration", "")),
-            "pe_ratio": _fmt(r.get("pe_ratio", "")),
-            "peg_ratio": _fmt(r.get("peg_ratio", "")),
-            "v412_total_score": _fmt(r.get("v412_total_score", "")),
-            "eps_source": str(r.get("eps_source_used", "")),
-            "rev_hit": f"{hit}/{req}",
-            "rev_stair": "PASS" if bool(r.get("revenue_stair_gate", False)) else "FAIL/NA",
-            "close": _fmt(r.get("close", "")),
-            "rsi": _fmt(r.get("rsi14", "")),
-            "trend": _fmt(r.get("trend_score", "")),
-            "risk": str(r.get("風險旗標", "")),
-            "action": str(r.get("建議動作", "")),
-            "gap": str(r.get("資料缺口/未通過原因", "")),
-        })
-
-    out = pd.DataFrame(rows, columns=ui_columns)
-    out.columns = [UI_HIGH_GROWTH_HEADERS.get(c, c) for c in out.columns]
-    return out
-
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -6283,7 +6195,6 @@ class HighGrowthEPSEngine:
             {"項目": "營收月份覆蓋狀態", "內容": "OK" if not missing_required_months else f"缺月：{missing_required_months}"},
             {"項目": "主選股模型", "內容": high_growth_model_definition_text("ZH")},
             {"項目": "報表語言模式", "內容": "Excel固定輸出中文(ZH)與英文(EN)各一份；UI固定中文"},
-            {"項目": "UI畫面輸出", "內容": "請見12_UI畫面輸出；此Sheet複製高成長EPS UI Treeview目前顯示欄位、排序與前250筆。"},
             {"項目": "主KPI_領先預測通過筆數", "內容": leading_count},
             {"項目": "主KPI_選股用EPS非空筆數", "內容": selection_eps_nonnull},
             {"項目": "主KPI_選股分數非空筆數", "內容": selection_score_nonnull},
@@ -6323,7 +6234,6 @@ class HighGrowthEPSEngine:
             {"序號": 7, "模組": "Outlier/Valuation", "新增/修改": "修改", "程式位置": "EPSForecastEngine.build_eps_features", "驗收點": "估值缺漏降權、YoY極端值有風險旗標與扣分欄"},
             {"序號": 8, "模組": "Run Evidence", "新增/修改": "新增", "程式位置": "HighGrowthEPSEngine._build_same_run_evidence", "驗收點": "Excel含同一run DB/log/Universe與缺月資訊"},
             {"序號": 9, "模組": "No Touch Guard", "新增/修改": "查核", "程式位置": "分類/Universe/Bootstrap/主UI", "驗收點": "不得修改分類、Universe、Bootstrap、主UI架構"},
-            {"序號": 10, "模組": "UI Export Sheet", "新增/修改": "新增", "程式位置": "build_high_growth_ui_export_df + HighGrowthEPSEngine.export_report", "驗收點": "新增12_UI畫面輸出；只複製高成長EPS UI欄位/排序，不改分類、Universe、Bootstrap、主UI架構"},
         ])
         if leading_df.empty:
             leading_df = pd.DataFrame([{"狀態": "NO_LEADING_FORECAST_PASS", "說明": "目前沒有領先預測通過候選。"}])
@@ -6334,7 +6244,6 @@ class HighGrowthEPSEngine:
         # Debug 欄位保留原始工程欄名，供追溯，不放主摘要。
         debug_cols = [c for c in ["stock_id", "stock_name", "strict_pass", "legacy_strict_pass", "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "leading_pass", "selection_gate", "selection_score", "selection_eps", "q1_ratio_quality", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "legacy_forecast_eps_gate", "forecast_eps_gate", "v412_total_score", "valuation_data_missing", "effective_valuation_score", "effective_valuation_weight", "outlier_risk_flag", "outlier_penalty"] if c in df.columns]
         debug_raw = df[debug_cols].head(5000).copy() if debug_cols and df is not None and not df.empty else pd.DataFrame()
-        ui_export_df = build_high_growth_ui_export_df(df, quarters=self.tracking_quarters, limit=250)
         tables = {
             "00_結論摘要": summary,
             "01_DB可用性盤點": assets,
@@ -6350,7 +6259,6 @@ class HighGrowthEPSEngine:
             "09_Debug原始欄位": pd.concat([debug_summary, debug_raw], ignore_index=True, sort=False) if not debug_raw.empty else debug_summary,
             "10_全部結果": df.head(5000),
             "11_Run證據": run_evidence,
-            "12_UI畫面輸出": ui_export_df,
         }
         # V4.14：Excel 報表層才做欄位顯示名稱轉換；固定輸出中文與英文各一份。
         # 注意：UI 不使用 REPORT_LANGUAGE，不可再因報表語言設定而出現英文/雙語欄位。
@@ -13491,6 +13399,8 @@ class AppUI:
         control.pack(fill="x")
         ttk.Button(control, text="① 產生高成長EPS V4報表", command=self.on_highgrowth_report).pack(side="left", padx=4)
         ttk.Button(control, text="② 開啟高成長EPS報表", command=self.on_open_highgrowth_report).pack(side="left", padx=4)
+        # HIGH_GROWTH_EPS_UI_EXPORT_BUTTON_20260603：只匯出目前EPS UI畫面Treeview內容，不重跑引擎、不影響原報表流程。
+        ttk.Button(control, text="③ 產出報告", command=self.on_export_highgrowth_ui_report).pack(side="left", padx=4)
         ttk.Label(control, text="追蹤季度").pack(side="left", padx=(12, 2))
         self.highgrowth_q1_var = tk.BooleanVar(value=True)
         self.highgrowth_q2_var = tk.BooleanVar(value=False)
@@ -13592,6 +13502,108 @@ class AppUI:
         if not path.exists():
             return messagebox.showwarning("找不到報表", f"找不到高成長EPS V4報表：\n{path}\n\n請先按『① 產生高成長EPS V4報表』。")
         open_path(path)
+
+    def _highgrowth_tree_to_dataframe(self) -> pd.DataFrame:
+        """HIGH_GROWTH_EPS_UI_EXPORT_BUTTON_20260603：擷取目前高成長EPS UI畫面內容。
+
+        目的：使用者要求「把畫面的內容產出一個Excel檔」，因此本函式只讀取
+        self.highgrowth_tree 目前可見的 Treeview rows 與中文表頭，不重新計算、
+        不改變 last_highgrowth_df，也不影響既有中/英文完整報表輸出流程。
+        """
+        if not hasattr(self, "highgrowth_tree"):
+            return pd.DataFrame()
+        tree = self.highgrowth_tree
+        columns = list(tree["columns"])
+        headers = []
+        for col in columns:
+            try:
+                header = str(tree.heading(col, "text") or col).strip()
+            except Exception:
+                header = str(col)
+            headers.append(header or str(col))
+
+        rows = []
+        for item in tree.get_children():
+            try:
+                values = list(tree.item(item, "values") or [])
+            except Exception:
+                values = []
+            if len(values) < len(columns):
+                values = values + [""] * (len(columns) - len(values))
+            elif len(values) > len(columns):
+                values = values[:len(columns)]
+            rows.append(values)
+        return pd.DataFrame(rows, columns=headers)
+
+    def on_export_highgrowth_ui_report(self):
+        """UI按鈕：將目前高成長EPS畫面內容輸出為Excel。"""
+        # Tkinter Treeview / 變數讀取固定在UI主執行緒完成；背景執行緒只負責資料整理與檔案輸出。
+        quarters = self._selected_highgrowth_quarters()
+        mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
+        ui_df = self._highgrowth_tree_to_dataframe()
+        ui_columns = list(self.highgrowth_tree["columns"]) if hasattr(self, "highgrowth_tree") else []
+
+        def worker():
+            try:
+                self.ui_call(self.start_task, "高成長EPS畫面報告", 3)
+                self.ui_call(self.update_task, "高成長EPS畫面報告", 1, 3, item="讀取目前UI畫面")
+                df = ui_df.copy() if isinstance(ui_df, pd.DataFrame) else pd.DataFrame()
+
+                if df is None or df.empty:
+                    self.ui_call(self.update_task, "高成長EPS畫面報告", 2, 3, item="UI無資料，改讀最新快取並刷新")
+                    latest_df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=mode).get_latest_view()
+                    self.ui_call(self._refresh_highgrowth_tree, latest_df)
+                    # ui_call 為非同步排程；這裡直接以最新資料轉成UI欄位輸出，避免空白報表。
+                    if isinstance(latest_df, pd.DataFrame) and not latest_df.empty:
+                        display_rows = []
+                        def fmt(v):
+                            try:
+                                if pd.isna(v):
+                                    return ""
+                                return f"{float(v):.2f}"
+                            except Exception:
+                                return str(v or "")
+                        sort_cols = [c for c in ["strict_pass", "forecast_candidate", "v412_total_score", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "valuation_score_v412", "trend_score"] if c in latest_df.columns]
+                        view = latest_df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last").head(250).reset_index(drop=True) if sort_cols else latest_df.head(250).reset_index(drop=True)
+                        headers = [str(UI_HIGH_GROWTH_HEADERS.get(c, c)) for c in ui_columns]
+                        for i, r in view.iterrows():
+                            rev_stair = "PASS" if bool(r.get("revenue_stair_gate", False)) else "FAIL/NA"
+                            rev_hit = f"{int(float(r.get('revenue_month_count_hit', 0) or 0))}/{int(float(r.get('revenue_month_count_required', 0) or 0))}"
+                            display_rows.append([
+                                str(r.get("基本面狀態", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")), str(r.get("industry", "")), str(r.get("追蹤季度", "+".join(quarters))),
+                                fmt(r.get("actual_q1_eps", "")), fmt(r.get("selection_eps", "")), fmt(r.get("predicted_q2_eps", "")), fmt(r.get("predicted_q3_eps", "")), fmt(r.get("eps_acceleration", "")), fmt(r.get("revenue_acceleration", "")),
+                                fmt(r.get("pe_ratio", "")), fmt(r.get("peg_ratio", "")), fmt(r.get("v412_total_score", "")), str(r.get("eps_source_used", "")),
+                                rev_hit, rev_stair, fmt(r.get("close", "")), fmt(r.get("rsi14", "")), fmt(r.get("trend_score", "")),
+                                str(r.get("風險旗標", "")), str(r.get("建議動作", "")), str(r.get("資料缺口/未通過原因", ""))
+                            ])
+                        if headers and display_rows:
+                            df = pd.DataFrame(display_rows, columns=headers)
+
+                if df is None or df.empty:
+                    df = pd.DataFrame([{"狀態": "NO_UI_DATA", "說明": "目前高成長EPS UI畫面沒有資料，請先產生高成長EPS V4報表。"}])
+
+                quarters_text = "+".join(quarters)
+                meta = pd.DataFrame([
+                    {"項目": "報表類型", "內容": "高成長EPS UI畫面輸出"},
+                    {"項目": "輸出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                    {"項目": "追蹤季度", "內容": quarters_text},
+                    {"項目": "模式", "內容": mode},
+                    {"項目": "資料筆數", "內容": int(len(df))},
+                    {"項目": "資料來源", "內容": "目前Tkinter Treeview畫面內容；若畫面為空，讀取最新HighGrowthEPSEngine快取後輸出同版面欄位。"},
+                ])
+
+                self.ui_call(self.update_task, "高成長EPS畫面報告", 2, 3, item="輸出Excel")
+                base = HIGH_GROWTH_REPORT_DIR / f"high_growth_eps_ui_report_{quarters_text}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                out_path, out_type = write_table_bundle(base, {"00_輸出說明": meta, "01_UI畫面內容": df}, preferred="excel")
+                self.last_highgrowth_ui_report_path = Path(out_path)
+                self.ui_call(self.update_task, "高成長EPS畫面報告", 3, 3, success=len(df), item=Path(out_path).name)
+                self.ui_call(self.append_log, f"高成長EPS UI畫面報告已產出：{out_path}")
+                self.ui_call(self.finish_task, "高成長EPS畫面報告", f"已產出：{out_path}")
+                self.ui_call(messagebox.showinfo, "完成", f"高成長EPS UI畫面報告已輸出（{out_type}）：\n{out_path}")
+            except Exception as exc:
+                self.ui_call(self.finish_task, "高成長EPS畫面報告", f"失敗：{exc}")
+                self.ui_call(messagebox.showerror, "錯誤", str(exc))
+        self._run_in_thread(worker, "high_growth_eps_ui_export_report")
 
     def _build_prebreakout_tab(self):
         """PREBREAKOUT_UI_REPORT_PATCH：爆發前雷達分頁，與TOP20語義分離。"""
