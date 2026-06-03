@@ -384,30 +384,6 @@ CLASSIFICATION_DOWNLOAD_SOURCES = {
 BOOTSTRAP_LOCK = threading.Lock()
 BOOTSTRAP_EVENT = threading.Event()
 
-# V4.16-R1 STARTUP_NO18_FIX：避免啟動或初始化失敗時，把內建18檔示範清單誤當全市場主檔。
-# 若官方Universe/本地主檔不足此門檻，只能作為示範/觀察清單，不得覆蓋 stocks_master。
-MIN_FULL_MARKET_UNIVERSE_ROWS = int(os.getenv("GTC_MIN_FULL_MARKET_UNIVERSE_ROWS", "500"))
-GTC_STARTUP_FETCH_UNIVERSE = os.getenv("GTC_STARTUP_FETCH_UNIVERSE", "1").strip() == "1"
-GTC_AUTO_CLASSIFICATION_DOWNLOAD = os.getenv("GTC_AUTO_CLASSIFICATION_DOWNLOAD", "0").strip() == "1"
-
-def is_full_market_universe(df: pd.DataFrame | None, min_rows: int = MIN_FULL_MARKET_UNIVERSE_ROWS) -> bool:
-    try:
-        return isinstance(df, pd.DataFrame) and len(df) >= int(min_rows) and "stock_id" in df.columns
-    except Exception:
-        return False
-
-def safe_read_master_csv_candidate(csv_path: Path) -> pd.DataFrame:
-    try:
-        if csv_path and Path(csv_path).exists():
-            x = pd.read_csv(csv_path, dtype=str).fillna("")
-            if "stock_id" in x.columns:
-                x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id)
-                x = x[x["stock_id"].astype(str).str.fullmatch(r"\d{4,5}", na=False)].copy()
-            return x
-    except Exception as exc:
-        log_warning(f"讀取主檔候選失敗：{csv_path}｜{exc}")
-    return pd.DataFrame()
-
 def set_classification_log_callback(cb):
     global CLASSIFICATION_LOG_CALLBACK
     CLASSIFICATION_LOG_CALLBACK = cb
@@ -1002,9 +978,6 @@ def ensure_classification_book(force_refresh: bool = False, log_cb=None) -> Opti
             if not meta or Path(str(meta.get("path", "")).split(" | ")[0]) != p:
                 _write_classification_meta(_build_classification_meta(p, source="LOCAL", note="discovered existing file"))
             return p
-        # V4.16-R1：狀態查詢/啟動不可因找不到本地分類檔而自動連外，避免UI卡住或看似閃退。
-        if not GTC_AUTO_CLASSIFICATION_DOWNLOAD:
-            return None
     return download_classification_book(force_refresh=force_refresh, log_cb=log_cb)
 
 def resolve_classification_book() -> Optional[Path]:
@@ -1032,8 +1005,7 @@ def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]
     for p in _classification_csv_candidates_by_market(market):
         if Path(p).exists():
             return Path(p)
-    # V4.16-R1：預設不自動下載分類；只有手動更新或環境變數允許時才連外。
-    if market in ("上市", "上櫃") and GTC_AUTO_CLASSIFICATION_DOWNLOAD:
+    if market in ("上市", "上櫃"):
         try:
             downloaded = _download_single_classification_csv(market, force_refresh=False, log_cb=classification_debug_log)
             if downloaded is not None and Path(downloaded).exists():
@@ -2042,67 +2014,54 @@ def fetch_tpex_universe() -> pd.DataFrame:
 
 
 def build_full_market_universe() -> pd.DataFrame:
-    """建立全市場股票主檔。
+    twse = fetch_twse_universe()
+    tpex = fetch_tpex_universe()
+    all_df = pd.concat([twse, tpex], ignore_index=True)
+    if all_df.empty:
+        csv_path = resolve_master_csv()
+        if csv_path.exists():
+            x = pd.read_csv(csv_path, dtype=str).fillna("")
+            return _normalize_master_df(x, "上市")
+        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
 
-    V4.16-R1：修正「股票數只剩18檔」問題。
-    - 啟動/初始化若官方全市場抓取失敗，不得把 DEFAULT_MASTER_CSV 的18檔示範清單寫成全市場。
-    - 只有資料筆數 >= MIN_FULL_MARKET_UNIVERSE_ROWS 才視為全市場主檔。
-    - 若本地主檔不足門檻，只回傳空表，讓UI保持啟動並提示使用者更新，不覆蓋DB。
-    """
-    all_df = pd.DataFrame()
-    if GTC_STARTUP_FETCH_UNIVERSE:
-        twse = fetch_twse_universe()
-        tpex = fetch_tpex_universe()
-        parts = [df for df in [twse, tpex] if isinstance(df, pd.DataFrame) and not df.empty]
-        if parts:
-            all_df = pd.concat(parts, ignore_index=True)
+    try:
+        csv_path = resolve_master_csv()
+        if csv_path.exists():
+            x = pd.read_csv(csv_path, dtype=str).fillna("")
+            x = _normalize_master_df(x, "上市", persist_classification_summary=False)
+            if x is not None and not x.empty and "stock_id" in x.columns:
+                x["stock_id"] = x["stock_id"].astype(str).str.strip()
+                x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
+                keep_cols = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
+                for c in keep_cols:
+                    if c not in x.columns:
+                        x[c] = ""
+                x = x[keep_cols].drop_duplicates(subset=["stock_id"]).set_index("stock_id")
+                all_df = all_df.drop_duplicates(subset=["stock_id"]).set_index("stock_id")
 
-    if not all_df.empty and is_full_market_universe(all_df):
-        try:
-            csv_path = resolve_master_csv()
-            if csv_path.exists():
-                x = safe_read_master_csv_candidate(csv_path)
-                # 只有本地主檔本身也像全市場時，才允許覆蓋官方資料欄位；避免18檔示範清單污染全市場。
-                if is_full_market_universe(x):
-                    x = _normalize_master_df(x, "上市", persist_classification_summary=False)
-                    if x is not None and not x.empty and "stock_id" in x.columns:
-                        x["stock_id"] = x["stock_id"].astype(str).str.strip()
-                        x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
-                        keep_cols = ["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]
-                        for c in keep_cols:
-                            if c not in x.columns:
-                                x[c] = ""
-                        x = x[keep_cols].drop_duplicates(subset=["stock_id"]).set_index("stock_id")
-                        all_df = all_df.drop_duplicates(subset=["stock_id"]).set_index("stock_id")
-                        invalid_text = {"", "未分類", "全市場", "系統掃描"}
-                        for col in ["stock_name", "market", "industry", "theme", "sub_theme"]:
-                            if col in x.columns and col in all_df.columns:
-                                valid_mask = ~x[col].astype(str).isin(invalid_text)
-                                valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
-                                if len(valid_ids) > 0:
-                                    all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
-                        for col in ["is_etf", "is_active", "update_date"]:
-                            if col in x.columns and col in all_df.columns:
-                                valid_mask = x[col].astype(str).str.strip().ne("")
-                                valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
-                                if len(valid_ids) > 0:
-                                    all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
-                        all_df = all_df.reset_index()
-                else:
-                    log_warning(f"本地主檔只有 {len(x)} 檔，判定為示範/觀察清單，不覆蓋官方全市場Universe：{csv_path}")
-        except Exception as exc:
-            log_warning(f"主檔覆蓋既有 CSV 時略過：{exc}")
-        if "stock_id" not in all_df.columns:
-            return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
-        return all_df.drop_duplicates(subset=["stock_id"]).sort_values(["market", "industry", "stock_id"]).reset_index(drop=True)
+                invalid_text = {"", "未分類", "全市場", "系統掃描"}
+                for col in ["stock_name", "market", "industry", "theme", "sub_theme"]:
+                    if col in x.columns and col in all_df.columns:
+                        valid_mask = ~x[col].astype(str).isin(invalid_text)
+                        valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
+                        if len(valid_ids) > 0:
+                            all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
 
-    # 官方抓取失敗時，只接受足夠大的本地主檔；拒絕18檔示範清單。
-    csv_path = resolve_master_csv()
-    x = safe_read_master_csv_candidate(csv_path)
-    if is_full_market_universe(x):
-        return _normalize_master_df(x, "上市")
-    log_warning(f"全市場Universe建立失敗；本地主檔只有 {len(x)} 檔，低於門檻 {MIN_FULL_MARKET_UNIVERSE_ROWS}，不匯入，避免股票池被縮成18檔。")
-    return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+                for col in ["is_etf", "is_active", "update_date"]:
+                    if col in x.columns and col in all_df.columns:
+                        valid_mask = x[col].astype(str).str.strip().ne("")
+                        valid_ids = x.index[valid_mask & x.index.isin(all_df.index)]
+                        if len(valid_ids) > 0:
+                            all_df.loc[valid_ids, col] = x.loc[valid_ids, col]
+
+                all_df = all_df.reset_index()
+    except Exception as exc:
+        log_warning(f"主檔覆蓋既有 CSV 時略過：{exc}")
+
+    if "stock_id" not in all_df.columns:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
+
+    return all_df.drop_duplicates(subset=["stock_id"]).sort_values(["market", "industry", "stock_id"]).reset_index(drop=True)
 
 
 
@@ -3757,7 +3716,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_16_SEMANTIC_REPORT_GATE_CLOSURE_FIX_20260603"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R1_STRICT_PASS_SUMMARY_FIX_20260603"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -3816,13 +3775,13 @@ HIGH_GROWTH_COLUMN_MAP = {
     "selection_eps": {"zh": "選股用EPS", "en": "Selection EPS"},
     "selection_eps_source": {"zh": "選股EPS來源", "en": "Selection EPS Source"},
     "selection_eps_confidence": {"zh": "選股EPS信心", "en": "Selection EPS Confidence"},
-    "selection_score": {"zh": "選股分數", "en": "Selection Score"},
-    "selection_gate": {"zh": "選股Gate", "en": "Selection Gate"},
-    "official_eps_verified_pass": {"zh": "正式EPS驗證通過", "en": "Official EPS Verified Pass"},
-    "valuation_data_missing": {"zh": "估值資料缺口", "en": "Valuation Data Missing"},
     "legacy_forecast_eps_gate": {"zh": "舊預估EPS Gate", "en": "Legacy Forecast EPS Gate"},
     "v412_pass": {"zh": "V4.12領先通過", "en": "V4.12 Leading Pass"},
     "leading_pass": {"zh": "領先預測通過", "en": "Leading Forecast Pass"},
+    "official_eps_verified_pass": {"zh": "正式EPS驗證通過", "en": "Official EPS Verified Pass"},
+    "selection_gate": {"zh": "選股Gate", "en": "Selection Gate"},
+    "selection_score": {"zh": "選股分數", "en": "Selection Score"},
+    "valuation_data_missing": {"zh": "估值資料缺漏", "en": "Valuation Data Missing"},
     "eps_cumulative_used": {"zh": "累計/預估EPS", "en": "Cumulative/Forecast EPS"},
     "forecast_eps_cumulative": {"zh": "營收推估累計EPS", "en": "Revenue Forecast Cumulative EPS"},
     "forecast_eps_cumulative_raw": {"zh": "營收推估累計EPS(原始)", "en": "Raw Revenue Forecast Cumulative EPS"},
@@ -3904,12 +3863,13 @@ HIGH_GROWTH_SHEET_MAP = {
     "01_DB可用性盤點": {"zh": "01_DB可用性盤點", "en": "01_DB_Availability"},
     "02_領先預測通過黑馬池": {"zh": "02_領先預測通過黑馬池", "en": "02_Leading_Forecast_Pass"},
     "03_EPS_TTM代理追蹤池": {"zh": "03_EPS_TTM代理追蹤池", "en": "03_EPS_TTM_Proxy_Tracking"},
-    "04_正式EPS驗證通過": {"zh": "04_正式EPS驗證通過", "en": "04_Official_EPS_Verified"},
+    "04_正式EPS驗證通過": {"zh": "04_正式EPS驗證通過", "en": "04_Official_EPS_Verified_Pass"},
     "05_不通過與資料缺口": {"zh": "05_不通過與資料缺口", "en": "05_Fail_Data_Gap"},
-    "06_EPS特徵中繼_Debug": {"zh": "06_EPS特徵中繼_Debug", "en": "06_EPS_Features_Debug"},
-    "07_營收明細來源": {"zh": "07_營收明細來源", "en": "07_Revenue_Source"},
-    "08_全部結果": {"zh": "08_全部結果", "en": "08_All_Results"},
-    "09_修改查檢表": {"zh": "09_修改查檢表", "en": "09_Checklist"},
+    "06_營收明細來源": {"zh": "06_營收明細來源", "en": "06_Revenue_Source"},
+    "07_EPS特徵中繼": {"zh": "07_EPS特徵中繼", "en": "07_EPS_Features"},
+    "08_修改查檢表": {"zh": "08_修改查檢表", "en": "08_Checklist"},
+    "09_Debug原始欄位": {"zh": "09_Debug原始欄位", "en": "09_Debug_Raw_Fields"},
+    "10_全部結果": {"zh": "10_全部結果", "en": "10_All_Results"},
 }
 
 def high_growth_sheet_label(name: str, language: str | None = None) -> str:
@@ -3959,7 +3919,7 @@ def high_growth_model_definition_text(language: str | None = None) -> str:
 # V4.14：UI高成長EPS欄位固定全中文；英文/雙語只存在於匯出報表檔案。
 UI_HIGH_GROWTH_HEADERS = {
     "status": "狀態", "rank": "排序", "id": "代號", "name": "名稱", "industry": "產業",
-    "quarters": "追蹤季度", "actual_q1_eps": "2026Q1實際EPS", "selection_eps": "選股用EPS", "selection_score": "選股分數", "predicted_q2_eps": "預測Q2 EPS",
+    "quarters": "追蹤季度", "actual_q1_eps": "2026Q1實際EPS", "selection_eps": "選股用EPS", "predicted_q2_eps": "預測Q2 EPS",
     "predicted_q3_eps": "預測Q3 EPS", "eps_acceleration": "EPS加速度", "revenue_acceleration": "營收加速度",
     "pe_ratio": "本益比", "peg_ratio": "PEG", "v412_total_score": "V4.12總分", "eps_source": "EPS來源",
     "rev_hit": "營收月數", "rev_stair": "營收階梯", "close": "現價", "rsi": "RSI", "trend": "趨勢分",
@@ -5722,16 +5682,12 @@ class EPSForecastEngine:
         x["predicted_q1_eps_model"] = (x["base_quarter_eps_for_prediction"] * growth_factor).round(4)
         # Q2/Q3 預測使用同一營收加速度因子，並保留保守遞延：Q3 僅在營收動能為正時加速。
         x["predicted_q2_eps"] = (x["base_quarter_eps_for_prediction"] * growth_factor).round(4)
-        # V4.16 PATCH-01：明確建立「選股用EPS」與來源/信心；主選股EPS固定採 predicted_q2_eps。
-        x["selection_eps"] = pd.to_numeric(x["predicted_q2_eps"], errors="coerce")
-        x["selection_eps_source"] = np.select(
-            [x["prediction_basis"].eq("BASE_ANNUAL_EPS"), x["prediction_basis"].eq("EPS_TTM_PROXY")],
-            ["BASE_ANNUAL_EPS_REVENUE_FORECAST", "EPS_TTM_REVENUE_FORECAST"],
-            default="NO_VALID_EPS_BASIS",
-        )
+        # V4.15：明確建立「選股用EPS」；領先選股主欄位固定採 predicted_q2_eps，不再讓使用者誤看 actual_q1_eps 或 eps_cumulative_used。
+        x["selection_eps"] = x["predicted_q2_eps"]
+        x["selection_eps_source"] = "PREDICTED_Q2_EPS"
         x["selection_eps_confidence"] = np.select(
             [x["prediction_basis"].eq("BASE_ANNUAL_EPS"), x["prediction_basis"].eq("EPS_TTM_PROXY"), x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
-            ["HIGH", "MEDIUM", "LOW"],
+            ["HIGH_BASE_ANNUAL_EPS", "MEDIUM_EPS_TTM_PROXY", "LOW_NO_VALID_EPS_BASIS"],
             default="PARTIAL",
         )
         q3_extra_factor = (1.0 + (x["avg_revenue_yoy_used"].fillna(0).clip(lower=0, upper=300) / 100.0) * 0.18).clip(lower=1.0, upper=1.54)
@@ -5781,7 +5737,8 @@ class EPSForecastEngine:
             default=10,
         )
         x["revenue_acceleration_score_v412"] = np.clip(40 + x["revenue_acceleration"].fillna(0) * 0.6, 0, 100).round(2)
-        x["valuation_data_missing"] = x["pe_ratio"].isna() & pd.Series(x["peg_ratio"], index=x.index).isna()
+        # V4.15-R1：估值缺資料不得給 default=50 中性高分；缺 PE/PEG 時降權並明確標記。
+        x["valuation_data_missing"] = x["pe_ratio"].isna() | x["peg_ratio"].isna()
         x["pe_score"] = np.select(
             [x["pe_ratio"].gt(0) & x["pe_ratio"].le(10),
              x["pe_ratio"].gt(10) & x["pe_ratio"].le(15),
@@ -5790,7 +5747,7 @@ class EPSForecastEngine:
              x["pe_ratio"].gt(30) & x["pe_ratio"].le(40),
              x["pe_ratio"].gt(40)],
             [100, 85, 70, 45, 25, 5],
-            default=25,
+            default=20,
         )
         x["peg_score"] = np.select(
             [x["peg_ratio"].gt(0) & x["peg_ratio"].le(0.8),
@@ -5799,19 +5756,17 @@ class EPSForecastEngine:
              x["peg_ratio"].gt(1.8) & x["peg_ratio"].le(2.5),
              x["peg_ratio"].gt(2.5)],
             [100, 80, 60, 35, 10],
-            default=25,
+            default=20,
         )
-        x["valuation_score_v412"] = np.where(
-            x["valuation_data_missing"],
-            25.0,
-            (pd.Series(x["pe_score"], index=x.index).fillna(25.0) * 0.65 + pd.Series(x["peg_score"], index=x.index).fillna(25.0) * 0.35),
-        ).round(2)
+        x["valuation_score_v412"] = (x["pe_score"] * 0.65 + x["peg_score"] * 0.35).round(2)
         x["v412_total_score"] = (
             x["predicted_q2_eps_score"] * HIGH_GROWTH_V412_WEIGHTS["predicted_q2_eps_score"] +
             x["eps_acceleration_score_v412"] * HIGH_GROWTH_V412_WEIGHTS["eps_acceleration_score_v412"] +
             x["revenue_acceleration_score_v412"] * HIGH_GROWTH_V412_WEIGHTS["revenue_acceleration_score_v412"] +
             x["valuation_score_v412"] * HIGH_GROWTH_V412_WEIGHTS["valuation_score_v412"]
         ).round(2)
+        # V4.15-R1：selection_score 為新版領先預測主選股分數，供摘要/報表驗收使用。
+        x["selection_score"] = x["v412_total_score"]
         x["v412_prediction_quality"] = np.select(
             [x["prediction_basis"].eq("BASE_ANNUAL_EPS") & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1),
              x["prediction_basis"].eq("EPS_TTM_PROXY") & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1),
@@ -5915,30 +5870,40 @@ class HighGrowthEPSEngine:
         return self._read_sql(q)
 
     def _gap_reason(self, r) -> str:
-        # V4.16 PATCH-03：選股主策略改為領先預測；正式EPS只作驗證層，避免候選股顯示舊正式EPS失敗理由。
-        if bool(r.get("official_eps_verified_pass", False)):
-            return "正式EPS驗證通過"
-        if bool(r.get("leading_pass", False)):
-            return "領先預測條件通過；正式EPS僅作驗證"
-        if bool(r.get("ttm_proxy_candidate", False)):
-            return "EPS_TTM代理追蹤；需正式EPS驗證"
-        reasons = []
-        try:
-            if not bool(r.get("v412_leading_candidate", False)):
-                reasons.append("領先預測條件未達標")
-        except Exception:
-            reasons.append("領先預測條件未達標")
-        try:
-            sel_eps = pd.to_numeric(r.get("selection_eps"), errors="coerce")
-            if pd.isna(sel_eps) or float(sel_eps) <= 0:
-                reasons.append("選股用EPS缺資料")
-        except Exception:
-            reasons.append("選股用EPS缺資料")
-        if bool(r.get("valuation_data_missing", False)):
-            reasons.append("估值資料不足")
+        gaps = []
+        is_leading = bool(r.get("v412_pass", False) or r.get("v412_leading_candidate", False) or r.get("forecast_candidate", False))
+        is_ttm = bool(r.get("ttm_proxy_candidate", False))
+        if is_leading:
+            if pd.isna(r.get("selection_eps")) or float(r.get("selection_eps") or 0) <= 0:
+                gaps.append("選股用EPS缺資料或小於等於0")
+            if float(r.get("v412_total_score") or 0) < HIGH_GROWTH_V412_MIN_LEADING_SCORE:
+                gaps.append(f"V4.12領先預測分數低於{HIGH_GROWTH_V412_MIN_LEADING_SCORE:.0f}")
+            if int(float(r.get("revenue_month_count_hit") or 0)) < HIGH_GROWTH_V412_MIN_REVENUE_HIT:
+                gaps.append("領先預測缺少有效營收月數")
+            q = str(r.get("v412_prediction_quality", ""))
+            if q not in ("LEADING_FORECAST_BASE_EPS", "LEADING_FORECAST_TTM_PROXY"):
+                gaps.append(f"預測品質不足:{q or 'MISSING'}")
+            return "；".join(gaps) if gaps else "領先預測條件通過；actual_q1_eps僅作驗證"
+        if is_ttm:
+            if str(r.get("eps_ttm_quality", "")) != "EPS_TTM_PROXY_ONLY":
+                gaps.append("EPS_TTM代理資料不足")
+            if not bool(r.get("revenue_partial_yoy_gate", False)):
+                gaps.append("營收部分YoY條件未達標")
+            return "；".join(gaps) if gaps else "EPS_TTM代理追蹤；待正式季度/年度EPS驗證"
+        if str(r.get("base_eps_quality", "")) not in ("STRICT",):
+            gaps.append("2025全年EPS非正式來源或缺資料")
+        if str(r.get("eps_data_quality", "")) != "STRICT":
+            gaps.append("所選季度EPS非完整正式季報，使用預測/代理或缺資料")
+        if not bool(r.get("revenue_complete_gate", False)):
+            gaps.append("所選季度對應月營收資料不完整")
+        if not bool(r.get("revenue_yoy_gate", False)):
+            gaps.append(f"營收YoY未全數達{self.min_yoy:.0f}%")
+        if not bool(r.get("revenue_stair_gate", False)):
+            gaps.append("營收未形成月月走高階梯")
+        # V4.15：正式EPS倍率失敗只適用正式嚴格驗證，不再套到領先預測候選。
         if str(r.get("eps_data_quality", "")) == "STRICT" and not bool(r.get("eps_gate", False)):
-            reasons.append("正式EPS驗證未通過")
-        return "；".join(dict.fromkeys([x for x in reasons if x])) if reasons else "未通過/資料不足"
+            gaps.append("正式實際所選季度EPS未大於去年全年EPS")
+        return "；".join(gaps) if gaps else ""
 
     def build_screening_df(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         master = self._load_master()
@@ -5958,78 +5923,77 @@ class HighGrowthEPSEngine:
                 ["STRICT", "PARTIAL_OR_PROXY"],
                 default="MISSING",
             )
-        # V4.16 PATCH-02：正式EPS驗證層與領先預測選股層分離。
-        x["official_eps_verified_pass"] = (
-            x.get("eps_gate", False).fillna(False).astype(bool)
-            & x.get("revenue_strict_gate", False).fillna(False).astype(bool)
-            & x.get("eps_data_quality", "").astype(str).eq("STRICT")
-        )
-        # strict_pass 保留為 legacy 相容欄位；不可再作為主選股結果。
-        x["strict_pass"] = x["official_eps_verified_pass"]
+        # 嚴格通過：只允許正式季EPS + 完整營收Gate + EPS倍數>1。
+        x["strict_pass"] = x["eps_gate"].fillna(False) & x["revenue_strict_gate"].fillna(False) & x["eps_data_quality"].eq("STRICT")
+        # V4.15-R1：strict_pass 僅保留為 legacy/相容欄位；正式報表主KPI改用 official_eps_verified_pass。
+        x["official_eps_verified_pass"] = x["strict_pass"].fillna(False).astype(bool)
 
-        # Partial Gate：目前 DB 可能僅有部分月營收，領先預測策略允許使用部分營收軌跡作黑馬觀察。
+        # Partial Gate：目前 DB 僅有 11504 單月營收，Q1 所需 11502/11503/11504 不完整；
+        # 因此不能要求 revenue_yoy_gate(all 3 months) 才進候選，否則全數被打成資料不足。
         x["revenue_partial_yoy_gate"] = (
             pd.to_numeric(x.get("avg_revenue_yoy"), errors="coerce").ge(self.min_yoy)
             & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1)
         )
 
-        x["leading_pass"] = (
-            (~x["official_eps_verified_pass"])
-            & x.get("v412_leading_candidate", False).fillna(False).astype(bool)
-            & pd.to_numeric(x.get("selection_eps"), errors="coerce").gt(0)
+        # V4.15：領先預測主Gate。strict_pass只代表正式財報驗證；forecast_candidate才是比財報早知道的主選股池。
+        x["v412_pass"] = x.get("v412_pass", x.get("v412_leading_candidate", False)).fillna(False).astype(bool)
+        x["leading_pass"] = x["v412_pass"]
+        x["forecast_eps_gate"] = x["v412_pass"]
+        # V4.15-R1：selection_gate 是新版主選股 Gate；strict_pass 不再代表主選股結果。
+        x["selection_gate"] = x["leading_pass"].fillna(False).astype(bool)
+        x["forecast_candidate"] = (
+            (~x["strict_pass"])
+            & x["v412_pass"]
         )
-        x["forecast_eps_gate"] = x["leading_pass"]
-        x["v412_pass"] = x["leading_pass"]
-        x["forecast_candidate"] = x["leading_pass"]
 
+        # EPS_TTM 追蹤候選：DB 已有 EPS_TTM，可作最近四季獲利能力與排序追蹤；
+        # 但不可標成 ACTUAL_PASS，也不可直接等同 2025全年EPS或2026Q1單季EPS。
         x["ttm_proxy_candidate"] = (
-            (~x["official_eps_verified_pass"])
-            & (~x["leading_pass"])
+            (~x["strict_pass"])
+            & (~x["forecast_candidate"])
             & x.get("eps_ttm_proxy_gate", False).fillna(False).astype(bool)
             & x["revenue_partial_yoy_gate"].fillna(False)
         )
-        x["proxy_pass"] = x["leading_pass"] | x["ttm_proxy_candidate"]
-        x["selection_score"] = pd.to_numeric(x.get("v412_total_score"), errors="coerce")
-        x["selection_gate"] = x["official_eps_verified_pass"] | x["leading_pass"]
 
+        # 代理候選：保留舊語義，方便UI/下載相容。
+        x["proxy_pass"] = x["forecast_candidate"] | x["ttm_proxy_candidate"]
+        x["資料缺口/未通過原因"] = x.apply(self._gap_reason, axis=1)
         x["基本面狀態"] = np.select(
-            [x["official_eps_verified_pass"], x["leading_pass"], x["ttm_proxy_candidate"]],
-            ["正式EPS驗證通過", "領先預測通過", "EPS_TTM代理追蹤"],
+            [x["strict_pass"], x["forecast_candidate"], x["ttm_proxy_candidate"]],
+            ["嚴格通過", "預測候選", "EPS_TTM追蹤候選"],
             default="未通過/資料不足",
         )
-        x["資料缺口/未通過原因"] = x.apply(self._gap_reason, axis=1)
         x["投資分層"] = np.select([
-            x["official_eps_verified_pass"] & pd.to_numeric(x.get("trend_score"), errors="coerce").fillna(0).ge(75) & pd.to_numeric(x.get("rsi14"), errors="coerce").fillna(0).le(75),
-            x["official_eps_verified_pass"],
-            x["leading_pass"],
+            x["strict_pass"] & pd.to_numeric(x.get("trend_score"), errors="coerce").fillna(0).ge(75) & pd.to_numeric(x.get("rsi14"), errors="coerce").fillna(0).le(75),
+            x["strict_pass"],
+            x["forecast_candidate"],
             x["ttm_proxy_candidate"],
         ], ["核心觀察/可進技術驗證", "基本面核心/等技術確認", "財報公布前黑馬追蹤", "EPS_TTM中信心追蹤"], default="排除或補資料")
         x["風險旗標"] = np.select([
             pd.to_numeric(x.get("rsi14"), errors="coerce").fillna(0).gt(80),
             pd.to_numeric(x.get("trend_score"), errors="coerce").fillna(100).lt(50),
             x["ttm_proxy_candidate"],
-            x.get("valuation_data_missing", False).fillna(False).astype(bool),
             x["eps_data_quality"].ne("STRICT") | x["revenue_data_quality"].ne("STRICT"),
-        ], ["RSI過熱", "趨勢偏弱", "EPS_TTM_ONLY_需正式EPS驗證", "估值資料不足已降權", "資料不足不可嚴格通過"], default="OK")
+        ], ["RSI過熱", "趨勢偏弱", "EPS_TTM_ONLY_需正式EPS驗證", "資料不足不可嚴格通過"], default="OK")
         x["建議動作"] = np.select([
-            x["official_eps_verified_pass"] & x["風險旗標"].eq("OK"),
-            x["official_eps_verified_pass"],
-            x["leading_pass"],
+            x["strict_pass"] & x["風險旗標"].eq("OK"),
+            x["strict_pass"],
+            x["forecast_candidate"],
             x["ttm_proxy_candidate"],
         ], ["列入投資規劃，等待價量確認", "列核心清單但需控管風險", "列入黑馬追蹤，等正式EPS驗證", "可追蹤但不可當正式通過；待季度/年度EPS補齊"], default="不列入本策略")
         x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
         months = self.revenue_engine.required_months(self.tracking_quarters)
-        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "selection_eps", "selection_eps_source", "selection_eps_confidence", "selection_score", "selection_gate", "official_eps_verified_pass", "leading_pass", "valuation_data_missing", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "eps_surprise_pct", "prediction_basis", "v412_model_definition", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
+        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "official_eps_verified_pass", "selection_gate", "selection_score", "valuation_data_missing", "selection_eps", "selection_eps_source", "selection_eps_confidence", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "eps_surprise_pct", "prediction_basis", "v412_model_definition", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
         for m in months:
             order_cols += [f"rev_{m}", f"yoy_{m}"]
-        order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_partial_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "official_eps_verified_pass", "selection_gate", "strict_pass", "v412_pass", "leading_pass", "legacy_forecast_eps_gate", "forecast_eps_gate", "forecast_candidate", "ttm_proxy_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
+        order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_partial_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "strict_pass", "v412_pass", "leading_pass", "legacy_forecast_eps_gate", "forecast_eps_gate", "forecast_candidate", "ttm_proxy_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
         for c in order_cols:
             if c not in x.columns:
-                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "selection_eps", "selection_score", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "v412_total_score", "prediction_error", "eps_surprise", "eps_surprise_pct", "avg_revenue_yoy_used") else ""
+                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "selection_score", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "v412_total_score", "prediction_error", "eps_surprise", "eps_surprise_pct", "avg_revenue_yoy_used") else (False if c in ("official_eps_verified_pass", "selection_gate", "valuation_data_missing") else "")
         x = x[order_cols].copy()
         # V4.12 主排序：先看領先預測總分，再看 Q2/Q3 EPS、EPS 加速度、營收加速度與估值。
-        x = x.sort_values(["selection_gate", "leading_pass", "official_eps_verified_pass", "selection_score", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "valuation_score_v412", "trend_score"], ascending=[False, False, False, False, False, False, False, False, False, False, False], na_position="last")
+        x = x.sort_values(["selection_gate", "selection_score", "forecast_candidate", "official_eps_verified_pass", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "valuation_score_v412", "trend_score"], ascending=[False, False, False, False, False, False, False, False, False, False, False], na_position="last")
         return x, self.inspect_db_assets(), rev_raw, eps_features
 
     def export_report(self, output_dir: Path | None = None, log_cb=None) -> Path:
@@ -6039,16 +6003,19 @@ class HighGrowthEPSEngine:
         out_path = get_high_growth_report_path(datetime.now().strftime("%Y%m%d"), self.tracking_quarters)
         if output_dir:
             out_path = Path(output_dir) / out_path.name
-        official_df = df[df["基本面狀態"].eq("正式EPS驗證通過")].copy() if not df.empty else pd.DataFrame()
-        leading_df = df[df["基本面狀態"].eq("領先預測通過")].copy() if not df.empty else pd.DataFrame()
-        ttm_df = df[df["基本面狀態"].eq("EPS_TTM代理追蹤")].copy() if not df.empty else pd.DataFrame()
+        # V4.15-R1：報表摘要語意閉環。strict_pass 不再作為主選股 KPI。
+        official_df = df[df.get("official_eps_verified_pass", df.get("strict_pass", False)).fillna(False).astype(bool)].copy() if not df.empty else pd.DataFrame()
+        leading_df = df[df.get("selection_gate", df.get("leading_pass", False)).fillna(False).astype(bool)].copy() if not df.empty else pd.DataFrame()
+        ttm_only_df = df[df["基本面狀態"].eq("EPS_TTM追蹤候選")].copy() if not df.empty else pd.DataFrame()
         fail_df = df[df["基本面狀態"].eq("未通過/資料不足")].copy() if not df.empty else pd.DataFrame()
         official_count = int(len(official_df))
         leading_count = int(len(leading_df))
-        ttm_count = int(len(ttm_df))
+        ttm_count = int(len(ttm_only_df))
         fail_count = int(len(fail_df))
-        selection_eps_nonnull = int(pd.to_numeric(df.get("selection_eps"), errors="coerce").notna().sum()) if df is not None and not df.empty and "selection_eps" in df.columns else 0
-        selection_gate_count = int(df.get("selection_gate", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if df is not None and not df.empty and "selection_gate" in df.columns else 0
+        selection_eps_nonnull = int(pd.to_numeric(df.get("selection_eps"), errors="coerce").gt(0).sum()) if df is not None and not df.empty and "selection_eps" in df.columns else 0
+        selection_score_nonnull = int(pd.to_numeric(df.get("selection_score"), errors="coerce").notna().sum()) if df is not None and not df.empty and "selection_score" in df.columns else 0
+        valuation_missing_count = int(df.get("valuation_data_missing", pd.Series(False, index=df.index)).fillna(False).astype(bool).sum()) if df is not None and not df.empty else 0
+        # Debug診斷保留，但不放在中文首頁主KPI，避免和新版選股主結果混淆。
         actual_q1_nonnull = int(pd.to_numeric(df.get("actual_q1_eps"), errors="coerce").notna().sum()) if df is not None and not df.empty and "actual_q1_eps" in df.columns else 0
         q1_ratio_valid = int(pd.to_numeric(df.get("q1_vs_annual_ratio"), errors="coerce").notna().sum()) if df is not None and not df.empty and "q1_vs_annual_ratio" in df.columns else 0
         q1_ratio_raw_nonnull = int(pd.to_numeric(df.get("q1_vs_annual_ratio_raw"), errors="coerce").notna().sum()) if df is not None and not df.empty and "q1_vs_annual_ratio_raw" in df.columns else 0
@@ -6062,43 +6029,59 @@ class HighGrowthEPSEngine:
         except Exception:
             annual_eps_rows = 0
         summary = pd.DataFrame([
-            {"項目": "主策略", "內容": "領先EPS預測選股：40%預測Q2 EPS + 25%EPS加速度 + 20%營收加速度 + 15%估值；正式EPS僅作驗證層"},
+            {"項目": "V4架構", "內容": "RevenueAccelerationEngine → EPSForecastEngine → HighGrowthEPSEngine"},
+            {"項目": "V4.15-R1修正主旨", "內容": "報表摘要不能再用舊 strict_pass=0 當主結果；主KPI改為領先預測通過、選股用EPS與選股分數。"},
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
-            {"項目": "領先預測通過筆數", "內容": leading_count},
-            {"項目": "選股用EPS非空筆數", "內容": selection_eps_nonnull},
-            {"項目": "選股Gate通過筆數", "內容": selection_gate_count},
-            {"項目": "正式EPS驗證通過筆數", "內容": official_count},
-            {"項目": "EPS_TTM代理追蹤筆數", "內容": ttm_count},
+            {"項目": "主選股模型", "內容": high_growth_model_definition_text("ZH")},
+            {"項目": "報表語言模式", "內容": "Excel固定輸出中文(ZH)與英文(EN)各一份；UI固定中文"},
+            {"項目": "主KPI_領先預測通過筆數", "內容": leading_count},
+            {"項目": "主KPI_選股用EPS非空筆數", "內容": selection_eps_nonnull},
+            {"項目": "主KPI_選股分數非空筆數", "內容": selection_score_nonnull},
+            {"項目": "驗證KPI_正式EPS驗證通過筆數", "內容": official_count},
+            {"項目": "追蹤KPI_EPS_TTM代理追蹤筆數", "內容": ttm_count},
             {"項目": "未通過/資料不足筆數", "內容": fail_count},
+            {"項目": "估值資料缺漏筆數", "內容": valuation_missing_count},
+            {"項目": "strict_pass語意", "內容": "Legacy相容欄位；只代表正式EPS驗證，不代表新版領先預測主選股結果。"},
+            {"項目": "禁止修改範圍", "內容": "未修改分類、Universe、Bootstrap、主UI架構。"},
+            {"項目": "輸出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            {"項目": "規則版本", "內容": HIGH_GROWTH_RULE_VERSION},
+        ])
+        debug_summary = pd.DataFrame([
             {"項目": "actual_q1_eps非空筆數", "內容": actual_q1_nonnull},
             {"項目": "q1_vs_annual_ratio有效筆數", "內容": q1_ratio_valid},
             {"項目": "q1_vs_annual_ratio_raw非空筆數", "內容": q1_ratio_raw_nonnull},
             {"項目": "q1_ratio_quality分布", "內容": json.dumps(q1_quality_counts, ensure_ascii=False)},
             {"項目": "annual_eps_history_2025筆數", "內容": annual_eps_rows},
-            {"項目": "報表語言模式", "內容": "Excel固定輸出中文(ZH)與英文(EN)各一份；UI固定中文"},
-            {"項目": "說明", "內容": "strict_pass保留為legacy相容欄位，不再作為主選股結果；主選股池以leading_pass + selection_eps + selection_score為準。"},
-            {"項目": "輸出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-            {"項目": "規則版本", "內容": HIGH_GROWTH_RULE_VERSION},
         ])
         rules = pd.DataFrame([
-            {"序號": 1, "模組": "EPSForecastEngine", "新增/修改": "修改", "程式位置": "build_eps_features", "驗收點": "selection_eps/source/confidence與forecast_eps_gate/legacy_forecast_eps_gate分離"},
-            {"序號": 2, "模組": "HighGrowthEPSEngine", "新增/修改": "修改", "程式位置": "build_screening_df", "驗收點": "official_eps_verified_pass/leading_pass/selection_gate/selection_score存在且主排序使用新版語意"},
-            {"序號": 3, "模組": "HighGrowthEPSEngine", "新增/修改": "修改", "程式位置": "_gap_reason", "驗收點": "領先預測池不再顯示正式EPS未通過舊語句"},
-            {"序號": 4, "模組": "Report Export", "新增/修改": "修改", "程式位置": "export_report", "驗收點": "摘要KPI與02/03/04/05分頁分層符合V4.16"},
-            {"序號": 5, "模組": "Valuation", "新增/修改": "修改", "程式位置": "valuation scoring", "驗收點": "PE/PEG缺資料時valuation_data_missing=True且估值分數降權"},
+            {"序號": 1, "模組": "Summary", "新增/修改": "修改", "程式位置": "HighGrowthEPSEngine.export_report", "驗收點": "00摘要以領先預測通過/selection_eps/selection_score為主KPI，不再以嚴格通過筆數為主KPI"},
+            {"序號": 2, "模組": "Candidate Sheets", "新增/修改": "修改", "程式位置": "HighGrowthEPSEngine.export_report", "驗收點": "領先預測、EPS_TTM代理、正式EPS驗證分表輸出，不混表"},
+            {"序號": 3, "模組": "Build Screening", "新增/修改": "修改", "程式位置": "HighGrowthEPSEngine.build_screening_df", "驗收點": "存在 official_eps_verified_pass、selection_gate、selection_score、valuation_data_missing"},
+            {"序號": 4, "模組": "Valuation", "新增/修改": "修改", "程式位置": "EPSForecastEngine.build_eps_features", "驗收點": "PE/PEG缺值降權並標記 valuation_data_missing，不再給 default=50 中性高分"},
+            {"序號": 5, "模組": "No Touch Guard", "新增/修改": "查核", "程式位置": "分類/Universe/Bootstrap/主UI", "驗收點": "不得修改分類、Universe、Bootstrap、主UI架構"},
         ])
+        if leading_df.empty:
+            leading_df = pd.DataFrame([{"狀態": "NO_LEADING_FORECAST_PASS", "說明": "目前沒有領先預測通過候選。"}])
+        if ttm_only_df.empty:
+            ttm_only_df = pd.DataFrame([{"狀態": "NO_EPS_TTM_PROXY", "說明": "目前沒有EPS_TTM代理追蹤候選。"}])
+        if official_df.empty:
+            official_df = pd.DataFrame([{"狀態": "NO_OFFICIAL_EPS_VERIFIED_PASS", "說明": "目前DB沒有正式EPS驗證通過個股。"}])
+        # Debug 欄位保留原始工程欄名，供追溯，不放主摘要。
+        debug_cols = [c for c in ["stock_id", "stock_name", "strict_pass", "official_eps_verified_pass", "leading_pass", "selection_gate", "selection_score", "selection_eps", "q1_ratio_quality", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "legacy_forecast_eps_gate", "forecast_eps_gate", "v412_total_score", "valuation_data_missing"] if c in df.columns]
+        debug_raw = df[debug_cols].head(5000).copy() if debug_cols and df is not None and not df.empty else pd.DataFrame()
         tables = {
             "00_結論摘要": summary,
             "01_DB可用性盤點": assets,
             "02_領先預測通過黑馬池": leading_df.head(500),
-            "03_EPS_TTM代理追蹤池": ttm_df.head(500),
+            "03_EPS_TTM代理追蹤池": ttm_only_df.head(500),
             "04_正式EPS驗證通過": official_df.head(500),
             "05_不通過與資料缺口": fail_df.head(1000),
-            "06_EPS特徵中繼_Debug": eps_features.head(5000) if eps_features is not None else pd.DataFrame(),
-            "07_營收明細來源": rev_raw.head(5000) if rev_raw is not None else pd.DataFrame(),
-            "08_全部結果": df.head(5000),
-            "09_修改查檢表": rules,
+            "06_營收明細來源": rev_raw.head(5000) if rev_raw is not None else pd.DataFrame(),
+            "07_EPS特徵中繼": eps_features.head(5000) if eps_features is not None else pd.DataFrame(),
+            "08_修改查檢表": rules,
+            "09_Debug原始欄位": pd.concat([debug_summary, debug_raw], ignore_index=True, sort=False) if not debug_raw.empty else debug_summary,
+            "10_全部結果": df.head(5000),
         }
         # V4.14：Excel 報表層才做欄位顯示名稱轉換；固定輸出中文與英文各一份。
         # 注意：UI 不使用 REPORT_LANGUAGE，不可再因報表語言設定而出現英文/雙語欄位。
@@ -6117,7 +6100,7 @@ class HighGrowthEPSEngine:
             generated_paths.append(Path(final_path))
         out_path = generated_paths[0] if generated_paths else out_path
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V4.16] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading_pass_count={leading_count}｜selection_eps_non_null={selection_eps_nonnull}｜official_verified_count={official_count}｜ttm_proxy={ttm_count}｜fail={fail_count}｜annual_eps_2025={annual_eps_rows}")
+            log_cb(f"[HIGH_GROWTH_V4.15_R1] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_verified={official_count}｜ttm_proxy={ttm_count}｜fail={fail_count}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
@@ -13253,10 +13236,10 @@ class AppUI:
         # V4.15：UI固定中文，不提供語言切換；中文/英文只在匯出Excel各產生一份。
         self.highgrowth_status_var = tk.StringVar(value=f"V4.15報表輸出：{HIGH_GROWTH_REPORT_DIR}｜Excel中文/英文各一份")
         ttk.Label(control, textvariable=self.highgrowth_status_var).pack(side="left", padx=12)
-        cols = ("status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "selection_eps", "selection_score", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "pe_ratio", "peg_ratio", "v412_total_score", "eps_source", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
+        cols = ("status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "pe_ratio", "peg_ratio", "v412_total_score", "eps_source", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
         headers = dict(UI_HIGH_GROWTH_HEADERS)
         self.highgrowth_tree = self._make_tree(self.tab_highgrowth, cols, headers)
-        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":130,"quarters":95,"actual_q1_eps":125,"selection_eps":110,"selection_score":100,"predicted_q2_eps":125,"predicted_q3_eps":125,"eps_acceleration":125,"revenue_acceleration":135,"pe_ratio":90,"peg_ratio":90,"v412_total_score":100,"eps_source":170,"rev_hit":115,"rev_stair":110,"close":80,"rsi":70,"trend":90,"risk":150,"action":270,"gap":440}
+        widths = {"status":120,"rank":55,"id":80,"name":120,"industry":130,"quarters":95,"actual_q1_eps":125,"selection_eps":110,"predicted_q2_eps":125,"predicted_q3_eps":125,"eps_acceleration":125,"revenue_acceleration":135,"pe_ratio":90,"peg_ratio":90,"v412_total_score":100,"eps_source":170,"rev_hit":115,"rev_stair":110,"close":80,"rsi":70,"trend":90,"risk":150,"action":270,"gap":440}
         for c, w in widths.items():
             try:
                 self.highgrowth_tree.column(c, width=w, minwidth=55, stretch=False)
@@ -13288,9 +13271,7 @@ class AppUI:
                 return
             self.highgrowth_tree.delete(*self.highgrowth_tree.get_children())
             if df is None or df.empty:
-                empty_values = ["NO_DATA", "", "", "", "", "+".join(quarters)] + [""] * (len(self.highgrowth_tree["columns"]) - 6)
-                empty_values[-1] = "請先產生高成長EPS報表"
-                self.highgrowth_tree.insert("", "end", values=tuple(empty_values))
+                self.highgrowth_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "+".join(quarters), "", "", "", "", "", "", "", "", "", "", "", "", "請先產生高成長EPS報表"))
                 return
             def fmt(v):
                 try:
@@ -13298,21 +13279,21 @@ class AppUI:
                     return f"{float(v):.2f}"
                 except Exception:
                     return str(v or "")
-            sort_cols = [c for c in ["selection_gate", "leading_pass", "official_eps_verified_pass", "selection_score", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "valuation_score_v412", "trend_score"] if c in df.columns]
+            sort_cols = [c for c in ["strict_pass", "forecast_candidate", "v412_total_score", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "valuation_score_v412", "trend_score"] if c in df.columns]
             view = df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last").head(250).reset_index(drop=True) if sort_cols else df.head(250).reset_index(drop=True)
             for i, r in view.iterrows():
                 rev_stair = "PASS" if bool(r.get("revenue_stair_gate", False)) else "FAIL/NA"
                 rev_hit = f"{int(float(r.get('revenue_month_count_hit', 0) or 0))}/{int(float(r.get('revenue_month_count_required', 0) or 0))}"
                 self.highgrowth_tree.insert("", "end", values=(
                     str(r.get("基本面狀態", "")), i+1, str(r.get("stock_id", "")), str(r.get("stock_name", "")), str(r.get("industry", "")), str(r.get("追蹤季度", "+".join(quarters))),
-                    fmt(r.get("actual_q1_eps", "")), fmt(r.get("selection_eps", "")), fmt(r.get("selection_score", "")), fmt(r.get("predicted_q2_eps", "")), fmt(r.get("predicted_q3_eps", "")), fmt(r.get("eps_acceleration", "")), fmt(r.get("revenue_acceleration", "")),
+                    fmt(r.get("actual_q1_eps", "")), fmt(r.get("selection_eps", "")), fmt(r.get("predicted_q2_eps", "")), fmt(r.get("predicted_q3_eps", "")), fmt(r.get("eps_acceleration", "")), fmt(r.get("revenue_acceleration", "")),
                     fmt(r.get("pe_ratio", "")), fmt(r.get("peg_ratio", "")), fmt(r.get("v412_total_score", "")), str(r.get("eps_source_used", "")),
                     rev_hit, rev_stair, fmt(r.get("close", "")), fmt(r.get("rsi14", "")), fmt(r.get("trend_score", "")),
                     str(r.get("風險旗標", "")), str(r.get("建議動作", "")), str(r.get("資料缺口/未通過原因", ""))
                 ))
             if hasattr(self, "highgrowth_status_var"):
                 counts = df.get("基本面狀態", pd.Series(dtype=str)).fillna("").astype(str).value_counts().to_dict()
-                self.highgrowth_status_var.set(f"V4.16最新篩選：{len(df)}筆｜季度={'+'.join(quarters)}｜狀態{counts}｜報表：{self.last_highgrowth_report_path or HIGH_GROWTH_REPORT_DIR}｜另產英文版")
+                self.highgrowth_status_var.set(f"V4.15最新篩選：{len(df)}筆｜季度={'+'.join(quarters)}｜狀態{counts}｜報表：{self.last_highgrowth_report_path or HIGH_GROWTH_REPORT_DIR}｜另產英文版")
         except Exception as exc:
             self.append_log(f"刷新高成長EPS V4表失敗：{exc}", "ERROR")
 
@@ -14653,7 +14634,7 @@ class AppUI:
                     "條件預掛": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
                     "執行下單清單": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "投資組合狀態", "風險備註"],
                     "組合交易計畫": ["優先級", "代號", "名稱", "現價", "漲跌", "漲跌幅%", "市場", "產業", "題材", "分類", "狀態", "進場區", "停損", "目標價", "1.382", "1.618", "RR", "勝率", "模型分數", "交易分數", "ATR%", "Kelly%", "建議張數", "建議金額", "單檔曝險%", "題材曝險%", "產業曝險%", "投資組合狀態", "風險備註"],
-                    "高成長EPS報表": ["stock_id", "stock_name", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "selection_eps", "selection_score", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "selected_actual_vs_annual_ratio", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "eps_source_used", "avg_revenue_yoy", "avg_revenue_yoy_used", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "official_eps_verified_pass", "selection_gate", "selection_score", "strict_pass", "forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因"],
+                    "高成長EPS報表": ["stock_id", "stock_name", "追蹤季度", "基本面狀態", "投資分層", "base_annual_eps", "actual_q1_eps", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "selected_actual_vs_annual_ratio", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "eps_source_used", "avg_revenue_yoy", "avg_revenue_yoy_used", "revenue_complete_gate", "revenue_yoy_gate", "revenue_stair_gate", "strict_pass", "forecast_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因"],
                     "唯一決策": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "market", "industry", "theme", "ui_state", "entry_zone", "stop_loss", "target_price", "rr", "win_rate", "decision", "final_trade_decision"],
                     "操作SOP": ["step", "module", "focus", "rule", "purpose", "output"],
                     "未分類清單": ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"],
@@ -15687,15 +15668,16 @@ class AppUI:
                 self.ui_call(self.start_task, "初始化全市場", 4)
                 self.ui_call(self.update_task, "初始化全市場", 1, 4, item="抓取主檔")
                 universe = build_full_market_universe()
-                if not is_full_market_universe(universe):
+                if universe is None or universe.empty:
+                    csv_path = resolve_master_csv()
+                    self.db.import_master_csv(csv_path)
                     master2 = self.db.get_master()
                     self.ui_call(self.refresh_filters)
                     self.ui_call(self.refresh_all_tables)
                     self.ui_call(self.refresh_classification_summary_ui)
-                    self.ui_call(self.update_task, "初始化全市場", 4, 4, fail=1, item="未取得全市場")
-                    msg = f"全市場抓取失敗或筆數不足（取得 {0 if universe is None else len(universe)} 檔，門檻 {MIN_FULL_MARKET_UNIVERSE_ROWS} 檔）。\n已拒絕匯入18檔示範清單，避免股票池被縮小。\n目前DB主檔：{len(master2)} 檔。"
-                    self.ui_call(self.set_status, msg)
-                    self.ui_call(messagebox.showwarning, "未更新全市場", msg)
+                    self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
+                    self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master2)} 檔。")
+                    self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master2)} 檔\n\n使用主檔：{csv_path}")
                     return
                 self.db.import_master_df(universe)
                 master2 = self.db.get_master()
@@ -16469,31 +16451,28 @@ def bootstrap():
         init_message = "股票主檔已就緒"
         try:
             master = db.get_master()
-            # V4.16-R1：小於門檻的主檔多半是內建18檔示範清單，不能宣稱為全市場。
-            if master.empty or len(master) < MIN_FULL_MARKET_UNIVERSE_ROWS:
-                if not master.empty:
-                    log_warning(f"啟動偵測到股票主檔只有 {len(master)} 檔，低於全市場門檻 {MIN_FULL_MARKET_UNIVERSE_ROWS}；嘗試重建，但不會用18檔示範清單覆蓋。")
+            if master.empty:
                 universe = build_full_market_universe()
-                if is_full_market_universe(universe):
+                if universe is not None and not universe.empty:
                     db.import_master_df(universe)
                     master = db.get_master()
                     init_message = f"已自動建立全市場股票主檔，共 {len(master)} 檔"
-                elif master.empty:
-                    init_message = f"全市場股票主檔尚未建立；官方Universe/本地主檔不足 {MIN_FULL_MARKET_UNIVERSE_ROWS} 檔，已拒絕匯入18檔示範清單，UI仍可啟動。請使用『初始化全市場』或放入完整 stocks_master.csv。"
                 else:
-                    init_message = f"目前股票主檔只有 {len(master)} 檔，低於全市場門檻 {MIN_FULL_MARKET_UNIVERSE_ROWS}；未再用18檔清單覆蓋。請重新初始化全市場。"
+                    csv_path = resolve_master_csv()
+                    db.import_master_csv(csv_path)
+                    master = db.get_master()
+                    init_message = f"已改用本地主檔，共 {len(master)} 檔 | {csv_path}"
             else:
                 init_message = f"股票主檔已載入，共 {len(master)} 檔"
 
-            if db.get_ranking_rows_count() == 0 and db.get_total_price_rows() > 0 and len(db.get_master()) >= MIN_FULL_MARKET_UNIVERSE_ROWS:
+            if db.get_ranking_rows_count() == 0 and db.get_total_price_rows() > 0:
                 rank_count = RankingEngine(db).rebuild()
                 if rank_count > 0:
                     init_message += f"｜已自動重建排行 {rank_count} 檔"
                 else:
                     init_message += "｜已有歷史資料，但目前不足以形成排行"
         except Exception as e:
-            log_exception("bootstrap 初始化失敗", e)
-            init_message = f"股票主檔初始化失敗：{e}；UI仍嘗試啟動，請檢查Log。"
+            init_message = f"股票主檔初始化失敗：{e}"
 
         BOOTSTRAP_EVENT.set()
         log_info(f"bootstrap done｜{init_message}")
@@ -16502,39 +16481,18 @@ def bootstrap():
 
 def main():
     log_info("main start")
-    db = None
-    root = None
-    try:
-        db, init_message = bootstrap()
-        root = tk.Tk()
-        app = AppUI(root, db)
-        app.set_status(init_message)
+    db, init_message = bootstrap()
+    root = tk.Tk()
+    app = AppUI(root, db)
+    app.set_status(init_message)
 
-        def _close():
-            log_info("application closing")
-            try:
-                db.close()
-            except Exception:
-                pass
-            root.destroy()
+    def _close():
+        log_info("application closing")
+        db.close()
+        root.destroy()
 
-        root.protocol("WM_DELETE_WINDOW", _close)
-        root.mainloop()
-    except Exception as exc:
-        log_exception("主程式啟動失敗", exc)
-        try:
-            if root is not None:
-                messagebox.showerror("啟動失敗", f"主程式啟動失敗：\n{exc}\n\n請查看 logs/gtc_ai_trading_YYYYMMDD.log")
-            else:
-                print(f"主程式啟動失敗：{exc}", file=sys.stderr)
-        except Exception:
-            pass
-        try:
-            if db is not None:
-                db.close()
-        except Exception:
-            pass
-        raise
+    root.protocol("WM_DELETE_WINDOW", _close)
+    root.mainloop()
 
 
 if __name__ == "__main__":
