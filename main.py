@@ -338,12 +338,12 @@ def resolve_master_csv() -> Path:
     return ensure_external_master_csv()
 
 
-# CLASSIFICATION_LOCAL_OPENAPI_FIX_20260604：分類來源改為本機 data/classification 優先；官網只作新版 OpenAPI JSON fallback。
-# 不再使用已失效的 mopsfin.twse.com.tw/opendata/*.csv，避免開機/分類補抓因 404 卡住。
+# CLASSIFICATION_TPEX_JSON_FALLBACK_FIX_20260604_R2：分類來源改為本機 data/classification 優先；官網只作新版 JSON fallback。
+# 上市使用 TWSE OpenAPI；上櫃/興櫃使用 TPEx OpenAPI；JSON 解析失敗不得再當 CSV 用 cp950/big5 硬讀。
 CLASSIFICATION_DOWNLOAD_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 CLASSIFICATION_DOWNLOAD_URL_TWSE = CLASSIFICATION_DOWNLOAD_URL
-CLASSIFICATION_DOWNLOAD_URL_TPEX = "https://openapi.twse.com.tw/v1/opendata/t187ap03_O"
-CLASSIFICATION_DOWNLOAD_URL_TWSE_R = "https://openapi.twse.com.tw/v1/opendata/t187ap03_R"
+CLASSIFICATION_DOWNLOAD_URL_TPEX = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+CLASSIFICATION_DOWNLOAD_URL_TWSE_R = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_R"
 CLASSIFICATION_LEGACY_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
 CLASSIFICATION_CACHE_DIR = EXTERNAL_DATA_DIR / "classification"
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -381,12 +381,12 @@ CLASSIFICATION_DOWNLOAD_SOURCES = {
     "上櫃": {
         "url": CLASSIFICATION_DOWNLOAD_URL_TPEX,
         "cache_path": CLASSIFICATION_CACHE_CSV_TPEX,
-        "source": "TWSE-OPENAPI-JSON-O",
+        "source": "TPEX-OPENAPI-JSON-O",
     },
     "興櫃": {
         "url": CLASSIFICATION_DOWNLOAD_URL_TWSE_R,
         "cache_path": CLASSIFICATION_CACHE_DIR / "台股官方產業分類_興櫃.csv",
-        "source": "TWSE-OPENAPI-JSON-R",
+        "source": "TPEX-OPENAPI-JSON-R",
     },
 }
 BOOTSTRAP_LOCK = threading.Lock()
@@ -911,31 +911,26 @@ def _download_single_classification_csv(market: str, force_refresh: bool = False
             resp = requests.get(
                 cfg["url"],
                 timeout=CLASSIFICATION_DOWNLOAD_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*", "Referer": "https://openapi.twse.com.tw/"}
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*", "Referer": "https://www.tpex.org.tw/openapi/" if market in ("上櫃", "興櫃") else "https://openapi.twse.com.tw/"}
             )
             resp.raise_for_status()
             content = resp.content or b""
             if len(content) < 128:
                 raise ValueError("下載內容過小，疑似失敗或非有效檔案")
 
-            # 新版 OpenAPI 正常回傳 JSON 陣列；若少數環境回傳 CSV，仍保留兼容。
+            # 新版 OpenAPI fallback 僅接受 JSON 陣列。
+            # JSON 解析失敗時直接進入 warning/fallback，不再把回應內容當 CSV 用 cp950/big5 硬讀，
+            # 避免 HTML/錯誤頁被誤判成分類資料而污染 ClassificationEngine。
             content_type = str(resp.headers.get("Content-Type", "") or "").lower()
             text_body = resp.text or ""
-            if "json" in content_type or text_body.lstrip().startswith(("[", "{")):
-                data = resp.json()
-                if isinstance(data, dict):
-                    data = data.get("data") or data.get("records") or data.get("result") or []
-                if not isinstance(data, list):
-                    raise ValueError("OpenAPI JSON格式不是陣列")
-                probe = pd.DataFrame(data).astype(str).fillna("")
-            else:
-                tmp_path = cache_path.with_suffix(".download.tmp.csv")
-                tmp_path.write_bytes(content)
-                probe = safe_read_csv_auto(tmp_path)
-                try:
-                    tmp_path.unlink()
-                except Exception:
-                    pass
+            if not ("json" in content_type or text_body.lstrip().startswith(("[", "{"))):
+                raise ValueError(f"OpenAPI fallback 回傳非 JSON：content_type={content_type or 'unknown'}")
+            data = resp.json()
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("records") or data.get("result") or []
+            if not isinstance(data, list):
+                raise ValueError("OpenAPI JSON格式不是陣列")
+            probe = pd.DataFrame(data).astype(str).fillna("")
 
             parsed = _extract_official_csv_rows(probe, market=market)
             if parsed is None or parsed.empty:
@@ -965,7 +960,7 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
     CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     downloaded = []
     errors = []
-    for market in ("上市", "上櫃"):
+    for market in ("上市", "上櫃", "興櫃"):
         try:
             p = _download_single_classification_csv(market, force_refresh=force_refresh, log_cb=log_cb)
             if p is not None:
@@ -989,7 +984,7 @@ def download_classification_book(force_refresh: bool = False, log_cb=None) -> Op
         CLASSIFICATION_MEMORY_CACHE["meta"] = meta
         CLASSIFICATION_MEMORY_CACHE["market"] = "ALL"
         first_path = downloaded[0][1]
-        note = "已下載官方分類 OpenAPI 並轉存 CSV（上市+上櫃）" if len(downloaded) == 2 else f"部分下載成功：{','.join(m for m,_ in downloaded)}"
+        note = "已下載官方分類 OpenAPI 並轉存 CSV（上市+上櫃+興櫃）" if len(downloaded) == 3 else f"部分下載成功：{','.join(m for m,_ in downloaded)}"
         _set_classification_load_info(False, 0, first_path, note)
         return first_path
 
@@ -1087,7 +1082,7 @@ def resolve_classification_book_by_market(market: str = "ALL") -> Optional[Path]
     for p in _classification_csv_candidates_by_market(market):
         if Path(p).exists():
             return Path(p)
-    if market in ("上市", "上櫃"):
+    if market in ("上市", "上櫃", "興櫃"):
         try:
             downloaded = _download_single_classification_csv(market, force_refresh=False, log_cb=classification_debug_log)
             if downloaded is not None and Path(downloaded).exists():
@@ -1107,7 +1102,8 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
             return cached_all
         twse = load_official_classification_book("上市")
         tpex = load_official_classification_book("上櫃")
-        parts = [df for df in [twse, tpex] if df is not None and not df.empty]
+        emerging = load_official_classification_book("興櫃")
+        parts = [df for df in [twse, tpex, emerging] if df is not None and not df.empty]
         if not parts:
             note = "找不到任何官方分類來源（ALL）"
             classification_debug_log(note, "WARNING")
