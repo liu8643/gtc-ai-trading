@@ -3716,7 +3716,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R2A_BUILD_PY310_FSTRING_FIX_20260603"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R3_UI_EXPORT_20260603"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -3895,6 +3895,7 @@ HIGH_GROWTH_SHEET_MAP = {
     "08_修改查檢表": {"zh": "08_修改查檢表", "en": "08_Checklist"},
     "09_Debug原始欄位": {"zh": "09_Debug原始欄位", "en": "09_Debug_Raw_Fields"},
     "10_全部結果": {"zh": "10_全部結果", "en": "10_All_Results"},
+    "12_UI畫面輸出": {"zh": "12_UI畫面輸出", "en": "12_UI_Display_Export"},
 }
 
 def high_growth_sheet_label(name: str, language: str | None = None) -> str:
@@ -3950,6 +3951,109 @@ UI_HIGH_GROWTH_HEADERS = {
     "rev_hit": "營收月數", "rev_stair": "營收階梯", "close": "現價", "rsi": "RSI", "trend": "趨勢分",
     "risk": "風險旗標", "action": "建議動作", "gap": "資料缺口/未通過原因",
 }
+
+
+# V4.15-R3：將高成長EPS UI Treeview 實際顯示內容輸出到 Excel。
+# 原則：只複製 UI 呈現欄位與排序，不改 UI、不改選股公式、不改分類/Universe/Bootstrap。
+def build_high_growth_ui_export_df(df: pd.DataFrame | None, quarters=None, limit: int = 250) -> pd.DataFrame:
+    quarters = normalize_high_growth_quarters(quarters)
+    ui_columns = [
+        "status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "selection_eps",
+        "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration",
+        "pe_ratio", "peg_ratio", "v412_total_score", "eps_source", "rev_hit", "rev_stair",
+        "close", "rsi", "trend", "risk", "action", "gap"
+    ]
+
+    def _fmt(v):
+        try:
+            if pd.isna(v):
+                return ""
+            return round(float(v), 2)
+        except Exception:
+            return str(v or "")
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        empty = pd.DataFrame([{
+            "status": "NO_DATA",
+            "rank": "",
+            "id": "",
+            "name": "",
+            "industry": "",
+            "quarters": "+".join(quarters),
+            "actual_q1_eps": "",
+            "selection_eps": "",
+            "predicted_q2_eps": "",
+            "predicted_q3_eps": "",
+            "eps_acceleration": "",
+            "revenue_acceleration": "",
+            "pe_ratio": "",
+            "peg_ratio": "",
+            "v412_total_score": "",
+            "eps_source": "",
+            "rev_hit": "",
+            "rev_stair": "",
+            "close": "",
+            "rsi": "",
+            "trend": "",
+            "risk": "",
+            "action": "",
+            "gap": "請先產生高成長EPS報表",
+        }])
+        empty.columns = [UI_HIGH_GROWTH_HEADERS.get(c, c) for c in empty.columns]
+        return empty
+
+    sort_cols = [
+        c for c in [
+            "strict_pass", "forecast_candidate", "v412_total_score", "selection_eps",
+            "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration",
+            "valuation_score_v412", "trend_score"
+        ] if c in df.columns
+    ]
+    view = df.copy()
+    if sort_cols:
+        view = view.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    view = view.head(int(limit or 250)).reset_index(drop=True)
+
+    rows = []
+    for i, r in view.iterrows():
+        try:
+            hit = int(float(r.get("revenue_month_count_hit", 0) or 0))
+        except Exception:
+            hit = 0
+        try:
+            req = int(float(r.get("revenue_month_count_required", 0) or 0))
+        except Exception:
+            req = 0
+        rev_stair = "PASS" if bool(r.get("revenue_stair_gate", False)) else "FAIL/NA"
+        rows.append({
+            "status": str(r.get("基本面狀態", "")),
+            "rank": i + 1,
+            "id": str(r.get("stock_id", "")),
+            "name": str(r.get("stock_name", "")),
+            "industry": str(r.get("industry", "")),
+            "quarters": str(r.get("追蹤季度", "+".join(quarters))),
+            "actual_q1_eps": _fmt(r.get("actual_q1_eps", "")),
+            "selection_eps": _fmt(r.get("selection_eps", "")),
+            "predicted_q2_eps": _fmt(r.get("predicted_q2_eps", "")),
+            "predicted_q3_eps": _fmt(r.get("predicted_q3_eps", "")),
+            "eps_acceleration": _fmt(r.get("eps_acceleration", "")),
+            "revenue_acceleration": _fmt(r.get("revenue_acceleration", "")),
+            "pe_ratio": _fmt(r.get("pe_ratio", "")),
+            "peg_ratio": _fmt(r.get("peg_ratio", "")),
+            "v412_total_score": _fmt(r.get("v412_total_score", "")),
+            "eps_source": str(r.get("eps_source_used", "")),
+            "rev_hit": f"{hit}/{req}",
+            "rev_stair": rev_stair,
+            "close": _fmt(r.get("close", "")),
+            "rsi": _fmt(r.get("rsi14", "")),
+            "trend": _fmt(r.get("trend_score", "")),
+            "risk": str(r.get("風險旗標", "")),
+            "action": str(r.get("建議動作", "")),
+            "gap": str(r.get("資料缺口/未通過原因", "")),
+        })
+    out = pd.DataFrame(rows, columns=ui_columns)
+    out.columns = [UI_HIGH_GROWTH_HEADERS.get(c, c) for c in out.columns]
+    return out
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -6199,6 +6303,7 @@ class HighGrowthEPSEngine:
             {"項目": "主KPI_選股用EPS非空筆數", "內容": selection_eps_nonnull},
             {"項目": "主KPI_選股分數非空筆數", "內容": selection_score_nonnull},
             {"項目": "正式EPS驗證區", "內容": "請見04_正式EPS驗證通過與04A_正式EPS驗證KPI；首頁主KPI不再顯示strict_pass=0。"},
+            {"項目": "UI畫面輸出", "內容": "請見12_UI畫面輸出；完整複製高成長EPS UI Treeview目前顯示欄位、排序與前250筆內容。"},
             {"項目": "追蹤KPI_EPS_TTM代理追蹤筆數", "內容": ttm_count},
             {"項目": "未通過/資料不足筆數", "內容": fail_count},
             {"項目": "估值資料缺漏筆數", "內容": valuation_missing_count},
@@ -6234,6 +6339,7 @@ class HighGrowthEPSEngine:
             {"序號": 7, "模組": "Outlier/Valuation", "新增/修改": "修改", "程式位置": "EPSForecastEngine.build_eps_features", "驗收點": "估值缺漏降權、YoY極端值有風險旗標與扣分欄"},
             {"序號": 8, "模組": "Run Evidence", "新增/修改": "新增", "程式位置": "HighGrowthEPSEngine._build_same_run_evidence", "驗收點": "Excel含同一run DB/log/Universe與缺月資訊"},
             {"序號": 9, "模組": "No Touch Guard", "新增/修改": "查核", "程式位置": "分類/Universe/Bootstrap/主UI", "驗收點": "不得修改分類、Universe、Bootstrap、主UI架構"},
+            {"序號": 10, "模組": "UI Export", "新增/修改": "新增", "程式位置": "build_high_growth_ui_export_df + HighGrowthEPSEngine.export_report", "驗收點": "12_UI畫面輸出完全保留UI目前欄位、排序與顯示格式，並與02/04新舊邏輯分表並存"},
         ])
         if leading_df.empty:
             leading_df = pd.DataFrame([{"狀態": "NO_LEADING_FORECAST_PASS", "說明": "目前沒有領先預測通過候選。"}])
@@ -6244,6 +6350,7 @@ class HighGrowthEPSEngine:
         # Debug 欄位保留原始工程欄名，供追溯，不放主摘要。
         debug_cols = [c for c in ["stock_id", "stock_name", "strict_pass", "legacy_strict_pass", "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "leading_pass", "selection_gate", "selection_score", "selection_eps", "q1_ratio_quality", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "legacy_forecast_eps_gate", "forecast_eps_gate", "v412_total_score", "valuation_data_missing", "effective_valuation_score", "effective_valuation_weight", "outlier_risk_flag", "outlier_penalty"] if c in df.columns]
         debug_raw = df[debug_cols].head(5000).copy() if debug_cols and df is not None and not df.empty else pd.DataFrame()
+        ui_export_df = build_high_growth_ui_export_df(df, quarters=self.tracking_quarters, limit=250)
         tables = {
             "00_結論摘要": summary,
             "01_DB可用性盤點": assets,
@@ -6259,6 +6366,7 @@ class HighGrowthEPSEngine:
             "09_Debug原始欄位": pd.concat([debug_summary, debug_raw], ignore_index=True, sort=False) if not debug_raw.empty else debug_summary,
             "10_全部結果": df.head(5000),
             "11_Run證據": run_evidence,
+            "12_UI畫面輸出": ui_export_df,
         }
         # V4.14：Excel 報表層才做欄位顯示名稱轉換；固定輸出中文與英文各一份。
         # 注意：UI 不使用 REPORT_LANGUAGE，不可再因報表語言設定而出現英文/雙語欄位。
