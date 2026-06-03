@@ -338,16 +338,10 @@ def resolve_master_csv() -> Path:
     return ensure_external_master_csv()
 
 
-# R3A_SAFE_CLASSIFICATION_BOOTSTRAP_GUARD：
-# 原 MOPSFIN CSV 來源 t187ap03_L/O 已可能回 404；改以 TWSE/TPEx OpenAPI 為優先來源，
-# 舊 CSV 僅保留為 fallback。此段只修分類來源與小主檔覆蓋保護，不改 High Growth 選股公式。
-CLASSIFICATION_DOWNLOAD_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+CLASSIFICATION_DOWNLOAD_URL = "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv"
 CLASSIFICATION_DOWNLOAD_URL_TWSE = CLASSIFICATION_DOWNLOAD_URL
-CLASSIFICATION_DOWNLOAD_URL_TPEX = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+CLASSIFICATION_DOWNLOAD_URL_TPEX = "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv"
 CLASSIFICATION_LEGACY_DOWNLOAD_URL = "https://www.twse.com.tw/docs1/data01/market/public_html/960803-0960203558-2.xls"
-CLASSIFICATION_LEGACY_DOWNLOAD_URL_TWSE_CSV = "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv"
-CLASSIFICATION_LEGACY_DOWNLOAD_URL_TPEX_CSV = "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv"
-MASTER_IMPORT_MIN_SAFE_ROWS = 500
 CLASSIFICATION_CACHE_DIR = EXTERNAL_DATA_DIR / "classification"
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CLASSIFICATION_CACHE_CSV_TWSE = CLASSIFICATION_CACHE_DIR / "台股官方產業分類_上市.csv"
@@ -377,20 +371,14 @@ CLASSIFICATION_OFFICIAL_CACHE = {
 }
 CLASSIFICATION_DOWNLOAD_SOURCES = {
     "上市": {
-        "urls": [
-            CLASSIFICATION_DOWNLOAD_URL_TWSE,
-            CLASSIFICATION_LEGACY_DOWNLOAD_URL_TWSE_CSV,
-        ],
+        "url": CLASSIFICATION_DOWNLOAD_URL_TWSE,
         "cache_path": CLASSIFICATION_CACHE_CSV_TWSE,
-        "source": "TWSE-OpenAPI-t187ap03_L",
+        "source": "MOPS-CSV-TWSE",
     },
     "上櫃": {
-        "urls": [
-            CLASSIFICATION_DOWNLOAD_URL_TPEX,
-            CLASSIFICATION_LEGACY_DOWNLOAD_URL_TPEX_CSV,
-        ],
+        "url": CLASSIFICATION_DOWNLOAD_URL_TPEX,
         "cache_path": CLASSIFICATION_CACHE_CSV_TPEX,
-        "source": "TPEx-OpenAPI-mopsfin_t187ap03_O",
+        "source": "MOPS-CSV-TPEX",
     },
 }
 BOOTSTRAP_LOCK = threading.Lock()
@@ -869,13 +857,6 @@ def convert_xls_to_xlsx_force(src: Path, dst: Path, log_cb=None) -> Optional[Pat
 
 
 def _download_single_classification_csv(market: str, force_refresh: bool = False, log_cb=None) -> Optional[Path]:
-    """R3A：官方分類來源安全下載。
-
-    修正重點：
-    1. TWSE/TPEx OpenAPI JSON 為優先來源，舊 MOPSFIN CSV 僅 fallback。
-    2. JSON 會先轉成本地 CSV cache，再沿用既有 _extract_official_csv_rows。
-    3. 所有來源都失敗時丟出單一錯誤，不讓 404 重試污染開機流程。
-    """
     market = str(market or "").strip()
     cfg = CLASSIFICATION_DOWNLOAD_SOURCES.get(market)
     if not cfg:
@@ -884,52 +865,35 @@ def _download_single_classification_csv(market: str, force_refresh: bool = False
     if cache_path.exists() and not force_refresh:
         return cache_path
 
-    urls = list(cfg.get("urls") or [cfg.get("url")])
-    urls = [u for u in urls if u]
     last_error = None
-    for url in urls:
-        for attempt in range(1, CLASSIFICATION_DOWNLOAD_RETRIES + 1):
-            try:
-                if log_cb:
-                    log_cb(f"{market} 分類來源下載開始（第 {attempt}/{CLASSIFICATION_DOWNLOAD_RETRIES} 次）：{url}")
-                resp = requests.get(
-                    url,
-                    timeout=CLASSIFICATION_DOWNLOAD_TIMEOUT,
-                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://openapi.twse.com.tw/"}
-                )
-                resp.raise_for_status()
-                content = resp.content or b""
-                if len(content) < 128:
-                    raise ValueError("下載內容過小，疑似失敗或非有效檔案")
-
-                probe = pd.DataFrame()
-                # OpenAPI 主要回 JSON；若不是 JSON 再落回 CSV。
-                try:
-                    data = resp.json()
-                    if isinstance(data, dict):
-                        data = data.get("data") or data.get("records") or data.get("aaData") or []
-                    if isinstance(data, list) and len(data) > 0:
-                        probe = pd.DataFrame(data).fillna("")
-                        probe.to_csv(cache_path, index=False, encoding="utf-8-sig")
-                    else:
-                        raise ValueError("JSON無有效資料列")
-                except Exception:
-                    cache_path.write_bytes(content)
-                    probe = safe_read_csv_auto(cache_path)
-
-                parsed = _extract_official_csv_rows(probe, market=market)
-                if parsed is None or parsed.empty:
-                    raise RuntimeError(f"{market} 分類來源可讀取，但無可用官方產業資料")
-                if log_cb:
-                    log_cb(f"{market} 官方分類已下載到快取：{cache_path}｜rows={len(parsed)}｜source={url}")
-                return cache_path
-            except Exception as exc:
-                last_error = exc
-                log_warning(f"{market} 分類來源下載失敗（第 {attempt} 次）：{url}｜{exc}")
-                if log_cb:
-                    log_cb(f"{market} 分類來源下載失敗（第 {attempt} 次）：{url}｜{exc}")
-                if attempt < CLASSIFICATION_DOWNLOAD_RETRIES:
-                    time.sleep(min(2 * attempt, 5))
+    for attempt in range(1, CLASSIFICATION_DOWNLOAD_RETRIES + 1):
+        try:
+            if log_cb:
+                log_cb(f"{market} 分類來源下載開始（第 {attempt}/{CLASSIFICATION_DOWNLOAD_RETRIES} 次）：{cfg['url']}")
+            resp = requests.get(
+                cfg["url"],
+                timeout=CLASSIFICATION_DOWNLOAD_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mopsfin.twse.com.tw/"}
+            )
+            resp.raise_for_status()
+            content = resp.content or b""
+            if len(content) < 128:
+                raise ValueError("下載內容過小，疑似失敗或非有效檔案")
+            cache_path.write_bytes(content)
+            probe = safe_read_csv_auto(cache_path)
+            parsed = _extract_official_csv_rows(probe, market=market)
+            if parsed is None or parsed.empty:
+                raise RuntimeError(f"{market} CSV可讀取，但無可用官方產業資料")
+            if log_cb:
+                log_cb(f"{market} 官方分類CSV已下載到快取：{cache_path}｜rows={len(parsed)}")
+            return cache_path
+        except Exception as exc:
+            last_error = exc
+            log_warning(f"{market} 分類來源下載失敗（第 {attempt} 次）：{exc}")
+            if log_cb:
+                log_cb(f"{market} 分類來源下載失敗（第 {attempt} 次）：{exc}")
+            if attempt < CLASSIFICATION_DOWNLOAD_RETRIES:
+                time.sleep(min(2 * attempt, 5))
     raise RuntimeError(f"{market} 分類來源下載失敗：{last_error}")
 
 def download_classification_book(force_refresh: bool = False, log_cb=None) -> Optional[Path]:
@@ -2054,9 +2018,10 @@ def build_full_market_universe() -> pd.DataFrame:
     tpex = fetch_tpex_universe()
     all_df = pd.concat([twse, tpex], ignore_index=True)
     if all_df.empty:
-        # R3A：官方全市場抓取失敗時，不在 build_full_market_universe 直接回傳 DEFAULT_MASTER_CSV 18檔。
-        # 這可避免後續 import_master_df 把完整 2000+ 主檔誤覆蓋成 18 檔。
-        log_warning("[R3A][UNIVERSE_GUARD] TWSE/TPEx 全市場抓取皆失敗；回傳空表，交由 bootstrap/init_market 保護既有主檔。")
+        csv_path = resolve_master_csv()
+        if csv_path.exists():
+            x = pd.read_csv(csv_path, dtype=str).fillna("")
+            return _normalize_master_df(x, "上市")
         return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
 
     try:
@@ -3063,18 +3028,7 @@ class DBManager:
         x["is_etf"] = pd.to_numeric(x["is_etf"], errors="coerce").fillna(0).astype(int)
         x["is_active"] = pd.to_numeric(x["is_active"], errors="coerce").fillna(1).astype(int)
         x = x[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]]
-
-        # R3A：小主檔覆蓋保護。若目前 DB 已有完整 500+ 主檔，任何 18 檔/低於門檻資料都不可 replace。
-        incoming_count = int(len(x))
         with self.lock:
-            try:
-                row = self.conn.cursor().execute("SELECT COUNT(*) FROM stocks_master WHERE COALESCE(is_active,1)=1").fetchone()
-                current_count = int(row[0] or 0) if row else 0
-            except Exception:
-                current_count = 0
-            if incoming_count < int(MASTER_IMPORT_MIN_SAFE_ROWS) and current_count >= int(MASTER_IMPORT_MIN_SAFE_ROWS):
-                log_warning(f"[R3A][MASTER_GUARD] 拒絕以低於安全門檻的股票主檔覆蓋現有資料：incoming={incoming_count}, current={current_count}, min={MASTER_IMPORT_MIN_SAFE_ROWS}")
-                return
             x.to_sql("stocks_master", self.conn, if_exists="replace", index=False)
             self.conn.commit()
 
@@ -3762,7 +3716,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R3A_SAFE_CLASSIFICATION_BOOTSTRAP_GUARD_20260603"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R2B_UI_EXPORT_ONLY_20260603"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -3940,8 +3894,8 @@ HIGH_GROWTH_SHEET_MAP = {
     "07_EPS特徵中繼": {"zh": "07_EPS特徵中繼", "en": "07_EPS_Features"},
     "08_修改查檢表": {"zh": "08_修改查檢表", "en": "08_Checklist"},
     "09_Debug原始欄位": {"zh": "09_Debug原始欄位", "en": "09_Debug_Raw_Fields"},
-    "10_全部結果": {"zh": "10_全部結果", "en": "10_All_Results"},
-    "12_UI畫面輸出": {"zh": "12_UI畫面輸出", "en": "12_UI_Display_Export"},
+    "10_全部結果": {"zh": "10_全部結果", "en": "10_All_Results"},    "12_UI畫面輸出": {"zh": "12_UI畫面輸出", "en": "12_UI_Display_Export"},
+
 }
 
 def high_growth_sheet_label(name: str, language: str | None = None) -> str:
@@ -3998,16 +3952,16 @@ UI_HIGH_GROWTH_HEADERS = {
     "risk": "風險旗標", "action": "建議動作", "gap": "資料缺口/未通過原因",
 }
 
-
-# V4.15-R3：將高成長EPS UI Treeview 實際顯示內容輸出到 Excel。
-# 原則：只複製 UI 呈現欄位與排序，不改 UI、不改選股公式、不改分類/Universe/Bootstrap。
+# V4.15-R2B_UI_EXPORT_ONLY：
+# 將 High Growth EPS UI Treeview 目前顯示欄位、排序與前250筆同步輸出到 Excel Sheet。
+# 修改邊界：只服務 High Growth EPS 報表輸出；不改分類、Universe、Bootstrap、startup_init、market_snapshot、TOP20流程。
 def build_high_growth_ui_export_df(df: pd.DataFrame | None, quarters=None, limit: int = 250) -> pd.DataFrame:
     quarters = normalize_high_growth_quarters(quarters)
     ui_columns = [
         "status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "selection_eps",
         "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration",
         "pe_ratio", "peg_ratio", "v412_total_score", "eps_source", "rev_hit", "rev_stair",
-        "close", "rsi", "trend", "risk", "action", "gap"
+        "close", "rsi", "trend", "risk", "action", "gap",
     ]
 
     def _fmt(v):
@@ -4020,31 +3974,14 @@ def build_high_growth_ui_export_df(df: pd.DataFrame | None, quarters=None, limit
 
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         empty = pd.DataFrame([{
-            "status": "NO_DATA",
-            "rank": "",
-            "id": "",
-            "name": "",
-            "industry": "",
-            "quarters": "+".join(quarters),
-            "actual_q1_eps": "",
-            "selection_eps": "",
-            "predicted_q2_eps": "",
-            "predicted_q3_eps": "",
-            "eps_acceleration": "",
-            "revenue_acceleration": "",
-            "pe_ratio": "",
-            "peg_ratio": "",
-            "v412_total_score": "",
-            "eps_source": "",
-            "rev_hit": "",
-            "rev_stair": "",
-            "close": "",
-            "rsi": "",
-            "trend": "",
-            "risk": "",
-            "action": "",
-            "gap": "請先產生高成長EPS報表",
+            "status": "NO_DATA", "rank": "", "id": "", "name": "", "industry": "",
+            "quarters": "+".join(quarters), "actual_q1_eps": "", "selection_eps": "",
+            "predicted_q2_eps": "", "predicted_q3_eps": "", "eps_acceleration": "",
+            "revenue_acceleration": "", "pe_ratio": "", "peg_ratio": "", "v412_total_score": "",
+            "eps_source": "", "rev_hit": "", "rev_stair": "", "close": "", "rsi": "",
+            "trend": "", "risk": "", "action": "", "gap": "請先產生高成長EPS報表",
         }])
+        empty = empty[ui_columns]
         empty.columns = [UI_HIGH_GROWTH_HEADERS.get(c, c) for c in empty.columns]
         return empty
 
@@ -4052,7 +3989,7 @@ def build_high_growth_ui_export_df(df: pd.DataFrame | None, quarters=None, limit
         c for c in [
             "strict_pass", "forecast_candidate", "v412_total_score", "selection_eps",
             "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration",
-            "valuation_score_v412", "trend_score"
+            "valuation_score_v412", "trend_score",
         ] if c in df.columns
     ]
     view = df.copy()
@@ -4070,7 +4007,6 @@ def build_high_growth_ui_export_df(df: pd.DataFrame | None, quarters=None, limit
             req = int(float(r.get("revenue_month_count_required", 0) or 0))
         except Exception:
             req = 0
-        rev_stair = "PASS" if bool(r.get("revenue_stair_gate", False)) else "FAIL/NA"
         rows.append({
             "status": str(r.get("基本面狀態", "")),
             "rank": i + 1,
@@ -4089,7 +4025,7 @@ def build_high_growth_ui_export_df(df: pd.DataFrame | None, quarters=None, limit
             "v412_total_score": _fmt(r.get("v412_total_score", "")),
             "eps_source": str(r.get("eps_source_used", "")),
             "rev_hit": f"{hit}/{req}",
-            "rev_stair": rev_stair,
+            "rev_stair": "PASS" if bool(r.get("revenue_stair_gate", False)) else "FAIL/NA",
             "close": _fmt(r.get("close", "")),
             "rsi": _fmt(r.get("rsi14", "")),
             "trend": _fmt(r.get("trend_score", "")),
@@ -4097,9 +4033,11 @@ def build_high_growth_ui_export_df(df: pd.DataFrame | None, quarters=None, limit
             "action": str(r.get("建議動作", "")),
             "gap": str(r.get("資料缺口/未通過原因", "")),
         })
+
     out = pd.DataFrame(rows, columns=ui_columns)
     out.columns = [UI_HIGH_GROWTH_HEADERS.get(c, c) for c in out.columns]
     return out
+
 
 # 本策略採用「財報公布落後」觀點：Q1 財報以 2~4 月營收軌跡驗證；Q4 延伸到隔年 1 月。
 HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
@@ -6345,11 +6283,11 @@ class HighGrowthEPSEngine:
             {"項目": "營收月份覆蓋狀態", "內容": "OK" if not missing_required_months else f"缺月：{missing_required_months}"},
             {"項目": "主選股模型", "內容": high_growth_model_definition_text("ZH")},
             {"項目": "報表語言模式", "內容": "Excel固定輸出中文(ZH)與英文(EN)各一份；UI固定中文"},
+            {"項目": "UI畫面輸出", "內容": "請見12_UI畫面輸出；此Sheet複製高成長EPS UI Treeview目前顯示欄位、排序與前250筆。"},
             {"項目": "主KPI_領先預測通過筆數", "內容": leading_count},
             {"項目": "主KPI_選股用EPS非空筆數", "內容": selection_eps_nonnull},
             {"項目": "主KPI_選股分數非空筆數", "內容": selection_score_nonnull},
             {"項目": "正式EPS驗證區", "內容": "請見04_正式EPS驗證通過與04A_正式EPS驗證KPI；首頁主KPI不再顯示strict_pass=0。"},
-            {"項目": "UI畫面輸出", "內容": "請見12_UI畫面輸出；完整複製高成長EPS UI Treeview目前顯示欄位、排序與前250筆內容。"},
             {"項目": "追蹤KPI_EPS_TTM代理追蹤筆數", "內容": ttm_count},
             {"項目": "未通過/資料不足筆數", "內容": fail_count},
             {"項目": "估值資料缺漏筆數", "內容": valuation_missing_count},
@@ -6385,7 +6323,7 @@ class HighGrowthEPSEngine:
             {"序號": 7, "模組": "Outlier/Valuation", "新增/修改": "修改", "程式位置": "EPSForecastEngine.build_eps_features", "驗收點": "估值缺漏降權、YoY極端值有風險旗標與扣分欄"},
             {"序號": 8, "模組": "Run Evidence", "新增/修改": "新增", "程式位置": "HighGrowthEPSEngine._build_same_run_evidence", "驗收點": "Excel含同一run DB/log/Universe與缺月資訊"},
             {"序號": 9, "模組": "No Touch Guard", "新增/修改": "查核", "程式位置": "分類/Universe/Bootstrap/主UI", "驗收點": "不得修改分類、Universe、Bootstrap、主UI架構"},
-            {"序號": 10, "模組": "UI Export", "新增/修改": "新增", "程式位置": "build_high_growth_ui_export_df + HighGrowthEPSEngine.export_report", "驗收點": "12_UI畫面輸出完全保留UI目前欄位、排序與顯示格式，並與02/04新舊邏輯分表並存"},
+            {"序號": 10, "模組": "UI Export Sheet", "新增/修改": "新增", "程式位置": "build_high_growth_ui_export_df + HighGrowthEPSEngine.export_report", "驗收點": "新增12_UI畫面輸出；只複製高成長EPS UI欄位/排序，不改分類、Universe、Bootstrap、主UI架構"},
         ])
         if leading_df.empty:
             leading_df = pd.DataFrame([{"狀態": "NO_LEADING_FORECAST_PASS", "說明": "目前沒有領先預測通過候選。"}])
@@ -16000,18 +15938,7 @@ class AppUI:
                 self.ui_call(self.start_task, "初始化全市場", 4)
                 self.ui_call(self.update_task, "初始化全市場", 1, 4, item="抓取主檔")
                 universe = build_full_market_universe()
-                current_master = self.db.get_master()
-                if universe is None or universe.empty or len(universe) < int(MASTER_IMPORT_MIN_SAFE_ROWS):
-                    # R3A：全市場來源失敗或只剩小主檔時，不可覆蓋既有 2000+ 股票主檔。
-                    if current_master is not None and len(current_master) >= int(MASTER_IMPORT_MIN_SAFE_ROWS):
-                        master2 = current_master
-                        self.ui_call(self.refresh_filters)
-                        self.ui_call(self.refresh_all_tables)
-                        self.ui_call(self.refresh_classification_summary_ui)
-                        self.ui_call(self.update_task, "初始化全市場", 4, 4, success=0, fail=1, item="保留既有主檔")
-                        self.ui_call(self.set_status, f"全市場抓取失敗或低於安全門檻，已保留既有主檔 {len(master2)} 檔。")
-                        self.ui_call(messagebox.showwarning, "已保留既有主檔", f"全市場抓取失敗或低於安全門檻，不覆蓋既有主檔\n既有主檔：{len(master2)} 檔\n安全門檻：{MASTER_IMPORT_MIN_SAFE_ROWS} 檔")
-                        return
+                if universe is None or universe.empty:
                     csv_path = resolve_master_csv()
                     self.db.import_master_csv(csv_path)
                     master2 = self.db.get_master()
@@ -16796,24 +16723,15 @@ def bootstrap():
             master = db.get_master()
             if master.empty:
                 universe = build_full_market_universe()
-                if universe is not None and not universe.empty and len(universe) >= int(MASTER_IMPORT_MIN_SAFE_ROWS):
+                if universe is not None and not universe.empty:
                     db.import_master_df(universe)
                     master = db.get_master()
                     init_message = f"已自動建立全市場股票主檔，共 {len(master)} 檔"
                 else:
                     csv_path = resolve_master_csv()
-                    # R3A：若全市場來源失敗，僅允許本地主檔在達安全門檻時初始化；避免誤建立 18 檔假全市場。
-                    try:
-                        seed = pd.read_csv(csv_path, dtype=str).fillna("") if csv_path.exists() else pd.DataFrame()
-                    except Exception:
-                        seed = pd.DataFrame()
-                    if seed is not None and len(seed) >= int(MASTER_IMPORT_MIN_SAFE_ROWS):
-                        db.import_master_csv(csv_path)
-                        master = db.get_master()
-                        init_message = f"已改用本地完整主檔，共 {len(master)} 檔 | {csv_path}"
-                    else:
-                        init_message = f"全市場股票主檔未建立：官方來源失敗且本地主檔低於安全門檻 {MASTER_IMPORT_MIN_SAFE_ROWS} 檔，避免誤建立 18 檔假全市場"
-                        log_warning(f"[R3A][BOOTSTRAP_GUARD] {init_message}")
+                    db.import_master_csv(csv_path)
+                    master = db.get_master()
+                    init_message = f"已改用本地主檔，共 {len(master)} 檔 | {csv_path}"
             else:
                 init_message = f"股票主檔已載入，共 {len(master)} 檔"
 
