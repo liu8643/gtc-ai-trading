@@ -1972,14 +1972,22 @@ def safe_sheet_name(name: str) -> str:
 
 
 def write_table_bundle(base_path: Path, tables: Dict[str, pd.DataFrame], preferred: str = "excel") -> tuple[Path, str]:
+    # R5A_EXPORT_EMPTY_GUARD_FIX_20260604：
+    # 保留空 DataFrame（只要有欄位或由呼叫端提供狀態列），避免「下載TOP20」在尚未執行AI選股時直接丟出
+    # 「沒有可輸出的資料」並中斷 UI。真正無資料時由 export_selected_data 產出明確狀態列。
     clean_tables = {}
     for name, df in (tables or {}).items():
         if df is None:
             continue
-        if isinstance(df, pd.DataFrame) and not df.empty:
+        if isinstance(df, pd.DataFrame):
             clean_tables[str(name)] = df.copy()
+        else:
+            try:
+                clean_tables[str(name)] = pd.DataFrame(df)
+            except Exception:
+                continue
     if not clean_tables:
-        raise ValueError("沒有可輸出的資料")
+        raise ValueError("沒有可輸出的資料：tables 為空或格式無法轉成 DataFrame")
 
     preferred = (preferred or "excel").lower()
     engine = available_excel_engine()
@@ -15560,6 +15568,52 @@ class AppUI:
                 except Exception:
                     pass
 
+    def _export_empty_reason_df(self, target: str, reason: str = "") -> pd.DataFrame:
+        """R5A：當使用者未先建立排行/TOP20時，下載動作仍輸出診斷表，而非直接跳錯。"""
+        try:
+            history_rows = int(self.db.get_total_price_rows())
+        except Exception:
+            history_rows = 0
+        try:
+            ranking_rows = int(self.db.get_ranking_rows_count())
+        except Exception:
+            ranking_rows = 0
+        return pd.DataFrame([{
+            "狀態": "無可輸出資料",
+            "下載目標": str(target or ""),
+            "原因": reason or "目前尚未建立此下載目標的資料",
+            "建議操作順序": "1. 初始化全市場 → 2. 建立完整歷史/每日增量更新 → 3. 重建排行 → 4. 執行AI選股TOP20 → 5. 再下載TOP20",
+            "目前歷史資料筆數": history_rows,
+            "目前最新排行筆數": ranking_rows,
+            "產生時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }])
+
+    def _fallback_export_dataframe(self, target: str, df: pd.DataFrame) -> pd.DataFrame:
+        """R5A：下載 TOP20/TOP5 時，若畫面快取尚未建立，依序嘗試候選池/最新排行；仍無資料則輸出診斷列。"""
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+        target = str(target or "")
+        if target == "TOP20":
+            candidate = getattr(self, "last_candidate_top20_df", pd.DataFrame())
+            if isinstance(candidate, pd.DataFrame) and not candidate.empty:
+                return candidate.copy()
+            try:
+                ranking = self.db.get_latest_ranking()
+                if ranking is not None and not ranking.empty:
+                    return ranking.sort_values(["rank_all"]).head(20).reset_index(drop=True)
+            except Exception:
+                pass
+            return self._export_empty_reason_df(target, "TOP20尚未建立；log顯示目前只執行 startup_init 與 export_TOP20，尚未執行 AI選股TOP20/重建排行，且最新排行筆數為0。")
+        if target == "TOP5":
+            try:
+                top20 = self._fallback_export_dataframe("TOP20", pd.DataFrame())
+                if top20 is not None and not top20.empty and "狀態" not in top20.columns:
+                    return top20.head(5).copy()
+            except Exception:
+                pass
+            return self._export_empty_reason_df(target, "TOP5需先有TOP20或最新排行資料。")
+        return self._export_empty_reason_df(target, f"{target}目前沒有畫面快取或資料表來源。")
+
     def export_selected_data(self):
         target = self.download_target_var.get().strip() or "TOP20"
 
@@ -15589,7 +15643,8 @@ class AppUI:
             df = mapping.get(target, pd.DataFrame())
             if df is None:
                 df = pd.DataFrame()
-            if isinstance(df, pd.DataFrame) and not df.empty:
+            df = self._fallback_export_dataframe(target, df)
+            if isinstance(df, pd.DataFrame) and not df.empty and "狀態" not in df.columns:
                 id_col = "stock_id" if "stock_id" in df.columns else ("代號" if "代號" in df.columns else None)
                 df = self.enrich_price_and_export_fields(df, id_col=id_col)
             if df.empty:
