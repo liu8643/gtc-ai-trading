@@ -198,6 +198,11 @@ MARGIN_DATA_SOURCE_POLICY = [
     "禁止 Mitake / 券商 SDK / 未授權商業資料",
 ]
 STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
+# R4B_STABILITY_OBSERVABILITY_FIX_20260604：集中管理長任務可觀測性/快停/黑名單。
+NO_DATA_BLACKLIST_PATH = RUNTIME_DIR / "data" / "no_data_blacklist.json"
+NO_DATA_BLACKLIST_TTL_DAYS = 7
+CLASSIFICATION_SCHEMA_MISMATCH_STOP_RETRY = True
+DECISION_LOG_LIMIT = int(os.getenv("GTC_DECISION_LOG_LIMIT", "20") or "20")
 
 
 # FIX9 AI投資組合引擎：獨立於原 TOP20。TOP20 保留「主流TOP20 + 起爆TOP20 + 雙引擎共振」原設計；
@@ -749,13 +754,13 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
 
     for c in x.columns:
         base = str(c).split("__dup")[0].strip()
-        if base in ("公司代號", "股票代號", "證券代號", "公司代碼"):
+        if base in ("公司代號", "股票代號", "證券代號", "公司代碼", "代號", "有價證券代號", "SecuritiesCompanyCode", "CompanyCode", "Code"):
             code_col = c if code_col is None else code_col
-        elif base in ("公司名稱", "公司簡稱", "證券名稱", "股票名稱"):
+        elif base in ("公司名稱", "公司簡稱", "證券名稱", "股票名稱", "名稱", "有價證券名稱", "簡稱", "CompanyName", "Name"):
             name_col = c if name_col is None else name_col
-        elif base in ("新產業類別", "新產業別", "產業名稱", "industry_name"):
+        elif base in ("新產業類別", "新產業別", "產業名稱", "產業別名稱", "產業類別名稱", "IndustryName", "industry_name"):
             industry_name_col = c if industry_name_col is None else industry_name_col
-        elif base in ("產業別", "產業類別", "產業代碼", "產業類別代號", "industry_code"):
+        elif base in ("產業別", "產業類別", "產業代碼", "產業類別代號", "產業別代號", "IndustryCode", "industry_code"):
             industry_code_col = c if industry_code_col is None else industry_code_col
 
     industry_col = industry_name_col or industry_code_col
@@ -942,7 +947,15 @@ def _download_single_classification_csv(market: str, force_refresh: bool = False
             probe = pd.DataFrame(data).astype(str).fillna("")
             parsed = _extract_official_csv_rows(probe, market=market)
             if parsed is None or parsed.empty:
-                raise RuntimeError(f"{market} OpenAPI JSON可讀取，但無可用官方產業資料")
+                cols = [str(c) for c in probe.columns[:30]]
+                sample = probe.head(1).to_dict("records") if probe is not None and not probe.empty else []
+                msg = f"{market} OpenAPI JSON可讀取，但無可用官方產業資料｜SCHEMA_MISMATCH｜columns={cols}｜sample={sample[:1]}"
+                log_warning(msg)
+                if log_cb:
+                    log_cb(msg)
+                if CLASSIFICATION_SCHEMA_MISMATCH_STOP_RETRY:
+                    raise RuntimeError("SCHEMA_MISMATCH_NO_RETRY: " + msg)
+                raise RuntimeError(msg)
 
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             probe.to_csv(cache_path, index=False, encoding="utf-8-sig")
@@ -954,6 +967,8 @@ def _download_single_classification_csv(market: str, force_refresh: bool = False
             log_warning(f"{market} 分類 OpenAPI fallback 失敗（第 {attempt} 次）：{exc}")
             if log_cb:
                 log_cb(f"{market} 分類 OpenAPI fallback 失敗（第 {attempt} 次）：{exc}")
+            if "SCHEMA_MISMATCH_NO_RETRY" in str(exc):
+                break
             if attempt < CLASSIFICATION_DOWNLOAD_RETRIES:
                 time.sleep(min(2 * attempt, 5))
     raise RuntimeError(f"{market} 分類 OpenAPI fallback 失敗：{last_error}")
@@ -1466,8 +1481,15 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
     _write_unclassified_report(unclassified)
 
     coverage = 1.0 - float(x["industry_final"].isin(["未分類", "未匹配"]).mean()) if len(x) else 0.0
+    try:
+        log_info(
+            f"[分類覆蓋率][scope=CALC_INPUT] total={total} covered={covered} unclassified={unclassified_count} "
+            f"official={summary.get('official',0)} manual={summary.get('manual',0)} rule={summary.get('rule_engine',0)} ai={summary.get('ai_infer',0)} coverage={coverage:.2%}"
+        )
+    except Exception:
+        pass
     if coverage < 0.95:
-        log_warning(f"分類覆蓋率不足：{coverage:.2%}")
+        log_warning(f"分類覆蓋率不足：scope=CALC_INPUT total={total} covered={covered} unclassified={unclassified_count} coverage={coverage:.2%}")
     return unclassified, summary
 
 THEME_RULES = [
@@ -2895,7 +2917,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4a_openapi_cache_append_only",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4b_stability_observability_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3803,7 +3825,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4A_REVENUE_OPENAPI_CACHE_APPEND_ONLY_20260604"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4B_STABILITY_OBSERVABILITY_FIX_20260604"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -4459,7 +4481,7 @@ class RevenueOpenAPICacheDownloader:
             return pd.DataFrame()
         cache_df["source_url"] = cache_df.get("source_url", "").fillna("").astype(str)
         cache_df.loc[~cache_df["source_url"].str.contains("OFFICIAL_OPENAPI_CACHE", na=False), "source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(self.latest_cache_file() or "download_memory")
-        log_info(f"[REVENUE][OPENAPI_CACHE] append-only supplement rows={len(cache_df)} months={sorted(cache_df['revenue_month'].astype(str).unique().tolist())}")
+        log_info(f"[REVENUE][OPENAPI_CACHE][APPEND_ONLY] required_months={required} append_rows={len(cache_df)} months={sorted(cache_df['revenue_month'].astype(str).unique().tolist())} zero_rejected=1 policy=INSERT_OR_IGNORE_ONLY")
         return cache_df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
 
@@ -6344,11 +6366,15 @@ class HighGrowthEPSEngine:
         # official_eps_revenue_pass：正式EPS + 完整營收Gate + 營收階梯的雙驗證。
         # legacy_strict_pass/strict_pass：保留舊版相容欄位，不再作新版主選股KPI。
         x["official_eps_only_pass"] = (
-            x["eps_gate"].fillna(False).astype(bool)
-            & x["eps_data_quality"].eq("STRICT")
+            x["eps_data_quality"].eq("STRICT")
+            & x.get("actual_eps_complete_gate", False).fillna(False).astype(bool)
+            & pd.to_numeric(x.get("selected_actual_eps_cumulative"), errors="coerce").gt(0)
         )
+        # R4B：official_eps_only_pass 只代表「正式EPS本身可用且為正」，不得因2025全年EPS基準缺失被壓成0。
+        # 真正 EPS > 年度EPS 與營收完整驗證，留在 official_eps_revenue_pass / legacy_strict_pass。
         x["official_eps_revenue_pass"] = (
             x["official_eps_only_pass"].fillna(False).astype(bool)
+            & x["eps_gate"].fillna(False).astype(bool)
             & x["revenue_strict_gate"].fillna(False).astype(bool)
         )
         x["legacy_strict_pass"] = x["official_eps_revenue_pass"].fillna(False).astype(bool)
@@ -6651,7 +6677,9 @@ class HighGrowthEPSEngine:
         out_path = generated_paths[0] if generated_paths else out_path
         missing_months_text = missing_required_months or 'NONE'
         if log_cb:
-            log_cb(f"[HIGH_GROWTH_V4.15_R2A] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
+            if missing_required_months or official_eps_only_count == 0 or annual_eps_rows == 0:
+                log_cb(f"[HIGH_GROWTH][QUALITY_GATE][WARNING] diagnostic_only_candidate=1｜annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜missing_months={missing_months_text}")
+            log_cb(f"[HIGH_GROWTH_V4.15_R4B] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
@@ -6818,6 +6846,29 @@ class DataEngine:
         return latest
 
 
+    def _load_no_data_blacklist(self) -> dict:
+        try:
+            if NO_DATA_BLACKLIST_PATH.exists():
+                return json.loads(NO_DATA_BLACKLIST_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_no_data_blacklist(self, data: dict):
+        try:
+            NO_DATA_BLACKLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+            NO_DATA_BLACKLIST_PATH.write_text(json.dumps(data or {}, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log_warning(f"[HISTORY][NO_DATA_TTL] save failed：{exc}")
+
+    def _is_no_data_ttl_active(self, stock_id: str, blacklist: dict) -> bool:
+        try:
+            item = blacklist.get(str(stock_id), {}) if isinstance(blacklist, dict) else {}
+            ts = float(item.get("ts", 0) or 0)
+            return ts > 0 and ((time.time() - ts) / 86400.0) < float(NO_DATA_BLACKLIST_TTL_DAYS)
+        except Exception:
+            return False
+
     def build_full_history(self, min_days: int = 240, batch_size: int = 25, sleep_sec: float = 0.6, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
         master = self.db.get_master()
         if master.empty:
@@ -6825,18 +6876,39 @@ class DataEngine:
         success = 0
         failed = 0
         rows = 0
+        skipped = 0
+        failure_summary = {"NO_DATA": 0, "TTL_SKIP": 0, "EXCEPTION": 0, "INVALID_CODE": 0}
+        no_data_blacklist = self._load_no_data_blacklist()
         total = len(master)
+        if log_cb:
+            ready_count = int(master["stock_id"].astype(str).apply(self.db.get_price_history_count).ge(min_days).sum())
+            log_cb(f"[BUILD_HISTORY][START] total={total} ready={ready_count} min_days={min_days} no_data_ttl_days={NO_DATA_BLACKLIST_TTL_DAYS}")
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷完整歷史建庫")
-            stock_id = str(row["stock_id"])
-            market = str(row["market"])
+            stock_id = normalize_stock_id(row.get("stock_id", ""))
+            market = str(row.get("market", ""))
+            if not stock_id:
+                skipped += 1
+                failure_summary["INVALID_CODE"] += 1
+                if progress_cb:
+                    progress_cb(idx, total, str(row.get("stock_id", "")), 0, "skip")
+                continue
             existing = self.db.get_price_history_count(stock_id)
             if existing >= min_days:
                 if progress_cb:
                     progress_cb(idx, total, stock_id, existing, "skip")
                 if log_cb and (idx % 25 == 0 or idx == total):
                     log_cb(f"[{idx}/{total}] {stock_id} 已具備 {existing} 筆歷史，跳過")
+                skipped += 1
+                continue
+            if self._is_no_data_ttl_active(stock_id, no_data_blacklist):
+                skipped += 1
+                failure_summary["TTL_SKIP"] += 1
+                if progress_cb:
+                    progress_cb(idx, total, stock_id, existing, "skip")
+                if log_cb and (idx % 50 == 0 or idx == total):
+                    log_cb(f"[{idx}/{total}] {stock_id} no_data TTL未到，跳過")
                 continue
             try:
                 hist_df = self.download_history(stock_id, market, period="2y")
@@ -6845,18 +6917,23 @@ class DataEngine:
                     success += 1
                     rows += len(hist_df)
                     current_count = self.db.get_price_history_count(stock_id)
+                    if stock_id in no_data_blacklist:
+                        no_data_blacklist.pop(stock_id, None)
                     if log_cb:
                         log_cb(f"[{idx}/{total}] {stock_id} 補建成功，新增/覆蓋 {len(hist_df)} 筆，累計 {current_count} 筆")
                     if progress_cb:
                         progress_cb(idx, total, stock_id, current_count, "ok")
                 else:
                     failed += 1
+                    failure_summary["NO_DATA"] += 1
+                    no_data_blacklist[stock_id] = {"ts": time.time(), "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "reason": "NO_DATA"}
                     if log_cb:
                         log_cb(f"[{idx}/{total}] {stock_id} 無可用歷史資料")
                     if progress_cb:
                         progress_cb(idx, total, stock_id, existing, "fail")
             except Exception as e:
                 failed += 1
+                failure_summary["EXCEPTION"] += 1
                 if log_cb:
                     log_cb(f"[{idx}/{total}] {stock_id} 下載失敗：{e}")
                 if progress_cb:
@@ -6865,6 +6942,9 @@ class DataEngine:
                 if log_cb:
                     log_cb(f"--- 分批節點：已處理 {idx}/{total}，暫停 {sleep_sec:.1f} 秒，避免介面卡住 ---")
                 time.sleep(sleep_sec)
+        self._save_no_data_blacklist(no_data_blacklist)
+        if log_cb:
+            log_cb(f"[BUILD_HISTORY][DONE] success={success} failed={failed} skipped={skipped} rows={rows} failure_summary={failure_summary}")
         return success, failed, rows
 
     def update_incremental(self, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
@@ -6872,8 +6952,12 @@ class DataEngine:
         if master.empty:
             return 0, 0, 0
 
+        if log_cb:
+            log_cb(f"[UPDATE_DAILY][START] master={len(master)}")
         twse_df = self.fetch_twse_daily()
         tpex_df = self.fetch_tpex_daily()
+        if log_cb:
+            log_cb(f"[UPDATE_DAILY][OFFICIAL_SOURCE] twse_rows={0 if twse_df is None else len(twse_df)} tpex_rows={0 if tpex_df is None else len(tpex_df)}")
 
         official_map = {}
         if not twse_df.empty:
@@ -6928,6 +7012,7 @@ class DataEngine:
 
         if log_cb:
             log_cb(f"每日更新彙總｜官方 {source_summary['official']} 檔｜Yahoo備援 {source_summary['yahoo']} 檔｜未取到 {source_summary['none']} 檔")
+            log_cb(f"[UPDATE_DAILY][DONE] success={success} failed={failed} rows={rows} source_summary={source_summary}")
         return success, failed, rows
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
@@ -10183,7 +10268,15 @@ class DecisionLayerEngine:
             out["ui_state"] = "可交易-部分外部資料NE"
         if eps_matrix_decision_note:
             out["decision_reason_short"] = short_reason(str(out.get("decision_reason_short", "")) + "｜" + eps_matrix_decision_note, 160)
-        log_info(f"[EPS MATRIX][DECISION] stock={stock_id} cat={eps_category} cell={matrix_cell} score={revenue_eps_score} trade_allowed={trade_allowed}")
+        try:
+            counter = int(getattr(DecisionLayerEngine, "_decision_log_counter", 0)) + 1
+            setattr(DecisionLayerEngine, "_decision_log_counter", counter)
+            if counter <= DECISION_LOG_LIMIT or trade_allowed:
+                log_info(f"[EPS MATRIX][DECISION] stock={stock_id} cat={eps_category} cell={matrix_cell} score={revenue_eps_score} trade_allowed={trade_allowed}")
+            elif counter == DECISION_LOG_LIMIT + 1:
+                log_info(f"[EPS MATRIX][DECISION] log suppressed after {DECISION_LOG_LIMIT} rows; full details are available in trade_plan/export sheets")
+        except Exception:
+            pass
         return out
 
     def evaluate_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -14522,16 +14615,21 @@ class AppUI:
         def runner():
             self.cancel_event.clear()
             self.current_job = name
+            job_id = f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            start_ts = time.time()
             self.ui_call(self.set_busy, True)
             self.ui_call(self.reset_progress)
-            self.ui_call(self.append_log, f"背景作業啟動：{name}")
-            log_info(f"背景作業啟動：{name}")
+            self.ui_call(self.append_log, f"背景作業啟動：{name}｜job_id={job_id}")
+            log_info(f"背景作業啟動：{name}｜job_id={job_id}")
             try:
                 target()
-                self.ui_call(self.append_log, f"背景作業完成：{name}")
+                elapsed = time.time() - start_ts
+                self.ui_call(self.append_log, f"背景作業完成：{name}｜job_id={job_id}｜elapsed_sec={elapsed:.2f}")
+                log_info(f"背景作業完成：{name}｜job_id={job_id}｜elapsed_sec={elapsed:.2f}")
             except Exception as exc:
-                log_exception(f"背景作業失敗：{name}", exc)
-                self.ui_call(self.append_log, f"背景作業失敗：{name}｜{exc}", "ERROR")
+                elapsed = time.time() - start_ts
+                log_exception(f"背景作業失敗：{name}｜job_id={job_id}｜elapsed_sec={elapsed:.2f}", exc)
+                self.ui_call(self.append_log, f"背景作業失敗：{name}｜job_id={job_id}｜elapsed_sec={elapsed:.2f}｜{exc}", "ERROR")
                 self.ui_call(messagebox.showerror, "背景作業錯誤", f"{name} 執行失敗：\n{exc}")
             finally:
                 self.current_job = None
@@ -15956,6 +16054,12 @@ class AppUI:
             self.append_log(f"[AI_PORTFOLIO] UI填表失敗：{exc}", "ERROR")
 
     def show_ai_portfolio_engine(self):
+        now_ts = time.time()
+        last_ts = float(getattr(self, "_last_ai_portfolio_run_ts", 0.0) or 0.0)
+        if now_ts - last_ts < 10:
+            self.append_log(f"[AI_PORTFOLIO] debounce：10秒內重複觸發已略過｜elapsed={now_ts-last_ts:.2f}s", "WARNING")
+            return
+        self._last_ai_portfolio_run_ts = now_ts
         def worker():
             try:
                 self.ui_call(self.clear_log)
@@ -15971,7 +16075,8 @@ class AppUI:
                 self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
                 self.ui_call(self.update_task, "AI投資組合引擎", 2, 3, item=f"組合={len(main)}")
                 self.ui_call(self.finish_task, "AI投資組合引擎", f"AI投資組合完成｜主表 {len(main)} 檔｜交易欄位已補齊｜TOP20原設計未變動")
-                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 完成：主表={len(main)}｜交易欄位={AI_PORTFOLIO_TRADE_COLUMNS}｜設定={AI_PORTFOLIO_CONFIG_PATH}")
+                pool_rows = {k: len(v) for k, v in tables.items() if isinstance(v, pd.DataFrame)}
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 完成：主表={len(main)}｜sheet_rows={pool_rows}｜交易欄位={AI_PORTFOLIO_TRADE_COLUMNS}｜設定={AI_PORTFOLIO_CONFIG_PATH}")
             except Exception as exc:
                 self.ui_call(self.append_log, f"[AI_PORTFOLIO] 失敗：{exc}", "ERROR")
                 self.ui_call(messagebox.showerror, "AI投資組合", f"AI投資組合引擎失敗：\n{exc}")
@@ -15989,7 +16094,9 @@ class AppUI:
                 self.ui_call(self._populate_ai_portfolio_tree, self.last_ai_portfolio_df)
                 self.ui_call(self.left_notebook.select, self.tab_ai_portfolio)
                 self.ui_call(messagebox.showinfo, "AI投資組合", f"AI投資組合報表已輸出（{out_type}）：\n{out_path}")
-                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 報表輸出：{out_path}｜已含買進下緣/買進上緣/停損/目標1/目標2/RR/風險旗標")
+                sheet_rows = {k: len(v) for k, v in tables.items() if isinstance(v, pd.DataFrame)}
+                file_size = Path(out_path).stat().st_size if Path(out_path).exists() else 0
+                self.ui_call(self.append_log, f"[AI_PORTFOLIO] 報表輸出：{out_path}｜sheet_rows={sheet_rows}｜file_size={file_size}｜已含買進下緣/買進上緣/停損/目標1/目標2/RR/風險旗標")
                 try:
                     open_path(out_path)
                 except Exception:
