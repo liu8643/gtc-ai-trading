@@ -355,8 +355,6 @@ CLASSIFICATION_CACHE_CSV = CLASSIFICATION_CACHE_CSV_TWSE  # backward compatibili
 CLASSIFICATION_CACHE_XLS = CLASSIFICATION_CACHE_DIR / "台股類股分類.xls"
 CLASSIFICATION_CACHE_XLSX = CLASSIFICATION_CACHE_DIR / "台股類股分類.xlsx"
 CLASSIFICATION_META_PATH = CLASSIFICATION_CACHE_DIR / "classification_meta.json"
-CLASSIFICATION_DIAGNOSTIC_DIR = CLASSIFICATION_CACHE_DIR / "diagnostics"
-CLASSIFICATION_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
 CLASSIFICATION_CACHE_PICKLE = CLASSIFICATION_CACHE_DIR / "classification_cache.pkl"
 CLASSIFICATION_MAX_AGE_DAYS = 7
 CLASSIFICATION_DOWNLOAD_TIMEOUT = (10, 45)
@@ -749,33 +747,15 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
     industry_name_col = None
     industry_code_col = None
 
-    code_aliases = {
-        "公司代號", "股票代號", "證券代號", "公司代碼", "公司代號/證券代號",
-        "SecuritiesCompanyCode", "CompanyCode", "Code", "StockCode", "StockNo",
-        "有價證券代號", "證券代號代碼",
-    }
-    name_aliases = {
-        "公司名稱", "公司簡稱", "證券名稱", "股票名稱",
-        "CompanyName", "Name", "SecuritiesCompanyName", "SecuritiesName", "StockName",
-    }
-    industry_name_aliases = {
-        "新產業類別", "新產業別", "產業名稱", "產業別名稱", "產業類別名稱",
-        "industry_name", "IndustryName", "IndustryCategoryName", "IndustryTypeName",
-    }
-    industry_code_aliases = {
-        "產業別", "產業類別", "產業代碼", "產業類別代號", "產業別代碼",
-        "industry_code", "IndustryCode", "IndustryCategory", "IndustryType", "IndustrialCode",
-    }
     for c in x.columns:
         base = str(c).split("__dup")[0].strip()
-        compact = re.sub(r"\s+", "", base)
-        if base in code_aliases or compact in code_aliases:
+        if base in ("公司代號", "股票代號", "證券代號", "公司代碼"):
             code_col = c if code_col is None else code_col
-        elif base in name_aliases or compact in name_aliases:
+        elif base in ("公司名稱", "公司簡稱", "證券名稱", "股票名稱"):
             name_col = c if name_col is None else name_col
-        elif base in industry_name_aliases or compact in industry_name_aliases:
+        elif base in ("新產業類別", "新產業別", "產業名稱", "industry_name"):
             industry_name_col = c if industry_name_col is None else industry_name_col
-        elif base in industry_code_aliases or compact in industry_code_aliases:
+        elif base in ("產業別", "產業類別", "產業代碼", "產業類別代號", "industry_code"):
             industry_code_col = c if industry_code_col is None else industry_code_col
 
     industry_col = industry_name_col or industry_code_col
@@ -916,33 +896,6 @@ def convert_xls_to_xlsx_force(src: Path, dst: Path, log_cb=None) -> Optional[Pat
 
 
 
-
-def _write_classification_schema_diagnostic(market: str, url: str, df: pd.DataFrame, reason: str) -> Path:
-    """R5B：官方分類 JSON 可讀但欄位不符時，保留原始欄位與樣本，避免無證據重試。"""
-    try:
-        CLASSIFICATION_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_market = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff]", "_", str(market or "market"))
-        diag_path = CLASSIFICATION_DIAGNOSTIC_DIR / f"classification_schema_mismatch_{safe_market}_{ts}.json"
-        sample = []
-        try:
-            sample = df.head(5).fillna("").astype(str).to_dict(orient="records") if isinstance(df, pd.DataFrame) else []
-        except Exception:
-            sample = []
-        payload = {
-            "market": market,
-            "url": url,
-            "reason": reason,
-            "columns": list(df.columns) if isinstance(df, pd.DataFrame) else [],
-            "rows": int(len(df)) if isinstance(df, pd.DataFrame) else 0,
-            "sample": sample,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        diag_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return diag_path
-    except Exception:
-        return CLASSIFICATION_DIAGNOSTIC_DIR / "classification_schema_mismatch_write_failed.json"
-
 def _download_single_classification_csv(market: str, force_refresh: bool = False, log_cb=None) -> Optional[Path]:
     """分類 OpenAPI JSON fallback。
 
@@ -988,18 +941,11 @@ def _download_single_classification_csv(market: str, force_refresh: bool = False
 
             probe = pd.DataFrame(data).astype(str).fillna("")
             parsed = _extract_official_csv_rows(probe, market=market)
+            if parsed is None or parsed.empty:
+                raise RuntimeError(f"{market} OpenAPI JSON可讀取，但無可用官方產業資料")
+
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             probe.to_csv(cache_path, index=False, encoding="utf-8-sig")
-            if parsed is None or parsed.empty:
-                diag_path = _write_classification_schema_diagnostic(
-                    market, cfg["url"], probe, f"{market} OpenAPI JSON可讀取，但欄位別名無法對應股票代號/產業欄位"
-                )
-                msg = f"{market} OpenAPI JSON可讀但無可用官方產業資料；已保留原始快取={cache_path}；診斷={diag_path}；columns={list(probe.columns)[:12]}"
-                log_warning(msg)
-                if log_cb:
-                    log_cb(msg, "WARNING") if callable(log_cb) else None
-                return cache_path
-
             if log_cb:
                 log_cb(f"{market} 官方分類 OpenAPI 已轉存 CSV 快取：{cache_path}｜rows={len(parsed)}")
             return cache_path
@@ -1196,9 +1142,7 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         raw = safe_read_classification_source(path)
         out = _extract_official_csv_rows(raw, market=market)
         if out is None or out.empty:
-            diag_path = _write_classification_schema_diagnostic(market, str(path), raw, f"{market} 官方分類可讀取，但沒有有效資料")
-            classification_debug_log(f"分類來源欄位不符（{market}）：已輸出診斷 {diag_path}｜columns={list(raw.columns)[:12]}", "WARNING")
-            return empty_df
+            raise RuntimeError(f"{market} 官方分類可讀取，但沒有有效資料")
         out["stock_id"] = out["stock_id"].astype(str).map(normalize_stock_id)
         out["industry_official"] = out["industry_official"].astype(str).map(normalize_official_industry_name)
         out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
@@ -2028,22 +1972,14 @@ def safe_sheet_name(name: str) -> str:
 
 
 def write_table_bundle(base_path: Path, tables: Dict[str, pd.DataFrame], preferred: str = "excel") -> tuple[Path, str]:
-    # R5A_EXPORT_EMPTY_GUARD_FIX_20260604：
-    # 保留空 DataFrame（只要有欄位或由呼叫端提供狀態列），避免「下載TOP20」在尚未執行AI選股時直接丟出
-    # 「沒有可輸出的資料」並中斷 UI。真正無資料時由 export_selected_data 產出明確狀態列。
     clean_tables = {}
     for name, df in (tables or {}).items():
         if df is None:
             continue
-        if isinstance(df, pd.DataFrame):
+        if isinstance(df, pd.DataFrame) and not df.empty:
             clean_tables[str(name)] = df.copy()
-        else:
-            try:
-                clean_tables[str(name)] = pd.DataFrame(df)
-            except Exception:
-                continue
     if not clean_tables:
-        raise ValueError("沒有可輸出的資料：tables 為空或格式無法轉成 DataFrame")
+        raise ValueError("沒有可輸出的資料")
 
     preferred = (preferred or "excel").lower()
     engine = available_excel_engine()
@@ -2959,7 +2895,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4a_openapi_cache_append_only",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3867,36 +3803,10 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5_REVENUE_OPENAPI_CACHE_DOWNLOADER_FIX_20260604"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4A_REVENUE_OPENAPI_CACHE_APPEND_ONLY_20260604"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
-
-# R5_REVENUE_OPENAPI_CACHE_DOWNLOADER_FIX：官方月營收快取層。
-# 定位：保留 R4 external_revenue/history fallback 主邏輯；新增前置 cache downloader，不取代 DB writer / RevenueAccelerationEngine。
-REVENUE_CACHE_DIR = EXTERNAL_DATA_DIR / "revenue_cache"
-REVENUE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-REVENUE_OPENAPI_ENDPOINTS = {
-    "TWSE_REVENUE_L": {
-        "market": "上市",
-        "url": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
-        "referer": "https://openapi.twse.com.tw/",
-        "source_level": "OFFICIAL_OPENAPI_CACHE",
-    },
-    "TPEX_REVENUE_O": {
-        "market": "上櫃",
-        "url": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
-        "referer": "https://www.tpex.org.tw/openapi/",
-        "source_level": "OFFICIAL_OPENAPI_CACHE",
-    },
-    "TPEX_REVENUE_R": {
-        "market": "興櫃",
-        "url": "https://www.tpex.org.tw/openapi/v1/t187ap05_R",
-        "referer": "https://www.tpex.org.tw/openapi/",
-        "source_level": "OFFICIAL_OPENAPI_CACHE",
-    },
-}
-REVENUE_CACHE_MAX_AGE_HOURS = float(os.getenv("GTC_REVENUE_CACHE_MAX_AGE_HOURS", "12"))
 
 # V4.12 LEADING_EPS_FORECAST_SELECTION_FIX：選股策略改為「領先預測」而非等待正式 EPS。
 # 核心排序：40% predicted_q2_eps + 25% eps_acceleration + 20% revenue_acceleration + 15% valuation(PE/PEG)。
@@ -4136,6 +4046,23 @@ HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
     "Q4": ["202611", "202612", "202701"],
 }
 
+# R4A_REVENUE_OPENAPI_CACHE_APPEND_ONLY_20260604：官方月營收快取層。
+# 設計原則：只作備援/補缺，不取代 R4 原本月營收主流程；快取資料只允許 append/repair，禁止覆蓋既有有效 history。
+REVENUE_CACHE_DIR = RUNTIME_DIR / "data" / "revenue_cache"
+REVENUE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+REVENUE_OPENAPI_ENDPOINTS = {
+    "TWSE_REVENUE_L": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+    "TPEX_REVENUE_O": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+}
+REVENUE_OPENAPI_OPTIONAL_ENDPOINTS = {
+    "TPEX_REVENUE_R": "https://www.tpex.org.tw/openapi/v1/t187ap05_R",
+}
+REVENUE_CACHE_APPEND_ONLY_POLICY = (
+    "R4A：OpenAPI 月營收快取層僅在 R4 原流程失敗或缺指定月份時補資料；"
+    "只補缺漏 stock_id+revenue_month，不覆蓋 external_revenue_history 既有有效資料；"
+    "revenue<=0 或月份無法正規化者禁止寫入。"
+)
+
 
 def get_high_growth_report_path(date_str: str | None = None, quarters: list[str] | None = None) -> Path:
     d = date_str or datetime.now().strftime("%Y%m%d")
@@ -4320,6 +4247,220 @@ class RevenueAccelerationEngine:
         base["revenue_acceleration_score"] = np.clip(40 + base["avg_revenue_yoy"].fillna(0) * 0.6 + base["revenue_month_count_hit"] * 3, 0, 100).round(2)
         base["revenue_data_quality"] = np.where(base["revenue_strict_gate"], "STRICT", np.where(base["revenue_month_count_hit"] > 0, "PARTIAL_OR_PROXY", "MISSING"))
         return base, rev
+
+
+class RevenueOpenAPICacheDownloader:
+    """R4A：官方月營收 OpenAPI 快取下載器（append-only repair layer）。
+
+    定位：
+    - 不取代 R4 原本 fetch_revenue / writer / history fallback。
+    - 僅在原流程缺月份或官方抓取失敗時，補讀/補抓官方 OpenAPI 快取。
+    - 寫入 history 時必須由呼叫端使用 INSERT OR IGNORE / append-only，禁止覆蓋既有有效資料。
+    """
+
+    def __init__(self, cache_dir: Path | None = None):
+        self.cache_dir = Path(cache_dir or REVENUE_CACHE_DIR)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.endpoints = dict(REVENUE_OPENAPI_ENDPOINTS)
+        self.optional_endpoints = dict(REVENUE_OPENAPI_OPTIONAL_ENDPOINTS)
+
+    @staticmethod
+    def _num(v, default: float = np.nan) -> float:
+        try:
+            s = str(v).replace(',', '').replace('--', '').strip()
+            if s in ('', '-', 'None', 'nan', 'NaN', '<NA>'):
+                return float(default)
+            return float(s)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _find_revenue_columns(raw: pd.DataFrame) -> dict:
+        col_map = {}
+        if raw is None or raw.empty:
+            return col_map
+        for c in raw.columns:
+            cs = str(c).strip()
+            if cs in ("公司代號", "公司代碼", "股票代號", "證券代號", "SecuritiesCompanyCode", "Code"):
+                col_map.setdefault("stock_id", c)
+            elif (cs in ("出表年月", "出表日期", "資料年月", "年月", "營收年月", "營業收入年月", "月份", "RevenueMonth", "YearMonth", "month", "Month")
+                  or ("資料年月" in cs) or ("營收年月" in cs) or ("出表年月" in cs)):
+                col_map.setdefault("revenue_month", c)
+            elif (("當月營收" in cs) or ("本月營收" in cs) or cs in ("營業收入-當月營收", "營收", "revenue", "Revenue")):
+                if "累計" not in cs and "去年" not in cs and "增減" not in cs:
+                    col_map.setdefault("revenue", c)
+            elif ("上月" in cs and "增減" in cs) or ("MoM" in cs) or ("mom" == cs.lower()):
+                col_map.setdefault("mom", c)
+            elif ((("去年" in cs or "同期" in cs or "YoY" in cs or "yoy" == cs.lower()) and "增減" in cs)
+                  or cs in ("營業收入-去年同月增減(%)", "去年同月增減(%)")):
+                col_map.setdefault("yoy", c)
+            elif (("累計" in cs and "營收" in cs and "增減" not in cs) or cs in ("累計營業收入-當月累計營收", "累計營收")):
+                col_map.setdefault("cumulative_revenue", c)
+            elif ("累計" in cs and "增減" in cs) or cs in ("累計營業收入-前期比較增減(%)", "累計增減(%)"):
+                col_map.setdefault("cumulative_yoy", c)
+        return col_map
+
+    def _read_remote_json_df(self, url: str, referer: str = "") -> tuple[pd.DataFrame, str]:
+        resp = requests.get(
+            url,
+            timeout=45,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": referer or ("https://www.tpex.org.tw/openapi/" if "tpex.org.tw" in str(url) else "https://openapi.twse.com.tw/"),
+            },
+        )
+        status = str(resp.status_code)
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            raise RuntimeError(f"OpenAPI cache JSON解析失敗：{exc}") from exc
+        if isinstance(payload, dict):
+            payload = payload.get("data") or payload.get("records") or payload.get("result") or []
+        if not isinstance(payload, list):
+            raise RuntimeError("OpenAPI cache JSON格式不是陣列")
+        return pd.DataFrame(payload).astype(str).fillna(""), status
+
+    def parse_revenue_openapi(self, raw: pd.DataFrame, source_label: str = "") -> tuple[pd.DataFrame, str]:
+        if raw is None or raw.empty:
+            return pd.DataFrame(), f"{source_label} cache raw rows=0"
+        col_map = self._find_revenue_columns(raw)
+        if "stock_id" not in col_map or "revenue" not in col_map or "revenue_month" not in col_map:
+            return pd.DataFrame(), f"{source_label} cache欄位無法辨識：{list(raw.columns)[:20]}"
+        rows = []
+        for _, r in raw.iterrows():
+            sid = normalize_stock_id(r.get(col_map.get("stock_id"), ""))
+            month = RevenueAccelerationEngine.normalize_month(r.get(col_map.get("revenue_month"), ""))
+            revenue = self._num(r.get(col_map.get("revenue"), np.nan), default=np.nan)
+            if not sid or not month or (not np.isfinite(revenue)) or float(revenue) <= 0:
+                continue
+            rows.append({
+                "stock_id": sid,
+                "revenue_month": month,
+                "revenue": float(revenue),
+                "mom": self._num(r.get(col_map.get("mom"), np.nan), default=np.nan),
+                "yoy": self._num(r.get(col_map.get("yoy"), np.nan), default=np.nan),
+                "cumulative_revenue": self._num(r.get(col_map.get("cumulative_revenue"), np.nan), default=np.nan),
+                "cumulative_yoy": self._num(r.get(col_map.get("cumulative_yoy"), np.nan), default=np.nan),
+                "source_date": datetime.now().strftime("%Y-%m-%d"),
+                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "cache_source_label": source_label,
+            })
+        out = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if rows else pd.DataFrame()
+        if out.empty:
+            return out, f"{source_label} cache解析後有效 rows=0"
+        return out, ""
+
+    def save_cache_df(self, df: pd.DataFrame, source_tag: str = "official_openapi") -> Path | None:
+        if df is None or df.empty:
+            return None
+        try:
+            x = df.copy()
+            if "revenue_month" in x.columns:
+                x["revenue_month"] = x["revenue_month"].map(RevenueAccelerationEngine.normalize_month).fillna("").astype(str)
+            if "revenue" in x.columns:
+                x["revenue"] = pd.to_numeric(x["revenue"], errors="coerce")
+            x = x[(x.get("revenue_month", pd.Series(dtype=str)).astype(str).ne("")) & (x.get("revenue", pd.Series(dtype=float)) > 0)].copy()
+            if x.empty:
+                return None
+            out = self.cache_dir / f"revenue_openapi_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{source_tag}.csv"
+            x.to_csv(out, index=False, encoding="utf-8-sig")
+            log_info(f"[REVENUE][OPENAPI_CACHE] saved cache={out} rows={len(x)} months={sorted(x['revenue_month'].astype(str).unique().tolist())}")
+            return out
+        except Exception as exc:
+            log_warning(f"[REVENUE][OPENAPI_CACHE] save cache failed：{exc}")
+            return None
+
+    def latest_cache_file(self) -> Path | None:
+        files = sorted(self.cache_dir.glob("revenue_openapi_*.csv"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        return files[0] if files else None
+
+    def read_latest_cache(self) -> pd.DataFrame:
+        p = self.latest_cache_file()
+        if p is None:
+            return pd.DataFrame()
+        last_error = None
+        for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+            try:
+                df = pd.read_csv(p, encoding=enc, dtype=str).fillna("")
+                if df.empty:
+                    return pd.DataFrame()
+                df["stock_id"] = df.get("stock_id", "").map(normalize_stock_id)
+                df["revenue_month"] = df.get("revenue_month", "").map(RevenueAccelerationEngine.normalize_month)
+                for c in ["revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy"]:
+                    if c not in df.columns:
+                        df[c] = np.nan
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df[(df["stock_id"].astype(str).ne("")) & (df["revenue_month"].astype(str).ne("")) & (df["revenue"] > 0)].copy()
+                if df.empty:
+                    return pd.DataFrame()
+                df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(p)
+                if "source_date" not in df.columns:
+                    df["source_date"] = datetime.now().strftime("%Y-%m-%d")
+                if "update_time" not in df.columns:
+                    df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                return df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
+            except Exception as exc:
+                last_error = exc
+                continue
+        log_warning(f"[REVENUE][OPENAPI_CACHE] read latest cache failed：{last_error}")
+        return pd.DataFrame()
+
+    def download_latest_cache(self, include_optional: bool = False) -> tuple[pd.DataFrame, Path | None, str]:
+        parts, errors = [], []
+        endpoints = dict(self.endpoints)
+        if include_optional:
+            endpoints.update(self.optional_endpoints)
+        for label, url in endpoints.items():
+            try:
+                raw, status = self._read_remote_json_df(url)
+                parsed, err = self.parse_revenue_openapi(raw, source_label=label)
+                if parsed is None or parsed.empty:
+                    errors.append(err or f"{label} rows=0")
+                    continue
+                parsed["source_url"] = url
+                parts.append(parsed)
+                log_info(f"[REVENUE][OPENAPI_CACHE][{label}] download rows={len(parsed)} status={status}")
+            except Exception as exc:
+                errors.append(f"{label}:{exc}")
+                log_warning(f"[REVENUE][OPENAPI_CACHE][{label}] download failed：{exc}")
+        df = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if parts else pd.DataFrame()
+        cache_path = self.save_cache_df(df, source_tag="download") if df is not None and not df.empty else None
+        if df is not None and not df.empty:
+            df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(cache_path or "download_memory")
+        return df, cache_path, " ; ".join(errors)
+
+    def supplement_missing_only(self, existing_df: pd.DataFrame | None, required_months: list[str], force_download: bool = False) -> pd.DataFrame:
+        required = [RevenueAccelerationEngine.normalize_month(m) for m in (required_months or [])]
+        required = [m for m in required if m]
+        if not required:
+            return pd.DataFrame()
+        existing = existing_df.copy() if isinstance(existing_df, pd.DataFrame) else pd.DataFrame()
+        if not existing.empty and "revenue_month" in existing.columns:
+            existing["stock_id"] = existing.get("stock_id", "").map(normalize_stock_id)
+            existing["revenue_month"] = existing["revenue_month"].map(RevenueAccelerationEngine.normalize_month)
+            existing["revenue"] = pd.to_numeric(existing.get("revenue"), errors="coerce")
+        cache_df = pd.DataFrame()
+        if not force_download:
+            cache_df = self.read_latest_cache()
+        if cache_df is None or cache_df.empty:
+            cache_df, _, _ = self.download_latest_cache(include_optional=False)
+        if cache_df is None or cache_df.empty:
+            return pd.DataFrame()
+        cache_df = cache_df[cache_df["revenue_month"].astype(str).isin(required)].copy()
+        if cache_df.empty:
+            return pd.DataFrame()
+        if not existing.empty and {"stock_id", "revenue_month"}.issubset(existing.columns):
+            exist_keys = set(zip(existing["stock_id"].astype(str), existing["revenue_month"].astype(str)))
+            cache_df = cache_df[~cache_df.apply(lambda r: (str(r.get("stock_id", "")), str(r.get("revenue_month", ""))) in exist_keys, axis=1)].copy()
+        cache_df = cache_df[pd.to_numeric(cache_df.get("revenue"), errors="coerce") > 0].copy()
+        if cache_df.empty:
+            return pd.DataFrame()
+        cache_df["source_url"] = cache_df.get("source_url", "").fillna("").astype(str)
+        cache_df.loc[~cache_df["source_url"].str.contains("OFFICIAL_OPENAPI_CACHE", na=False), "source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(self.latest_cache_file() or "download_memory")
+        log_info(f"[REVENUE][OPENAPI_CACHE] append-only supplement rows={len(cache_df)} months={sorted(cache_df['revenue_month'].astype(str).unique().tolist())}")
+        return cache_df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
 
 class EPSForecastEngine:
@@ -7034,264 +7175,6 @@ class RankingEngine:
 
 
 
-class RevenueOpenAPICacheDownloader:
-    """R5：官方 OpenAPI 月營收快取下載器。
-
-    設計原則：
-    - 只作前置快取層，不取代 R4 的 external_revenue / external_revenue_history DB 寫入與 fallback。
-    - 上市、上櫃、興櫃分開抓；單一市場失敗不阻斷另一市場資料。
-    - 同時保留 raw cache 與 normalized cache，便於追查「某月份營收為 0」的真因。
-    - 第二次執行優先使用 REVENUE_CACHE_DIR 內最新有效快取，降低網路依賴與開機等待。
-    """
-
-    NORMALIZED_COLUMNS = [
-        "stock_id", "revenue_month", "revenue", "mom", "yoy",
-        "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time",
-        "market", "source_label", "cache_file",
-    ]
-
-    def __init__(self, cache_dir: Path | None = None, endpoints: dict | None = None, max_age_hours: float | None = None):
-        self.cache_dir = Path(cache_dir or REVENUE_CACHE_DIR)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.endpoints = dict(endpoints or REVENUE_OPENAPI_ENDPOINTS)
-        self.max_age_hours = float(REVENUE_CACHE_MAX_AGE_HOURS if max_age_hours is None else max_age_hours)
-
-    @staticmethod
-    def _num(v, default: float = 0.0) -> float:
-        try:
-            s = str(v).replace(",", "").replace("--", "").strip()
-            if s in ("", "-", "None", "nan", "NaN", "<NA>"):
-                return float(default)
-            return float(s)
-        except Exception:
-            return float(default)
-
-    @staticmethod
-    def _json_to_df(payload) -> pd.DataFrame:
-        if isinstance(payload, dict):
-            payload = payload.get("data") or payload.get("records") or payload.get("result") or []
-        if not isinstance(payload, list):
-            raise RuntimeError("OpenAPI JSON格式不是陣列")
-        return pd.DataFrame(payload).astype(str).fillna("")
-
-    def _fetch_one(self, label: str, cfg: dict) -> tuple[pd.DataFrame, dict]:
-        url = str(cfg.get("url", ""))
-        referer = str(cfg.get("referer", "https://openapi.twse.com.tw/"))
-        resp = requests.get(url, timeout=45, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": referer,
-        })
-        status = str(resp.status_code)
-        resp.raise_for_status()
-        try:
-            raw_df = self._json_to_df(resp.json())
-        except Exception as exc:
-            raise RuntimeError(f"{label} OpenAPI JSON解析失敗：{exc}")
-        meta = {
-            "source_label": label,
-            "market": cfg.get("market", ""),
-            "url": url,
-            "http_status": status,
-            "raw_rows": int(len(raw_df)),
-            "fetch_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "success" if len(raw_df) > 0 else "empty",
-        }
-        return raw_df, meta
-
-    def _column_map(self, raw: pd.DataFrame) -> dict:
-        col_map = {}
-        for c in raw.columns:
-            cs = str(c).strip()
-            if cs in ("公司代號", "公司代碼", "股票代號", "證券代號", "SecuritiesCompanyCode", "Code"):
-                col_map["stock_id"] = c
-            elif (cs in ("出表年月", "出表日期", "資料年月", "年月", "營收年月", "營業收入年月", "月份", "RevenueMonth", "YearMonth", "month", "Month")
-                  or ("資料年月" in cs) or ("營收年月" in cs) or ("出表年月" in cs)):
-                col_map["revenue_month"] = c
-            elif (("當月營收" in cs) or ("本月營收" in cs) or cs in ("營業收入-當月營收", "營收", "revenue", "Revenue")):
-                if "累計" not in cs and "去年" not in cs and "增減" not in cs:
-                    col_map["revenue"] = c
-            elif ("上月" in cs and "增減" in cs) or ("MoM" in cs) or ("mom" == cs.lower()):
-                col_map["mom"] = c
-            elif ((("去年" in cs or "同期" in cs or "YoY" in cs or "yoy" == cs.lower()) and "增減" in cs)
-                  or cs in ("營業收入-去年同月增減(%)", "去年同月增減(%)")):
-                col_map["yoy"] = c
-            elif (("累計" in cs and "營收" in cs and "增減" not in cs) or cs in ("累計營業收入-當月累計營收", "累計營收")):
-                col_map["cumulative_revenue"] = c
-            elif ("累計" in cs and "增減" in cs) or cs in ("累計營業收入-前期比較增減(%)", "累計增減(%)"):
-                col_map["cumulative_yoy"] = c
-        return col_map
-
-    def normalize_raw_df(self, raw: pd.DataFrame, label: str, cfg: dict, cache_file: str = "") -> tuple[pd.DataFrame, str]:
-        if raw is None or raw.empty:
-            return pd.DataFrame(columns=self.NORMALIZED_COLUMNS), f"{label} raw empty"
-        col_map = self._column_map(raw)
-        if "stock_id" not in col_map or "revenue_month" not in col_map or "revenue" not in col_map:
-            return pd.DataFrame(columns=self.NORMALIZED_COLUMNS), f"{label} 缺必要欄位：stock_id/revenue_month/revenue；raw_columns={list(raw.columns)[:20]}"
-        rows = []
-        for _, r in raw.iterrows():
-            sid = normalize_stock_id(r.get(col_map.get("stock_id"), ""))
-            month = RevenueAccelerationEngine.normalize_month(r.get(col_map.get("revenue_month"), ""))
-            if not sid or not month:
-                continue
-            raw_revenue = str(r.get(col_map.get("revenue"), "")).strip()
-            revenue = self._num(raw_revenue, 0)
-            # 0值防呆：空白/-- 不當作 0 入庫；真實文字 0 仍保留，交由診斷追查。
-            if revenue == 0 and raw_revenue in ("", "-", "--", "nan", "None", "<NA>"):
-                continue
-            rows.append({
-                "stock_id": sid,
-                "revenue_month": month,
-                "revenue": revenue,
-                "mom": self._num(r.get(col_map.get("mom"), 0)),
-                "yoy": self._num(r.get(col_map.get("yoy"), 0)),
-                "cumulative_revenue": self._num(r.get(col_map.get("cumulative_revenue"), 0)),
-                "cumulative_yoy": self._num(r.get(col_map.get("cumulative_yoy"), 0)),
-                "source_date": datetime.now().strftime("%Y-%m-%d"),
-                "source_url": str(cfg.get("url", "")),
-                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "market": str(cfg.get("market", "")),
-                "source_label": label,
-                "cache_file": str(cache_file or ""),
-            })
-        out = pd.DataFrame(rows)
-        if out.empty:
-            return pd.DataFrame(columns=self.NORMALIZED_COLUMNS), f"{label} normalized rows=0"
-        out = out.drop_duplicates(subset=["stock_id", "revenue_month"], keep="last")
-        return out[self.NORMALIZED_COLUMNS], ""
-
-    def _write_cache_files(self, raw_parts: list[tuple[str, pd.DataFrame, dict]], normalized: pd.DataFrame, status_rows: list[dict]) -> dict:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        written = {}
-        for label, raw_df, meta in raw_parts:
-            raw_path = self.cache_dir / f"revenue_openapi_raw_{label}_{ts}.csv"
-            raw_df.to_csv(raw_path, index=False, encoding="utf-8-sig")
-            written[f"raw_{label}"] = str(raw_path)
-        norm_path = self.cache_dir / f"revenue_openapi_normalized_{ts}.csv"
-        normalized.to_csv(norm_path, index=False, encoding="utf-8-sig")
-        written["normalized_csv"] = str(norm_path)
-        status_path = self.cache_dir / f"revenue_openapi_status_{ts}.json"
-        status_path.write_text(json.dumps(status_rows, ensure_ascii=False, indent=2), encoding="utf-8")
-        written["status_json"] = str(status_path)
-        # latest 指標檔，讓第二次執行可快速讀取。
-        latest_path = self.cache_dir / "revenue_openapi_latest.csv"
-        normalized.to_csv(latest_path, index=False, encoding="utf-8-sig")
-        written["latest_csv"] = str(latest_path)
-        return written
-
-    def latest_cache_path(self) -> Optional[Path]:
-        candidates = [self.cache_dir / "revenue_openapi_latest.csv"]
-        candidates += sorted(self.cache_dir.glob("revenue_openapi_normalized_*.csv"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-        for path in candidates:
-            try:
-                if not path.exists() or path.stat().st_size <= 0:
-                    continue
-                if self.max_age_hours > 0:
-                    age_hours = (time.time() - path.stat().st_mtime) / 3600.0
-                    if age_hours > self.max_age_hours:
-                        continue
-                return path
-            except Exception:
-                continue
-        return None
-
-    def read_latest_cache(self) -> pd.DataFrame:
-        path = self.latest_cache_path()
-        if path is None:
-            return pd.DataFrame(columns=self.NORMALIZED_COLUMNS)
-        try:
-            df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
-        except Exception:
-            df = pd.read_csv(path, dtype=str).fillna("")
-        for c in self.NORMALIZED_COLUMNS:
-            if c not in df.columns:
-                df[c] = ""
-        df["stock_id"] = df["stock_id"].map(normalize_stock_id)
-        df["revenue_month"] = df["revenue_month"].map(RevenueAccelerationEngine.normalize_month)
-        for c in ["revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df[(df["stock_id"].astype(str).ne("")) & (df["revenue_month"].astype(str).str.fullmatch(r"\d{6}", na=False))].copy()
-        return df[self.NORMALIZED_COLUMNS].drop_duplicates(subset=["stock_id", "revenue_month"], keep="last")
-
-    def refresh(self, use_existing_cache: bool = True, force_refresh: bool = False, log_cb=None) -> tuple[pd.DataFrame, dict]:
-        if use_existing_cache and not force_refresh:
-            cached = self.read_latest_cache()
-            if cached is not None and not cached.empty:
-                meta = {
-                    "status": "cache_hit",
-                    "rows": int(len(cached)),
-                    "cache_path": str(self.latest_cache_path() or ""),
-                    "source_level": "OFFICIAL_OPENAPI_CACHE",
-                    "message": "使用最新官方月營收快取，不重抓網路",
-                }
-                if log_cb:
-                    log_cb(f"[REVENUE][OPENAPI_CACHE] cache_hit rows={len(cached)} path={meta['cache_path']}")
-                log_info(f"[REVENUE][OPENAPI_CACHE] cache_hit rows={len(cached)} path={meta['cache_path']}")
-                return cached, meta
-
-        raw_parts = []
-        normalized_parts = []
-        status_rows = []
-        for label, cfg in self.endpoints.items():
-            try:
-                raw_df, meta = self._fetch_one(label, cfg)
-                norm_df, parse_error = self.normalize_raw_df(raw_df, label, cfg)
-                meta["normalized_rows"] = int(len(norm_df))
-                meta["parse_error"] = parse_error
-                status_rows.append(meta)
-                raw_parts.append((label, raw_df, meta))
-                if norm_df is not None and not norm_df.empty:
-                    normalized_parts.append(norm_df)
-                if log_cb:
-                    log_cb(f"[REVENUE][OPENAPI_CACHE][{label}] raw={len(raw_df)} normalized={len(norm_df)} error={parse_error}")
-                log_info(f"[REVENUE][OPENAPI_CACHE][{label}] raw={len(raw_df)} normalized={len(norm_df)} error={parse_error}")
-            except Exception as exc:
-                err = {
-                    "source_label": label,
-                    "market": cfg.get("market", ""),
-                    "url": cfg.get("url", ""),
-                    "status": "fail",
-                    "error_message": str(exc),
-                    "fetch_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                status_rows.append(err)
-                log_warning(f"[REVENUE][OPENAPI_CACHE][{label}] failed: {exc}")
-                if log_cb:
-                    log_cb(f"[REVENUE][OPENAPI_CACHE][{label}] failed: {exc}")
-                continue
-        if not normalized_parts:
-            cached = self.read_latest_cache()
-            if cached is not None and not cached.empty:
-                return cached, {
-                    "status": "official_fail_cache_hit",
-                    "rows": int(len(cached)),
-                    "cache_path": str(self.latest_cache_path() or ""),
-                    "source_level": "OFFICIAL_OPENAPI_CACHE_FALLBACK",
-                    "message": "OpenAPI 當次失敗，使用既有官方快取",
-                    "errors": status_rows,
-                }
-            return pd.DataFrame(columns=self.NORMALIZED_COLUMNS), {
-                "status": "fail",
-                "rows": 0,
-                "source_level": "OFFICIAL_OPENAPI_CACHE",
-                "message": "OpenAPI 與既有快取皆無可用月營收資料",
-                "errors": status_rows,
-            }
-        normalized = pd.concat(normalized_parts, ignore_index=True).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last")
-        written = self._write_cache_files(raw_parts, normalized, status_rows)
-        normalized["cache_file"] = written.get("normalized_csv", "")
-        meta = {
-            "status": "success",
-            "rows": int(len(normalized)),
-            "source_level": "OFFICIAL_OPENAPI_CACHE",
-            "cache_path": written.get("normalized_csv", ""),
-            "latest_cache_path": written.get("latest_csv", ""),
-            "request_url": " | ".join([str(cfg.get("url", "")) for cfg in self.endpoints.values()]),
-            "status_json": written.get("status_json", ""),
-            "details": status_rows,
-        }
-        return normalized[self.NORMALIZED_COLUMNS], meta
-
 
 
 
@@ -7365,7 +7248,7 @@ class ExternalSourceConfig:
             "fallback_days": 45,
             "mandatory": True,
             "parser": "fetch_revenue",
-            "source_priority": "R5：0.官方OpenAPI月營收快取層 data/revenue_cache → 1.TWSE OpenAPI t187ap05_L 上市月營收 JSON → 2.TPEx OpenAPI mopsfin_t187ap05_O 上櫃月營收 JSON → 3.R4 local history fallback；禁止舊 mopsfin CSV",
+            "source_priority": "1.TWSE OpenAPI t187ap05_L 上市月營收 JSON → 2.TPEx OpenAPI mopsfin_t187ap05_O 上櫃月營收 JSON；禁止 舊 mopsfin CSV",
         },
         "valuation": {
             "source_name": "TWSE+TPEx 官方估值/EPS來源",
@@ -7481,11 +7364,13 @@ class ExternalDataWriter:
             # P0：月營收入庫前正規化月份，並拒絕無月份資料，避免覆蓋/污染 history。
             if result.target_table == "external_revenue" and "revenue_month" in df.columns:
                 df["revenue_month"] = df["revenue_month"].map(RevenueAccelerationEngine.normalize_month).fillna("").astype(str)
-                df = df[df["revenue_month"].astype(str).ne("")].copy()
+                if "revenue" in df.columns:
+                    df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce")
+                df = df[(df["revenue_month"].astype(str).ne("")) & (df.get("revenue", pd.Series(dtype=float)) > 0)].copy()
                 if df.empty:
                     result.status = "fail"
                     result.data_ready = 0
-                    result.error_message = "DB寫入前檢查失敗：revenue_month 全部無法正規化，禁止覆蓋既有資料"
+                    result.error_message = "DB寫入前檢查失敗：revenue_month 無法正規化或 revenue<=0，禁止覆蓋既有資料"
                     return result
             with self.db.lock:
                 if result.target_table == "market_snapshot":
@@ -7513,13 +7398,28 @@ class ExternalDataWriter:
                         for c in keep_hist:
                             if c not in hist.columns:
                                 hist[c] = None
+                        hist["revenue"] = pd.to_numeric(hist["revenue"], errors="coerce")
+                        hist = hist[(hist["revenue_month"].astype(str).ne("")) & (hist["revenue"] > 0)].copy()
                         hist = hist[keep_hist].drop_duplicates(subset=["stock_id", "revenue_month"], keep="last")
                         cur = self.db.conn.cursor()
-                        cur.executemany(
-                            "DELETE FROM external_revenue_history WHERE stock_id=? AND revenue_month=?",
-                            hist[["stock_id", "revenue_month"]].astype(str).drop_duplicates().itertuples(index=False, name=None),
-                        )
-                        hist.to_sql("external_revenue_history", self.db.conn, if_exists="append", index=False)
+                        cache_mask = hist["source_url"].fillna("").astype(str).str.contains("OFFICIAL_OPENAPI_CACHE", na=False)
+                        hist_regular = hist.loc[~cache_mask].copy()
+                        hist_cache = hist.loc[cache_mask].copy()
+                        if not hist_regular.empty:
+                            cur.executemany(
+                                "DELETE FROM external_revenue_history WHERE stock_id=? AND revenue_month=?",
+                                hist_regular[["stock_id", "revenue_month"]].astype(str).drop_duplicates().itertuples(index=False, name=None),
+                            )
+                            hist_regular.to_sql("external_revenue_history", self.db.conn, if_exists="append", index=False)
+                        if not hist_cache.empty:
+                            # R4A：官方快取只補缺，禁止覆蓋既有有效 history。
+                            cur.executemany(
+                                """INSERT OR IGNORE INTO external_revenue_history
+                                   (stock_id, revenue_month, revenue, mom, yoy, cumulative_revenue, cumulative_yoy, source_url, source_date, update_time)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                hist_cache[keep_hist].itertuples(index=False, name=None),
+                            )
+                            log_info(f"[REVENUE][OPENAPI_CACHE] history append-only inserted_or_ignored rows={len(hist_cache)}")
                 else:
                     raise ValueError(f"未知target_table：{result.target_table}")
                 self.db.conn.commit()
@@ -8419,38 +8319,6 @@ class ExternalDataFetcher:
             if u and u not in urls:
                 urls.append(u)
 
-        # R5：優先使用官方 OpenAPI 月營收快取層；若快取不存在或失效，下載後落地，再交給既有 DB writer 寫 external_revenue/history。
-        # 此段不取代 R4 local history fallback；OpenAPI cache 失敗時仍會往下走原本即時 OpenAPI 與 local cache fallback。
-        try:
-            cache_downloader = RevenueOpenAPICacheDownloader()
-            cache_df, cache_meta = cache_downloader.refresh(use_existing_cache=True, force_refresh=False)
-            if cache_df is not None and not cache_df.empty:
-                db_df = cache_df.copy()
-                keep_cols = ["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]
-                for c in keep_cols:
-                    if c not in db_df.columns:
-                        db_df[c] = None
-                db_df["source_url"] = db_df["source_url"].fillna("").astype(str) + " | " + str(cache_meta.get("cache_path") or cache_meta.get("latest_cache_path") or "")
-                db_df["revenue_month"] = self._normalize_revenue_month_series(db_df["revenue_month"])
-                db_df = db_df[db_df["revenue_month"].astype(str).ne("")].copy()
-                if not db_df.empty:
-                    return ExternalPipelineResult(
-                        module,
-                        "success" if str(cache_meta.get("status")) in ("success", "cache_hit") else "fallback",
-                        df=db_df[keep_cols].drop_duplicates(subset=["stock_id", "revenue_month"], keep="last"),
-                        source_name=cfg.get("source_name", "") + "｜官方OpenAPI快取層",
-                        official_url=cfg.get("official_url", ""),
-                        request_url=str(cache_meta.get("request_url") or cache_meta.get("cache_path") or cache_meta.get("latest_cache_path") or "OFFICIAL_OPENAPI_CACHE"),
-                        source_date=datetime.now().strftime("%Y-%m-%d"),
-                        http_status=str(cache_meta.get("status", "cache")),
-                        fallback_count=0 if str(cache_meta.get("status")) in ("success", "cache_hit") else 1,
-                        target_table=cfg.get("target_table", ""),
-                        data_ready=1,
-                        source_level=str(cache_meta.get("source_level", "OFFICIAL_OPENAPI_CACHE")),
-                    )
-        except Exception as exc:
-            log_warning(f"[REVENUE][OPENAPI_CACHE] cache layer skipped; continue R4 path｜{exc}")
-
         parts = []
         errors = []
         used_urls = []
@@ -8481,7 +8349,31 @@ class ExternalDataFetcher:
         df = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if parts else pd.DataFrame()
         if not df.empty:
             df["revenue_month"] = self._normalize_revenue_month_series(df["revenue_month"])
-            df = df[df["revenue_month"].astype(str).ne("")].drop_duplicates(subset=["stock_id", "revenue_month"], keep="last")
+            if "revenue" in df.columns:
+                df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce")
+            df = df[(df["revenue_month"].astype(str).ne("")) & (df["revenue"] > 0)].drop_duplicates(subset=["stock_id", "revenue_month"], keep="last")
+
+            # R4A：只新增官方 OpenAPI cache artifact，不改 R4 原本成功資料流。
+            cache_downloader = RevenueOpenAPICacheDownloader(REVENUE_CACHE_DIR)
+            cache_path = cache_downloader.save_cache_df(df, source_tag="r4_original_success")
+
+            # R4A：若 R4 成功結果仍缺高成長 EPS 指定月份，才用本地/下載快取補缺；只補不存在的 stock_id+month。
+            required_months = []
+            try:
+                required_months = RevenueAccelerationEngine(self.db).required_months(HIGH_GROWTH_DEFAULT_QUARTERS)
+            except Exception:
+                required_months = []
+            available_months = set(df["revenue_month"].dropna().astype(str).unique().tolist())
+            missing_months = [m for m in required_months if m and m not in available_months]
+            if missing_months:
+                supplement = cache_downloader.supplement_missing_only(df, missing_months, force_download=False)
+                if supplement is not None and not supplement.empty:
+                    df = pd.concat([df, supplement], ignore_index=True).drop_duplicates(subset=["stock_id", "revenue_month"], keep="first")
+                    http_statuses.append(f"OFFICIAL_OPENAPI_CACHE_APPEND_ONLY:rows={len(supplement)}:months={','.join(missing_months)}")
+                    log_warning(f"[REVENUE][OPENAPI_CACHE] R4 success but missing months={missing_months}; append-only supplement rows={len(supplement)} cache={cache_path}")
+                else:
+                    log_warning(f"[REVENUE][OPENAPI_CACHE] R4 success but missing months={missing_months}; cache supplement rows=0, keep R4 result unchanged")
+
             return ExternalPipelineResult(
                 module,
                 "success",
@@ -8496,8 +8388,28 @@ class ExternalDataFetcher:
                 source_level="official",
             )
 
-        # P0：當次官方來源失敗時，不讓 revenue_rows=0 污染 EPS Matrix；保留最後成功月份。
-        cache_df = self._read_cached_revenue_fallback(reason=" ; ".join(errors))
+        # R4A：官方來源完全失敗時，先嘗試官方 OpenAPI cache downloader；失敗後才回到 R4 local history fallback。
+        cache_downloader = RevenueOpenAPICacheDownloader(REVENUE_CACHE_DIR)
+        official_cache_df, official_cache_path, cache_errors = cache_downloader.download_latest_cache(include_optional=False)
+        if official_cache_df is not None and not official_cache_df.empty:
+            return ExternalPipelineResult(
+                module,
+                "fallback",
+                df=official_cache_df,
+                source_name=cfg.get("source_name","") + "｜official openapi cache append-only",
+                official_url=cfg.get("official_url",""),
+                request_url=" | ".join(urls) + f" | OFFICIAL_OPENAPI_CACHE:{official_cache_path}",
+                source_date=str(official_cache_df["source_date"].dropna().astype(str).max() or datetime.now().strftime("%Y-%m-%d")),
+                http_status="official_fetch_fail_openapi_cache_fallback",
+                fallback_count=1,
+                error_message="官方月營收 OpenAPI 當次失敗，改用 official openapi cache downloader；" + (" ; ".join(errors) or cache_errors or "官方月營收 OpenAPI 資料抓取失敗"),
+                target_table=cfg.get("target_table",""),
+                data_ready=1,
+                source_level="official_openapi_cache_append_only",
+            )
+
+        # P0/R4：當次官方來源與快取下載器都失敗時，不讓 revenue_rows=0 污染 EPS Matrix；保留最後成功月份。
+        cache_df = self._read_cached_revenue_fallback(reason=" ; ".join(errors) + (" ; " + cache_errors if cache_errors else ""))
         if cache_df is not None and not cache_df.empty:
             return ExternalPipelineResult(
                 module,
@@ -14612,18 +14524,13 @@ class AppUI:
             self.current_job = name
             self.ui_call(self.set_busy, True)
             self.ui_call(self.reset_progress)
-            job_id = f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-            start_ts = time.time()
             self.ui_call(self.append_log, f"背景作業啟動：{name}")
-            log_info(f"背景作業啟動：{name}｜job_id={job_id}｜thread={threading.current_thread().name}")
+            log_info(f"背景作業啟動：{name}")
             try:
                 target()
-                elapsed_ms = int((time.time() - start_ts) * 1000)
                 self.ui_call(self.append_log, f"背景作業完成：{name}")
-                log_info(f"背景作業完成：{name}｜job_id={job_id}｜elapsed_ms={elapsed_ms}")
             except Exception as exc:
-                elapsed_ms = int((time.time() - start_ts) * 1000)
-                log_exception(f"背景作業失敗：{name}｜job_id={job_id}｜elapsed_ms={elapsed_ms}", exc)
+                log_exception(f"背景作業失敗：{name}", exc)
                 self.ui_call(self.append_log, f"背景作業失敗：{name}｜{exc}", "ERROR")
                 self.ui_call(messagebox.showerror, "背景作業錯誤", f"{name} 執行失敗：\n{exc}")
             finally:
@@ -15629,108 +15536,6 @@ class AppUI:
                 except Exception:
                     pass
 
-    def _safe_df_rows(self, df) -> int:
-        try:
-            return int(len(df)) if isinstance(df, pd.DataFrame) else 0
-        except Exception:
-            return 0
-
-    def _export_state_snapshot(self, target: str, stage: str, extra: dict | None = None) -> dict:
-        """R5B：匯出前後統一記錄 DB 與 UI 快取狀態，避免 log 只看到啟動/完成。"""
-        snap = {
-            "target": str(target or ""),
-            "stage": str(stage or ""),
-            "last_top20_rows": self._safe_df_rows(getattr(self, "last_top20_df", pd.DataFrame())),
-            "last_top5_rows": self._safe_df_rows(getattr(self, "last_top5_df", pd.DataFrame())),
-            "candidate_top20_rows": self._safe_df_rows(getattr(self, "last_candidate_top20_df", pd.DataFrame())),
-            "highgrowth_rows": self._safe_df_rows(getattr(self, "last_highgrowth_df", pd.DataFrame())),
-        }
-        try:
-            snap["price_history_rows"] = int(self.db.get_total_price_rows())
-        except Exception as exc:
-            snap["price_history_rows"] = -1
-            snap["price_history_error"] = str(exc)
-        try:
-            snap["ranking_rows"] = int(self.db.get_ranking_rows_count())
-        except Exception as exc:
-            snap["ranking_rows"] = -1
-            snap["ranking_error"] = str(exc)
-        try:
-            latest_date = self.db.get_last_price_date()
-            snap["last_price_date"] = latest_date or ""
-        except Exception:
-            snap["last_price_date"] = ""
-        if extra:
-            snap.update(extra)
-        try:
-            log_info("[R5B][EXPORT_DIAG] " + json.dumps(snap, ensure_ascii=False, default=str))
-        except Exception:
-            pass
-        return snap
-
-    def _describe_export_source(self, target: str, original_df, final_df) -> str:
-        if isinstance(final_df, pd.DataFrame) and not final_df.empty and "狀態" in final_df.columns:
-            return "diagnostic_empty_reason"
-        if isinstance(original_df, pd.DataFrame) and not original_df.empty:
-            return "ui_cache"
-        if str(target) in ("TOP20", "TOP5"):
-            try:
-                candidate = getattr(self, "last_candidate_top20_df", pd.DataFrame())
-                if isinstance(candidate, pd.DataFrame) and not candidate.empty:
-                    return "last_candidate_top20_df"
-                ranking = self.db.get_latest_ranking()
-                if ranking is not None and not ranking.empty:
-                    return "ranking_result_fallback"
-            except Exception:
-                pass
-        return "empty_or_unknown"
-
-    def _export_empty_reason_df(self, target: str, reason: str = "") -> pd.DataFrame:
-        """R5A：當使用者未先建立排行/TOP20時，下載動作仍輸出診斷表，而非直接跳錯。"""
-        try:
-            history_rows = int(self.db.get_total_price_rows())
-        except Exception:
-            history_rows = 0
-        try:
-            ranking_rows = int(self.db.get_ranking_rows_count())
-        except Exception:
-            ranking_rows = 0
-        return pd.DataFrame([{
-            "狀態": "無可輸出資料",
-            "下載目標": str(target or ""),
-            "原因": reason or "目前尚未建立此下載目標的資料",
-            "建議操作順序": "1. 初始化全市場 → 2. 建立完整歷史/每日增量更新 → 3. 重建排行 → 4. 執行AI選股TOP20 → 5. 再下載TOP20",
-            "目前歷史資料筆數": history_rows,
-            "目前最新排行筆數": ranking_rows,
-            "產生時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }])
-
-    def _fallback_export_dataframe(self, target: str, df: pd.DataFrame) -> pd.DataFrame:
-        """R5A：下載 TOP20/TOP5 時，若畫面快取尚未建立，依序嘗試候選池/最新排行；仍無資料則輸出診斷列。"""
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-        target = str(target or "")
-        if target == "TOP20":
-            candidate = getattr(self, "last_candidate_top20_df", pd.DataFrame())
-            if isinstance(candidate, pd.DataFrame) and not candidate.empty:
-                return candidate.copy()
-            try:
-                ranking = self.db.get_latest_ranking()
-                if ranking is not None and not ranking.empty:
-                    return ranking.sort_values(["rank_all"]).head(20).reset_index(drop=True)
-            except Exception:
-                pass
-            return self._export_empty_reason_df(target, "TOP20尚未建立；log顯示目前只執行 startup_init 與 export_TOP20，尚未執行 AI選股TOP20/重建排行，且最新排行筆數為0。")
-        if target == "TOP5":
-            try:
-                top20 = self._fallback_export_dataframe("TOP20", pd.DataFrame())
-                if top20 is not None and not top20.empty and "狀態" not in top20.columns:
-                    return top20.head(5).copy()
-            except Exception:
-                pass
-            return self._export_empty_reason_df(target, "TOP5需先有TOP20或最新排行資料。")
-        return self._export_empty_reason_df(target, f"{target}目前沒有畫面快取或資料表來源。")
-
     def export_selected_data(self):
         target = self.download_target_var.get().strip() or "TOP20"
 
@@ -15757,22 +15562,10 @@ class AppUI:
                 "分類V2摘要": pd.DataFrame([get_classification_v2_summary()]) if get_classification_v2_summary() else pd.DataFrame(),
             }
             mapping["唯一決策"] = getattr(self, "last_unique_decision_df", pd.DataFrame())
-            self._export_state_snapshot(target, "mapping_built", {
-                "mapping_rows": {k: self._safe_df_rows(v) for k, v in mapping.items() if isinstance(v, pd.DataFrame)}
-            })
             df = mapping.get(target, pd.DataFrame())
-            original_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
             if df is None:
                 df = pd.DataFrame()
-            df = self._fallback_export_dataframe(target, df)
-            export_source = self._describe_export_source(target, original_df, df)
-            self._export_state_snapshot(target, "after_fallback", {
-                "original_rows": self._safe_df_rows(original_df),
-                "final_rows": self._safe_df_rows(df),
-                "export_source": export_source,
-                "final_columns": list(df.columns)[:30] if isinstance(df, pd.DataFrame) else [],
-            })
-            if isinstance(df, pd.DataFrame) and not df.empty and "狀態" not in df.columns:
+            if isinstance(df, pd.DataFrame) and not df.empty:
                 id_col = "stock_id" if "stock_id" in df.columns else ("代號" if "代號" in df.columns else None)
                 df = self.enrich_price_and_export_fields(df, id_col=id_col)
             if df.empty:
@@ -15799,19 +15592,11 @@ class AppUI:
                 base = RUNTIME_DIR / f"{target}_Data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 self.ui_call(self.update_task, f"下載{target}", 2, 3, item="輸出檔案")
                 out_path, out_type = write_table_bundle(base, {target: df}, preferred="excel")
-                self._export_state_snapshot(target, "write_success", {
-                    "out_path": str(out_path),
-                    "out_type": out_type,
-                    "output_rows": self._safe_df_rows(df),
-                    "export_source": export_source,
-                })
                 display_name = Path(out_path).name if isinstance(out_path, Path) else str(out_path)
                 self.ui_call(self.update_task, f"下載{target}", 3, 3, success=1, item=display_name)
                 self.ui_call(self.finish_task, f"下載{target}", f"{target} 資料已輸出：{display_name}")
                 self.ui_call(messagebox.showinfo, "完成", f"{target} 資料已輸出（{out_type}）：\n{out_path}")
             except Exception as e:
-                log_exception(f"[R5B][EXPORT_ERROR] target={target} source={locals().get('export_source', 'unknown')}", e)
-                self._export_state_snapshot(target, "write_failed", {"error": str(e), "export_source": locals().get("export_source", "unknown")})
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
 
         self._run_in_thread(worker, f"export_{target}")
