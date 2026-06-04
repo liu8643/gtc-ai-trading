@@ -355,6 +355,8 @@ CLASSIFICATION_CACHE_CSV = CLASSIFICATION_CACHE_CSV_TWSE  # backward compatibili
 CLASSIFICATION_CACHE_XLS = CLASSIFICATION_CACHE_DIR / "台股類股分類.xls"
 CLASSIFICATION_CACHE_XLSX = CLASSIFICATION_CACHE_DIR / "台股類股分類.xlsx"
 CLASSIFICATION_META_PATH = CLASSIFICATION_CACHE_DIR / "classification_meta.json"
+CLASSIFICATION_DIAGNOSTIC_DIR = CLASSIFICATION_CACHE_DIR / "diagnostics"
+CLASSIFICATION_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
 CLASSIFICATION_CACHE_PICKLE = CLASSIFICATION_CACHE_DIR / "classification_cache.pkl"
 CLASSIFICATION_MAX_AGE_DAYS = 7
 CLASSIFICATION_DOWNLOAD_TIMEOUT = (10, 45)
@@ -747,15 +749,33 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
     industry_name_col = None
     industry_code_col = None
 
+    code_aliases = {
+        "公司代號", "股票代號", "證券代號", "公司代碼", "公司代號/證券代號",
+        "SecuritiesCompanyCode", "CompanyCode", "Code", "StockCode", "StockNo",
+        "有價證券代號", "證券代號代碼",
+    }
+    name_aliases = {
+        "公司名稱", "公司簡稱", "證券名稱", "股票名稱",
+        "CompanyName", "Name", "SecuritiesCompanyName", "SecuritiesName", "StockName",
+    }
+    industry_name_aliases = {
+        "新產業類別", "新產業別", "產業名稱", "產業別名稱", "產業類別名稱",
+        "industry_name", "IndustryName", "IndustryCategoryName", "IndustryTypeName",
+    }
+    industry_code_aliases = {
+        "產業別", "產業類別", "產業代碼", "產業類別代號", "產業別代碼",
+        "industry_code", "IndustryCode", "IndustryCategory", "IndustryType", "IndustrialCode",
+    }
     for c in x.columns:
         base = str(c).split("__dup")[0].strip()
-        if base in ("公司代號", "股票代號", "證券代號", "公司代碼"):
+        compact = re.sub(r"\s+", "", base)
+        if base in code_aliases or compact in code_aliases:
             code_col = c if code_col is None else code_col
-        elif base in ("公司名稱", "公司簡稱", "證券名稱", "股票名稱"):
+        elif base in name_aliases or compact in name_aliases:
             name_col = c if name_col is None else name_col
-        elif base in ("新產業類別", "新產業別", "產業名稱", "industry_name"):
+        elif base in industry_name_aliases or compact in industry_name_aliases:
             industry_name_col = c if industry_name_col is None else industry_name_col
-        elif base in ("產業別", "產業類別", "產業代碼", "產業類別代號", "industry_code"):
+        elif base in industry_code_aliases or compact in industry_code_aliases:
             industry_code_col = c if industry_code_col is None else industry_code_col
 
     industry_col = industry_name_col or industry_code_col
@@ -896,6 +916,33 @@ def convert_xls_to_xlsx_force(src: Path, dst: Path, log_cb=None) -> Optional[Pat
 
 
 
+
+def _write_classification_schema_diagnostic(market: str, url: str, df: pd.DataFrame, reason: str) -> Path:
+    """R5B：官方分類 JSON 可讀但欄位不符時，保留原始欄位與樣本，避免無證據重試。"""
+    try:
+        CLASSIFICATION_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_market = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff]", "_", str(market or "market"))
+        diag_path = CLASSIFICATION_DIAGNOSTIC_DIR / f"classification_schema_mismatch_{safe_market}_{ts}.json"
+        sample = []
+        try:
+            sample = df.head(5).fillna("").astype(str).to_dict(orient="records") if isinstance(df, pd.DataFrame) else []
+        except Exception:
+            sample = []
+        payload = {
+            "market": market,
+            "url": url,
+            "reason": reason,
+            "columns": list(df.columns) if isinstance(df, pd.DataFrame) else [],
+            "rows": int(len(df)) if isinstance(df, pd.DataFrame) else 0,
+            "sample": sample,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        diag_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return diag_path
+    except Exception:
+        return CLASSIFICATION_DIAGNOSTIC_DIR / "classification_schema_mismatch_write_failed.json"
+
 def _download_single_classification_csv(market: str, force_refresh: bool = False, log_cb=None) -> Optional[Path]:
     """分類 OpenAPI JSON fallback。
 
@@ -941,11 +988,18 @@ def _download_single_classification_csv(market: str, force_refresh: bool = False
 
             probe = pd.DataFrame(data).astype(str).fillna("")
             parsed = _extract_official_csv_rows(probe, market=market)
-            if parsed is None or parsed.empty:
-                raise RuntimeError(f"{market} OpenAPI JSON可讀取，但無可用官方產業資料")
-
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             probe.to_csv(cache_path, index=False, encoding="utf-8-sig")
+            if parsed is None or parsed.empty:
+                diag_path = _write_classification_schema_diagnostic(
+                    market, cfg["url"], probe, f"{market} OpenAPI JSON可讀取，但欄位別名無法對應股票代號/產業欄位"
+                )
+                msg = f"{market} OpenAPI JSON可讀但無可用官方產業資料；已保留原始快取={cache_path}；診斷={diag_path}；columns={list(probe.columns)[:12]}"
+                log_warning(msg)
+                if log_cb:
+                    log_cb(msg, "WARNING") if callable(log_cb) else None
+                return cache_path
+
             if log_cb:
                 log_cb(f"{market} 官方分類 OpenAPI 已轉存 CSV 快取：{cache_path}｜rows={len(parsed)}")
             return cache_path
@@ -1142,7 +1196,9 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
         raw = safe_read_classification_source(path)
         out = _extract_official_csv_rows(raw, market=market)
         if out is None or out.empty:
-            raise RuntimeError(f"{market} 官方分類可讀取，但沒有有效資料")
+            diag_path = _write_classification_schema_diagnostic(market, str(path), raw, f"{market} 官方分類可讀取，但沒有有效資料")
+            classification_debug_log(f"分類來源欄位不符（{market}）：已輸出診斷 {diag_path}｜columns={list(raw.columns)[:12]}", "WARNING")
+            return empty_df
         out["stock_id"] = out["stock_id"].astype(str).map(normalize_stock_id)
         out["industry_official"] = out["industry_official"].astype(str).map(normalize_official_industry_name)
         out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
@@ -14556,13 +14612,18 @@ class AppUI:
             self.current_job = name
             self.ui_call(self.set_busy, True)
             self.ui_call(self.reset_progress)
+            job_id = f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            start_ts = time.time()
             self.ui_call(self.append_log, f"背景作業啟動：{name}")
-            log_info(f"背景作業啟動：{name}")
+            log_info(f"背景作業啟動：{name}｜job_id={job_id}｜thread={threading.current_thread().name}")
             try:
                 target()
+                elapsed_ms = int((time.time() - start_ts) * 1000)
                 self.ui_call(self.append_log, f"背景作業完成：{name}")
+                log_info(f"背景作業完成：{name}｜job_id={job_id}｜elapsed_ms={elapsed_ms}")
             except Exception as exc:
-                log_exception(f"背景作業失敗：{name}", exc)
+                elapsed_ms = int((time.time() - start_ts) * 1000)
+                log_exception(f"背景作業失敗：{name}｜job_id={job_id}｜elapsed_ms={elapsed_ms}", exc)
                 self.ui_call(self.append_log, f"背景作業失敗：{name}｜{exc}", "ERROR")
                 self.ui_call(messagebox.showerror, "背景作業錯誤", f"{name} 執行失敗：\n{exc}")
             finally:
@@ -15568,6 +15629,62 @@ class AppUI:
                 except Exception:
                     pass
 
+    def _safe_df_rows(self, df) -> int:
+        try:
+            return int(len(df)) if isinstance(df, pd.DataFrame) else 0
+        except Exception:
+            return 0
+
+    def _export_state_snapshot(self, target: str, stage: str, extra: dict | None = None) -> dict:
+        """R5B：匯出前後統一記錄 DB 與 UI 快取狀態，避免 log 只看到啟動/完成。"""
+        snap = {
+            "target": str(target or ""),
+            "stage": str(stage or ""),
+            "last_top20_rows": self._safe_df_rows(getattr(self, "last_top20_df", pd.DataFrame())),
+            "last_top5_rows": self._safe_df_rows(getattr(self, "last_top5_df", pd.DataFrame())),
+            "candidate_top20_rows": self._safe_df_rows(getattr(self, "last_candidate_top20_df", pd.DataFrame())),
+            "highgrowth_rows": self._safe_df_rows(getattr(self, "last_highgrowth_df", pd.DataFrame())),
+        }
+        try:
+            snap["price_history_rows"] = int(self.db.get_total_price_rows())
+        except Exception as exc:
+            snap["price_history_rows"] = -1
+            snap["price_history_error"] = str(exc)
+        try:
+            snap["ranking_rows"] = int(self.db.get_ranking_rows_count())
+        except Exception as exc:
+            snap["ranking_rows"] = -1
+            snap["ranking_error"] = str(exc)
+        try:
+            latest_date = self.db.get_last_price_date()
+            snap["last_price_date"] = latest_date or ""
+        except Exception:
+            snap["last_price_date"] = ""
+        if extra:
+            snap.update(extra)
+        try:
+            log_info("[R5B][EXPORT_DIAG] " + json.dumps(snap, ensure_ascii=False, default=str))
+        except Exception:
+            pass
+        return snap
+
+    def _describe_export_source(self, target: str, original_df, final_df) -> str:
+        if isinstance(final_df, pd.DataFrame) and not final_df.empty and "狀態" in final_df.columns:
+            return "diagnostic_empty_reason"
+        if isinstance(original_df, pd.DataFrame) and not original_df.empty:
+            return "ui_cache"
+        if str(target) in ("TOP20", "TOP5"):
+            try:
+                candidate = getattr(self, "last_candidate_top20_df", pd.DataFrame())
+                if isinstance(candidate, pd.DataFrame) and not candidate.empty:
+                    return "last_candidate_top20_df"
+                ranking = self.db.get_latest_ranking()
+                if ranking is not None and not ranking.empty:
+                    return "ranking_result_fallback"
+            except Exception:
+                pass
+        return "empty_or_unknown"
+
     def _export_empty_reason_df(self, target: str, reason: str = "") -> pd.DataFrame:
         """R5A：當使用者未先建立排行/TOP20時，下載動作仍輸出診斷表，而非直接跳錯。"""
         try:
@@ -15640,10 +15757,21 @@ class AppUI:
                 "分類V2摘要": pd.DataFrame([get_classification_v2_summary()]) if get_classification_v2_summary() else pd.DataFrame(),
             }
             mapping["唯一決策"] = getattr(self, "last_unique_decision_df", pd.DataFrame())
+            self._export_state_snapshot(target, "mapping_built", {
+                "mapping_rows": {k: self._safe_df_rows(v) for k, v in mapping.items() if isinstance(v, pd.DataFrame)}
+            })
             df = mapping.get(target, pd.DataFrame())
+            original_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
             if df is None:
                 df = pd.DataFrame()
             df = self._fallback_export_dataframe(target, df)
+            export_source = self._describe_export_source(target, original_df, df)
+            self._export_state_snapshot(target, "after_fallback", {
+                "original_rows": self._safe_df_rows(original_df),
+                "final_rows": self._safe_df_rows(df),
+                "export_source": export_source,
+                "final_columns": list(df.columns)[:30] if isinstance(df, pd.DataFrame) else [],
+            })
             if isinstance(df, pd.DataFrame) and not df.empty and "狀態" not in df.columns:
                 id_col = "stock_id" if "stock_id" in df.columns else ("代號" if "代號" in df.columns else None)
                 df = self.enrich_price_and_export_fields(df, id_col=id_col)
@@ -15671,11 +15799,19 @@ class AppUI:
                 base = RUNTIME_DIR / f"{target}_Data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 self.ui_call(self.update_task, f"下載{target}", 2, 3, item="輸出檔案")
                 out_path, out_type = write_table_bundle(base, {target: df}, preferred="excel")
+                self._export_state_snapshot(target, "write_success", {
+                    "out_path": str(out_path),
+                    "out_type": out_type,
+                    "output_rows": self._safe_df_rows(df),
+                    "export_source": export_source,
+                })
                 display_name = Path(out_path).name if isinstance(out_path, Path) else str(out_path)
                 self.ui_call(self.update_task, f"下載{target}", 3, 3, success=1, item=display_name)
                 self.ui_call(self.finish_task, f"下載{target}", f"{target} 資料已輸出：{display_name}")
                 self.ui_call(messagebox.showinfo, "完成", f"{target} 資料已輸出（{out_type}）：\n{out_path}")
             except Exception as e:
+                log_exception(f"[R5B][EXPORT_ERROR] target={target} source={locals().get('export_source', 'unknown')}", e)
+                self._export_state_snapshot(target, "write_failed", {"error": str(e), "export_source": locals().get("export_source", "unknown")})
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
 
         self._run_in_thread(worker, f"export_{target}")
