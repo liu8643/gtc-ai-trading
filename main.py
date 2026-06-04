@@ -3803,7 +3803,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R2A_BUILD_PY310_FSTRING_FIX_20260603"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4_REVENUE_INCREMENTAL_FALLBACK_FIX_20260604"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -4116,18 +4116,50 @@ class RevenueAccelerationEngine:
 
     @staticmethod
     def normalize_month(value) -> str:
-        s = str(value or "").strip().replace("-", "").replace("/", "")
-        if not s or s.lower() in ("nan", "none", "null"):
+        """月營收月份正規化。
+
+        R3 修正重點：
+        - 支援 OpenAPI / DB / Excel 可能出現的 115年04月、115/04、115-04、11504、202604、2026年04月。
+        - 舊版只移除 - /，遇到「115年04月」會無法命中，導致 external_revenue 有資料但 required_months 全部 MISSING。
+        - 失敗時回傳空字串，不用目前月份硬補，避免偽造覆蓋率。
+        """
+        if value is None:
             return ""
-        m = re.search(r"(\d{3,4})(\d{2})", s)
-        if not m:
+        s = str(value).strip().replace("\ufeff", "")
+        if not s or s.lower() in ("nan", "none", "null", "<na>"):
             return ""
-        y = int(m.group(1)); mm = int(m.group(2))
-        if mm < 1 or mm > 12:
-            return ""
-        if y < 1000:
-            y += 1911
-        return f"{y:04d}{mm:02d}"
+        if re.fullmatch(r"\d+\.0+", s):
+            try:
+                s = str(int(float(s)))
+            except Exception:
+                pass
+
+        # 西元：2026年04月 / 2026-04 / 2026/4 / 202604
+        m = re.search(r"(20\d{2}|19\d{2})\D{0,3}(\d{1,2})", s)
+        if m:
+            y = int(m.group(1)); mm = int(m.group(2))
+            if 1 <= mm <= 12:
+                return f"{y:04d}{mm:02d}"
+
+        # 民國：115年04月 / 115/04 / 115-4 / 民國115年4月 / 11504
+        m = re.search(r"(\d{2,3})\D{0,3}(\d{1,2})", s)
+        if m:
+            y = int(m.group(1)); mm = int(m.group(2))
+            if y < 1911 and 1 <= mm <= 12:
+                return f"{y + 1911:04d}{mm:02d}"
+
+        digits = re.sub(r"\D", "", s)
+        if len(digits) >= 6:
+            # 202604
+            y = int(digits[:4]); mm = int(digits[4:6])
+            if y >= 1911 and 1 <= mm <= 12:
+                return f"{y:04d}{mm:02d}"
+        if len(digits) == 5:
+            # 11504
+            y = int(digits[:3]); mm = int(digits[3:5])
+            if 1 <= mm <= 12:
+                return f"{y + 1911:04d}{mm:02d}"
+        return ""
 
     def required_months(self, quarters=None) -> list[str]:
         months = []
@@ -6180,10 +6212,19 @@ class HighGrowthEPSEngine:
                         )
             except Exception:
                 rev = pd.DataFrame()
+        available_months_text = ""
+        latest_available_month = ""
         if rev is not None and not rev.empty:
             if "revenue_month_norm" not in rev.columns and "revenue_month" in rev.columns:
                 rev["revenue_month_norm"] = rev["revenue_month"].map(self.revenue_engine.normalize_month)
             rev["stock_id"] = rev.get("stock_id", "").map(normalize_stock_id) if "stock_id" in rev.columns else ""
+            try:
+                available_months = sorted([m for m in rev.get("revenue_month_norm", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if m])
+                available_months_text = ",".join(available_months[-12:])
+                latest_available_month = available_months[-1] if available_months else ""
+            except Exception:
+                available_months_text = ""
+                latest_available_month = ""
         for m in required_months:
             if rev is not None and not rev.empty and "revenue_month_norm" in rev.columns:
                 part = rev[rev["revenue_month_norm"].astype(str).eq(str(m))].copy()
@@ -6197,6 +6238,9 @@ class HighGrowthEPSEngine:
                 "available_stock_count": available_stock_count,
                 "coverage_status": "OK" if available_rows > 0 else "MISSING",
                 "missing_months": "" if available_rows > 0 else m,
+                "available_months_in_db_last12": available_months_text,
+                "latest_available_month": latest_available_month,
+                "diagnosis": "" if available_rows > 0 else ("DB有月營收但缺指定月份，需補歷史月或檢查月份格式" if available_months_text else "DB沒有可辨識月營收月份"),
             })
         if not rows:
             rows.append({
@@ -6227,6 +6271,7 @@ class HighGrowthEPSEngine:
             {"run_evidence_item": "screening_rows_same_run", "run_evidence_value": int(len(df) if isinstance(df, pd.DataFrame) else 0)},
             {"run_evidence_item": "required_revenue_months", "run_evidence_value": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
             {"run_evidence_item": "missing_required_revenue_months", "run_evidence_value": coverage_missing or "NONE"},
+            {"run_evidence_item": "available_revenue_months_last12", "run_evidence_value": ",".join(sorted(set(revenue_month_coverage.get("available_months_in_db_last12", pd.Series(dtype=str)).dropna().astype(str).tolist()))) if isinstance(revenue_month_coverage, pd.DataFrame) and "available_months_in_db_last12" in revenue_month_coverage.columns else ""},
             {"run_evidence_item": "no_touch_guard", "run_evidence_value": "分類/Universe/Bootstrap/主UI架構未修改"},
         ]
         return pd.DataFrame(rows)
@@ -6331,6 +6376,16 @@ class HighGrowthEPSEngine:
         # Debug 欄位保留原始工程欄名，供追溯，不放主摘要。
         debug_cols = [c for c in ["stock_id", "stock_name", "strict_pass", "legacy_strict_pass", "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "leading_pass", "selection_gate", "selection_score", "selection_eps", "q1_ratio_quality", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "legacy_forecast_eps_gate", "forecast_eps_gate", "v412_total_score", "valuation_data_missing", "effective_valuation_score", "effective_valuation_weight", "outlier_risk_flag", "outlier_penalty"] if c in df.columns]
         debug_raw = df[debug_cols].head(5000).copy() if debug_cols and df is not None and not df.empty else pd.DataFrame()
+        revenue_detail_sheet = rev_raw.head(5000) if rev_raw is not None and not rev_raw.empty else pd.DataFrame([
+            {
+                "diagnostic_item": "NO_REVENUE_DETAIL_ROWS",
+                "diagnostic_result": "月營收明細為空；請看01A月份覆蓋與09同Run證據",
+                "required_months": ",".join(required_months),
+                "missing_required_months": missing_required_months or "NONE",
+                "policy": "P1：即使 rev_detail 為空也要輸出診斷，禁止直接消失",
+                "rule_version": HIGH_GROWTH_RULE_VERSION,
+            }
+        ])
         tables = {
             "00_結論摘要": summary,
             "01_DB可用性盤點": assets,
@@ -6340,7 +6395,7 @@ class HighGrowthEPSEngine:
             "04_正式EPS驗證通過": official_df.head(500),
             "04A_正式EPS驗證KPI": validation_kpi,
             "05_不通過與資料缺口": fail_df.head(1000),
-            "06_營收明細來源": rev_raw.head(5000) if rev_raw is not None else pd.DataFrame(),
+            "06_營收明細來源": revenue_detail_sheet,
             "07_EPS特徵中繼": eps_features.head(5000) if eps_features is not None else pd.DataFrame(),
             "08_修改查檢表": rules,
             "09_Debug原始欄位": pd.concat([debug_summary, debug_raw], ignore_index=True, sort=False) if not debug_raw.empty else debug_summary,
@@ -6955,6 +7010,7 @@ class ExternalSourceConfig:
             "request_templates": [
                 "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
                 "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+                "https://www.tpex.org.tw/openapi/v1/t187ap05_R",
             ],
             "target_table": "external_revenue",
             "required_columns": ["stock_id", "revenue_month", "revenue", "yoy"],
@@ -7074,6 +7130,15 @@ class ExternalDataWriter:
             result.data_ready = 0
             return result
         try:
+            # P0：月營收入庫前正規化月份，並拒絕無月份資料，避免覆蓋/污染 history。
+            if result.target_table == "external_revenue" and "revenue_month" in df.columns:
+                df["revenue_month"] = df["revenue_month"].map(RevenueAccelerationEngine.normalize_month).fillna("").astype(str)
+                df = df[df["revenue_month"].astype(str).ne("")].copy()
+                if df.empty:
+                    result.status = "fail"
+                    result.data_ready = 0
+                    result.error_message = "DB寫入前檢查失敗：revenue_month 全部無法正規化，禁止覆蓋既有資料"
+                    return result
             with self.db.lock:
                 if result.target_table == "market_snapshot":
                     self._delete_existing_rows("market_snapshot", df)
@@ -7089,6 +7154,24 @@ class ExternalDataWriter:
                 }:
                     self._delete_existing_rows(result.target_table, df)
                     df.to_sql(result.target_table, self.db.conn, if_exists="append", index=False)
+
+                    # R3：月營收成功寫入 external_revenue 時，同步累積到 external_revenue_history。
+                    # 原先只更新快照表，HighGrowth EPS 主要讀 history，導致連結改成功但 required months 仍命中 0。
+                    if result.target_table == "external_revenue" and {"stock_id", "revenue_month"}.issubset(df.columns):
+                        hist = df.copy()
+                        if "source_url" not in hist.columns:
+                            hist["source_url"] = str(result.request_url or "")
+                        keep_hist = ["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_url", "source_date", "update_time"]
+                        for c in keep_hist:
+                            if c not in hist.columns:
+                                hist[c] = None
+                        hist = hist[keep_hist].drop_duplicates(subset=["stock_id", "revenue_month"], keep="last")
+                        cur = self.db.conn.cursor()
+                        cur.executemany(
+                            "DELETE FROM external_revenue_history WHERE stock_id=? AND revenue_month=?",
+                            hist[["stock_id", "revenue_month"]].astype(str).drop_duplicates().itertuples(index=False, name=None),
+                        )
+                        hist.to_sql("external_revenue_history", self.db.conn, if_exists="append", index=False)
                 else:
                     raise ValueError(f"未知target_table：{result.target_table}")
                 self.db.conn.commit()
@@ -7854,21 +7937,65 @@ class ExternalDataFetcher:
 
     def _normalize_revenue_month(self, value) -> str:
         """將 115/04、115年04月、202604、2026/04 等月別統一為 YYYYMM。"""
-        s = str(value or "").strip()
-        if not s:
-            return datetime.now().strftime("%Y%m")
-        # 先判斷西元四碼，避免 2026/04 被誤切成 ROC 202/6。
-        m = re.search(r"(\d{4})\s*[年/-]?\s*(\d{1,2})", s)
-        if m:
-            return f"{int(m.group(1))}{int(m.group(2)):02d}"
-        m = re.search(r"(\d{2,3})\s*[年/-]\s*(\d{1,2})", s)
-        if m and int(m.group(1)) < 1911:
-            return f"{int(m.group(1)) + 1911}{int(m.group(2)):02d}"
-        digits = re.sub(r"\D", "", s)
-        if len(digits) >= 6:
-            # 202604 類型為西元年月；11504 類型則補成 202604 等需由前方 ROC 格式處理。
-            return digits[:6]
-        return s
+        norm = RevenueAccelerationEngine.normalize_month(value)
+        if norm:
+            return norm
+        # 不用目前月份硬補，避免抓到無月份欄位時把全部資料寫成當月，污染 required_months。
+        return ""
+
+    def _normalize_revenue_month_series(self, s: pd.Series) -> pd.Series:
+        """P0：所有 revenue_month 入庫/讀取前一律正規化，支援既有 11504 舊資料。"""
+        if s is None:
+            return pd.Series(dtype="object")
+        return pd.Series(s).map(self._normalize_revenue_month).fillna("").astype(str)
+
+    def _read_cached_revenue_fallback(self, reason: str = "") -> pd.DataFrame:
+        """P0：官方 OpenAPI 當次失敗時，回退使用最後成功月營收快取，不清空 external_revenue/history。
+
+        回傳 latest revenue_month 的每股一筆資料，並明確標示 source_url/source_level，
+        讓 FinancialFeatureEngine 與 HighGrowth 報表仍可使用 202604 等已成功月份。
+        """
+        parts = []
+        for table in ["external_revenue_history", "external_revenue"]:
+            try:
+                if not hasattr(self.db, "read_table"):
+                    continue
+                df = self.db.read_table(table, limit=None)
+                if df is None or df.empty or "revenue_month" not in df.columns or "stock_id" not in df.columns:
+                    continue
+                x = df.copy()
+                x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+                x["revenue_month"] = self._normalize_revenue_month_series(x["revenue_month"])
+                x = x[(x["stock_id"].astype(str) != "") & (x["revenue_month"].astype(str) != "")].copy()
+                if x.empty:
+                    continue
+                for c in ["revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy"]:
+                    if c not in x.columns:
+                        x[c] = np.nan
+                    x[c] = pd.to_numeric(x[c], errors="coerce")
+                if "source_date" not in x.columns:
+                    x["source_date"] = ""
+                if "update_time" not in x.columns:
+                    x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                x["source_url"] = str(x.get("source_url", "")) if "source_url" not in x.columns else x["source_url"].fillna("").astype(str)
+                x["_source_table"] = table
+                parts.append(x[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time", "_source_table"]])
+            except Exception as exc:
+                log_warning(f"[REVENUE][CACHE_FALLBACK] read {table} failed｜{exc}")
+        if not parts:
+            return pd.DataFrame()
+        all_df = pd.concat(parts, ignore_index=True)
+        all_df = all_df[all_df["revenue_month"].astype(str).str.fullmatch(r"\d{6}", na=False)].copy()
+        if all_df.empty:
+            return pd.DataFrame()
+        latest_month = sorted(all_df["revenue_month"].astype(str).unique().tolist())[-1]
+        out = all_df[all_df["revenue_month"].astype(str).eq(latest_month)].copy()
+        out = out.sort_values(["stock_id", "_source_table"]).drop_duplicates(subset=["stock_id", "revenue_month"], keep="first")
+        out["source_url"] = "local_cache:external_revenue_history_or_external_revenue"
+        out["source_date"] = out["source_date"].replace("", datetime.now().strftime("%Y-%m-%d"))
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_warning(f"[REVENUE][CACHE_FALLBACK] official fetch failed; preserve latest cached month={latest_month} rows={len(out)} reason={reason}")
+        return out[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
 
     def _parse_revenue_rows(self, raw: pd.DataFrame, source_label: str = "") -> tuple[pd.DataFrame, str]:
         """解析 TWSE/TPEx t187ap05 OpenAPI 月營收 JSON DataFrame。"""
@@ -7879,7 +8006,8 @@ class ExternalDataFetcher:
             cs = str(c).strip()
             if cs in ("公司代號", "公司代碼", "股票代號", "證券代號", "SecuritiesCompanyCode", "Code"):
                 col_map["stock_id"] = c
-            elif cs in ("出表年月", "資料年月", "年月", "營收年月", "RevenueMonth", "YearMonth"):
+            elif (cs in ("出表年月", "出表日期", "資料年月", "年月", "營收年月", "營業收入年月", "月份", "RevenueMonth", "YearMonth", "month", "Month")
+                  or ("資料年月" in cs) or ("營收年月" in cs) or ("出表年月" in cs)):
                 col_map["revenue_month"] = c
             elif ("當月營收" in cs) or ("本月營收" in cs) or cs in ("營業收入-當月營收", "營收", "revenue", "Revenue"):
                 if "累計" not in cs and "去年" not in cs and "增減" not in cs:
@@ -7901,7 +8029,9 @@ class ExternalDataFetcher:
             sid = normalize_stock_id(r.get(col_map.get("stock_id"), ""))
             if not sid:
                 continue
-            month = self._normalize_revenue_month(r.get(col_map.get("revenue_month"), datetime.now().strftime("%Y%m")))
+            month = self._normalize_revenue_month(r.get(col_map.get("revenue_month"), ""))
+            if not month:
+                continue
             rev = self._num(r.get(col_map.get("revenue"), 0))
             if rev == 0 and str(r.get(col_map.get("revenue"), "")).strip() in ("", "-", "--", "nan", "None"):
                 continue
@@ -7935,6 +8065,7 @@ class ExternalDataFetcher:
         default_urls = [
             "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
             "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+            "https://www.tpex.org.tw/openapi/v1/t187ap05_R",
         ]
         for u in default_urls:
             if u and u not in urls:
@@ -7948,7 +8079,10 @@ class ExternalDataFetcher:
             try:
                 referer = self._revenue_referer_for_url(url)
                 raw, http_status = self._read_remote_json_df(url, referer=referer)
-                label = "TPEX_REVENUE_O" if "tpex.org.tw" in url else "TWSE_REVENUE_L"
+                if "t187ap05_R" in url:
+                    label = "TPEX_REVENUE_R"
+                else:
+                    label = "TPEX_REVENUE_O" if "tpex.org.tw" in url else "TWSE_REVENUE_L"
                 parsed, parse_error = self._parse_revenue_rows(raw, source_label=label)
                 if parsed is None or parsed.empty:
                     errors.append(parse_error or f"{label} rows=0")
@@ -7966,6 +8100,8 @@ class ExternalDataFetcher:
 
         df = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if parts else pd.DataFrame()
         if not df.empty:
+            df["revenue_month"] = self._normalize_revenue_month_series(df["revenue_month"])
+            df = df[df["revenue_month"].astype(str).ne("")].drop_duplicates(subset=["stock_id", "revenue_month"], keep="last")
             return ExternalPipelineResult(
                 module,
                 "success",
@@ -7979,6 +8115,26 @@ class ExternalDataFetcher:
                 data_ready=1,
                 source_level="official",
             )
+
+        # P0：當次官方來源失敗時，不讓 revenue_rows=0 污染 EPS Matrix；保留最後成功月份。
+        cache_df = self._read_cached_revenue_fallback(reason=" ; ".join(errors))
+        if cache_df is not None and not cache_df.empty:
+            return ExternalPipelineResult(
+                module,
+                "fallback",
+                df=cache_df,
+                source_name=cfg.get("source_name","") + "｜local cache fallback",
+                official_url=cfg.get("official_url",""),
+                request_url=" | ".join(urls) + " | local_cache:external_revenue_history",
+                source_date=str(cache_df["source_date"].dropna().astype(str).max() or datetime.now().strftime("%Y-%m-%d")),
+                http_status="official_fail_cache_fallback",
+                fallback_count=1,
+                error_message="官方月營收 OpenAPI 當次失敗，已保留最後成功快取月份；" + (" ; ".join(errors) or "官方月營收 OpenAPI 資料抓取失敗"),
+                target_table=cfg.get("target_table",""),
+                data_ready=1,
+                source_level="local_cache_fallback_preserve_history",
+            )
+
         return ExternalPipelineResult(
             module,
             "fail",
@@ -8391,6 +8547,14 @@ class ExternalDataFetcher:
     def _execute_module(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
         t0 = time.time()
         self.db.log_system_run(event="external_pipeline", status="start", message=f"module={module}", run_id=run_id, step="fetch", module=module)
+        # P0：防止任何舊 mopsfin CSV 退役網址從其他同步路徑漏進來。
+        if module == "revenue":
+            all_urls = " ".join([str(cfg.get("request_template", ""))] + [str(u) for u in (cfg.get("request_templates") or [])])
+            retired_host = "mopsfin" + ".twse.com.tw"
+            retired_o = "t187ap05_" + "O.csv"
+            retired_l = "t187ap05_" + "L.csv"
+            if retired_host in all_urls or retired_o in all_urls or retired_l in all_urls:
+                log_warning(f"[REVENUE][OLD_URL_GUARD] deprecated revenue URL detected in config and ignored: {all_urls}")
         func = getattr(self, str(cfg.get("parser", "")), None)
         if not callable(func):
             result = ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=f"找不到parser：{cfg.get('parser')}", target_table=cfg.get("target_table",""), data_ready=0)
@@ -9079,6 +9243,34 @@ class FinancialFeatureEngine:
         df = self.db.read_table(table, limit=None)
         return self._standardize_feature_source(df, table, date_col)
 
+    def _latest_revenue_by_stock(self) -> pd.DataFrame:
+        """P0：合併 external_revenue_history + external_revenue，月份正規化後取最後成功月份。"""
+        parts = []
+        for table, priority in [("external_revenue_history", 1), ("external_revenue", 2)]:
+            try:
+                df = self.db.read_table(table, limit=None)
+                x = self._standardize_feature_source(df, "external_revenue", "revenue_month")
+                if x is None or x.empty:
+                    continue
+                x["revenue_month"] = x["revenue_month"].map(RevenueAccelerationEngine.normalize_month).fillna("").astype(str)
+                x = x[x["revenue_month"].astype(str).str.fullmatch(r"\d{6}", na=False)].copy()
+                if x.empty:
+                    continue
+                x["_priority"] = priority
+                x["source_table"] = table
+                parts.append(x)
+            except Exception as exc:
+                log_warning(f"[EPS MATRIX][REVENUE_HISTORY_FALLBACK] skip {table}｜{exc}")
+        if not parts:
+            return pd.DataFrame()
+        all_df = pd.concat(parts, ignore_index=True)
+        all_df = all_df.sort_values(["stock_id", "revenue_month", "_priority"]).drop_duplicates(subset=["stock_id", "revenue_month"], keep="first")
+        latest = sorted(all_df["revenue_month"].astype(str).unique().tolist())[-1]
+        out = all_df[all_df["revenue_month"].astype(str).eq(latest)].copy()
+        out = out.drop_duplicates(subset=["stock_id"], keep="first")
+        log_info(f"[EPS MATRIX][REVENUE_HISTORY_FALLBACK] latest_month={latest} rows={len(out)} source_tables={sorted(out.get('source_table', pd.Series(dtype=str)).astype(str).unique().tolist())}")
+        return out
+
     def build_eps_ttm(self, row: pd.Series, latest_close_map: dict | None = None) -> tuple[float, str]:
         eps_ttm = self._num(row.get("eps_ttm"), np.nan)
         if np.isfinite(eps_ttm):
@@ -9198,7 +9390,8 @@ class FinancialFeatureEngine:
         feature_date = datetime.now().strftime("%Y-%m-%d")
         master = self.db.get_master()
         valuation = self._latest_by_stock("external_valuation", "data_date")
-        revenue = self._latest_by_stock("external_revenue", "revenue_month")
+        # P0：FinancialFeature 不只讀當次快照 external_revenue；若同步失敗，改用 history 最後成功月份。
+        revenue = self._latest_revenue_by_stock()
         latest_close_map = self._latest_close_map()
         if master is None or master.empty:
             return pd.DataFrame()
