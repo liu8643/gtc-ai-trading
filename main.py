@@ -6947,14 +6947,21 @@ class ExternalSourceConfig:
             "oas_swagger_url": TWSE_OPENAPI_SWAGGER_URL,
         },
         "revenue": {
-            "source_name": "MOPS 月營收",
-            "official_url": "https://mops.twse.com.tw",
-            "request_template": "https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv",
+            # MOPSFIN_RETIREMENT_FIX_20260604：
+            # 舊 mopsfin opendata t187ap05_*.csv 已退役，月營收改用 TWSE/TPEx OpenAPI JSON。
+            "source_name": "TWSE+TPEx 官方月營收 OpenAPI",
+            "official_url": "https://openapi.twse.com.tw/ | https://www.tpex.org.tw/openapi/",
+            "request_template": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+            "request_templates": [
+                "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+                "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+            ],
             "target_table": "external_revenue",
             "required_columns": ["stock_id", "revenue_month", "revenue", "yoy"],
             "fallback_days": 45,
             "mandatory": True,
             "parser": "fetch_revenue",
+            "source_priority": "1.TWSE OpenAPI t187ap05_L 上市月營收 JSON → 2.TPEx OpenAPI mopsfin_t187ap05_O 上櫃月營收 JSON；禁止 舊 mopsfin CSV",
         },
         "valuation": {
             "source_name": "TWSE+TPEx 官方估值/EPS來源",
@@ -7803,8 +7810,13 @@ class ExternalDataFetcher:
                 return ExternalPipelineResult(module, "success", df=macro, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url="internal:external_margin aggregate", source_date=date_iso, http_status="internal", fallback_count=0, target_table=cfg.get("target_table",""), data_ready=1, source_level="official_aggregate")
         return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=cfg.get("request_template",""), source_date=datetime.now().strftime("%Y-%m-%d"), error_message="external_margin尚無資料，無法彙總市場融資情緒；請先同步margin", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
 
-    def _read_remote_csv(self, url: str) -> tuple[pd.DataFrame, str]:
-        resp = requests.get(url, timeout=45, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mopsfin.twse.com.tw/"})
+    def _read_remote_csv(self, url: str, referer: str = "https://www.twse.com.tw/") -> tuple[pd.DataFrame, str]:
+        """通用遠端 CSV 讀取。
+
+        MOPSFIN_RETIREMENT_FIX_20260604：
+        不再固定使用 舊 mopsfin 網域 當 Referer；JSON 來源不得進入此 CSV reader。
+        """
+        resp = requests.get(url, timeout=45, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
         resp.raise_for_status()
         content = resp.content
         last_error = None
@@ -7815,58 +7827,170 @@ class ExternalDataFetcher:
                 last_error = exc
         raise RuntimeError(f"CSV解析失敗：{last_error}")
 
-    def fetch_revenue(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
-        urls = [cfg.get("request_template",""), "https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv"]
-        all_rows = []
-        last_error = ""
-        used_url = ""
-        http_status = ""
-        for url in urls:
-            try:
-                raw, http_status = self._read_remote_csv(url)
-                used_url = url
-                col_map = {}
-                for c in raw.columns:
-                    cs = str(c).strip()
-                    if cs in ("公司代號", "公司代碼", "股票代號"):
-                        col_map["stock_id"] = c
-                    elif cs in ("出表年月", "資料年月", "年月", "營收年月"):
-                        col_map["revenue_month"] = c
-                    elif "當月營收" in cs:
-                        col_map["revenue"] = c
-                    elif "上月" in cs and "增減" in cs:
-                        col_map["mom"] = c
-                    elif ("去年" in cs or "同期" in cs) and "增減" in cs:
-                        col_map["yoy"] = c
-                    elif "累計營收" in cs and "當月" not in cs:
-                        col_map["cumulative_revenue"] = c
-                    elif "累計" in cs and "增減" in cs:
-                        col_map["cumulative_yoy"] = c
-                if "stock_id" not in col_map or "revenue" not in col_map:
-                    last_error = f"MOPS月營收欄位無法辨識：{list(raw.columns)[:12]}"
-                    continue
-                for _, r in raw.iterrows():
-                    sid = normalize_stock_id(r.get(col_map.get("stock_id"), ""))
-                    if not sid:
-                        continue
-                    month = str(r.get(col_map.get("revenue_month"), datetime.now().strftime("%Y%m"))).strip()
-                    rev = self._num(r.get(col_map.get("revenue"), 0))
-                    yoy = self._num(r.get(col_map.get("yoy"), 0))
-                    mom = self._num(r.get(col_map.get("mom"), 0))
-                    all_rows.append({
-                        "stock_id": sid, "revenue_month": month, "revenue": rev, "mom": mom, "yoy": yoy,
-                        "cumulative_revenue": self._num(r.get(col_map.get("cumulative_revenue"), 0)),
-                        "cumulative_yoy": self._num(r.get(col_map.get("cumulative_yoy"), 0)),
-                        "source_date": datetime.now().strftime("%Y-%m-%d"),
-                        "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-            except Exception as exc:
-                last_error = str(exc)
+    def _read_remote_json_df(self, url: str, referer: str = "https://openapi.twse.com.tw/") -> tuple[pd.DataFrame, str]:
+        """嚴格讀取官方 OpenAPI JSON 陣列；JSON 失敗不再 fallback 到 cp950/big5 CSV。"""
+        resp = requests.get(
+            url,
+            timeout=45,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": referer,
+            },
+        )
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            raise RuntimeError(f"OpenAPI JSON解析失敗，不執行CSV/cp950 fallback：{exc}")
+        if isinstance(payload, dict):
+            payload = payload.get("data") or payload.get("records") or payload.get("result") or []
+        if not isinstance(payload, list):
+            raise RuntimeError("OpenAPI JSON格式不是陣列")
+        return pd.DataFrame(payload).astype(str).fillna(""), str(resp.status_code)
+
+    def _revenue_referer_for_url(self, url: str) -> str:
+        return "https://www.tpex.org.tw/openapi/" if "tpex.org.tw" in str(url) else "https://openapi.twse.com.tw/"
+
+    def _normalize_revenue_month(self, value) -> str:
+        """將 115/04、115年04月、202604、2026/04 等月別統一為 YYYYMM。"""
+        s = str(value or "").strip()
+        if not s:
+            return datetime.now().strftime("%Y%m")
+        # 先判斷西元四碼，避免 2026/04 被誤切成 ROC 202/6。
+        m = re.search(r"(\d{4})\s*[年/-]?\s*(\d{1,2})", s)
+        if m:
+            return f"{int(m.group(1))}{int(m.group(2)):02d}"
+        m = re.search(r"(\d{2,3})\s*[年/-]\s*(\d{1,2})", s)
+        if m and int(m.group(1)) < 1911:
+            return f"{int(m.group(1)) + 1911}{int(m.group(2)):02d}"
+        digits = re.sub(r"\D", "", s)
+        if len(digits) >= 6:
+            # 202604 類型為西元年月；11504 類型則補成 202604 等需由前方 ROC 格式處理。
+            return digits[:6]
+        return s
+
+    def _parse_revenue_rows(self, raw: pd.DataFrame, source_label: str = "") -> tuple[pd.DataFrame, str]:
+        """解析 TWSE/TPEx t187ap05 OpenAPI 月營收 JSON DataFrame。"""
+        if raw is None or raw.empty:
+            return pd.DataFrame(), "月營收來源為空"
+        col_map = {}
+        for c in raw.columns:
+            cs = str(c).strip()
+            if cs in ("公司代號", "公司代碼", "股票代號", "證券代號", "SecuritiesCompanyCode", "Code"):
+                col_map["stock_id"] = c
+            elif cs in ("出表年月", "資料年月", "年月", "營收年月", "RevenueMonth", "YearMonth"):
+                col_map["revenue_month"] = c
+            elif ("當月營收" in cs) or ("本月營收" in cs) or cs in ("營業收入-當月營收", "營收", "revenue", "Revenue"):
+                if "累計" not in cs and "去年" not in cs and "增減" not in cs:
+                    col_map["revenue"] = c
+            elif ("上月" in cs and "增減" in cs) or ("MoM" in cs) or ("mom" == cs.lower()):
+                col_map["mom"] = c
+            elif (("去年" in cs or "同期" in cs or "YoY" in cs or "yoy" == cs.lower()) and "增減" in cs) or cs in ("營業收入-去年同月增減(%)", "去年同月增減(%)"):
+                col_map["yoy"] = c
+            elif (("累計" in cs and "營收" in cs and "增減" not in cs) or cs in ("累計營業收入-當月累計營收", "累計營收")):
+                col_map["cumulative_revenue"] = c
+            elif ("累計" in cs and "增減" in cs) or cs in ("累計營業收入-前期比較增減(%)", "累計增減(%)"):
+                col_map["cumulative_yoy"] = c
+
+        if "stock_id" not in col_map or "revenue" not in col_map:
+            return pd.DataFrame(), f"{source_label}月營收欄位無法辨識：{list(raw.columns)[:20]}"
+
+        rows = []
+        for _, r in raw.iterrows():
+            sid = normalize_stock_id(r.get(col_map.get("stock_id"), ""))
+            if not sid:
                 continue
-        df = pd.DataFrame(all_rows).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if all_rows else pd.DataFrame()
+            month = self._normalize_revenue_month(r.get(col_map.get("revenue_month"), datetime.now().strftime("%Y%m")))
+            rev = self._num(r.get(col_map.get("revenue"), 0))
+            if rev == 0 and str(r.get(col_map.get("revenue"), "")).strip() in ("", "-", "--", "nan", "None"):
+                continue
+            rows.append({
+                "stock_id": sid,
+                "revenue_month": month,
+                "revenue": rev,
+                "mom": self._num(r.get(col_map.get("mom"), 0)),
+                "yoy": self._num(r.get(col_map.get("yoy"), 0)),
+                "cumulative_revenue": self._num(r.get(col_map.get("cumulative_revenue"), 0)),
+                "cumulative_yoy": self._num(r.get(col_map.get("cumulative_yoy"), 0)),
+                "source_date": datetime.now().strftime("%Y-%m-%d"),
+                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if rows else pd.DataFrame()
+        if df.empty:
+            return df, f"{source_label}月營收解析後 rows=0"
+        return df, ""
+
+    def fetch_revenue(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
+        """TWSE/TPEx 官方月營收 JSON 合併。
+
+        修正重點：
+        1) 移除 舊 mopsfin opendata t187ap05_L/O.csv 退役連結。
+        2) 上市使用 TWSE OpenAPI t187ap05_L；上櫃使用 TPEx OpenAPI mopsfin_t187ap05_O。
+        3) 單一市場失敗不得清空另一市場已取得資料。
+        """
+        urls = list(cfg.get("request_templates") or [])
+        if not urls and cfg.get("request_template"):
+            urls = [cfg.get("request_template")]
+        default_urls = [
+            "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+            "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+        ]
+        for u in default_urls:
+            if u and u not in urls:
+                urls.append(u)
+
+        parts = []
+        errors = []
+        used_urls = []
+        http_statuses = []
+        for url in [u for u in urls if str(u or "").strip()]:
+            try:
+                referer = self._revenue_referer_for_url(url)
+                raw, http_status = self._read_remote_json_df(url, referer=referer)
+                label = "TPEX_REVENUE_O" if "tpex.org.tw" in url else "TWSE_REVENUE_L"
+                parsed, parse_error = self._parse_revenue_rows(raw, source_label=label)
+                if parsed is None or parsed.empty:
+                    errors.append(parse_error or f"{label} rows=0")
+                    log_warning(f"[REVENUE][{label}] rows=0 url={url} error={parse_error}")
+                    continue
+                parts.append(parsed)
+                used_urls.append(url)
+                http_statuses.append(f"{label}:{http_status}:rows={len(parsed)}")
+                log_info(f"[REVENUE][{label}] success rows={len(parsed)} url={url}")
+            except Exception as exc:
+                err = f"{url} | {exc}"
+                errors.append(err)
+                log_warning(f"[REVENUE] OpenAPI fetch failed: {err}")
+                continue
+
+        df = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if parts else pd.DataFrame()
         if not df.empty:
-            return ExternalPipelineResult(module, "success", df=df, source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=used_url, source_date=datetime.now().strftime("%Y-%m-%d"), http_status=http_status, target_table=cfg.get("target_table",""), data_ready=1, source_level="official")
-        return ExternalPipelineResult(module, "fail", source_name=cfg.get("source_name",""), official_url=cfg.get("official_url",""), request_url=" | ".join(urls), source_date=datetime.now().strftime("%Y-%m-%d"), error_message=last_error or "MOPS月營收資料抓取失敗", target_table=cfg.get("target_table",""), data_ready=0, source_level="official")
+            return ExternalPipelineResult(
+                module,
+                "success",
+                df=df,
+                source_name=cfg.get("source_name",""),
+                official_url=cfg.get("official_url",""),
+                request_url=" | ".join(used_urls),
+                source_date=datetime.now().strftime("%Y-%m-%d"),
+                http_status=";".join(http_statuses),
+                target_table=cfg.get("target_table",""),
+                data_ready=1,
+                source_level="official",
+            )
+        return ExternalPipelineResult(
+            module,
+            "fail",
+            source_name=cfg.get("source_name",""),
+            official_url=cfg.get("official_url",""),
+            request_url=" | ".join(urls),
+            source_date=datetime.now().strftime("%Y-%m-%d"),
+            error_message=" ; ".join(errors) or "官方月營收 OpenAPI 資料抓取失敗",
+            target_table=cfg.get("target_table",""),
+            data_ready=0,
+            source_level="official",
+        )
 
     def _request_text(self, url: str, timeout: int = 45, referer: str = "https://www.tpex.org.tw/") -> tuple[str, str]:
         resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
