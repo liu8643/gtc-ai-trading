@@ -400,6 +400,61 @@ CLASSIFICATION_DOWNLOAD_SOURCES = {
         "referer": "https://www.tpex.org.tw/openapi/",
     },
 }
+
+# R4H_CLASSIFICATION_LOCAL_REQUIRED_FIX_20260605：
+# 上市/上櫃官方分類 CSV 是分類主來源，OpenAPI 僅能作為手動補檔來源。
+# 啟動/分類載入前若任一必要 CSV 不存在，直接 P0 阻斷，避免只用上市檔造成覆蓋率 91.41% 假正常。
+REQUIRED_CLASSIFICATION_FILES = {
+    "上市": "台股官方產業分類_上市.csv",
+    "上櫃": "台股官方產業分類_上櫃.csv",
+}
+
+def validate_required_classification_files(strict: bool = True) -> bool:
+    """
+    R4H FIX：啟動/分類載入時強制確認上市、上櫃官方分類 CSV 是否存在。
+    原則：
+    1. 本機 CSV 是主來源。
+    2. OpenAPI fallback 不得在缺少必要 CSV 時默默取代主來源。
+    3. strict=True 時，缺任一必要檔直接 raise RuntimeError。
+    """
+    search_dirs = [
+        RUNTIME_DIR / "data" / "classification",
+        BASE_DIR / "data" / "classification",
+        CLASSIFICATION_CACHE_DIR,
+    ]
+
+    missing = []
+    found = {}
+
+    for market, filename in REQUIRED_CLASSIFICATION_FILES.items():
+        hit = None
+        for folder in search_dirs:
+            try:
+                p = Path(folder) / filename
+                if p.exists() and p.stat().st_size > 0:
+                    hit = p
+                    break
+            except Exception:
+                continue
+
+        if hit is not None:
+            found[market] = str(hit)
+            classification_debug_log(f"必要分類檔確認存在：{market}｜{hit}")
+        else:
+            missing.append(f"{market}:{filename}")
+
+    if missing:
+        msg = (
+            "必要官方分類CSV缺失，停止使用不完整分類資料。"
+            f" missing={missing}｜search_dirs={[str(x) for x in search_dirs]}"
+        )
+        log_error("[分類載入][P0] " + msg)
+        classification_debug_log(msg, "ERROR")
+        if strict:
+            raise RuntimeError(msg)
+        return False
+
+    return True
 BOOTSTRAP_LOCK = threading.Lock()
 BOOTSTRAP_EVENT = threading.Event()
 
@@ -425,60 +480,6 @@ def classification_debug_log(message: str, level: str = "INFO"):
             cb(msg, level)
     except Exception:
         pass
-
-
-# R4G_CLASSIFICATION_REQUIRED_TPEX_SCHEMA_FIX_20260605：上市/上櫃官方分類 CSV 必要檔完整性檢查。
-# 目的：避免本機上櫃 CSV 缺失時，程式默默 fallback，最後只產生上市分類與大量未匹配清單。
-REQUIRED_CLASSIFICATION_FILES = {
-    "上市": "台股官方產業分類_上市.csv",
-    "上櫃": "台股官方產業分類_上櫃.csv",
-}
-
-
-def validate_required_classification_files(strict: bool = True) -> bool:
-    """
-    R4G FIX：啟動/分類載入前強制確認上市/上櫃官方分類 CSV 是否存在。
-
-    原則：
-    1. 本機 CSV 是主來源。
-    2. OpenAPI 只能做人工/維護用備援，不可在必要檔缺失時默默取代主流程。
-    3. strict=True 時，缺任一必要檔直接 raise RuntimeError，避免半套分類繼續污染報表。
-    """
-    search_dirs = [
-        RUNTIME_DIR / "data" / "classification",
-        BASE_DIR / "data" / "classification",
-        CLASSIFICATION_CACHE_DIR,
-    ]
-
-    missing = []
-    found = {}
-
-    for market, filename in REQUIRED_CLASSIFICATION_FILES.items():
-        hit = None
-        for folder in search_dirs:
-            p = Path(folder) / filename
-            if p.exists() and p.stat().st_size > 0:
-                hit = p
-                break
-
-        if hit:
-            found[market] = str(hit)
-            classification_debug_log(f"必要分類檔確認存在：{market}｜{hit}")
-        else:
-            missing.append(f"{market}:{filename}")
-
-    if missing:
-        msg = (
-            "必要官方分類CSV缺失，停止使用不完整分類資料。"
-            f" missing={missing}｜search_dirs={[str(x) for x in search_dirs]}"
-        )
-        log_error("[分類載入][P0] " + msg)
-        if strict:
-            raise RuntimeError(msg)
-        return False
-
-    return True
-
 
 def _append_classification_summary_history(summary: dict, promoted: bool = False):
     global CLASSIFICATION_V2_SUMMARY_HISTORY
@@ -795,17 +796,16 @@ def _validate_classification_helper_integrity():
 
 
 def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.DataFrame:
-    """解析官方分類來源，支援 TWSE/TPEX OpenAPI 與本機 CSV 欄位。
-
-    R4G FIX：
-    - 支援 TPEX 上櫃 OpenAPI 欄位 SecuritiesCompanyCode / CompanyName / CompanyAbbreviation / SecuritiesIndustryCode。
-    - SecuritiesIndustryCode 需補零後以 INDUSTRY_CODE_MAP 轉正式產業名稱。
-    - schema mismatch 不再靜默回空表，需寫入 log 供追查。
+    """
+    R4H FIX：解析 TWSE/TPEX 官方分類 CSV/OpenAPI 欄位。
+    - TWSE 常用中文欄位。
+    - TPEX OpenAPI 使用 SecuritiesCompanyCode / CompanyName / CompanyAbbreviation / SecuritiesIndustryCode。
+    - SecuritiesIndustryCode 是產業代碼，需先補零後用 INDUSTRY_CODE_MAP 轉成中文產業名稱。
     """
     empty_cols = [
         "stock_id", "stock_name_official",
         "stock_name_norm_official", "market_official",
-        "industry_official",
+        "industry_official"
     ]
     if df is None or df.empty:
         return pd.DataFrame(columns=empty_cols)
@@ -854,7 +854,7 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
     if code_col is None or industry_col is None:
         log_error(
             f"[分類載入][SCHEMA_MISMATCH] {market} 無法辨識欄位｜"
-            f"code_col={code_col}｜industry_col={industry_col}｜columns={[str(c) for c in x.columns]}"
+            f"columns={[str(c) for c in x.columns]}"
         )
         return pd.DataFrame(columns=empty_cols)
 
@@ -864,7 +864,8 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
         "industry_official": x[industry_col].astype(str).str.strip(),
     })
 
-    # R4G FIX：TPEX SecuritiesIndustryCode 是產業代碼，需先補零再轉 INDUSTRY_CODE_MAP。
+    # R4H FIX：TPEX SecuritiesIndustryCode / IndustryCode 是產業代碼，不是產業名稱。
+    # 必須 1~2 位數補零後轉 INDUSTRY_CODE_MAP，否則會落入 SCHEMA_MISMATCH 或產業名稱空白。
     if industry_col == industry_code_col:
         out["industry_official"] = (
             out["industry_official"]
@@ -879,16 +880,21 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
     out["stock_name_norm_official"] = out["stock_name_official"].map(_normalize_stock_name_for_match)
     out["market_official"] = market
 
-    out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
+    out = out[
+        (out["stock_id"] != "") &
+        (out["industry_official"] != "")
+    ].copy()
 
     if out.empty:
         log_error(
             f"[分類載入][EMPTY_AFTER_PARSE] {market} 欄位可辨識但轉換後無有效資料｜"
             f"code_col={code_col}｜name_col={name_col}｜industry_col={industry_col}"
         )
+        return pd.DataFrame(columns=empty_cols)
 
     return out[
-        ["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]
+        ["stock_id", "stock_name_official", "stock_name_norm_official",
+         "market_official", "industry_official"]
     ].drop_duplicates(subset=["stock_id"], keep="first")
 
 def _try_convert_xls_to_xlsx(src: Path, dst: Path) -> Optional[Path]:
@@ -1231,7 +1237,8 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
     market = str(market or "ALL").strip() or "ALL"
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
 
-    # R4G FIX：分類載入入口先驗證上市/上櫃必要 CSV，避免缺上櫃檔時默默 fallback 後污染分類。
+    # R4H FIX：分類主來源必須先通過本機必要檔檢查。
+    # 避免缺上櫃 CSV 時自動 fallback 失敗後仍以不完整分類繼續執行。
     if market in ("ALL", "上市", "上櫃"):
         validate_required_classification_files(strict=True)
 
@@ -3032,7 +3039,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4f_report_output_hardening_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4h_classification_required_tpex_schema_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
