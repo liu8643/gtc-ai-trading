@@ -368,6 +368,7 @@ CLASSIFICATION_MEMORY_CACHE = {"df": None, "path": None, "mtime": None, "meta": 
 LAST_CLASSIFICATION_LOAD_INFO = {"loaded": False, "rows": 0, "path": "", "note": "尚未載入"}
 CLASSIFICATION_V2_SUMMARY_PATH = CLASSIFICATION_CACHE_DIR / "classification_v2_summary.json"
 CLASSIFICATION_V2_UNCLASSIFIED_PATH = CLASSIFICATION_CACHE_DIR / "未匹配分類清單.xlsx"
+CLASSIFICATION_R4K_UNCLASSIFIED_DEBUG_CSV = CLASSIFICATION_CACHE_DIR / "classification_unclassified_debug.csv"
 CLASSIFICATION_V2_LAST_SUMMARY = {}
 CLASSIFICATION_V2_SUMMARY_HISTORY = []
 CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS = 500
@@ -1644,7 +1645,74 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
     _append_classification_summary_history(summary, promoted=promoted)
     _write_unclassified_report(unclassified)
 
-    coverage = 1.0 - float(x["industry_final"].isin(["未分類", "未匹配"]).mean()) if len(x) else 0.0
+    # ==========================================================
+    # R4K DEBUG : 未分類股票完整輸出
+    # 目的：當分類覆蓋率未達 100% 時，直接在 Log 與 CSV 中列出未分類股票，
+    #      方便下一次從 Log/CSV 精準確認是哪幾檔造成 coverage 掉落。
+    # 注意：此區塊只增加可觀測性，不改變既有分類判斷結果。
+    # ==========================================================
+    try:
+        debug_cols = [
+            "stock_id", "stock_name", "market",
+            "industry_final", "theme_final", "sub_theme_final",
+            "classification_source", "classification_confidence", "classification_note"
+        ]
+        for col in debug_cols:
+            if col not in unclassified.columns:
+                unclassified[col] = ""
+
+        unclassified_debug_df = unclassified[debug_cols].copy()
+        unclassified_debug_df["industry_missing"] = unclassified_debug_df["industry_final"].map(_is_missing_classification_value)
+        unclassified_debug_df["theme_missing"] = unclassified_debug_df["theme_final"].map(_is_missing_classification_value)
+        unclassified_debug_df["sub_theme_missing"] = unclassified_debug_df["sub_theme_final"].map(_is_missing_classification_value)
+        unclassified_debug_df["all_missing"] = (
+            unclassified_debug_df["industry_missing"] &
+            unclassified_debug_df["theme_missing"] &
+            unclassified_debug_df["sub_theme_missing"]
+        )
+
+        industry_missing = int(unclassified_debug_df["industry_missing"].sum())
+        theme_missing = int(unclassified_debug_df["theme_missing"].sum())
+        sub_theme_missing = int(unclassified_debug_df["sub_theme_missing"].sum())
+        all_missing = int(unclassified_debug_df["all_missing"].sum())
+
+        log_warning(f"[UNCLASSIFIED DEBUG] count={len(unclassified_debug_df)}")
+        log_info(
+            f"[UNCLASSIFIED REASON] industry_missing={industry_missing} "
+            f"theme_missing={theme_missing} sub_theme_missing={sub_theme_missing} all_missing={all_missing}"
+        )
+
+        try:
+            CLASSIFICATION_R4K_UNCLASSIFIED_DEBUG_CSV.parent.mkdir(parents=True, exist_ok=True)
+            unclassified_debug_df.to_csv(
+                CLASSIFICATION_R4K_UNCLASSIFIED_DEBUG_CSV,
+                index=False,
+                encoding="utf-8-sig",
+            )
+            log_info(
+                f"[UNCLASSIFIED CSV] saved={CLASSIFICATION_R4K_UNCLASSIFIED_DEBUG_CSV} "
+                f"rows={len(unclassified_debug_df)}"
+            )
+            summary["unclassified_debug_csv"] = str(CLASSIFICATION_R4K_UNCLASSIFIED_DEBUG_CSV)
+        except Exception as csv_exc:
+            log_exception("[UNCLASSIFIED CSV FAILED]", csv_exc)
+
+        for _, row in unclassified_debug_df.iterrows():
+            log_warning(
+                "[UNCLASSIFIED] "
+                f"{row.get('stock_id', '')} {row.get('stock_name', '')} | "
+                f"market={row.get('market', '')} | "
+                f"industry={row.get('industry_final', '')} | "
+                f"theme={row.get('theme_final', '')} | "
+                f"sub_theme={row.get('sub_theme_final', '')} | "
+                f"source={row.get('classification_source', '')} | "
+                f"note={row.get('classification_note', '')}"
+            )
+
+    except Exception as exc:
+        log_exception("[UNCLASSIFIED DEBUG FAILED]", exc)
+
+    coverage = (covered / total) if total else 0.0
     try:
         log_info(
             f"[分類覆蓋率][scope=CALC_INPUT] total={total} covered={covered} unclassified={unclassified_count} "
