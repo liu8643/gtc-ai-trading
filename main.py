@@ -36,6 +36,8 @@ import logging
 import json
 import hashlib
 import zipfile
+import importlib.util
+import html as html_lib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -201,6 +203,12 @@ STATE_PATH = RUNTIME_DIR / "build_history_state_v9_2_final_release.json"
 # R4B_STABILITY_OBSERVABILITY_FIX_20260604：集中管理長任務可觀測性/快停/黑名單。
 NO_DATA_BLACKLIST_PATH = RUNTIME_DIR / "data" / "no_data_blacklist.json"
 NO_DATA_BLACKLIST_TTL_DAYS = 7
+# R4L_HISTORY_NO_DATA_FAST_SKIP_FIX_20260605：
+# 01/02/91 開頭多為特殊商品、權證/受益證券/TDR 等，Yahoo 通常無 2Y 歷史資料。
+# 建歷史前先跳過，避免逐檔打 Yahoo 造成 UI 變慢。00 開頭 ETF 不預先全排除，
+# 由 no_data_blacklist 記錄實際 NO_DATA，避免誤殺可支援 ETF。
+HISTORY_SPECIAL_PRODUCT_SKIP_PREFIXES = ("01", "02", "91")
+NO_DATA_BLACKLIST_SAVE_EVERY = 20
 CLASSIFICATION_SCHEMA_MISMATCH_STOP_RETRY = True
 DECISION_LOG_LIMIT = int(os.getenv("GTC_DECISION_LOG_LIMIT", "20") or "20")
 
@@ -3195,7 +3203,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4j_classification_theme_supplement_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5a_eps_data_gap_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -4103,7 +4111,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4F_REPORT_OUTPUT_HARDENING_FIX_20260605"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5A_EPS_DATA_GAP_FIX_20260606"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -5113,10 +5121,24 @@ class EPSForecastEngine:
             log_warning(f"[HIGH_GROWTH][OPENAPI_EPS] required columns missing source={source_key} market={market} cols={list(sample.keys())[:20]} required={required}")
             return pd.DataFrame()
         raw = pd.DataFrame(records)
-        raw_year = raw[year_col].astype(str).str.extract(r"(\d{2,4})", expand=False).fillna("")
-        raw_quarter = raw[quarter_col].astype(str).str.extract(r"([1-4])", expand=False).fillna("")
-        mask = raw_year.eq(roc_year) & raw_quarter.eq(str(q))
+        raw_year_token = raw[year_col].astype(str).str.extract(r"(\d{2,4})", expand=False).fillna("")
+        raw_quarter_token = raw[quarter_col].astype(str).str.upper().str.extract(r"(?:Q|第)?0?([1-4])", expand=False).fillna("")
+        raw_year_num = pd.to_numeric(raw_year_token, errors="coerce")
+        raw_year_western = raw_year_num.where(raw_year_num >= 1000, raw_year_num + 1911)
+        # R5A：OpenAPI 有些來源回傳民國年，有些回傳西元年；兩者統一成西元年比對。
+        mask = raw_year_western.eq(float(fiscal_year)) & raw_quarter_token.eq(str(q))
         rejected = int((~mask).sum())
+        matched = int(mask.sum())
+        try:
+            year_counts = raw_year_token.astype(str).value_counts().head(8).to_dict()
+            quarter_counts = raw_quarter_token.astype(str).value_counts().head(8).to_dict()
+            log_info(
+                f"[HIGH_GROWTH][OPENAPI_EPS MATCH] source={source_key} market={market} "
+                f"target={fiscal_year}Q{q} roc={roc_year} matched={matched} rejected={rejected} "
+                f"year_counts={year_counts} quarter_counts={quarter_counts}"
+            )
+        except Exception:
+            pass
         raw = raw.loc[mask].copy()
         if raw.empty:
             log_warning(f"[HIGH_GROWTH][OPENAPI_EPS] no matched rows source={source_key} market={market} fiscal_year={fiscal_year} roc={roc_year} q={q} rejected={rejected}")
@@ -5231,6 +5253,11 @@ class EPSForecastEngine:
                 self.db.conn.commit()
             result.update({"status": "imported", "rows": int(len(write)), "message": f"OpenAPI已寫入季度EPS {fiscal_year}Q{q}"})
             log_info(f"[HIGH_GROWTH][OPENAPI_EPS] quarterly_financial_history imported year={fiscal_year} q={q} rows={len(write)}")
+            if int(q) == 4:
+                try:
+                    self.ensure_annual_eps_from_quarterly_history(fiscal_year, force=True)
+                except Exception as backfill_exc:
+                    log_warning(f"[HIGH_GROWTH][OPENAPI_EPS] Q4 annual backfill skipped year={fiscal_year}｜{backfill_exc}")
             return result
         except Exception as exc:
             result.update({"status": "error", "rows": 0, "message": str(exc)})
@@ -5265,6 +5292,70 @@ class EPSForecastEngine:
             name = re.sub(r"\s+", "", name)
             out.append(name)
         return out
+
+    @staticmethod
+    def _strip_html_cell_text(value) -> str:
+        """R5A：不依賴 lxml 的 HTML cell 文字清理。"""
+        s = re.sub(r"<br\s*/?>", "\n", str(value or ""), flags=re.I)
+        s = re.sub(r"<[^>]+>", "", s)
+        try:
+            s = html_lib.unescape(s)
+        except Exception:
+            pass
+        s = s.replace("\u3000", " ").replace("\xa0", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _read_html_tables_safe(self, html_text: str, context: str = "") -> list[pd.DataFrame]:
+        """R5A：pd.read_html 缺 lxml 時的純 Python fallback。
+
+        EXE 若未打包 lxml，pd.read_html 會直接失敗，導致 MOPS EPS 全部無法匯入。
+        此函式先嘗試 pandas，失敗後用 regex + html 清理解析簡單 table/tr/td/th，
+        至少可解析 MOPS ajax_t163sb04 的 EPS 彙總表。
+        """
+        html = str(html_text or "")
+        if not html.strip():
+            return []
+        try:
+            tables = pd.read_html(io.StringIO(html))
+            if tables:
+                return list(tables)
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][HTML_TABLE_SAFE] pandas read_html failed context={context}｜{exc}")
+
+        tables = []
+        try:
+            table_blocks = re.findall(r"<table\b[^>]*>(.*?)</table>", html, flags=re.I | re.S)
+            for block in table_blocks:
+                rows = []
+                for tr in re.findall(r"<tr\b[^>]*>(.*?)</tr>", block, flags=re.I | re.S):
+                    cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", tr, flags=re.I | re.S)
+                    row = [self._strip_html_cell_text(c) for c in cells]
+                    if any(str(x).strip() for x in row):
+                        rows.append(row)
+                if not rows:
+                    continue
+                max_len = max(len(r) for r in rows)
+                rows = [r + [""] * (max_len - len(r)) for r in rows]
+                header_idx = None
+                for idx, r in enumerate(rows[:8]):
+                    joined = "|".join(r)
+                    if ("公司代號" in joined or "公司代碼" in joined) and ("每股盈餘" in joined or "基本每股盈餘" in joined):
+                        header_idx = idx
+                        break
+                if header_idx is None:
+                    header_idx = 0
+                header = rows[header_idx]
+                data = rows[header_idx + 1:]
+                if not data:
+                    continue
+                df = pd.DataFrame(data, columns=_coerce_unique_columns(header)).fillna("")
+                tables.append(df)
+            if tables:
+                log_info(f"[HIGH_GROWTH][HTML_TABLE_SAFE] fallback parsed context={context} tables={len(tables)}")
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][HTML_TABLE_SAFE] fallback failed context={context}｜{exc}")
+        return tables
 
     @staticmethod
     def _to_numeric_eps(value):
@@ -5388,10 +5479,12 @@ class EPSForecastEngine:
 
     def _parse_mops_eps_html(self, html_text: str, fiscal_year: int, season: int, market_type: str) -> pd.DataFrame:
         """解析 MOPS ajax_t163sb04 回傳 HTML 的 EPS 表格。"""
-        try:
-            tables = pd.read_html(io.StringIO(str(html_text or "")))
-        except Exception as exc:
-            log_warning(f"[HIGH_GROWTH][MOPS_EPS] read_html failed year={fiscal_year} season={season} market={market_type}｜{exc}")
+        tables = self._read_html_tables_safe(
+            str(html_text or ""),
+            context=f"MOPS_EPS_{int(fiscal_year)}Q{int(season)}_{market_type}",
+        )
+        if not tables:
+            log_warning(f"[HIGH_GROWTH][MOPS_EPS] read_html/table fallback failed year={fiscal_year} season={season} market={market_type}")
             return pd.DataFrame()
         target = None
         for df in tables:
@@ -5565,6 +5658,11 @@ class EPSForecastEngine:
                 self.db.conn.commit()
             result.update({"status": "imported", "rows": int(len(write)), "message": f"MOPS已寫入季度EPS {fiscal_year}Q{q}"})
             log_info(f"[HIGH_GROWTH][MOPS_EPS] quarterly_financial_history imported year={fiscal_year} q={q} rows={len(write)}")
+            if int(q) == 4:
+                try:
+                    self.ensure_annual_eps_from_quarterly_history(fiscal_year, force=True)
+                except Exception as backfill_exc:
+                    log_warning(f"[HIGH_GROWTH][MOPS_EPS] Q4 annual backfill skipped year={fiscal_year}｜{backfill_exc}")
             return result
         except Exception as exc:
             result.update({"status": "error", "rows": 0, "message": str(exc)})
@@ -5589,29 +5687,20 @@ class EPSForecastEngine:
                 return result
             q4 = q4.copy()
             q4["eps_full_year"] = pd.to_numeric(q4["eps_cumulative"], errors="coerce")
+            q4["eps_cumulative"] = pd.to_numeric(q4["eps_cumulative"], errors="coerce")
+            q4["eps_quarter"] = pd.to_numeric(q4.get("eps_quarter", np.nan), errors="coerce")
+            q4["eps_prev_cumulative"] = pd.to_numeric(q4.get("eps_prev_cumulative", np.nan), errors="coerce")
             q4 = q4.dropna(subset=["eps_full_year"])
-            q4["source_type"] = "MOPS_T163SB04_Q4_ANNUAL_EPS"
+            q4["source_type"] = "MOPS_T163SB04_Q4_CUMULATIVE_AS_ANNUAL_EPS"
             q4["source_date"] = f"{fiscal_year}Q4"
+            q4["eps_calc_method"] = "Q4_CUMULATIVE_AS_ANNUAL_EPS"
             q4["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            write = q4[["stock_id", "fiscal_year", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].copy()
-            if write.empty:
+            rows = self._write_annual_eps_history(q4, fiscal_year, source_label="MOPS_T163SB04_Q4_CUMULATIVE_AS_ANNUAL_EPS")
+            if rows <= 0:
                 result.update({"status": "parse_failed", "message": f"MOPS Q4無可寫入年度EPS {fiscal_year}"})
                 return result
-            with self.db.lock:
-                cur = self.db.conn.cursor()
-                cur.executemany("""
-                    INSERT INTO annual_eps_history(stock_id, fiscal_year, eps_full_year, source_type, source_url, source_date, update_time)
-                    VALUES(?,?,?,?,?,?,?)
-                    ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
-                        eps_full_year=excluded.eps_full_year,
-                        source_type=excluded.source_type,
-                        source_url=excluded.source_url,
-                        source_date=excluded.source_date,
-                        update_time=excluded.update_time
-                """, list(write.itertuples(index=False, name=None)))
-                self.db.conn.commit()
-            result.update({"status": "imported", "rows": int(len(write)), "message": f"MOPS已寫入全年EPS {fiscal_year}"})
-            log_info(f"[HIGH_GROWTH][MOPS_EPS] annual_eps_history imported fiscal_year={fiscal_year} rows={len(write)}")
+            result.update({"status": "imported", "rows": int(rows), "message": f"MOPS已用Q4累計EPS寫入全年EPS {fiscal_year}"})
+            log_info(f"[HIGH_GROWTH][MOPS_EPS] annual_eps_history imported from Q4 cumulative fiscal_year={fiscal_year} rows={rows}")
             return result
         except Exception as exc:
             result.update({"status": "error", "rows": 0, "message": str(exc)})
@@ -5706,7 +5795,12 @@ class EPSForecastEngine:
                 results["base_annual"] = results["base_annual_openapi"]
             else:
                 results["base_annual_mops"] = self.ensure_annual_eps_from_mops(self.base_year, force=force)
-                results["base_annual"] = results["base_annual_mops"]
+                if str(results["base_annual_mops"].get("status", "")).lower() in ("exists", "imported"):
+                    results["base_annual"] = results["base_annual_mops"]
+                else:
+                    # R5A/R5C：若 C05001/OpenAPI/MOPS 都失敗，最後由 quarterly_financial_history 內的 114Q4 累計EPS直接回填全年EPS。
+                    results["base_annual_qfh_backfill"] = self.ensure_annual_eps_from_quarterly_history(self.base_year, force=force)
+                    results["base_annual"] = results["base_annual_qfh_backfill"]
 
         for q in sorted({int(str(x).upper().replace("Q", "")) for x in quarters if str(x).upper().replace("Q", "").isdigit()}):
             # 去年同期：先 OpenAPI，失敗/無資料才 MOPS，供同比驗證，不作全年EPS替代。
@@ -6101,11 +6195,23 @@ class EPSForecastEngine:
             "eps_full_year": raw[eps_col].map(self._to_numeric_eps),
             "industry_api": raw.get("industry_api", ""),
         })
-        year_num = pd.to_numeric(out["year_raw"].astype(str).str.extract(r"(\d{2,4})", expand=False), errors="coerce")
+        year_token = out["year_raw"].astype(str).str.extract(r"(\d{2,4})", expand=False)
+        year_num = pd.to_numeric(year_token, errors="coerce")
         # OpenAPI 可能回傳民國年或西元年，統一為西元年。
         out["fiscal_year"] = np.where(year_num < 1000, year_num + 1911, year_num)
-        out["season"] = pd.to_numeric(out["season_raw"].astype(str).str.extract(r"([1-4])", expand=False), errors="coerce")
-        out = out[(out["fiscal_year"].astype("Int64") == fiscal_year) & (out["season"].astype("Int64") == int(season))].copy()
+        season_token = out["season_raw"].astype(str).str.upper().str.extract(r"(?:Q|第)?0?([1-4])", expand=False)
+        out["season"] = pd.to_numeric(season_token, errors="coerce")
+        match_mask = (out["fiscal_year"].astype("Int64") == fiscal_year) & (out["season"].astype("Int64") == int(season))
+        try:
+            log_info(
+                f"[HIGH_GROWTH][TWSE_OPENAPI_EPS MATCH] target={fiscal_year}Q{int(season)} "
+                f"matched={int(match_mask.sum())} rejected={int((~match_mask).sum())} "
+                f"year_counts={year_token.fillna('').astype(str).value_counts().head(8).to_dict()} "
+                f"season_counts={season_token.fillna('').astype(str).value_counts().head(8).to_dict()}"
+            )
+        except Exception:
+            pass
+        out = out[match_mask].copy()
         out = out.dropna(subset=["stock_id", "eps_full_year"])
         out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
         out["source_type"] = "TWSE_OPENAPI_T187AP06_ANNUAL_EPS"
@@ -7464,6 +7570,24 @@ class DataEngine:
         except Exception:
             return False
 
+    def _is_history_special_product_skip(self, stock_id: str, market: str = "", stock_name: str = "") -> tuple[bool, str]:
+        """R4L FIX：建立歷史資料前先排除 Yahoo 高機率無資料的特殊商品。
+
+        重點：
+        - 01/02/91 開頭在本系統歷史建庫不作為一般股票處理。
+        - 00 開頭 ETF 不直接全部排除，避免誤殺 0050/0056/006208/00919 等可支援商品；
+          實際 NO_DATA 由 no_data_blacklist 記錄，下次 TTL_SKIP。
+        """
+        sid = normalize_stock_id(stock_id)
+        if not sid:
+            return True, "INVALID_CODE"
+        if sid.startswith(tuple(HISTORY_SPECIAL_PRODUCT_SKIP_PREFIXES)):
+            return True, f"SPECIAL_PRODUCT_PREFIX_{sid[:2]}"
+        name = str(stock_name or "").strip()
+        if re.search(r"權證|牛證|熊證|認購|認售|TDR", name, flags=re.I):
+            return True, "SPECIAL_PRODUCT_NAME"
+        return False, ""
+
     def build_full_history(self, min_days: int = 240, batch_size: int = 25, sleep_sec: float = 0.6, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
         master = self.db.get_master()
         if master.empty:
@@ -7472,12 +7596,15 @@ class DataEngine:
         failed = 0
         rows = 0
         skipped = 0
-        failure_summary = {"NO_DATA": 0, "TTL_SKIP": 0, "EXCEPTION": 0, "INVALID_CODE": 0}
+        failure_summary = {"NO_DATA": 0, "TTL_SKIP": 0, "SPECIAL_SKIP": 0, "EXCEPTION": 0, "INVALID_CODE": 0}
         no_data_blacklist = self._load_no_data_blacklist()
         total = len(master)
         if log_cb:
             ready_count = int(master["stock_id"].astype(str).apply(self.db.get_price_history_count).ge(min_days).sum())
-            log_cb(f"[BUILD_HISTORY][START] total={total} ready={ready_count} min_days={min_days} no_data_ttl_days={NO_DATA_BLACKLIST_TTL_DAYS}")
+            blacklist_count = len(no_data_blacklist) if isinstance(no_data_blacklist, dict) else 0
+            sample_ids = master["stock_id"].astype(str).head(20).tolist() if "stock_id" in master.columns else []
+            log_cb(f"[BUILD_HISTORY][START] total={total} ready={ready_count} min_days={min_days} no_data_ttl_days={NO_DATA_BLACKLIST_TTL_DAYS} blacklist={blacklist_count}")
+            log_cb(f"[BUILD_HISTORY][SAMPLE] first20={sample_ids}")
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷完整歷史建庫")
@@ -7496,6 +7623,24 @@ class DataEngine:
                 if log_cb and (idx % 25 == 0 or idx == total):
                     log_cb(f"[{idx}/{total}] {stock_id} 已具備 {existing} 筆歷史，跳過")
                 skipped += 1
+                continue
+            special_skip, special_reason = self._is_history_special_product_skip(stock_id, market, row.get("stock_name", ""))
+            if special_skip:
+                skipped += 1
+                failure_summary["SPECIAL_SKIP"] += 1
+                no_data_blacklist[stock_id] = {
+                    "ts": time.time(),
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "reason": special_reason,
+                    "market": market,
+                    "stock_name": str(row.get("stock_name", "")),
+                }
+                if progress_cb:
+                    progress_cb(idx, total, stock_id, existing, "skip")
+                if log_cb and (idx % 25 == 0 or idx == total):
+                    log_cb(f"[{idx}/{total}] {stock_id} 特殊商品跳過，不打 Yahoo｜reason={special_reason}")
+                if failure_summary["SPECIAL_SKIP"] % int(NO_DATA_BLACKLIST_SAVE_EVERY) == 0:
+                    self._save_no_data_blacklist(no_data_blacklist)
                 continue
             if self._is_no_data_ttl_active(stock_id, no_data_blacklist):
                 skipped += 1
@@ -7521,9 +7666,17 @@ class DataEngine:
                 else:
                     failed += 1
                     failure_summary["NO_DATA"] += 1
-                    no_data_blacklist[stock_id] = {"ts": time.time(), "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "reason": "NO_DATA"}
+                    no_data_blacklist[stock_id] = {
+                        "ts": time.time(),
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "reason": "NO_DATA",
+                        "market": market,
+                        "stock_name": str(row.get("stock_name", "")),
+                    }
+                    if failure_summary["NO_DATA"] % int(NO_DATA_BLACKLIST_SAVE_EVERY) == 0:
+                        self._save_no_data_blacklist(no_data_blacklist)
                     if log_cb:
-                        log_cb(f"[{idx}/{total}] {stock_id} 無可用歷史資料")
+                        log_cb(f"[{idx}/{total}] {stock_id} 無可用歷史資料，已加入 no_data_blacklist")
                     if progress_cb:
                         progress_cb(idx, total, stock_id, existing, "fail")
             except Exception as e:
