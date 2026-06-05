@@ -2917,7 +2917,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4b_stability_observability_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4f_report_output_hardening_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3825,10 +3825,15 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4D_DEEP_AUDIT_GATE_REPAIR_20260605"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4F_REPORT_OUTPUT_HARDENING_FIX_20260605"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
+# R4F_REPORT_OUTPUT_HARDENING_FIX_20260605：真因樹 P0 驗收門檻。
+# 若年度 EPS 基準完全斷鏈，V4 核心條件「Q1 > 去年全年EPS」不可成立；
+# 報表只能輸出診斷資訊，不得把 TTM proxy 或 forecast 包裝成正式策略結果。
+HIGH_GROWTH_MIN_ANNUAL_EPS_ROWS_FOR_FORMAL_REPORT = int(os.getenv("GTC_HIGH_GROWTH_MIN_ANNUAL_EPS_ROWS", "1") or "1")
+HIGH_GROWTH_BLOCK_FORMAL_WHEN_ANNUAL_EPS_MISSING = os.getenv("GTC_HIGH_GROWTH_BLOCK_FORMAL_ON_MISSING_ANNUAL_EPS", "1").strip() != "0"
 
 # V4.12 LEADING_EPS_FORECAST_SELECTION_FIX：選股策略改為「領先預測」而非等待正式 EPS。
 # 核心排序：40% predicted_q2_eps + 25% eps_acceleration + 20% revenue_acceleration + 15% valuation(PE/PEG)。
@@ -4429,6 +4434,44 @@ class RevenueOpenAPICacheDownloader:
         log_warning(f"[REVENUE][OPENAPI_CACHE] read latest cache failed：{last_error}")
         return pd.DataFrame()
 
+    def read_all_caches(self, max_files: int = 80) -> pd.DataFrame:
+        """R4F：讀取所有本地 revenue_openapi_*.csv 快取，用於補歷史缺月。
+
+        原 R4A 只讀 latest cache，若最新官方 OpenAPI 只有 202604，就永遠補不到
+        202602/202603。此處只讀本機既有快取，不覆蓋 DB，仍維持 append-only。
+        """
+        files = sorted(self.cache_dir.glob("revenue_openapi_*.csv"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:int(max_files or 80)]
+        parts = []
+        for p in files:
+            for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+                try:
+                    df = pd.read_csv(p, encoding=enc, dtype=str).fillna("")
+                    if df is None or df.empty:
+                        break
+                    df["stock_id"] = df.get("stock_id", "").map(normalize_stock_id)
+                    df["revenue_month"] = df.get("revenue_month", "").map(RevenueAccelerationEngine.normalize_month)
+                    for c in ["revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy"]:
+                        if c not in df.columns:
+                            df[c] = np.nan
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    df = df[(df["stock_id"].astype(str).ne("")) & (df["revenue_month"].astype(str).ne("")) & (df["revenue"] > 0)].copy()
+                    if df.empty:
+                        break
+                    if "source_date" not in df.columns:
+                        df["source_date"] = datetime.now().strftime("%Y-%m-%d")
+                    if "update_time" not in df.columns:
+                        df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(p)
+                    parts.append(df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]])
+                    break
+                except Exception:
+                    continue
+        if not parts:
+            return pd.DataFrame()
+        out = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+        log_info(f"[REVENUE][OPENAPI_CACHE][ALL_LOCAL] files={len(files)} rows={len(out)} months={sorted(out['revenue_month'].astype(str).unique().tolist())[-12:]}")
+        return out
+
     def download_latest_cache(self, include_optional: bool = False) -> tuple[pd.DataFrame, Path | None, str]:
         parts, errors = [], []
         endpoints = dict(self.endpoints)
@@ -4453,6 +4496,98 @@ class RevenueOpenAPICacheDownloader:
             df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(cache_path or "download_memory")
         return df, cache_path, " ; ".join(errors)
 
+    def _flatten_revenue_html_table(self, df: pd.DataFrame) -> pd.DataFrame:
+        """R4F：MOPS HTML 月營收表格欄位扁平化，支援多層表頭。"""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        x = df.copy()
+        flat_cols = []
+        for c in x.columns:
+            if isinstance(c, tuple):
+                parts = [str(v).strip() for v in c if str(v).strip() and not str(v).startswith("Unnamed")]
+                flat_cols.append("-".join(parts) if parts else "")
+            else:
+                flat_cols.append(str(c).strip())
+        x.columns = flat_cols
+        x = x.loc[:, [c for c in x.columns if str(c).strip()]]
+        return x.fillna("")
+
+    def download_mops_history_month_cache(self, target_month: str) -> pd.DataFrame:
+        """R4F：補指定歷史月份月營收（例如 202602/202603）。
+
+        OpenAPI t187ap05 多數情境只回「最新月」；因此缺歷史月份時，必須改用
+        MOPS ajax_t21sc04 指定 year/month/TYPEK 逐月抓取。此方法只產生快取資料，
+        回傳後仍由 supplement_missing_only 以 append-only 寫入 history，不覆蓋既有資料。
+        """
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return pd.DataFrame()
+        year = int(m[:4]); month = int(m[4:6]); roc_year = year - 1911
+        url = "https://mops.twse.com.tw/mops/web/ajax_t21sc04"
+        parts, errors = [], []
+        for market_label, typek in [("上市", "sii"), ("上櫃", "otc")]:
+            try:
+                resp = requests.post(
+                    url,
+                    data={"encodeURIComponent": "1", "step": "1", "firstin": "1", "off": "1", "TYPEK": typek, "year": str(roc_year), "month": str(month)},
+                    timeout=45,
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mops.twse.com.tw/mops/web/t21sc04_ifrs"},
+                )
+                resp.raise_for_status()
+                html = resp.text or ""
+                if not html.strip() or ("查無資料" in html and "公司代號" not in html):
+                    errors.append(f"{market_label}:{m}:empty_html")
+                    continue
+                try:
+                    tables = pd.read_html(io.StringIO(html))
+                except Exception as read_exc:
+                    errors.append(f"{market_label}:{m}:read_html:{read_exc}")
+                    continue
+                parsed_parts = []
+                for t in tables:
+                    ft = self._flatten_revenue_html_table(t)
+                    if ft is None or ft.empty:
+                        continue
+                    parsed, err = self.parse_revenue_openapi(ft, source_label=f"MOPS_T21SC04_{market_label}_{m}")
+                    if parsed is not None and not parsed.empty:
+                        parsed["revenue_month"] = m
+                        parsed["source_url"] = f"MOPS_T21SC04:{typek}:{m}"
+                        parsed_parts.append(parsed)
+                if parsed_parts:
+                    part = pd.concat(parsed_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+                    parts.append(part)
+                    log_info(f"[REVENUE][MOPS_T21SC04_HISTORY][{market_label}] month={m} rows={len(part)}")
+                else:
+                    errors.append(f"{market_label}:{m}:parse_empty")
+            except Exception as exc:
+                errors.append(f"{market_label}:{m}:{exc}")
+                log_warning(f"[REVENUE][MOPS_T21SC04_HISTORY][{market_label}] failed month={m}｜{exc}")
+        if not parts:
+            log_warning(f"[REVENUE][MOPS_T21SC04_HISTORY] month={m} rows=0 errors={' ; '.join(errors)}")
+            return pd.DataFrame()
+        df = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+        df["source_date"] = f"{year}-{month:02d}"
+        df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cache_path = self.save_cache_df(df, source_tag=f"mops_t21sc04_{m}")
+        df["source_url"] = "OFFICIAL_MOPS_T21SC04_HISTORY_CACHE:" + str(cache_path or f"{m}")
+        return df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
+
+    def download_required_history_caches(self, required_months: list[str]) -> pd.DataFrame:
+        """R4F：逐月補缺歷史月營收，不使用最新月資料假補。"""
+        parts = []
+        for m in [RevenueAccelerationEngine.normalize_month(x) for x in (required_months or [])]:
+            if not m:
+                continue
+            try:
+                part = self.download_mops_history_month_cache(m)
+                if part is not None and not part.empty:
+                    parts.append(part)
+            except Exception as exc:
+                log_warning(f"[REVENUE][MOPS_T21SC04_HISTORY] required month failed {m}｜{exc}")
+        if not parts:
+            return pd.DataFrame()
+        return pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+
     def supplement_missing_only(self, existing_df: pd.DataFrame | None, required_months: list[str], force_download: bool = False) -> pd.DataFrame:
         required = [RevenueAccelerationEngine.normalize_month(m) for m in (required_months or [])]
         required = [m for m in required if m]
@@ -4465,12 +4600,22 @@ class RevenueOpenAPICacheDownloader:
             existing["revenue"] = pd.to_numeric(existing.get("revenue"), errors="coerce")
         cache_df = pd.DataFrame()
         if not force_download:
-            cache_df = self.read_latest_cache()
+            # R4F：先掃全部本地快取，避免 latest cache 只有最新月份而補不到歷史缺月。
+            cache_df = self.read_all_caches()
+            if cache_df is None or cache_df.empty:
+                cache_df = self.read_latest_cache()
         if cache_df is None or cache_df.empty:
             cache_df, _, _ = self.download_latest_cache(include_optional=False)
         if cache_df is None or cache_df.empty:
             return pd.DataFrame()
         cache_df = cache_df[cache_df["revenue_month"].astype(str).isin(required)].copy()
+        missing_after_cache = [m for m in required if m not in set(cache_df.get("revenue_month", pd.Series(dtype=str)).astype(str).tolist())]
+        if missing_after_cache:
+            # R4F：latest OpenAPI 只提供最新月時，改用 MOPS 指定月份歷史資料補 202602/202603。
+            hist_df = self.download_required_history_caches(missing_after_cache)
+            if hist_df is not None and not hist_df.empty:
+                cache_df = pd.concat([cache_df, hist_df], ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+                log_warning(f"[REVENUE][HISTORY_BACKFILL][R4F] missing_after_cache={missing_after_cache} hist_rows={len(hist_df)} months={sorted(hist_df['revenue_month'].astype(str).unique().tolist())}")
         if cache_df.empty:
             return pd.DataFrame()
         if not existing.empty and {"stock_id", "revenue_month"}.issubset(existing.columns):
@@ -5195,6 +5340,76 @@ class EPSForecastEngine:
             log_warning(f"[HIGH_GROWTH][MOPS_EPS] ensure_annual_eps_from_mops failed fiscal_year={fiscal_year}｜{exc}")
             return result
 
+    def ensure_annual_eps_from_quarterly_history(self, fiscal_year: int | None = None, force: bool = False) -> dict:
+        """R4F：由 quarterly_financial_history 的 Q4 累計 EPS 回補 annual_eps_history。
+
+        真因樹 RC-01：C05001/OpenAPI/MOPS 均可能失敗，但 DB 內若已存在 2025Q4
+        eps_cumulative，這就是全年 EPS；不得因 annual_eps_history 空表而讓 V4 核心
+        Gate 斷鏈。此方法只使用 Q4 累計 EPS，不用 eps_quarter 四季加總亂推。
+        """
+        fiscal_year = int(fiscal_year or self.base_year)
+        result = {"status": "skip", "rows": 0, "source": "quarterly_financial_history_q4_eps_cumulative", "message": ""}
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                row = cur.execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,)).fetchone()
+                existing = int(row[0] or 0) if row else 0
+            if existing > 0 and not force:
+                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                return result
+            if not self._table_exists("quarterly_financial_history"):
+                result.update({"status": "missing_table", "message": "quarterly_financial_history 不存在"})
+                return result
+            q = self._read_sql(
+                "SELECT stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_calc_method, source_url, source_date "
+                "FROM quarterly_financial_history WHERE quarter=4",
+            )
+            if q is None or q.empty:
+                result.update({"status": "no_q4", "message": "quarterly_financial_history 無 Q4 資料"})
+                return result
+            q = q.copy()
+            q["stock_id"] = q["stock_id"].map(normalize_stock_id)
+            fy = pd.to_numeric(q.get("fiscal_year"), errors="coerce")
+            q = q[((fy == fiscal_year) | (fy == fiscal_year - 1911))].copy()
+            if q.empty:
+                result.update({"status": "no_year_q4", "message": f"quarterly_financial_history 無 {fiscal_year}/114 Q4 資料"})
+                return result
+            q["eps_full_year"] = pd.to_numeric(q.get("eps_cumulative"), errors="coerce")
+            # 只有在 eps_calc_method 明確表示累積值時，才允許 eps 作為 fallback。
+            method = q.get("eps_calc_method", "").fillna("").astype(str).str.upper() if "eps_calc_method" in q.columns else pd.Series("", index=q.index)
+            eps_fallback = pd.to_numeric(q.get("eps"), errors="coerce")
+            q.loc[q["eps_full_year"].isna() & method.str.contains("CUMULATIVE|Q4|ANNUAL", regex=True), "eps_full_year"] = eps_fallback
+            q = q[(q["stock_id"].astype(str).ne("")) & q["eps_full_year"].notna()].copy()
+            if q.empty:
+                result.update({"status": "parse_empty", "message": "Q4 季報存在但 eps_cumulative 無有效全年 EPS"})
+                return result
+            q["source_type"] = "quarterly_financial_history_q4_eps_cumulative"
+            q["source_date"] = q.get("source_date", "").fillna("").astype(str).replace("", f"{fiscal_year}Q4")
+            q["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            write = q[["stock_id", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].copy()
+            write["fiscal_year"] = fiscal_year
+            write = write[["stock_id", "fiscal_year", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].drop_duplicates(["stock_id", "fiscal_year"], keep="last")
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.executemany("""
+                    INSERT INTO annual_eps_history(stock_id, fiscal_year, eps_full_year, source_type, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                        eps_full_year=excluded.eps_full_year,
+                        source_type=excluded.source_type,
+                        source_url=excluded.source_url,
+                        source_date=excluded.source_date,
+                        update_time=excluded.update_time
+                """, list(write.itertuples(index=False, name=None)))
+                self.db.conn.commit()
+            result.update({"status": "imported", "rows": int(len(write)), "message": "已由 quarterly_financial_history Q4 eps_cumulative 回補年度EPS"})
+            log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_QFH_BACKFILL] imported rows={len(write)} fiscal_year={fiscal_year}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_QFH_BACKFILL] failed fiscal_year={fiscal_year}｜{exc}")
+            return result
+
     def ensure_required_official_eps_from_mops(self, quarters=None, force: bool = False) -> dict:
         """高成長 EPS 報表前置匯入。
 
@@ -5764,7 +5979,10 @@ class EPSForecastEngine:
         if str(c05001_result.get("status", "")).lower() not in ("exists", "imported"):
             openapi_result = self.ensure_annual_eps_from_twse_openapi(self.base_year, force=False)
             if str(openapi_result.get("status", "")).lower() not in ("exists", "imported"):
-                self.ensure_annual_eps_from_mops(self.base_year, force=False)
+                mops_result = self.ensure_annual_eps_from_mops(self.base_year, force=False)
+                if str(mops_result.get("status", "")).lower() not in ("exists", "imported"):
+                    # R4F：最後官方/準官方 DB 回補；只使用 Q4 累計 EPS，不用 TTM 代理年度 EPS。
+                    self.ensure_annual_eps_from_quarterly_history(self.base_year, force=False)
         parts = []
         if self._table_exists("annual_eps_history"):
             # V4.15-R2：相容舊DB annual_eps_history 尚未有 source_type 欄位的情境。
@@ -5939,7 +6157,7 @@ class EPSForecastEngine:
         actual = self.load_actual_eps_by_quarter(quarters)
         ttm = self.load_eps_ttm_proxy()
         x = base.merge(base_eps, on="stock_id", how="left").merge(actual, on="stock_id", how="left").merge(ttm, on="stock_id", how="left")
-        # R4D_DEEP_AUDIT_GATE_REPAIR_20260605：年度EPS空表時仍保留source_date欄，避免07_EPS特徵中繼少欄。
+        # R4F_REPORT_OUTPUT_HARDENING_FIX：年度EPS空表時仍保留source_date欄，避免07_EPS特徵中繼少欄。
         if "source_date" not in x.columns:
             x["source_date"] = ""
         if revenue_features is not None and not revenue_features.empty:
@@ -6086,17 +6304,18 @@ class EPSForecastEngine:
         x["ttm_vs_annual_gate"] = x["ttm_vs_annual_ratio"].gt(1.0)
         x["eps_ttm_proxy_gate"] = ttm_available
 
-        # V4.12：領先 EPS 預測模型，不等正式財報公布才選股。
-        # 基礎 EPS：優先使用正數且非小基期的 2025 全年 EPS/4；若不可用，退回 EPS_TTM/4。
+        # R4F_REPORT_OUTPUT_HARDENING_FIX：領先 EPS 預測不得再用 EPS_TTM 代替 2025 全年 EPS。
+        # 真因樹 RC-04：年度 EPS 缺失時若用 current_eps_ttm/4，會把 TTM proxy 包裝成黑馬池，
+        # 造成 BASE_ANNUAL_EPS_MISSING 仍可通過 leading forecast。
+        strict_annual_basis = x["base_annual_eps"].notna() & x["base_annual_eps"].ge(HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO)
         x["base_quarter_eps_for_prediction"] = np.where(
-            x["base_annual_eps"].notna() & x["base_annual_eps"].ge(HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO),
+            strict_annual_basis,
             x["base_annual_eps"] / 4.0,
-            np.where(x["current_eps_ttm"].notna() & x["current_eps_ttm"].gt(0), x["current_eps_ttm"] / 4.0, np.nan),
+            np.nan,
         )
         x["prediction_basis"] = np.select(
-            [x["base_annual_eps"].notna() & x["base_annual_eps"].ge(HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO),
-             x["current_eps_ttm"].notna() & x["current_eps_ttm"].gt(0)],
-            ["BASE_ANNUAL_EPS", "EPS_TTM_PROXY"],
+            [strict_annual_basis, x["current_eps_ttm"].notna() & x["current_eps_ttm"].gt(0)],
+            ["BASE_ANNUAL_EPS", "EPS_TTM_PROXY_TRACKING_ONLY"],
             default="NO_VALID_EPS_BASIS",
         )
         growth_factor = 1.0 + (x["avg_revenue_yoy_used"].fillna(0) / 100.0) * 0.55
@@ -6108,8 +6327,8 @@ class EPSForecastEngine:
         x["selection_eps"] = x["predicted_q2_eps"]
         x["selection_eps_source"] = "PREDICTED_Q2_EPS"
         x["selection_eps_confidence"] = np.select(
-            [x["prediction_basis"].eq("BASE_ANNUAL_EPS"), x["prediction_basis"].eq("EPS_TTM_PROXY"), x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
-            ["HIGH_BASE_ANNUAL_EPS", "MEDIUM_EPS_TTM_PROXY", "LOW_NO_VALID_EPS_BASIS"],
+            [x["prediction_basis"].eq("BASE_ANNUAL_EPS"), x["prediction_basis"].eq("EPS_TTM_PROXY_TRACKING_ONLY"), x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
+            ["HIGH_BASE_ANNUAL_EPS", "TTM_TRACKING_ONLY_NOT_SELECTION", "LOW_NO_VALID_EPS_BASIS"],
             default="PARTIAL",
         )
         q3_extra_factor = (1.0 + (x["avg_revenue_yoy_used"].fillna(0).clip(lower=0, upper=300) / 100.0) * 0.18).clip(lower=1.0, upper=1.54)
@@ -6212,17 +6431,17 @@ class EPSForecastEngine:
         x["selection_score"] = (x["v412_total_score"] - x["outlier_penalty"]).clip(lower=0).round(2)
         x["v412_prediction_quality"] = np.select(
             [x["prediction_basis"].eq("BASE_ANNUAL_EPS") & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1),
-             x["prediction_basis"].eq("EPS_TTM_PROXY") & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1),
+             x["prediction_basis"].eq("EPS_TTM_PROXY_TRACKING_ONLY"),
              pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).lt(1),
              x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
-            ["LEADING_FORECAST_BASE_EPS", "LEADING_FORECAST_TTM_PROXY", "REVENUE_DATA_MISSING", "EPS_BASIS_MISSING"],
+            ["LEADING_FORECAST_BASE_EPS", "TTM_TRACKING_ONLY_NOT_LEADING", "REVENUE_DATA_MISSING", "EPS_BASIS_MISSING"],
             default="PARTIAL",
         )
         x["v412_leading_candidate"] = (
             x["v412_total_score"].ge(HIGH_GROWTH_V412_MIN_LEADING_SCORE) &
             x["selection_eps"].gt(0) &
             pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(HIGH_GROWTH_V412_MIN_REVENUE_HIT) &
-            x["v412_prediction_quality"].isin(["LEADING_FORECAST_BASE_EPS", "LEADING_FORECAST_TTM_PROXY"])
+            x["v412_prediction_quality"].eq("LEADING_FORECAST_BASE_EPS")
         )
         # V4.15：新的主Gate；forecast_eps_gate改為相容欄位，與領先預測候選一致，舊倍率Gate另存 legacy_forecast_eps_gate。
         x["v412_pass"] = x["v412_leading_candidate"].fillna(False).astype(bool)
@@ -6258,6 +6477,86 @@ class HighGrowthEPSEngine:
             return int(row[0] or 0)
         except Exception:
             return 0
+
+    def _annual_eps_rows_count(self) -> int:
+        """R4F：正式年度EPS可用筆數；不能只看表存在。"""
+        try:
+            if not self.eps_engine._table_exists("annual_eps_history"):
+                return 0
+            with self.db.lock:
+                row = self.db.conn.cursor().execute(
+                    "SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
+                    (self.eps_engine.base_year,),
+                ).fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
+
+    def _formal_report_allowed(self) -> tuple[bool, int]:
+        annual_rows = self._annual_eps_rows_count()
+        allowed = not (
+            HIGH_GROWTH_BLOCK_FORMAL_WHEN_ANNUAL_EPS_MISSING
+            and annual_rows < HIGH_GROWTH_MIN_ANNUAL_EPS_ROWS_FOR_FORMAL_REPORT
+        )
+        return bool(allowed), int(annual_rows)
+
+    def _append_gap_reason_text(self, base_value, reason: str) -> str:
+        s = str(base_value or "").strip()
+        if reason in s:
+            return s
+        return f"{s}；{reason}" if s else reason
+
+    def _apply_formal_block_if_needed(self, x: pd.DataFrame) -> pd.DataFrame:
+        """R4F：年度EPS基準未建立時，在資料列層級就阻斷正式策略 Gate。
+
+        R4E 只在 export_report 清空 02/04 分表，10_全部結果仍可能保留
+        selection_gate=True / forecast_candidate=True。R4F 將阻斷提前到 build_screening_df，
+        讓所有 sheet 與 UI 都同一語意。
+        """
+        allowed, annual_rows = self._formal_report_allowed()
+        if allowed or x is None or x.empty:
+            return x
+        reason = f"ANNUAL_EPS_HISTORY_ROWS_LT_MIN({annual_rows}<{HIGH_GROWTH_MIN_ANNUAL_EPS_ROWS_FOR_FORMAL_REPORT})"
+        bool_cols = [
+            "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "legacy_strict_pass", "strict_pass",
+            "v412_pass", "leading_pass", "forecast_eps_gate", "forecast_candidate", "selection_gate",
+        ]
+        for c in bool_cols:
+            if c in x.columns:
+                x[c] = False
+        for c in ["selection_eps", "selection_score", "predicted_q2_eps", "predicted_q3_eps"]:
+            if c in x.columns:
+                x[c] = np.nan
+        if "selection_eps_source" in x.columns:
+            x["selection_eps_source"] = "BLOCKED_BY_ANNUAL_EPS_HISTORY_MISSING"
+        if "selection_eps_confidence" in x.columns:
+            x["selection_eps_confidence"] = "LOW_NO_VALID_EPS_BASIS"
+        if "v412_prediction_quality" in x.columns:
+            x["v412_prediction_quality"] = np.where(
+                x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool),
+                "TTM_TRACKING_ONLY_NOT_LEADING",
+                "ANNUAL_EPS_MISSING_FORMAL_BLOCK",
+            )
+        if "prediction_basis" in x.columns:
+            x["prediction_basis"] = np.where(
+                x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool),
+                "EPS_TTM_PROXY_TRACKING_ONLY",
+                "NO_VALID_EPS_BASIS",
+            )
+        if "基本面狀態" in x.columns:
+            ttm_mask = x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            x["基本面狀態"] = np.where(ttm_mask, "EPS_TTM追蹤候選", "未通過/資料不足")
+        if "投資分層" in x.columns:
+            ttm_mask = x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            x["投資分層"] = np.where(ttm_mask, "EPS_TTM中信心追蹤", "年度EPS基準不足-診斷")
+        if "建議動作" in x.columns:
+            ttm_mask = x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            x["建議動作"] = np.where(ttm_mask, "可追蹤但不可當正式通過；待年度EPS補齊", "年度EPS基準不足，僅輸出診斷，不列入策略")
+        if "風險旗標" in x.columns:
+            x["風險旗標"] = np.where(x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool), "EPS_TTM_ONLY_需正式EPS驗證", "ANNUAL_EPS_MISSING")
+        if "資料缺口/未通過原因" in x.columns:
+            x["資料缺口/未通過原因"] = x["資料缺口/未通過原因"].map(lambda v: self._append_gap_reason_text(v, reason))
+        return x
 
     def _table_cols(self, table_name: str) -> list[str]:
         if not self._table_exists(table_name):
@@ -6324,8 +6623,8 @@ class HighGrowthEPSEngine:
             if int(float(r.get("revenue_month_count_hit") or 0)) < HIGH_GROWTH_V412_MIN_REVENUE_HIT:
                 gaps.append("領先預測缺少有效營收月數")
             q = str(r.get("v412_prediction_quality", ""))
-            if q not in ("LEADING_FORECAST_BASE_EPS", "LEADING_FORECAST_TTM_PROXY"):
-                gaps.append(f"預測品質不足:{q or 'MISSING'}")
+            if q != "LEADING_FORECAST_BASE_EPS":
+                gaps.append(f"預測品質不足:{q or 'MISSING'}；年度EPS基準未成立不得列黑馬池")
             return "；".join(gaps) if gaps else "領先預測條件通過；actual_q1_eps僅作驗證"
         if is_ttm:
             if str(r.get("eps_ttm_quality", "")) != "EPS_TTM_PROXY_ONLY":
@@ -6370,7 +6669,7 @@ class HighGrowthEPSEngine:
         # official_eps_only_pass：只檢查正式EPS本身是否通過；不再被營收缺月拖成0。
         # official_eps_revenue_pass：正式EPS + 完整營收Gate + 營收階梯的雙驗證。
         # legacy_strict_pass/strict_pass：保留舊版相容欄位，不再作新版主選股KPI。
-        # R4D_DEEP_AUDIT_GATE_REPAIR_20260605：恢復正式EPS本身通過的嚴格語意。
+        # R4F_REPORT_OUTPUT_HARDENING_FIX：恢復正式EPS本身通過的嚴格語意。
         # official_eps_only_pass 不要求三個月營收完整，但必須具備正式年度EPS基準，且Q1/所選季度正式EPS倍率通過。
         # 禁止 annual_eps_history=0 或 base_annual_eps missing 時，只因 actual_q1_eps 為正就暴增通過筆數。
         base_quality_strict = x.get("base_eps_quality", pd.Series("", index=x.index)).fillna("").astype(str).eq("STRICT")
@@ -6403,17 +6702,15 @@ class HighGrowthEPSEngine:
         x["forecast_eps_gate"] = x["v412_pass"]
         # V4.15-R1：selection_gate 是新版主選股 Gate；strict_pass 不再代表主選股結果。
         x["selection_gate"] = x["leading_pass"].fillna(False).astype(bool)
-        x["forecast_candidate"] = (
-            (~x["official_eps_verified_pass"])
-            & x["v412_pass"]
-        )
+        # R4F：候選池切分不得再受 official_eps_verified_pass 污染。
+        # forecast_candidate 僅代表「年度 EPS 基準 + 領先模型」成立；
+        # ttm_proxy_candidate 僅代表 TTM 追蹤池，不能排除正式/預測池，也不能當黑馬通過。
+        x["forecast_candidate"] = x["v412_pass"].fillna(False).astype(bool)
 
         # EPS_TTM 追蹤候選：DB 已有 EPS_TTM，可作最近四季獲利能力與排序追蹤；
         # 但不可標成 ACTUAL_PASS，也不可直接等同 2025全年EPS或2026Q1單季EPS。
         x["ttm_proxy_candidate"] = (
-            (~x["official_eps_verified_pass"])
-            & (~x["forecast_candidate"])
-            & x.get("eps_ttm_proxy_gate", False).fillna(False).astype(bool)
+            x.get("eps_ttm_proxy_gate", False).fillna(False).astype(bool)
             & x["revenue_partial_yoy_gate"].fillna(False)
         )
 
@@ -6445,6 +6742,9 @@ class HighGrowthEPSEngine:
             x["forecast_candidate"],
             x["ttm_proxy_candidate"],
         ], ["列入投資規劃，等待價量確認", "列核心清單但需控管風險", "正式EPS通過但營收完整性不足，需補月營收驗證", "列入黑馬追蹤，等正式EPS驗證", "可追蹤但不可當正式通過；待季度/年度EPS補齊"], default="不列入本策略")
+        # R4F：年度EPS基準未建立時，所有正式/領先策略 Gate 必須在列資料層級同步阻斷，
+        # 避免 02/04 分表被清空但 10_全部結果仍保留 selection_gate=True。
+        x = self._apply_formal_block_if_needed(x)
         x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
         months = self.revenue_engine.required_months(self.tracking_quarters)
@@ -6577,20 +6877,20 @@ class HighGrowthEPSEngine:
         q1_ratio_valid = int(pd.to_numeric(df.get("q1_vs_annual_ratio"), errors="coerce").notna().sum()) if df is not None and not df.empty and "q1_vs_annual_ratio" in df.columns else 0
         q1_ratio_raw_nonnull = int(pd.to_numeric(df.get("q1_vs_annual_ratio_raw"), errors="coerce").notna().sum()) if df is not None and not df.empty and "q1_vs_annual_ratio_raw" in df.columns else 0
         q1_quality_counts = df.get("q1_ratio_quality", pd.Series(dtype=str)).astype(str).value_counts().to_dict() if df is not None and not df.empty and "q1_ratio_quality" in df.columns else {}
-        annual_eps_rows = 0
-        try:
-            if self.eps_engine._table_exists("annual_eps_history"):
-                with self.db.lock:
-                    row = self.db.conn.cursor().execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (self.eps_engine.base_year,)).fetchone()
-                    annual_eps_rows = int(row[0] or 0) if row else 0
-        except Exception:
-            annual_eps_rows = 0
+        formal_report_allowed, annual_eps_rows = self._formal_report_allowed()
+        if not formal_report_allowed:
+            # R4F：年度 EPS 斷鏈時，強制清空正式/領先策略池，只保留診斷與 TTM 追蹤。
+            official_df = pd.DataFrame([{"狀態": "BLOCKED_BY_ANNUAL_EPS_MISSING", "說明": "annual_eps_history_2025 筆數不足，正式EPS驗證池不得產出。"}])
+            leading_df = pd.DataFrame([{"狀態": "BLOCKED_BY_ANNUAL_EPS_MISSING", "說明": "年度EPS基準斷鏈，領先預測黑馬池不得產出；請先補2025全年EPS。"}])
+            official_count = official_eps_only_count = official_eps_revenue_count = legacy_strict_count = leading_count = 0
         summary = pd.DataFrame([
             {"項目": "V4架構", "內容": "RevenueAccelerationEngine → EPSForecastEngine → HighGrowthEPSEngine"},
             {"項目": "V4.15-R1修正主旨", "內容": "報表摘要不能再用舊 strict_pass=0 當主結果；主KPI改為領先預測通過、選股用EPS與選股分數。"},
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(required_months)},
             {"項目": "營收月份覆蓋狀態", "內容": "OK" if not missing_required_months else f"缺月：{missing_required_months}"},
+            {"項目": "正式報表狀態", "內容": "FORMAL_OK" if formal_report_allowed else "DIAGNOSTIC_ONLY_BLOCKED_BY_ANNUAL_EPS_MISSING"},
+            {"項目": "年度EPS Gate", "內容": f"annual_eps_history_{self.eps_engine.base_year} rows={annual_eps_rows}; min_required={HIGH_GROWTH_MIN_ANNUAL_EPS_ROWS_FOR_FORMAL_REPORT}"},
             {"項目": "主選股模型", "內容": high_growth_model_definition_text("ZH")},
             {"項目": "報表語言模式", "內容": "Excel固定輸出中文(ZH)與英文(EN)各一份；UI固定中文"},
             {"項目": "主KPI_領先預測通過筆數", "內容": leading_count},
@@ -6616,6 +6916,9 @@ class HighGrowthEPSEngine:
             {"項目": "annual_eps_history_2025筆數", "內容": annual_eps_rows},
         ])
         validation_kpi = pd.DataFrame([
+            {"validation_metric": "formal_report_allowed", "validation_value": int(bool(formal_report_allowed)), "validation_note": "年度EPS基準未建立時只能輸出診斷報告，不得輸出正式策略池。"},
+            {"validation_metric": "formal_block_applied_to_all_rows", "validation_value": int((not formal_report_allowed) and (leading_count == 0) and (official_eps_only_count == 0)), "validation_note": "R4F新增：10_全部結果/02/04/UI同時阻斷，不只在分表層阻斷。"},
+            {"validation_metric": "annual_eps_history_rows", "validation_value": annual_eps_rows, "validation_note": "2025全年EPS基準筆數；必須>0才可做正式EPS驗證/黑馬池。"},
             {"validation_metric": "official_eps_only_pass", "validation_value": official_eps_only_count, "validation_note": "只代表正式EPS本身通過，不要求三個月營收完整。"},
             {"validation_metric": "official_eps_revenue_pass", "validation_value": official_eps_revenue_count, "validation_note": "正式EPS + 三月營收完整/YoY/階梯雙驗證通過。"},
             {"validation_metric": "legacy_strict_pass", "validation_value": legacy_strict_count, "validation_note": "舊版相容嚴格通過；不得作首頁主KPI。"},
@@ -6685,15 +6988,15 @@ class HighGrowthEPSEngine:
             generated_paths.append(Path(final_path))
         out_path = generated_paths[0] if generated_paths else out_path
         missing_months_text = missing_required_months or 'NONE'
-        quality_msg = f"[HIGH_GROWTH][QUALITY_GATE][R4D] annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜leading={leading_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}"
-        if missing_required_months or official_eps_only_count == 0 or annual_eps_rows == 0:
+        quality_msg = f"[HIGH_GROWTH][QUALITY_GATE][R4F] annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜leading={leading_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}"
+        if (not formal_report_allowed) or missing_required_months or official_eps_only_count == 0:
             log_warning(quality_msg + "｜diagnostic_only_candidate=1")
         else:
             log_info(quality_msg)
         if log_cb:
-            if missing_required_months or official_eps_only_count == 0 or annual_eps_rows == 0:
+            if (not formal_report_allowed) or missing_required_months or official_eps_only_count == 0:
                 log_cb(f"[HIGH_GROWTH][QUALITY_GATE][WARNING] diagnostic_only_candidate=1｜annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜missing_months={missing_months_text}")
-            log_cb(f"[HIGH_GROWTH_V4.15_R4D] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
+            log_cb(f"[HIGH_GROWTH_V4.15_R4F] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
