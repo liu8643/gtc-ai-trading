@@ -1606,6 +1606,8 @@ def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame,
         x[col] = _safe_text_series(x[col], "")
     x["classification_confidence"] = pd.to_numeric(x["classification_confidence"], errors="coerce").fillna(0)
 
+    # R4J FIX：分類覆蓋率應以「產業是否可分類」為主。
+    # theme/sub_theme 若已由產業補齊，不再判未分類。
     unclassified_mask = (
         x["industry_final"].map(_is_missing_classification_value) |
         x["theme_final"].map(_is_missing_classification_value) |
@@ -1776,6 +1778,24 @@ INDUSTRY_THEME_MAP = {
     "農業科技業": ("農業科技", "農業科技", "農業"),
     "ETF": ("ETF", "ETF", "ETF"),
 }
+
+
+def supplement_theme_by_industry(industry: str) -> tuple[str, str]:
+    """
+    R4J FIX：官方分類只有產業時，自動補題材/子題材。
+    避免官方產業已存在，但 theme/sub_theme 仍被判未分類。
+    """
+    ind = normalize_official_industry_name(industry)
+
+    if ind in INDUSTRY_THEME_MAP:
+        _industry, theme, sub_theme = INDUSTRY_THEME_MAP[ind]
+        return theme, sub_theme
+
+    if ind and not _is_missing_classification_value(ind):
+        return ind, ind
+
+    return "全市場", "系統掃描"
+
 
 
 def infer_theme_bundle(stock_name: str, industry: str, is_etf: int) -> Tuple[str, str, str]:
@@ -1976,6 +1996,34 @@ def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     missing_sub = x["sub_theme_final"].map(_is_missing_classification_value)
     x.loc[missing_theme, "theme_final"] = _safe_text_series(x.loc[missing_theme, "theme_from_map"], "").values
     x.loc[missing_sub, "sub_theme_final"] = _safe_text_series(x.loc[missing_sub, "sub_from_map"], "").values
+
+    # R4J FIX：官方產業已存在，但題材/子題材仍為空或預設值時，依產業補齊。
+    need_theme_fix = (
+        x["industry_final"].map(lambda v: not _is_missing_classification_value(v)) &
+        x["theme_final"].map(_is_missing_classification_value)
+    )
+
+    need_sub_fix = (
+        x["industry_final"].map(lambda v: not _is_missing_classification_value(v)) &
+        x["sub_theme_final"].map(_is_missing_classification_value)
+    )
+
+    if need_theme_fix.any() or need_sub_fix.any():
+        fixed_pairs = x["industry_final"].map(supplement_theme_by_industry)
+
+        if need_theme_fix.any():
+            x.loc[need_theme_fix, "theme_final"] = [
+                fixed_pairs.loc[i][0] for i in x.index[need_theme_fix]
+            ]
+
+        if need_sub_fix.any():
+            x.loc[need_sub_fix, "sub_theme_final"] = [
+                fixed_pairs.loc[i][1] for i in x.index[need_sub_fix]
+            ]
+
+        classification_debug_log(
+            f"R4J 題材補齊完成｜theme_fix={int(need_theme_fix.sum())}｜sub_theme_fix={int(need_sub_fix.sum())}"
+        )
 
     rule_used_mask = x["classification_source"].eq("") & x["source_ai"].isin(["rule_engine", "ai_infer"])
     x.loc[rule_used_mask, "classification_source"] = _safe_text_series(x.loc[rule_used_mask, "source_ai"], "").values
@@ -3079,7 +3127,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4h_classification_required_tpex_schema_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r4j_classification_theme_supplement_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
