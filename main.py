@@ -426,6 +426,60 @@ def classification_debug_log(message: str, level: str = "INFO"):
     except Exception:
         pass
 
+
+# R4G_CLASSIFICATION_REQUIRED_TPEX_SCHEMA_FIX_20260605：上市/上櫃官方分類 CSV 必要檔完整性檢查。
+# 目的：避免本機上櫃 CSV 缺失時，程式默默 fallback，最後只產生上市分類與大量未匹配清單。
+REQUIRED_CLASSIFICATION_FILES = {
+    "上市": "台股官方產業分類_上市.csv",
+    "上櫃": "台股官方產業分類_上櫃.csv",
+}
+
+
+def validate_required_classification_files(strict: bool = True) -> bool:
+    """
+    R4G FIX：啟動/分類載入前強制確認上市/上櫃官方分類 CSV 是否存在。
+
+    原則：
+    1. 本機 CSV 是主來源。
+    2. OpenAPI 只能做人工/維護用備援，不可在必要檔缺失時默默取代主流程。
+    3. strict=True 時，缺任一必要檔直接 raise RuntimeError，避免半套分類繼續污染報表。
+    """
+    search_dirs = [
+        RUNTIME_DIR / "data" / "classification",
+        BASE_DIR / "data" / "classification",
+        CLASSIFICATION_CACHE_DIR,
+    ]
+
+    missing = []
+    found = {}
+
+    for market, filename in REQUIRED_CLASSIFICATION_FILES.items():
+        hit = None
+        for folder in search_dirs:
+            p = Path(folder) / filename
+            if p.exists() and p.stat().st_size > 0:
+                hit = p
+                break
+
+        if hit:
+            found[market] = str(hit)
+            classification_debug_log(f"必要分類檔確認存在：{market}｜{hit}")
+        else:
+            missing.append(f"{market}:{filename}")
+
+    if missing:
+        msg = (
+            "必要官方分類CSV缺失，停止使用不完整分類資料。"
+            f" missing={missing}｜search_dirs={[str(x) for x in search_dirs]}"
+        )
+        log_error("[分類載入][P0] " + msg)
+        if strict:
+            raise RuntimeError(msg)
+        return False
+
+    return True
+
+
 def _append_classification_summary_history(summary: dict, promoted: bool = False):
     global CLASSIFICATION_V2_SUMMARY_HISTORY
     try:
@@ -741,8 +795,20 @@ def _validate_classification_helper_integrity():
 
 
 def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.DataFrame:
+    """解析官方分類來源，支援 TWSE/TPEX OpenAPI 與本機 CSV 欄位。
+
+    R4G FIX：
+    - 支援 TPEX 上櫃 OpenAPI 欄位 SecuritiesCompanyCode / CompanyName / CompanyAbbreviation / SecuritiesIndustryCode。
+    - SecuritiesIndustryCode 需補零後以 INDUSTRY_CODE_MAP 轉正式產業名稱。
+    - schema mismatch 不再靜默回空表，需寫入 log 供追查。
+    """
+    empty_cols = [
+        "stock_id", "stock_name_official",
+        "stock_name_norm_official", "market_official",
+        "industry_official",
+    ]
     if df is None or df.empty:
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+        return pd.DataFrame(columns=empty_cols)
 
     x = df.copy().fillna("")
     x.columns = _coerce_unique_columns(x.columns)
@@ -754,31 +820,76 @@ def _extract_official_csv_rows(df: pd.DataFrame, market: str = "上市") -> pd.D
 
     for c in x.columns:
         base = str(c).split("__dup")[0].strip()
-        if base in ("公司代號", "股票代號", "證券代號", "公司代碼", "代號", "有價證券代號", "SecuritiesCompanyCode", "CompanyCode", "Code"):
+
+        if base in (
+            "公司代號", "股票代號", "證券代號", "公司代碼", "代號",
+            "有價證券代號",
+            "SecuritiesCompanyCode", "CompanyCode", "Code"
+        ):
             code_col = c if code_col is None else code_col
-        elif base in ("公司名稱", "公司簡稱", "證券名稱", "股票名稱", "名稱", "有價證券名稱", "簡稱", "CompanyName", "Name"):
+
+        elif base in (
+            "公司名稱", "公司簡稱", "證券名稱", "股票名稱", "名稱",
+            "有價證券名稱", "簡稱",
+            "CompanyName", "CompanyAbbreviation", "Name"
+        ):
             name_col = c if name_col is None else name_col
-        elif base in ("新產業類別", "新產業別", "產業名稱", "產業別名稱", "產業類別名稱", "IndustryName", "industry_name"):
+
+        elif base in (
+            "新產業類別", "新產業別", "產業名稱", "產業別名稱",
+            "產業類別名稱", "IndustryName", "industry_name"
+        ):
             industry_name_col = c if industry_name_col is None else industry_name_col
-        elif base in ("產業別", "產業類別", "產業代碼", "產業類別代號", "產業別代號", "IndustryCode", "industry_code"):
+
+        elif base in (
+            "產業別", "產業類別", "產業代碼", "產業類別代號",
+            "產業別代號",
+            "IndustryCode", "industry_code",
+            "SecuritiesIndustryCode"
+        ):
             industry_code_col = c if industry_code_col is None else industry_code_col
 
     industry_col = industry_name_col or industry_code_col
+
     if code_col is None or industry_col is None:
-        return pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+        log_error(
+            f"[分類載入][SCHEMA_MISMATCH] {market} 無法辨識欄位｜"
+            f"code_col={code_col}｜industry_col={industry_col}｜columns={[str(c) for c in x.columns]}"
+        )
+        return pd.DataFrame(columns=empty_cols)
 
     out = pd.DataFrame({
         "stock_id": x[code_col].map(normalize_stock_id),
         "stock_name_official": x[name_col].astype(str).str.strip() if name_col in x.columns else "",
         "industry_official": x[industry_col].astype(str).str.strip(),
     })
+
+    # R4G FIX：TPEX SecuritiesIndustryCode 是產業代碼，需先補零再轉 INDUSTRY_CODE_MAP。
+    if industry_col == industry_code_col:
+        out["industry_official"] = (
+            out["industry_official"]
+            .astype(str)
+            .str.strip()
+            .str.replace(".0", "", regex=False)
+            .map(lambda v: v.zfill(2) if re.fullmatch(r"\d{1,2}", v) else v)
+            .map(lambda v: INDUSTRY_CODE_MAP.get(v, v))
+        )
+
     out["industry_official"] = out["industry_official"].map(normalize_official_industry_name)
     out["stock_name_norm_official"] = out["stock_name_official"].map(_normalize_stock_name_for_match)
     out["market_official"] = market
+
     out = out[(out["stock_id"] != "") & (out["industry_official"] != "")].copy()
+
     if out.empty:
-        return out
-    return out[["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]].drop_duplicates(subset=["stock_id"], keep="first")
+        log_error(
+            f"[分類載入][EMPTY_AFTER_PARSE] {market} 欄位可辨識但轉換後無有效資料｜"
+            f"code_col={code_col}｜name_col={name_col}｜industry_col={industry_col}"
+        )
+
+    return out[
+        ["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"]
+    ].drop_duplicates(subset=["stock_id"], keep="first")
 
 def _try_convert_xls_to_xlsx(src: Path, dst: Path) -> Optional[Path]:
     try:
@@ -1119,6 +1230,10 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
     _validate_classification_helper_integrity()
     market = str(market or "ALL").strip() or "ALL"
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
+
+    # R4G FIX：分類載入入口先驗證上市/上櫃必要 CSV，避免缺上櫃檔時默默 fallback 後污染分類。
+    if market in ("ALL", "上市", "上櫃"):
+        validate_required_classification_files(strict=True)
 
     if market == "ALL":
         cached_all = _get_cached_official_classification("ALL")
