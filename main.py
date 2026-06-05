@@ -401,7 +401,7 @@ CLASSIFICATION_DOWNLOAD_SOURCES = {
     },
 }
 
-# R4H_CLASSIFICATION_LOCAL_REQUIRED_FIX_20260605：
+# R4I_CLASSIFICATION_BOOTSTRAP_REQUIRED_FIX_20260605：
 # 上市/上櫃官方分類 CSV 是分類主來源，OpenAPI 僅能作為手動補檔來源。
 # 啟動/分類載入前若任一必要 CSV 不存在，直接 P0 阻斷，避免只用上市檔造成覆蓋率 91.41% 假正常。
 REQUIRED_CLASSIFICATION_FILES = {
@@ -409,13 +409,39 @@ REQUIRED_CLASSIFICATION_FILES = {
     "上櫃": "台股官方產業分類_上櫃.csv",
 }
 
-def validate_required_classification_files(strict: bool = True) -> bool:
+def _find_required_classification_file(market: str) -> Optional[Path]:
+    """R4I FIX：集中尋找必要分類檔，避免啟動時搜尋路徑不一致。"""
+    filename = REQUIRED_CLASSIFICATION_FILES.get(str(market or "").strip())
+    if not filename:
+        return None
+    search_dirs = [
+        RUNTIME_DIR / "data" / "classification",
+        BASE_DIR / "data" / "classification",
+        CLASSIFICATION_CACHE_DIR,
+    ]
+    for folder in search_dirs:
+        try:
+            p = Path(folder) / filename
+            if p.exists() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def validate_required_classification_files(strict: bool = True, auto_download: bool = False) -> bool:
     """
-    R4H FIX：啟動/分類載入時強制確認上市、上櫃官方分類 CSV 是否存在。
-    原則：
-    1. 本機 CSV 是主來源。
-    2. OpenAPI fallback 不得在缺少必要 CSV 時默默取代主來源。
-    3. strict=True 時，缺任一必要檔直接 raise RuntimeError。
+    R4I FIX：必要分類檔檢查不可放在 OpenAPI 補檔之前直接阻斷。
+
+    正確流程：
+    1. 先找本機/打包內上市、上櫃 CSV。
+    2. 若缺檔且 auto_download=True，先呼叫既有 OpenAPI downloader 補產 CSV。
+    3. 補產後再次檢查。
+    4. 仍缺檔時才 P0 阻斷。
+
+    目的：
+    - 避免 R4H 在第一次啟動時因 CSV 尚未落地就 raise，造成股票主檔初始化失敗與 UI 空白。
+    - 保留必要檔完整性要求：最終仍必須同時有上市、上櫃兩檔。
     """
     search_dirs = [
         RUNTIME_DIR / "data" / "classification",
@@ -423,30 +449,43 @@ def validate_required_classification_files(strict: bool = True) -> bool:
         CLASSIFICATION_CACHE_DIR,
     ]
 
-    missing = []
-    found = {}
+    def _scan_missing():
+        missing_items = []
+        found_items = {}
+        for market, filename in REQUIRED_CLASSIFICATION_FILES.items():
+            hit = _find_required_classification_file(market)
+            if hit:
+                found_items[market] = str(hit)
+                classification_debug_log(f"必要分類檔確認存在：{market}｜{hit}")
+            else:
+                missing_items.append((market, filename))
+        return missing_items, found_items
 
-    for market, filename in REQUIRED_CLASSIFICATION_FILES.items():
-        hit = None
-        for folder in search_dirs:
+    missing, found = _scan_missing()
+
+    if missing and auto_download:
+        classification_debug_log(
+            "必要分類檔缺失，先啟用官方 OpenAPI 補檔後再驗證｜"
+            f"missing={[f'{m}:{fn}' for m, fn in missing]}"
+        )
+        for market, _filename in list(missing):
             try:
-                p = Path(folder) / filename
-                if p.exists() and p.stat().st_size > 0:
-                    hit = p
-                    break
-            except Exception:
-                continue
-
-        if hit is not None:
-            found[market] = str(hit)
-            classification_debug_log(f"必要分類檔確認存在：{market}｜{hit}")
-        else:
-            missing.append(f"{market}:{filename}")
+                p = _download_single_classification_csv(
+                    market,
+                    force_refresh=False,
+                    log_cb=classification_debug_log,
+                )
+                if p is not None:
+                    classification_debug_log(f"必要分類檔自動補產完成：{market}｜{p}")
+            except Exception as exc:
+                classification_debug_log(f"必要分類檔自動補產失敗：{market}｜{exc}", "ERROR")
+        missing, found = _scan_missing()
 
     if missing:
+        missing_text = [f"{market}:{filename}" for market, filename in missing]
         msg = (
             "必要官方分類CSV缺失，停止使用不完整分類資料。"
-            f" missing={missing}｜search_dirs={[str(x) for x in search_dirs]}"
+            f" missing={missing_text}｜search_dirs={[str(x) for x in search_dirs]}"
         )
         log_error("[分類載入][P0] " + msg)
         classification_debug_log(msg, "ERROR")
@@ -455,6 +494,7 @@ def validate_required_classification_files(strict: bool = True) -> bool:
         return False
 
     return True
+
 BOOTSTRAP_LOCK = threading.Lock()
 BOOTSTRAP_EVENT = threading.Event()
 
@@ -1237,10 +1277,10 @@ def load_official_classification_book(market: str = "ALL") -> pd.DataFrame:
     market = str(market or "ALL").strip() or "ALL"
     empty_df = pd.DataFrame(columns=["stock_id", "stock_name_official", "stock_name_norm_official", "market_official", "industry_official"])
 
-    # R4H FIX：分類主來源必須先通過本機必要檔檢查。
-    # 避免缺上櫃 CSV 時自動 fallback 失敗後仍以不完整分類繼續執行。
+    # R4I FIX：第一次啟動時允許先補產必要 CSV，再做嚴格驗證。
+    # R4H 直接 strict=True 會在 CSV 尚未落地前阻斷股票主檔初始化，造成 UI 空白。
     if market in ("ALL", "上市", "上櫃"):
-        validate_required_classification_files(strict=True)
+        validate_required_classification_files(strict=True, auto_download=True)
 
     if market == "ALL":
         cached_all = _get_cached_official_classification("ALL")
