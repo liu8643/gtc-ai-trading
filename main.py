@@ -3825,7 +3825,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4B_STABILITY_OBSERVABILITY_FIX_20260604"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R4D_DEEP_AUDIT_GATE_REPAIR_20260605"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -5799,11 +5799,13 @@ class EPSForecastEngine:
                     parts.append(s[["stock_id", "base_annual_eps", "base_eps_source", "source_date"]])
         parts = [p for p in parts if p is not None and not p.empty]
         if not parts:
-            return pd.DataFrame(columns=["stock_id", "base_annual_eps", "base_eps_source", "base_eps_quality"])
+            return pd.DataFrame(columns=["stock_id", "base_annual_eps", "base_eps_source", "source_date", "base_eps_quality"])
         x = pd.concat(parts, ignore_index=True)
         x["stock_id"] = x["stock_id"].map(normalize_stock_id)
         x["base_annual_eps"] = pd.to_numeric(x["base_annual_eps"], errors="coerce")
         x = x.dropna(subset=["stock_id", "base_annual_eps"])
+        if "source_date" not in x.columns:
+            x["source_date"] = ""
         x["base_eps_quality"] = "STRICT"
         x["_priority"] = x["base_eps_source"].map({"annual_eps_history": 1, "TWSE_C05001_Q4_ANNUAL_EPS": 1, "TWSE_OPENAPI_T187AP06_ANNUAL_EPS": 1, "MOPS_T163SB04_Q4_ANNUAL_EPS": 1, "quarterly_financial_history_sum4_eps_quarter": 2, "quarterly_financial_history_sum4": 2}).fillna(9)
         return x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first").drop(columns=["_priority"], errors="ignore")
@@ -5937,6 +5939,9 @@ class EPSForecastEngine:
         actual = self.load_actual_eps_by_quarter(quarters)
         ttm = self.load_eps_ttm_proxy()
         x = base.merge(base_eps, on="stock_id", how="left").merge(actual, on="stock_id", how="left").merge(ttm, on="stock_id", how="left")
+        # R4D_DEEP_AUDIT_GATE_REPAIR_20260605：年度EPS空表時仍保留source_date欄，避免07_EPS特徵中繼少欄。
+        if "source_date" not in x.columns:
+            x["source_date"] = ""
         if revenue_features is not None and not revenue_features.empty:
             keep = [c for c in ["stock_id", "avg_revenue_yoy", "min_revenue_yoy", "revenue_acceleration_score", "revenue_month_count_hit", "revenue_month_count_required"] if c in revenue_features.columns]
             x = x.merge(revenue_features[keep], on="stock_id", how="left")
@@ -6365,16 +6370,20 @@ class HighGrowthEPSEngine:
         # official_eps_only_pass：只檢查正式EPS本身是否通過；不再被營收缺月拖成0。
         # official_eps_revenue_pass：正式EPS + 完整營收Gate + 營收階梯的雙驗證。
         # legacy_strict_pass/strict_pass：保留舊版相容欄位，不再作新版主選股KPI。
+        # R4D_DEEP_AUDIT_GATE_REPAIR_20260605：恢復正式EPS本身通過的嚴格語意。
+        # official_eps_only_pass 不要求三個月營收完整，但必須具備正式年度EPS基準，且Q1/所選季度正式EPS倍率通過。
+        # 禁止 annual_eps_history=0 或 base_annual_eps missing 時，只因 actual_q1_eps 為正就暴增通過筆數。
+        base_quality_strict = x.get("base_eps_quality", pd.Series("", index=x.index)).fillna("").astype(str).eq("STRICT")
         x["official_eps_only_pass"] = (
             x["eps_data_quality"].eq("STRICT")
+            & base_quality_strict
             & x.get("actual_eps_complete_gate", False).fillna(False).astype(bool)
             & pd.to_numeric(x.get("selected_actual_eps_cumulative"), errors="coerce").gt(0)
+            & x.get("q1_ratio_quality", pd.Series("", index=x.index)).fillna("").astype(str).eq("OK")
+            & x["eps_gate"].fillna(False).astype(bool)
         )
-        # R4B：official_eps_only_pass 只代表「正式EPS本身可用且為正」，不得因2025全年EPS基準缺失被壓成0。
-        # 真正 EPS > 年度EPS 與營收完整驗證，留在 official_eps_revenue_pass / legacy_strict_pass。
         x["official_eps_revenue_pass"] = (
             x["official_eps_only_pass"].fillna(False).astype(bool)
-            & x["eps_gate"].fillna(False).astype(bool)
             & x["revenue_strict_gate"].fillna(False).astype(bool)
         )
         x["legacy_strict_pass"] = x["official_eps_revenue_pass"].fillna(False).astype(bool)
@@ -6676,10 +6685,15 @@ class HighGrowthEPSEngine:
             generated_paths.append(Path(final_path))
         out_path = generated_paths[0] if generated_paths else out_path
         missing_months_text = missing_required_months or 'NONE'
+        quality_msg = f"[HIGH_GROWTH][QUALITY_GATE][R4D] annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜leading={leading_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}"
+        if missing_required_months or official_eps_only_count == 0 or annual_eps_rows == 0:
+            log_warning(quality_msg + "｜diagnostic_only_candidate=1")
+        else:
+            log_info(quality_msg)
         if log_cb:
             if missing_required_months or official_eps_only_count == 0 or annual_eps_rows == 0:
                 log_cb(f"[HIGH_GROWTH][QUALITY_GATE][WARNING] diagnostic_only_candidate=1｜annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜missing_months={missing_months_text}")
-            log_cb(f"[HIGH_GROWTH_V4.15_R4B] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
+            log_cb(f"[HIGH_GROWTH_V4.15_R4D] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
