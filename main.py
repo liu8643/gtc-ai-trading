@@ -6688,18 +6688,22 @@ class EPSForecastEngine:
         x["ttm_vs_annual_gate"] = x["ttm_vs_annual_ratio"].gt(1.0)
         x["eps_ttm_proxy_gate"] = ttm_available
 
-        # R4F_REPORT_OUTPUT_HARDENING_FIX：領先 EPS 預測不得再用 EPS_TTM 代替 2025 全年 EPS。
-        # 真因樹 RC-04：年度 EPS 缺失時若用 current_eps_ttm/4，會把 TTM proxy 包裝成黑馬池，
-        # 造成 BASE_ANNUAL_EPS_MISSING 仍可通過 leading forecast。
+        # R5B_SELECTION_EPS_PREDICTION_BASIS_RESTORE_AND_GUARD_FIX：
+        # 正常版邏輯：領先預測基準允許 base_annual_eps/4；若年度EPS缺失，回退 current_eps_ttm/4。
+        # R5A/R4F 把 EPS_TTM 改成 TRACKING_ONLY，導致 base_quarter_eps_for_prediction 全空，
+        # 進而讓 predicted_q2_eps / selection_eps / predicted_q3_eps / EPS加速度 / PEG 整批空白。
+        # 本修正恢復 current_eps_ttm/4 fallback，但保留 prediction_basis / confidence / basis_penalty 風險標示，
+        # 避免 EPS_TTM_PROXY 被誤認為正式年度EPS。
         strict_annual_basis = x["base_annual_eps"].notna() & x["base_annual_eps"].ge(HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO)
+        eps_ttm_proxy_basis = x["current_eps_ttm"].notna() & x["current_eps_ttm"].gt(0)
         x["base_quarter_eps_for_prediction"] = np.where(
             strict_annual_basis,
             x["base_annual_eps"] / 4.0,
-            np.nan,
+            np.where(eps_ttm_proxy_basis, x["current_eps_ttm"] / 4.0, np.nan),
         )
         x["prediction_basis"] = np.select(
-            [strict_annual_basis, x["current_eps_ttm"].notna() & x["current_eps_ttm"].gt(0)],
-            ["BASE_ANNUAL_EPS", "EPS_TTM_PROXY_TRACKING_ONLY"],
+            [strict_annual_basis, eps_ttm_proxy_basis],
+            ["BASE_ANNUAL_EPS", "EPS_TTM_PROXY"],
             default="NO_VALID_EPS_BASIS",
         )
         growth_factor = 1.0 + (x["avg_revenue_yoy_used"].fillna(0) / 100.0) * 0.55
@@ -6711,8 +6715,8 @@ class EPSForecastEngine:
         x["selection_eps"] = x["predicted_q2_eps"]
         x["selection_eps_source"] = "PREDICTED_Q2_EPS"
         x["selection_eps_confidence"] = np.select(
-            [x["prediction_basis"].eq("BASE_ANNUAL_EPS"), x["prediction_basis"].eq("EPS_TTM_PROXY_TRACKING_ONLY"), x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
-            ["HIGH_BASE_ANNUAL_EPS", "TTM_TRACKING_ONLY_NOT_SELECTION", "LOW_NO_VALID_EPS_BASIS"],
+            [x["prediction_basis"].eq("BASE_ANNUAL_EPS"), x["prediction_basis"].eq("EPS_TTM_PROXY"), x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
+            ["HIGH_BASE_ANNUAL_EPS", "MEDIUM_EPS_TTM_PROXY", "LOW_NO_VALID_EPS_BASIS"],
             default="PARTIAL",
         )
         q3_extra_factor = (1.0 + (x["avg_revenue_yoy_used"].fillna(0).clip(lower=0, upper=300) / 100.0) * 0.18).clip(lower=1.0, upper=1.54)
@@ -6811,14 +6815,29 @@ class EPSForecastEngine:
             [10.0, 8.0, 6.0],
             default=0.0,
         )
+        # R5B：EPS_TTM_PROXY 可以讓欄位恢復計算，但排名需降權，避免 proxy 取代正式年度EPS。
+        x["basis_penalty"] = np.select(
+            [x["prediction_basis"].eq("EPS_TTM_PROXY"), x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
+            [6.0, 15.0],
+            default=0.0,
+        )
+        x["outlier_penalty"] = (pd.to_numeric(x["outlier_penalty"], errors="coerce").fillna(0) + x["basis_penalty"]).round(2)
+        x["forecast_risk_flag"] = np.select(
+            [
+                x["prediction_basis"].eq("EPS_TTM_PROXY") & x["forecast_risk_flag"].astype(str).str.strip().ne(""),
+                x["prediction_basis"].eq("EPS_TTM_PROXY"),
+            ],
+            [x["forecast_risk_flag"].astype(str) + ";EPS_TTM_PROXY_BASIS", "EPS_TTM_PROXY_BASIS"],
+            default=x["forecast_risk_flag"],
+        )
         # V4.15-R1：selection_score 為新版領先預測主選股分數，供摘要/報表驗收使用。
         x["selection_score"] = (x["v412_total_score"] - x["outlier_penalty"]).clip(lower=0).round(2)
         x["v412_prediction_quality"] = np.select(
             [x["prediction_basis"].eq("BASE_ANNUAL_EPS") & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1),
-             x["prediction_basis"].eq("EPS_TTM_PROXY_TRACKING_ONLY"),
+             x["prediction_basis"].eq("EPS_TTM_PROXY") & pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).ge(1),
              pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).lt(1),
              x["prediction_basis"].eq("NO_VALID_EPS_BASIS")],
-            ["LEADING_FORECAST_BASE_EPS", "TTM_TRACKING_ONLY_NOT_LEADING", "REVENUE_DATA_MISSING", "EPS_BASIS_MISSING"],
+            ["LEADING_FORECAST_BASE_EPS", "EPS_TTM_PROXY_FORECAST_DOWNGRADED", "REVENUE_DATA_MISSING", "EPS_BASIS_MISSING"],
             default="PARTIAL",
         )
         x["v412_leading_candidate"] = (
@@ -6908,24 +6927,17 @@ class HighGrowthEPSEngine:
         for c in bool_cols:
             if c in x.columns:
                 x[c] = False
-        for c in ["selection_eps", "selection_score", "predicted_q2_eps", "predicted_q3_eps"]:
-            if c in x.columns:
-                x[c] = np.nan
-        if "selection_eps_source" in x.columns:
-            x["selection_eps_source"] = "BLOCKED_BY_ANNUAL_EPS_HISTORY_MISSING"
-        if "selection_eps_confidence" in x.columns:
-            x["selection_eps_confidence"] = "LOW_NO_VALID_EPS_BASIS"
+        # R5B：年度EPS不足時仍需保留報表欄位值（selection_eps/predicted_q2/q3/score），
+        # 只阻斷正式策略 Gate，不再把已由 EPS_TTM_PROXY 計算出的欄位清成 NaN。
+        # selection_eps_source / confidence / prediction_basis 保持前段模型判斷，避免 UI/Excel 再度整欄空白。
+        if "formal_block_reason" not in x.columns:
+            x["formal_block_reason"] = ""
+        x["formal_block_reason"] = reason
         if "v412_prediction_quality" in x.columns:
             x["v412_prediction_quality"] = np.where(
-                x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool),
-                "TTM_TRACKING_ONLY_NOT_LEADING",
+                x["v412_prediction_quality"].astype(str).eq("LEADING_FORECAST_BASE_EPS"),
                 "ANNUAL_EPS_MISSING_FORMAL_BLOCK",
-            )
-        if "prediction_basis" in x.columns:
-            x["prediction_basis"] = np.where(
-                x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool),
-                "EPS_TTM_PROXY_TRACKING_ONLY",
-                "NO_VALID_EPS_BASIS",
+                x["v412_prediction_quality"],
             )
         if "基本面狀態" in x.columns:
             ttm_mask = x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
@@ -7247,6 +7259,9 @@ class HighGrowthEPSEngine:
         ttm_count = int(len(ttm_only_df))
         fail_count = int(len(fail_df))
         selection_eps_nonnull = int(pd.to_numeric(df.get("selection_eps"), errors="coerce").gt(0).sum()) if df is not None and not df.empty and "selection_eps" in df.columns else 0
+        predicted_q2_nonnull = int(pd.to_numeric(df.get("predicted_q2_eps"), errors="coerce").gt(0).sum()) if df is not None and not df.empty and "predicted_q2_eps" in df.columns else 0
+        predicted_q3_nonnull = int(pd.to_numeric(df.get("predicted_q3_eps"), errors="coerce").gt(0).sum()) if df is not None and not df.empty and "predicted_q3_eps" in df.columns else 0
+        prediction_basis_counts = df.get("prediction_basis", pd.Series(dtype=object)).astype(str).value_counts().to_dict() if df is not None and not df.empty and "prediction_basis" in df.columns else {}
         selection_score_nonnull = int(pd.to_numeric(df.get("selection_score"), errors="coerce").notna().sum()) if df is not None and not df.empty and "selection_score" in df.columns else 0
         valuation_missing_count = int(df.get("valuation_data_missing", pd.Series(False, index=df.index)).fillna(False).astype(bool).sum()) if df is not None and not df.empty else 0
         pe_nonnull_count = int(pd.to_numeric(df.get("pe_ratio"), errors="coerce").notna().sum()) if df is not None and not df.empty and "pe_ratio" in df.columns else 0
@@ -7279,6 +7294,9 @@ class HighGrowthEPSEngine:
             {"項目": "報表語言模式", "內容": "Excel固定輸出中文(ZH)與英文(EN)各一份；UI固定中文"},
             {"項目": "主KPI_領先預測通過筆數", "內容": leading_count},
             {"項目": "主KPI_選股用EPS非空筆數", "內容": selection_eps_nonnull},
+            {"項目": "R5B_預測Q2 EPS非空筆數", "內容": predicted_q2_nonnull},
+            {"項目": "R5B_預測Q3 EPS非空筆數", "內容": predicted_q3_nonnull},
+            {"項目": "R5B_預測基準分布", "內容": json.dumps(prediction_basis_counts, ensure_ascii=False)},
             {"項目": "主KPI_選股分數非空筆數", "內容": selection_score_nonnull},
             {"項目": "正式EPS驗證區", "內容": "請見04_正式EPS驗證通過與04A_正式EPS驗證KPI；首頁主KPI不再顯示strict_pass=0。"},
             {"項目": "追蹤KPI_EPS_TTM代理追蹤筆數", "內容": ttm_count},
@@ -7297,6 +7315,9 @@ class HighGrowthEPSEngine:
             {"項目": "q1_vs_annual_ratio有效筆數", "內容": q1_ratio_valid},
             {"項目": "q1_vs_annual_ratio_raw非空筆數", "內容": q1_ratio_raw_nonnull},
             {"項目": "q1_ratio_quality分布", "內容": json.dumps(q1_quality_counts, ensure_ascii=False)},
+            {"項目": "R5B_predicted_q2_eps非空筆數", "內容": predicted_q2_nonnull},
+            {"項目": "R5B_predicted_q3_eps非空筆數", "內容": predicted_q3_nonnull},
+            {"項目": "R5B_prediction_basis分布", "內容": json.dumps(prediction_basis_counts, ensure_ascii=False)},
             {"項目": "annual_eps_history_2025筆數", "內容": annual_eps_rows},
         ])
         validation_kpi = pd.DataFrame([
@@ -7372,7 +7393,7 @@ class HighGrowthEPSEngine:
             generated_paths.append(Path(final_path))
         out_path = generated_paths[0] if generated_paths else out_path
         missing_months_text = missing_required_months or 'NONE'
-        quality_msg = f"[HIGH_GROWTH][QUALITY_GATE][R4F] annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜leading={leading_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}"
+        quality_msg = f"[HIGH_GROWTH][QUALITY_GATE][R5B] annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜leading={leading_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}"
         if (not formal_report_allowed) or missing_required_months or official_eps_only_count == 0:
             log_warning(quality_msg + "｜diagnostic_only_candidate=1")
         else:
@@ -7380,7 +7401,7 @@ class HighGrowthEPSEngine:
         if log_cb:
             if (not formal_report_allowed) or missing_required_months or official_eps_only_count == 0:
                 log_cb(f"[HIGH_GROWTH][QUALITY_GATE][WARNING] diagnostic_only_candidate=1｜annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜missing_months={missing_months_text}")
-            log_cb(f"[HIGH_GROWTH_V4.15_R4F] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
+            log_cb(f"[HIGH_GROWTH_V4.15_R5B] 報表輸出：中文={generated_paths[0] if len(generated_paths)>0 else ''}｜英文={generated_paths[1] if len(generated_paths)>1 else ''}｜model={high_growth_model_definition_text('ZH')}｜quarters={'+'.join(self.tracking_quarters)}｜leading={leading_count}｜selection_eps_nonnull={selection_eps_nonnull}｜predicted_q2_nonnull={predicted_q2_nonnull}｜predicted_q3_nonnull={predicted_q3_nonnull}｜prediction_basis_counts={prediction_basis_counts}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}")
         return Path(out_path)
 
     def get_latest_view(self, limit: int = 300) -> pd.DataFrame:
