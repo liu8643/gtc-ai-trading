@@ -2818,6 +2818,44 @@ class DBManager:
         )
         """)
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS annual_eps_history (
+            stock_id TEXT,
+            fiscal_year INTEGER,
+            fiscal_year_roc INTEGER,
+            quarter INTEGER,
+            eps_full_year REAL,
+            eps_cumulative REAL,
+            eps_quarter REAL,
+            eps_prev_cumulative REAL,
+            eps_calc_method TEXT,
+            source_type TEXT,
+            source_url TEXT,
+            source_file TEXT,
+            source_date TEXT,
+            update_time TEXT,
+            PRIMARY KEY(stock_id, fiscal_year)
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_annual_eps_history_stock_year ON annual_eps_history(stock_id, fiscal_year)")
+        # R5E_ANNUAL_EPS_INDEX05_IMPORT_FIX_20260606：年度EPS為正式Gate核心表，必須在DB基礎schema建立，不能只依賴EPSForecastEngine.ensure_schema。
+        for _col, _ddl in [
+            ("fiscal_year_roc", "fiscal_year_roc INTEGER"),
+            ("quarter", "quarter INTEGER"),
+            ("eps_cumulative", "eps_cumulative REAL"),
+            ("eps_quarter", "eps_quarter REAL"),
+            ("eps_prev_cumulative", "eps_prev_cumulative REAL"),
+            ("eps_calc_method", "eps_calc_method TEXT"),
+            ("source_type", "source_type TEXT"),
+            ("source_url", "source_url TEXT"),
+            ("source_file", "source_file TEXT"),
+            ("source_date", "source_date TEXT"),
+            ("update_time", "update_time TEXT"),
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE annual_eps_history ADD COLUMN {_ddl}")
+            except Exception:
+                pass
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS external_revenue_history (
             stock_id TEXT, revenue_month TEXT, revenue REAL, mom REAL, yoy REAL, cumulative_revenue REAL, cumulative_yoy REAL,
             source_url TEXT, source_date TEXT, update_time TEXT,
@@ -3203,7 +3241,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5d_formal_gate_leading_export_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5e_annual_eps_index05_import_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3394,7 +3432,7 @@ class DBManager:
                 return pd.DataFrame()
 
     def schema_check_df(self) -> pd.DataFrame:
-        required = ["stocks_master", "price_history", "ranking_result", "system_run_log", "external_data_log", "external_source_status", "market_snapshot", "external_revenue", "external_valuation", "financial_feature_daily", "external_dividend", "external_institutional", "external_margin", "external_event", "macro_module_score", "trade_plan", "quarterly_financial_history", "external_revenue_history", "external_institutional_history", "external_margin_history", "technical_feature_daily", "financial_quality_status", "prebreakout_signal_daily", "trade_plan_prebreakout"]
+        required = ["stocks_master", "price_history", "ranking_result", "system_run_log", "external_data_log", "external_source_status", "market_snapshot", "external_revenue", "external_valuation", "financial_feature_daily", "external_dividend", "external_institutional", "external_margin", "external_event", "macro_module_score", "trade_plan", "quarterly_financial_history", "annual_eps_history", "external_revenue_history", "external_institutional_history", "external_margin_history", "technical_feature_daily", "financial_quality_status", "prebreakout_signal_daily", "trade_plan_prebreakout"]
         rows = []
         with self.lock:
             existing = {r[0] for r in self.conn.cursor().execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -4973,10 +5011,17 @@ class EPSForecastEngine:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_annual_eps_history_stock_year ON annual_eps_history(stock_id, fiscal_year)")
                 # V4.8 EPS_CUMULATIVE_QUARTER_FIX：年度表保留原 eps_full_year，並新增累計/單季欄位作來源追溯。
                 for _col, _ddl in [
+                    ("fiscal_year_roc", "fiscal_year_roc INTEGER"),
+                    ("quarter", "quarter INTEGER"),
                     ("eps_cumulative", "eps_cumulative REAL"),
                     ("eps_quarter", "eps_quarter REAL"),
                     ("eps_prev_cumulative", "eps_prev_cumulative REAL"),
                     ("eps_calc_method", "eps_calc_method TEXT"),
+                    ("source_type", "source_type TEXT"),
+                    ("source_url", "source_url TEXT"),
+                    ("source_file", "source_file TEXT"),
+                    ("source_date", "source_date TEXT"),
+                    ("update_time", "update_time TEXT"),
                 ]:
                     try:
                         cur.execute(f"ALTER TABLE annual_eps_history ADD COLUMN {_ddl}")
@@ -5786,21 +5831,25 @@ class EPSForecastEngine:
         """
         quarters = normalize_high_growth_quarters(quarters)
         results = {}
-        results["base_annual_c05001"] = self.ensure_annual_eps_from_twse_c05001(self.base_year, force=force)
-        if str(results["base_annual_c05001"].get("status", "")).lower() in ("exists", "imported"):
-            results["base_annual"] = results["base_annual_c05001"]
+        results["base_annual_local_114q4"] = self.ensure_annual_eps_from_local_114q4_file(self.base_year, force=force)
+        if str(results["base_annual_local_114q4"].get("status", "")).lower() in ("exists", "imported"):
+            results["base_annual"] = results["base_annual_local_114q4"]
         else:
-            results["base_annual_openapi"] = self.ensure_annual_eps_from_twse_openapi(self.base_year, force=force)
-            if str(results["base_annual_openapi"].get("status", "")).lower() in ("exists", "imported"):
-                results["base_annual"] = results["base_annual_openapi"]
+            results["base_annual_c05001"] = self.ensure_annual_eps_from_twse_c05001(self.base_year, force=force)
+            if str(results["base_annual_c05001"].get("status", "")).lower() in ("exists", "imported"):
+                results["base_annual"] = results["base_annual_c05001"]
             else:
-                results["base_annual_mops"] = self.ensure_annual_eps_from_mops(self.base_year, force=force)
-                if str(results["base_annual_mops"].get("status", "")).lower() in ("exists", "imported"):
-                    results["base_annual"] = results["base_annual_mops"]
+                results["base_annual_openapi"] = self.ensure_annual_eps_from_twse_openapi(self.base_year, force=force)
+                if str(results["base_annual_openapi"].get("status", "")).lower() in ("exists", "imported"):
+                    results["base_annual"] = results["base_annual_openapi"]
                 else:
-                    # R5A/R5C：若 C05001/OpenAPI/MOPS 都失敗，最後由 quarterly_financial_history 內的 114Q4 累計EPS直接回填全年EPS。
-                    results["base_annual_qfh_backfill"] = self.ensure_annual_eps_from_quarterly_history(self.base_year, force=force)
-                    results["base_annual"] = results["base_annual_qfh_backfill"]
+                    results["base_annual_mops"] = self.ensure_annual_eps_from_mops(self.base_year, force=force)
+                    if str(results["base_annual_mops"].get("status", "")).lower() in ("exists", "imported"):
+                        results["base_annual"] = results["base_annual_mops"]
+                    else:
+                        # R5A/R5C：若 C05001/OpenAPI/MOPS 都失敗，最後由 quarterly_financial_history 內的 114Q4 累計EPS直接回填全年EPS。
+                        results["base_annual_qfh_backfill"] = self.ensure_annual_eps_from_quarterly_history(self.base_year, force=force)
+                        results["base_annual"] = results["base_annual_qfh_backfill"]
 
         for q in sorted({int(str(x).upper().replace("Q", "")) for x in quarters if str(x).upper().replace("Q", "").isdigit()}):
             # 去年同期：先 OpenAPI，失敗/無資料才 MOPS，供同比驗證，不作全年EPS替代。
@@ -5831,6 +5880,177 @@ class EPSForecastEngine:
         log_info(f"[HIGH_GROWTH][OFFICIAL_EPS] required official eps ensure results={results}")
         return results
 
+    def _annual_eps_local_candidate_paths(self, fiscal_year: int | None = None, quarter: str = "Q4") -> list[Path]:
+        """R5E：尋找使用者手動下載的 114Q4/2025Q4 EPS CSV/JSON。
+
+        目的：TWSE index05 的 ZIP 可能因頁面/路徑調整而下載失敗；若使用者已從官方頁面
+        手動下載 2025 Q4 或 114Q4 EPS 檔，程式應優先吃本機檔並寫入 annual_eps_history。
+        嚴格限制：若檔案內容有年度/季別欄位，必須為 fiscal_year=2025 / quarter=4；若沒有
+        年度/季別欄位，檔名必須含 114Q4 或 2025Q4，避免把 115Q1 誤寫成 2025 全年EPS。
+        """
+        fiscal_year = int(fiscal_year or self.base_year)
+        q = str(quarter or "Q4").upper().replace(" ", "")
+        roc_year = fiscal_year - 1911
+        roots: list[Path] = []
+        def _add(p):
+            try:
+                pp = Path(p).expanduser().resolve()
+                if pp.exists() and pp not in roots:
+                    roots.append(pp)
+            except Exception:
+                pass
+        for p in [
+            RUNTIME_DIR / "data" / "eps",
+            RUNTIME_DIR / "data" / "annual_eps",
+            RUNTIME_DIR / "data" / "twse_c05001",
+            RUNTIME_DIR / "data",
+            RUNTIME_DIR,
+            BASE_DIR / "data" / "eps",
+            BASE_DIR / "data" / "annual_eps",
+            BASE_DIR / "data" / "twse_c05001",
+            BASE_DIR / "data",
+            BASE_DIR,
+        ]:
+            _add(p)
+        try:
+            home = Path.home()
+            for sub in ["Downloads", "Desktop", "Documents", "OneDrive/Desktop", "OneDrive/Downloads"]:
+                _add(home / sub)
+        except Exception:
+            pass
+        patterns = [
+            f"{roc_year}Q4_eps.csv", f"{roc_year}Q4_eps.json", f"{roc_year}Q4*.csv", f"{roc_year}Q4*.json",
+            f"{fiscal_year}Q4_eps.csv", f"{fiscal_year}Q4_eps.json", f"{fiscal_year}Q4*.csv", f"{fiscal_year}Q4*.json",
+            f"*{roc_year}*Q4*EPS*.csv", f"*{roc_year}*Q4*EPS*.json",
+            f"*{fiscal_year}*Q4*EPS*.csv", f"*{fiscal_year}*Q4*EPS*.json",
+            f"annual_eps_history_{fiscal_year}.csv", f"annual_eps_history_{fiscal_year}.json",
+        ]
+        out, seen = [], set()
+        for root in roots:
+            for pat in patterns:
+                try:
+                    for p in root.glob(pat):
+                        try:
+                            if p.is_file():
+                                key = str(p.resolve())
+                                if key not in seen:
+                                    seen.add(key); out.append(p)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        if out:
+            log_info(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] candidates found={len(out)} first={out[0]}")
+        else:
+            log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] no local CSV/JSON candidate for fiscal_year={fiscal_year} roc={roc_year} {q}")
+        return out
+
+    def _parse_annual_eps_local_table(self, path: Path, fiscal_year: int | None = None, quarter: int = 4) -> pd.DataFrame:
+        """R5E：解析本機 114Q4/2025Q4 EPS CSV/JSON，輸出 annual_eps_history-ready DataFrame。"""
+        fiscal_year = int(fiscal_year or self.base_year)
+        q = int(quarter or 4)
+        roc_year = fiscal_year - 1911
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return pd.DataFrame()
+        ext = p.suffix.lower()
+        if ext == ".json":
+            data = json.loads(p.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("records") or data.get("result") or []
+            raw = pd.DataFrame(data)
+        elif ext == ".csv":
+            raw = safe_read_csv_auto(p)
+        else:
+            return pd.DataFrame()
+        if raw is None or raw.empty:
+            log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] raw empty file={p}")
+            return pd.DataFrame()
+        raw = raw.copy().fillna("")
+        def _find_col(candidates):
+            norm_map = {re.sub(r"[\s（）()：:]+", "", str(c)): c for c in raw.columns}
+            for cand in candidates:
+                key = re.sub(r"[\s（）()：:]+", "", str(cand))
+                if key in norm_map:
+                    return norm_map[key]
+            return None
+        code_col = _find_col(["公司代號", "公司代碼", "股票代號", "證券代號", "Code", "SecuritiesCompanyCode", "stock_id"])
+        name_col = _find_col(["公司名稱", "公司簡稱", "證券名稱", "股票名稱", "Name", "CompanyName", "stock_name"])
+        year_col = _find_col(["年度", "財報年度", "會計年度", "Year", "fiscal_year", "fiscal_year_roc"])
+        quarter_col = _find_col(["季別", "財報季別", "季度", "Quarter", "Season", "quarter"])
+        eps_col = _find_col(["基本每股盈餘（元）", "基本每股盈餘(元)", "基本每股盈餘", "EarningsPerShare", "BasicEarningsPerShare", "EPS", "eps", "eps_full_year"])
+        if code_col is None or eps_col is None:
+            raise RuntimeError(f"本機年度EPS檔欄位不足 file={p} code_col={code_col} eps_col={eps_col} columns={list(raw.columns)[:40]}")
+        filename_token_ok = bool(re.search(rf"({roc_year}|{fiscal_year}).*Q?4", p.name, flags=re.I))
+        if year_col is not None and quarter_col is not None:
+            year_token = raw[year_col].astype(str).str.extract(r"(\d{2,4})", expand=False)
+            year_num = pd.to_numeric(year_token, errors="coerce")
+            year_western = year_num.where(year_num >= 1000, year_num + 1911)
+            quarter_token = raw[quarter_col].astype(str).str.upper().str.extract(r"(?:Q|第)?0?([1-4])", expand=False)
+            q_num = pd.to_numeric(quarter_token, errors="coerce")
+            mask = year_western.eq(float(fiscal_year)) & q_num.eq(float(q))
+            log_info(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] file={p} target={fiscal_year}Q{q} matched={int(mask.sum())} rejected={int((~mask).sum())} year_counts={year_token.fillna('').astype(str).value_counts().head(5).to_dict()} quarter_counts={quarter_token.fillna('').astype(str).value_counts().head(5).to_dict()}")
+            raw = raw.loc[mask].copy()
+        elif not filename_token_ok:
+            raise RuntimeError(f"本機年度EPS檔缺年度/季別欄位，且檔名未標示114Q4/2025Q4，禁止寫入 annual_eps_history：{p.name}")
+        out = pd.DataFrame({
+            "stock_id": raw[code_col].astype(str).str.extract(r"(\d{4,5})", expand=False).fillna("").map(normalize_stock_id),
+            "stock_name": raw[name_col].astype(str).str.strip() if name_col in raw.columns else "",
+            "eps_full_year": raw[eps_col].map(self._to_numeric_eps),
+        })
+        out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
+        out = out.dropna(subset=["eps_full_year"])
+        if out.empty:
+            log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] parsed empty after EPS clean file={p}")
+            return pd.DataFrame()
+        out["fiscal_year"] = fiscal_year
+        out["fiscal_year_roc"] = roc_year
+        out["quarter"] = q
+        out["eps_cumulative"] = out["eps_full_year"]
+        out["eps_quarter"] = np.nan
+        out["eps_prev_cumulative"] = np.nan
+        out["eps_calc_method"] = "LOCAL_114Q4_Q4_CUMULATIVE_AS_ANNUAL_EPS"
+        out["source_type"] = "LOCAL_114Q4_EPS_FILE"
+        out["source_url"] = "LOCAL_FILE"
+        out["source_file"] = str(p)
+        out["source_date"] = f"{fiscal_year}Q{q}"
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        out = out.drop_duplicates(subset=["stock_id", "fiscal_year"], keep="last")
+        log_info(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] parsed file={p} rows={len(out)} sample={out[['stock_id','eps_full_year']].head(3).to_dict('records')}")
+        return out
+
+    def ensure_annual_eps_from_local_114q4_file(self, fiscal_year: int | None = None, force: bool = False) -> dict:
+        """R5E：本機 114Q4/2025Q4 CSV/JSON 優先補入 annual_eps_history。"""
+        fiscal_year = int(fiscal_year or self.base_year)
+        result = {"status": "skip", "rows": 0, "source_file": "", "source": "LOCAL_114Q4_EPS_FILE", "message": ""}
+        try:
+            with self.db.lock:
+                row = self.db.conn.cursor().execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,)).fetchone()
+                existing = int(row[0] or 0) if row else 0
+            if existing > 0 and not force:
+                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                return result
+            candidates = self._annual_eps_local_candidate_paths(fiscal_year, "Q4")
+            errors = []
+            for cand in candidates:
+                try:
+                    parsed = self._parse_annual_eps_local_table(cand, fiscal_year, quarter=4)
+                    rows = self._write_annual_eps_history(parsed, fiscal_year, source_label="LOCAL_114Q4_EPS_FILE")
+                    if rows > 0:
+                        result.update({"status": "imported", "rows": rows, "source_file": str(cand), "message": "已由本機114Q4/2025Q4 EPS檔補入年度EPS"})
+                        log_info(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] annual_eps_history imported rows={rows} file={cand}")
+                        return result
+                    errors.append(f"write_zero:{cand}")
+                except Exception as exc:
+                    errors.append(f"{cand}:{exc}")
+                    log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] candidate failed file={cand}｜{exc}")
+            result.update({"status": "missing_file" if not candidates else "parse_failed", "rows": 0, "message": "; ".join(errors[:5]) if errors else "找不到本機114Q4/2025Q4 EPS CSV/JSON"})
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] 補入annual_eps_history失敗：{exc}")
+            return result
+
     def _twse_c05001_candidate_paths(self, fiscal_year: int | None = None, quarter: str = "Q4") -> list[Path]:
         """尋找 TWSE C05001 財報 Excel/ZIP（V4.4 強化版）。
 
@@ -5840,6 +6060,7 @@ class EPSForecastEngine:
         """
         fiscal_year = int(fiscal_year or self.base_year)
         q = str(quarter or "Q4").upper().replace(" ", "")
+        roc_year = fiscal_year - 1911
         roots = []
         def _add_root(p):
             try:
@@ -5848,7 +6069,16 @@ class EPSForecastEngine:
                     roots.append(pp)
             except Exception:
                 pass
-        for p in [RUNTIME_DIR, RUNTIME_DIR / "data", RUNTIME_DIR / "reports", BASE_DIR, BASE_DIR / "data", BASE_DIR / "reports"]:
+        for p in [
+            RUNTIME_DIR / "data" / "twse_c05001" / f"{fiscal_year}{q}",
+            RUNTIME_DIR / "data" / "twse_c05001",
+            RUNTIME_DIR / "data" / "eps",
+            RUNTIME_DIR, RUNTIME_DIR / "data", RUNTIME_DIR / "reports",
+            BASE_DIR / "data" / "twse_c05001" / f"{fiscal_year}{q}",
+            BASE_DIR / "data" / "twse_c05001",
+            BASE_DIR / "data" / "eps",
+            BASE_DIR, BASE_DIR / "data", BASE_DIR / "reports",
+        ]:
             _add_root(p)
         try:
             p = Path(RUNTIME_DIR).resolve()
@@ -5867,6 +6097,8 @@ class EPSForecastEngine:
             f"{fiscal_year}{q}_C05001.zip", f"{fiscal_year}{q}_C05001.ZIP", f"{fiscal_year}{q}.zip", f"{fiscal_year}{q}.ZIP", f"*{fiscal_year}{q}*C05001*.zip", f"*{fiscal_year}{q}*C05001*.ZIP",
             f"{fiscal_year}{q}.xlsx", f"{fiscal_year}{q}.XLSX", f"{fiscal_year}{q}.xls", f"{fiscal_year}{q}.XLS", f"*{fiscal_year}{q}*C05001*.xlsx", f"*{fiscal_year}{q}*C05001*.XLSX", f"*{fiscal_year}{q}*C05001*.xls", f"*{fiscal_year}{q}*C05001*.XLS",
             f"*C05001*{fiscal_year}*{q}*.zip", f"*C05001*{fiscal_year}*{q}*.ZIP", f"*C05001*{fiscal_year}*{q}*.xlsx", f"*C05001*{fiscal_year}*{q}*.XLSX", f"*C05001*{fiscal_year}*{q}*.xls", f"*C05001*{fiscal_year}*{q}*.XLS",
+            f"{roc_year}{q}_C05001.zip", f"{roc_year}{q}.zip", f"*{roc_year}{q}*C05001*.zip", f"*C05001*{roc_year}*{q}*.zip",
+            f"{roc_year}{q}.xlsx", f"{roc_year}{q}.xls", f"*{roc_year}{q}*C05001*.xlsx", f"*{roc_year}{q}*C05001*.xls",
         ]
         out, seen = [], set()
         def _collect(root: Path, recursive: bool = False):
@@ -6077,6 +6309,12 @@ class EPSForecastEngine:
             log_warning(f"[HIGH_GROWTH][C05001] N欄年度EPS解析後為空：file={xlsx_path} sheet={sheet_name}")
             return pd.DataFrame()
         out["fiscal_year"] = fiscal_year
+        out["fiscal_year_roc"] = fiscal_year - 1911
+        out["quarter"] = 4
+        out["eps_cumulative"] = out["eps_full_year"]
+        out["eps_quarter"] = np.nan
+        out["eps_prev_cumulative"] = np.nan
+        out["eps_calc_method"] = "TWSE_C05001_Q4_CUMULATIVE_AS_ANNUAL_EPS"
         out["source_type"] = "TWSE_C05001_Q4_ANNUAL_EPS"
         out["source_url"] = "https://www.twse.com.tw/en/trading/statistics/index05.html"
         out["source_date"] = f"{fiscal_year}Q4"
@@ -6093,6 +6331,8 @@ class EPSForecastEngine:
         write = df.copy()
         write["stock_id"] = write["stock_id"].map(normalize_stock_id)
         write["fiscal_year"] = int(fiscal_year)
+        write["fiscal_year_roc"] = int(fiscal_year) - 1911
+        write["quarter"] = 4
         write["eps_full_year"] = pd.to_numeric(write.get("eps_full_year"), errors="coerce")
         # V4.8：年度EPS直接使用 Q4 累計EPS，不再由四季累計值相加。
         # eps_cumulative 保留與 eps_full_year 相同的官方累計年度值；eps_quarter 僅供來源若提供Q4單季時追溯，年度判斷不使用。
@@ -6113,6 +6353,7 @@ class EPSForecastEngine:
         for c, default in {
             "source_type": source_label or "OFFICIAL_ANNUAL_EPS",
             "source_url": "",
+            "source_file": "",
             "source_date": f"{int(fiscal_year)}Q4",
             "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }.items():
@@ -6120,15 +6361,17 @@ class EPSForecastEngine:
                 write[c] = default
         write = write.dropna(subset=["stock_id", "eps_full_year"])
         write = write[write["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)]
-        write = write[["stock_id", "fiscal_year", "eps_full_year", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"]].drop_duplicates(["stock_id", "fiscal_year"], keep="last")
+        write = write[["stock_id", "fiscal_year", "fiscal_year_roc", "quarter", "eps_full_year", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_file", "source_date", "update_time"]].drop_duplicates(["stock_id", "fiscal_year"], keep="last")
         if write.empty:
             return 0
         with self.db.lock:
             cur = self.db.conn.cursor()
             cur.executemany("""
-                INSERT INTO annual_eps_history(stock_id, fiscal_year, eps_full_year, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_date, update_time)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO annual_eps_history(stock_id, fiscal_year, fiscal_year_roc, quarter, eps_full_year, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_file, source_date, update_time)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                    fiscal_year_roc=excluded.fiscal_year_roc,
+                    quarter=excluded.quarter,
                     eps_full_year=excluded.eps_full_year,
                     eps_cumulative=excluded.eps_cumulative,
                     eps_quarter=excluded.eps_quarter,
@@ -6136,10 +6379,18 @@ class EPSForecastEngine:
                     eps_calc_method=excluded.eps_calc_method,
                     source_type=excluded.source_type,
                     source_url=excluded.source_url,
+                    source_file=excluded.source_file,
                     source_date=excluded.source_date,
                     update_time=excluded.update_time
             """, list(write.itertuples(index=False, name=None)))
             self.db.conn.commit()
+        try:
+            log_info(
+                f"[HIGH_GROWTH][ANNUAL_EPS_HISTORY] written_rows={len(write)} fiscal_year={int(fiscal_year)} "
+                f"sources={write['source_type'].astype(str).value_counts().to_dict()} sample={write[['stock_id','eps_full_year']].head(3).to_dict('records')}"
+            )
+        except Exception:
+            pass
         return int(len(write))
 
     def load_twse_openapi_annual_eps(self, fiscal_year: int | None = None, season: int = 4, timeout=(10, 30)) -> pd.DataFrame:
@@ -6244,36 +6495,72 @@ class EPSForecastEngine:
             return result
 
     def _download_twse_c05001_from_index(self, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
-        """V4.4：嘗試從 TWSE index05 頁面/靜態路徑下載 C05001 ZIP。"""
+        """R5E：從 TWSE index05 頁面解析 Q4 ZIP 真實連結，失敗才嘗試靜態候選。
+
+        修正點：舊版用猜測路徑下載，Log 曾出現 status=200 bytes=747，實際是錯誤/空HTML，
+        不是有效 ZIP。新版必須驗證 ZIP magic/zipfile 或有效 xls/xlsx 檔頭，避免把錯誤頁當檔案。
+        """
         fiscal_year = int(fiscal_year or self.base_year)
         q = str(quarter or "Q4").upper().replace(" ", "")
         from urllib.parse import urljoin
         out_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{fiscal_year}{q}"
         out_dir.mkdir(parents=True, exist_ok=True)
         index_urls = [
+            f"https://www.twse.com.tw/en/trading/statistics/index05.html?year={fiscal_year}",
             "https://www.twse.com.tw/en/trading/statistics/index05.html",
-            "https://www.twse.com.tw/en/statistics/index/05",
-            "https://wwwc.twse.com.tw/en/trading/statistics/index05.html",
-            "https://wwwc.twse.com.tw/en/statistics/index/05",
+            f"https://www.twse.com.tw/zh/trading/statistics/index05.html?year={fiscal_year}",
             "https://www.twse.com.tw/zh/trading/statistics/index05.html",
+            f"https://wwwc.twse.com.tw/en/trading/statistics/index05.html?year={fiscal_year}",
+            "https://wwwc.twse.com.tw/en/trading/statistics/index05.html",
+            f"https://wwwc.twse.com.tw/zh/trading/statistics/index05.html?year={fiscal_year}",
             "https://wwwc.twse.com.tw/zh/trading/statistics/index05.html",
         ]
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/en/trading/statistics/index05.html"}
-        candidate_urls = []
-        href_re = re.compile(r'(?:href|src)=["\']([^"\']+)["\']', re.I)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome Safari",
+            "Referer": "https://www.twse.com.tw/en/trading/statistics/index05.html",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/zip,*/*;q=0.8",
+        }
+        candidate_urls: list[str] = []
+        href_re = re.compile(r"(?:href|src)=['\"]([^'\"]+)['\"]", re.I)
+
+        def _add_candidate(u: str, reason: str = ""):
+            if not u:
+                return
+            low = u.lower()
+            if not low.endswith((".zip", ".xls", ".xlsx")):
+                return
+            # index05 真實連結可能不含 C05001，但通常位在 index05/statistics 路徑；放寬條件後再用檔案內容驗證。
+            score_hit = (
+                str(fiscal_year).lower() in low or
+                q.lower() in low or
+                "c05001" in low or
+                "index05" in low or
+                "financial" in low or
+                "statistics" in low
+            )
+            if score_hit and u not in candidate_urls:
+                candidate_urls.append(u)
+                log_info(f"[HIGH_GROWTH][C05001][INDEX05_LINK] add reason={reason} url={u}")
+
         for base_url in index_urls:
             try:
                 resp = requests.get(base_url, timeout=(10, 30), headers=headers)
+                log_info(f"[HIGH_GROWTH][C05001][INDEX05_PAGE] url={base_url} status={resp.status_code} bytes={len(resp.content) if resp.content else 0}")
                 if resp.status_code != 200 or not resp.text:
                     continue
-                for m in href_re.finditer(resp.text):
-                    u = urljoin(base_url, m.group(1))
-                    low = u.lower()
-                    if (str(fiscal_year).lower() in low and q.lower() in low and ("c05001" in low or "index05" in low) and low.endswith((".zip", ".xls", ".xlsx"))):
-                        candidate_urls.append(u)
+                html = resp.text
+                for m in href_re.finditer(html):
+                    _add_candidate(urljoin(base_url, m.group(1)), reason="href")
+                # 有些新頁面把下載路徑塞在 JS 字串，不一定是 href。
+                for m in re.finditer(r"['\"]([^'\"]+\.(?:zip|xls|xlsx)(?:\?[^'\"]*)?)['\"]", html, flags=re.I):
+                    _add_candidate(urljoin(base_url, m.group(1)), reason="js_string")
             except Exception as exc:
                 log_warning(f"[HIGH_GROWTH][C05001] index scan fail {base_url}｜{exc}")
-        static_names = [f"{fiscal_year}{q}_C05001.zip", f"{fiscal_year}{q}.zip", f"{fiscal_year}{q}.xls", f"{fiscal_year}{q}.xlsx"]
+
+        static_names = [
+            f"{fiscal_year}{q}_C05001.zip", f"{fiscal_year}{q}.zip", f"{fiscal_year}{q}.xls", f"{fiscal_year}{q}.xlsx",
+            f"C05001_{fiscal_year}{q}.zip", f"C05001_{fiscal_year}{q}.xls", f"C05001_{fiscal_year}{q}.xlsx",
+        ]
         static_bases = [
             "https://www.twse.com.tw/staticFiles/en/trading/statistics/financialInfo/",
             "https://www.twse.com.tw/staticFiles/zh/trading/statistics/financialInfo/",
@@ -6283,7 +6570,28 @@ class EPSForecastEngine:
         ]
         for b in static_bases:
             for n in static_names:
-                candidate_urls.append(urljoin(b, n))
+                _add_candidate(urljoin(b, n), reason="static_guess")
+
+        def _valid_download(content: bytes, url: str, ctype: str) -> tuple[bool, str]:
+            if not content or len(content) < 128:
+                return False, "too_small"
+            head = content[:512].lower()
+            if b"<html" in head or b"<!doctype" in head or b"for security reasons" in head or b"page can not be accessed" in head:
+                return False, "html_or_security_page"
+            low = url.lower()
+            if content[:2] == b"PK" or "zip" in ctype.lower() or low.endswith(".zip"):
+                try:
+                    with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
+                        names = zf.namelist()
+                    has_excel = any(str(n).lower().endswith((".xls", ".xlsx")) for n in names)
+                    return (has_excel, "zip_has_excel" if has_excel else f"zip_no_excel names={names[:5]}")
+                except Exception as exc:
+                    return False, f"zip_invalid:{exc}"
+            # xls Compound File / xlsx zip 已涵蓋；部分舊 xls 以 D0 CF 開頭。
+            if content.startswith(b"\xd0\xcf\x11\xe0") or low.endswith((".xls", ".xlsx")):
+                return True, "excel_binary_or_named_excel"
+            return False, "unknown_file_signature"
+
         seen = set()
         for url in candidate_urls:
             if url in seen:
@@ -6292,14 +6600,18 @@ class EPSForecastEngine:
             try:
                 resp = requests.get(url, timeout=(10, 60), headers=headers)
                 ctype = resp.headers.get("content-type", "")
-                if resp.status_code == 200 and resp.content and len(resp.content) > 1024 and not resp.content[:200].lower().startswith(b"<!doctype html"):
-                    suffix = ".zip" if "zip" in ctype.lower() or url.lower().endswith(".zip") else (".xlsx" if url.lower().endswith(".xlsx") else ".xls")
-                    target = out_dir / (Path(url).name or f"{fiscal_year}{q}_C05001{suffix}")
-                    target.write_bytes(resp.content)
-                    log_info(f"[HIGH_GROWTH][C05001] online download success url={url} file={target} bytes={len(resp.content)}")
+                content = resp.content or b""
+                ok, reason = _valid_download(content, url, ctype) if resp.status_code == 200 else (False, f"http_{resp.status_code}")
+                if ok:
+                    suffix = ".zip" if content[:2] == b"PK" or "zip" in ctype.lower() or url.lower().endswith(".zip") else (".xlsx" if url.lower().endswith(".xlsx") else ".xls")
+                    name = Path(url.split("?", 1)[0]).name or f"{fiscal_year}{q}_C05001{suffix}"
+                    if not name.lower().endswith((".zip", ".xls", ".xlsx")):
+                        name = f"{fiscal_year}{q}_C05001{suffix}"
+                    target = out_dir / name
+                    target.write_bytes(content)
+                    log_info(f"[HIGH_GROWTH][C05001] online download success url={url} file={target} bytes={len(content)} reason={reason}")
                     return target
-                else:
-                    log_warning(f"[HIGH_GROWTH][C05001] online candidate unavailable status={resp.status_code} bytes={len(resp.content) if resp.content else 0} url={url}")
+                log_warning(f"[HIGH_GROWTH][C05001] online candidate rejected status={resp.status_code} bytes={len(content)} reason={reason} url={url}")
             except Exception as exc:
                 log_warning(f"[HIGH_GROWTH][C05001] online download fail url={url}｜{exc}")
         return None
@@ -6358,15 +6670,17 @@ class EPSForecastEngine:
         注意：EPS_TTM 不在此函式使用，避免把 TTM 誤當年度 EPS。
         V4.3：若 DB 尚未有 annual_eps_history，會先嘗試使用本機 TWSE C05001 2025Q4 Excel/ZIP 補入。
         """
-        # V4.7：年度EPS來源順序改為「本地 TWSE C05001 Q4」主流程，OpenAPI備援，MOPS最後備援。
-        c05001_result = self.ensure_annual_eps_from_twse_c05001(self.base_year, force=False)
-        if str(c05001_result.get("status", "")).lower() not in ("exists", "imported"):
-            openapi_result = self.ensure_annual_eps_from_twse_openapi(self.base_year, force=False)
-            if str(openapi_result.get("status", "")).lower() not in ("exists", "imported"):
-                mops_result = self.ensure_annual_eps_from_mops(self.base_year, force=False)
-                if str(mops_result.get("status", "")).lower() not in ("exists", "imported"):
-                    # R4F：最後官方/準官方 DB 回補；只使用 Q4 累計 EPS，不用 TTM 代理年度 EPS。
-                    self.ensure_annual_eps_from_quarterly_history(self.base_year, force=False)
+        # R5E：年度EPS來源順序改為「本機114Q4/2025Q4 CSV/JSON」→「TWSE index05 C05001 Q4 ZIP/XLS」→OpenAPI→MOPS→QFH回補。
+        local_result = self.ensure_annual_eps_from_local_114q4_file(self.base_year, force=False)
+        if str(local_result.get("status", "")).lower() not in ("exists", "imported"):
+            c05001_result = self.ensure_annual_eps_from_twse_c05001(self.base_year, force=False)
+            if str(c05001_result.get("status", "")).lower() not in ("exists", "imported"):
+                openapi_result = self.ensure_annual_eps_from_twse_openapi(self.base_year, force=False)
+                if str(openapi_result.get("status", "")).lower() not in ("exists", "imported"):
+                    mops_result = self.ensure_annual_eps_from_mops(self.base_year, force=False)
+                    if str(mops_result.get("status", "")).lower() not in ("exists", "imported"):
+                        # R4F：最後官方/準官方 DB 回補；只使用 Q4 累計 EPS，不用 TTM 代理年度 EPS。
+                        self.ensure_annual_eps_from_quarterly_history(self.base_year, force=False)
         parts = []
         if self._table_exists("annual_eps_history"):
             # V4.15-R2：相容舊DB annual_eps_history 尚未有 source_type 欄位的情境。
