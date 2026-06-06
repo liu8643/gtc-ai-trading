@@ -3203,7 +3203,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5c_formal_gate_scope_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5d_formal_gate_leading_export_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -6939,16 +6939,48 @@ class HighGrowthEPSEngine:
         annual_basis_mask = pd.to_numeric(x.get("base_annual_eps", pd.Series(np.nan, index=x.index)), errors="coerce").notna()
         actual_q1_mask = pd.to_numeric(x.get("actual_q1_eps", pd.Series(np.nan, index=x.index)), errors="coerce").notna()
         official_mask_current = x.get("official_eps_verified_pass", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+        # R5D FIX：02_領先預測通過黑馬池不得只看 selection_gate。
+        # 實際 UI 有值的原因是 selection_eps / predicted_q2 / predicted_q3 已由 EPS_TTM/current_eps_ttm fallback 算出。
+        # 因此 02 候選池應保留 forecast/proxy/value-candidate，而不是被 annual/formal gate 或 selection_gate=0 清空。
+        prediction_value_mask = (
+            pd.to_numeric(x.get("selection_eps", pd.Series(np.nan, index=x.index)), errors="coerce").gt(0)
+            | pd.to_numeric(x.get("predicted_q2_eps", pd.Series(np.nan, index=x.index)), errors="coerce").gt(0)
+            | pd.to_numeric(x.get("predicted_q3_eps", pd.Series(np.nan, index=x.index)), errors="coerce").gt(0)
+        )
+        proxy_mask_current = (
+            x.get("proxy_pass", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            | x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            | ttm_mask
+        )
         leading_mask_current = (
             x.get("selection_gate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
             | x.get("leading_pass", pd.Series(False, index=x.index)).fillna(False).astype(bool)
             | x.get("forecast_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            | proxy_mask_current
+            | prediction_value_mask
         )
 
         x["eps_basis_type"] = np.select(
-            [ttm_mask, annual_basis_mask, actual_q1_mask],
-            ["EPS_TTM_PROXY", "ANNUAL_EPS", "ACTUAL_Q1_EPS"],
+            [ttm_mask, annual_basis_mask, actual_q1_mask, prediction_value_mask],
+            ["EPS_TTM_PROXY", "ANNUAL_EPS", "ACTUAL_Q1_EPS", "PREDICTION_VALUE"],
             default="DATA_INSUFFICIENT",
+        )
+        x["ui_source_type"] = np.select(
+            [
+                official_mask_current & bool(allowed),
+                x.get("ttm_proxy_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool) | ttm_mask,
+                x.get("forecast_candidate", pd.Series(False, index=x.index)).fillna(False).astype(bool),
+                prediction_value_mask,
+                leading_mask_current,
+            ],
+            [
+                "OFFICIAL_EPS_VERIFIED",
+                "EPS_TTM_PROXY",
+                "LEADING_FORECAST",
+                "PREDICTION_VALUE_CANDIDATE",
+                "LEADING_OR_PROXY_CANDIDATE",
+            ],
+            default="DIAGNOSTIC_ONLY",
         )
         x["annual_eps_ready"] = "YES" if bool(allowed) else "NO"
         x["formal_eps_ready"] = np.where(official_mask_current & bool(allowed), "YES", "NO")
@@ -7200,7 +7232,7 @@ class HighGrowthEPSEngine:
         x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
         months = self.revenue_engine.required_months(self.tracking_quarters)
-        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "eps_basis_type", "formal_eps_ready", "annual_eps_ready", "report_status", "formal_block_reason", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "legacy_strict_pass", "selection_gate", "selection_score", "valuation_data_missing", "effective_valuation_score", "effective_valuation_weight", "outlier_risk_flag", "outlier_penalty", "selection_eps", "selection_eps_source", "selection_eps_confidence", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "eps_surprise_pct", "prediction_basis", "v412_model_definition", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
+        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "eps_basis_type", "ui_source_type", "formal_eps_ready", "annual_eps_ready", "report_status", "formal_block_reason", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "legacy_strict_pass", "selection_gate", "selection_score", "valuation_data_missing", "effective_valuation_score", "effective_valuation_weight", "outlier_risk_flag", "outlier_penalty", "selection_eps", "selection_eps_source", "selection_eps_confidence", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "eps_surprise_pct", "prediction_basis", "v412_model_definition", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
         for m in months:
             order_cols += [f"rev_{m}", f"yoy_{m}"]
         order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_partial_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "legacy_strict_pass", "strict_pass", "v412_pass", "leading_pass", "legacy_forecast_eps_gate", "forecast_eps_gate", "forecast_candidate", "ttm_proxy_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
@@ -7304,7 +7336,24 @@ class HighGrowthEPSEngine:
             out_path = Path(output_dir) / out_path.name
         # V4.15-R1：報表摘要語意閉環。strict_pass 不再作為主選股 KPI。
         official_df = df[df.get("official_eps_verified_pass", df.get("strict_pass", False)).fillna(False).astype(bool)].copy() if not df.empty else pd.DataFrame()
-        leading_df = df[df.get("selection_gate", df.get("leading_pass", False)).fillna(False).astype(bool)].copy() if not df.empty else pd.DataFrame()
+        # R5D FIX：02_領先預測通過黑馬池改用「領先/代理/有預測值」候選口徑。
+        # 這裡是解決 UI 有值但 Engine 02 空白/BLOCKED 的核心修改點。
+        # formal_report_allowed 僅能限制 official_df/04，不能限制 leading_df/02。
+        if not df.empty:
+            leading_candidate_mask = (
+                df.get("selection_gate", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+                | df.get("leading_pass", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+                | df.get("forecast_candidate", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+                | df.get("proxy_pass", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+                | df.get("ttm_proxy_candidate", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+                | pd.to_numeric(df.get("selection_eps", pd.Series(np.nan, index=df.index)), errors="coerce").gt(0)
+                | pd.to_numeric(df.get("predicted_q2_eps", pd.Series(np.nan, index=df.index)), errors="coerce").gt(0)
+                | pd.to_numeric(df.get("predicted_q3_eps", pd.Series(np.nan, index=df.index)), errors="coerce").gt(0)
+            )
+            leading_df = df[leading_candidate_mask].copy()
+        else:
+            leading_candidate_mask = pd.Series(dtype=bool)
+            leading_df = pd.DataFrame()
         ttm_only_df = df[df["基本面狀態"].eq("EPS_TTM追蹤候選")].copy() if not df.empty else pd.DataFrame()
         fail_df = df[df["基本面狀態"].eq("未通過/資料不足")].copy() if not df.empty else pd.DataFrame()
         official_count = int(len(official_df))
@@ -7334,10 +7383,14 @@ class HighGrowthEPSEngine:
         q1_quality_counts = df.get("q1_ratio_quality", pd.Series(dtype=str)).astype(str).value_counts().to_dict() if df is not None and not df.empty and "q1_ratio_quality" in df.columns else {}
         formal_report_allowed, annual_eps_rows = self._formal_report_allowed()
         if not formal_report_allowed:
-            # R5C：年度 EPS 斷鏈時，只阻斷 04_正式EPS驗證通過。
-            # 02_領先預測通過黑馬池保留，因其設計目的就是使用 EPS_TTM/current_eps_ttm fallback 做早市場預測。
+            # R5D：年度 EPS 斷鏈時，只阻斷 04_正式EPS驗證通過。
+            # 02_領先預測通過黑馬池保留 forecast/proxy/value-candidate，避免 UI 有值但 Engine 02 空白。
             official_df = pd.DataFrame([{"狀態": "BLOCKED_BY_ANNUAL_EPS_MISSING", "說明": "annual_eps_history_2025 筆數不足，04正式EPS驗證池不得產出；02領先預測候選仍保留但標示為非正式。"}])
             official_count = official_eps_only_count = official_eps_revenue_count = legacy_strict_count = 0
+            try:
+                log_info(f"[HIGH_GROWTH][R5D_GATE_SCOPE] formal_allowed=0 official_df=BLOCKED leading_df_retained_rows={len(leading_df)} selection_eps_nonnull={selection_eps_nonnull} predicted_q2_nonnull={predicted_q2_nonnull} predicted_q3_nonnull={predicted_q3_nonnull}")
+            except Exception:
+                pass
         summary = pd.DataFrame([
             {"項目": "V4架構", "內容": "RevenueAccelerationEngine → EPSForecastEngine → HighGrowthEPSEngine"},
             {"項目": "V4.15-R1修正主旨", "內容": "報表摘要不能再用舊 strict_pass=0 當主結果；主KPI改為領先預測通過、選股用EPS與選股分數。"},
@@ -7379,7 +7432,7 @@ class HighGrowthEPSEngine:
         validation_kpi = pd.DataFrame([
             {"validation_metric": "formal_report_allowed", "validation_value": int(bool(formal_report_allowed)), "validation_note": "年度EPS基準未建立時只阻斷04正式EPS驗證池，不阻斷02領先預測池。"},
             {"validation_metric": "formal_block_scope_correct", "validation_value": int((not formal_report_allowed) and (official_eps_only_count == 0)), "validation_note": "R5C：formal Gate 只限制 official/strict 欄位；selection_gate/leading_pass/forecast_candidate 不被清空。"},
-            {"validation_metric": "leading_pool_retained_when_formal_blocked", "validation_value": int((not formal_report_allowed) and (leading_count >= 0)), "validation_note": "02領先預測通過黑馬池保留；若為0應由 selection_gate 條件決定，而非 formal Gate 清空。"},
+            {"validation_metric": "leading_pool_retained_when_formal_blocked", "validation_value": int((not formal_report_allowed) and (leading_count > 0 or selection_eps_nonnull == 0)), "validation_note": "02領先預測通過黑馬池保留 forecast/proxy/value-candidate；若 selection_eps/predicted 有值，02 不得因 annual/formal Gate 清空。"},
             {"validation_metric": "annual_eps_history_rows", "validation_value": annual_eps_rows, "validation_note": "2025全年EPS基準筆數；必須>0才可做04正式EPS驗證。"},
             {"validation_metric": "official_eps_only_pass", "validation_value": official_eps_only_count, "validation_note": "只代表正式EPS本身通過，不要求三個月營收完整。"},
             {"validation_metric": "official_eps_revenue_pass", "validation_value": official_eps_revenue_count, "validation_note": "正式EPS + 三月營收完整/YoY/階梯雙驗證通過。"},
@@ -7396,7 +7449,8 @@ class HighGrowthEPSEngine:
             {"序號": 6, "模組": "Official EPS Validation", "新增/修改": "修改", "程式位置": "HighGrowthEPSEngine.build_screening_df", "驗收點": "正式EPS本身通過與正式EPS+營收雙驗證拆分，不再只剩單一0"},
             {"序號": 7, "模組": "Outlier/Valuation", "新增/修改": "修改", "程式位置": "EPSForecastEngine.build_eps_features", "驗收點": "估值缺漏降權、YoY極端值有風險旗標與扣分欄"},
             {"序號": 8, "模組": "Run Evidence", "新增/修改": "新增", "程式位置": "HighGrowthEPSEngine._build_same_run_evidence", "驗收點": "Excel含同一run DB/log/Universe與缺月資訊"},
-            {"序號": 9, "模組": "No Touch Guard", "新增/修改": "查核", "程式位置": "分類/Universe/Bootstrap/主UI", "驗收點": "不得修改分類、Universe、Bootstrap、主UI架構"},
+            {"序號": 9, "模組": "R5D Formal Gate Scope", "新增/修改": "修改", "程式位置": "HighGrowthEPSEngine.export_report / _apply_formal_block_if_needed", "驗收點": "formal_report_allowed 只阻斷04 official_df；02 leading_df 保留 forecast/proxy/value-candidate，避免 UI 有值但 Engine 02 空白"},
+            {"序號": 10, "模組": "No Touch Guard", "新增/修改": "查核", "程式位置": "分類/Universe/Bootstrap/主UI", "驗收點": "不得修改分類、Universe、Bootstrap、主UI架構"},
         ])
         if leading_df.empty:
             leading_df = pd.DataFrame([{"狀態": "NO_LEADING_FORECAST_PASS", "說明": "目前沒有領先預測通過候選。"}])
@@ -7452,7 +7506,7 @@ class HighGrowthEPSEngine:
             generated_paths.append(Path(final_path))
         out_path = generated_paths[0] if generated_paths else out_path
         missing_months_text = missing_required_months or 'NONE'
-        quality_msg = f"[HIGH_GROWTH][QUALITY_GATE][R5B] annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜leading={leading_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}"
+        quality_msg = f"[HIGH_GROWTH][QUALITY_GATE][R5D] annual_eps_rows={annual_eps_rows}｜official_eps_only={official_eps_only_count}｜official_eps_revenue={official_eps_revenue_count}｜leading={leading_count}｜ttm_proxy={ttm_count}｜missing_months={missing_months_text}｜fail={fail_count}"
         if (not formal_report_allowed) or missing_required_months or official_eps_only_count == 0:
             log_warning(quality_msg + "｜diagnostic_only_candidate=1")
         else:
