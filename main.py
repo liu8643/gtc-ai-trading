@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5I_EXTERNAL_DATA_TRACE_ENGINE"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5J_EXTERNAL_DATA_HEALTH_REPORT"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -258,6 +258,34 @@ AI_PORTFOLIO_TRADE_COLUMNS = ["買進下緣", "買進上緣", "停損", "目標1
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH = LOG_DIR / f"gtc_ai_trading_{datetime.now().strftime('%Y%m%d')}.log"
+
+# R5J_EXTERNAL_DATA_HEALTH_REPORT_20260607：
+# 獨立外部資料 Trace 文字 log，不只寫 SQLite，方便現場不用開 DB 也能查外部來源異常。
+EXTERNAL_TRACE_TEXT_LOG_PATH = LOG_DIR / f"external_data_trace_{datetime.now().strftime('%Y%m%d')}.log"
+
+def append_external_trace_text_log(row: dict):
+    """R5J：將 ExternalDataTraceEngine.event 同步落文字檔。
+    不取代 SQLite，只提供現場快速檢視：
+    logs/external_data_trace_YYYYMMDD.log
+    """
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        line = (
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"run_id={row.get('run_id','')} | module={row.get('module','')} | "
+            f"source={row.get('source_name','')} | stage={row.get('stage','')} | "
+            f"status={row.get('status','')} | target={row.get('target_table','')} | "
+            f"http={row.get('http_status','')} | bytes={row.get('bytes',0)} | "
+            f"downloaded={row.get('rows_downloaded',0)} | parsed={row.get('rows_parsed',0)} | "
+            f"written={row.get('rows_written',0)} | verify={row.get('verify_count',0)} | "
+            f"fallback={row.get('fallback_used','')} | reason={row.get('fail_reason_code','')} | "
+            f"detail={str(row.get('fail_reason_detail','')).replace(chr(10), ' ')[:500]} | "
+            f"url={row.get('request_url','')} | file={row.get('source_file','')}\n"
+        )
+        with open(EXTERNAL_TRACE_TEXT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 def configure_app_logger() -> logging.Logger:
     logger = logging.getLogger("gtc_ai_trading")
@@ -2159,6 +2187,11 @@ CHART_DIR.mkdir(exist_ok=True)
 PREBREAKOUT_PATCH_VERSION = "PREBREAKOUT_FULL_RULE_ENGINE_V8_UI_SELECT_SYNC_20260524"
 PREBREAKOUT_REPORT_DIR = RUNTIME_DIR / "reports"
 PREBREAKOUT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+# R5J：全系統外部資料健康報表固定輸出位置，獨立於 High Growth EPS 報表。
+EXTERNAL_HEALTH_REPORT_DIR = RUNTIME_DIR / "reports"
+EXTERNAL_HEALTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+STRICT_EXTERNAL_HEALTH_GATE = os.getenv("GTC_STRICT_EXTERNAL_HEALTH_GATE", "0").strip() == "1"
 PREBREAKOUT_MIN_PRICE_HISTORY_DAYS = 250
 PREBREAKOUT_BUY_SCORE = 85.0
 PREBREAKOUT_WATCH_SCORE = 70.0
@@ -2841,6 +2874,57 @@ class DBManager:
             update_time TEXT
         )
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS system_external_source_registry_v2 (
+            module TEXT,
+            source_key TEXT,
+            source_name TEXT,
+            source_type TEXT,
+            priority_order INTEGER DEFAULT 0,
+            official_url TEXT,
+            request_template TEXT,
+            target_table TEXT,
+            expected_format TEXT,
+            min_rows INTEGER DEFAULT 0,
+            min_bytes INTEGER DEFAULT 0,
+            mandatory_level TEXT,
+            fallback_allowed INTEGER DEFAULT 1,
+            enabled INTEGER DEFAULT 1,
+            parser TEXT,
+            source_group TEXT,
+            note TEXT,
+            update_time TEXT,
+            PRIMARY KEY(module, source_key)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS external_health_run_history (
+            run_id TEXT,
+            report_time TEXT,
+            module TEXT,
+            final_status TEXT,
+            target_table TEXT,
+            verify_count INTEGER DEFAULT 0,
+            fail_reason_code TEXT,
+            fail_reason_detail TEXT,
+            action_required TEXT,
+            report_path TEXT,
+            PRIMARY KEY(run_id, module)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS external_data_quality_baseline (
+            table_name TEXT,
+            metric_name TEXT,
+            baseline_date TEXT,
+            baseline_value REAL,
+            last_value REAL,
+            delta_pct REAL,
+            status TEXT,
+            update_time TEXT,
+            PRIMARY KEY(table_name, metric_name)
+        )
+        """)
         fail_rows = [
             ("HTTP_FAIL", "P0/P1", "檢查網址、HTTP狀態、是否被阻擋；啟用下一層備援。"),
             ("BYTES_TOO_SMALL", "P0", "下載內容過小，常見為錯誤頁或空回應；不得寫入DB。"),
@@ -2862,18 +2946,28 @@ class DBManager:
                 suggested_fix=excluded.suggested_fix,
                 update_time=excluded.update_time
         """, [(code, sev, fix, datetime.now().strftime("%Y-%m-%d %H:%M:%S")) for code, sev, fix in fail_rows])
-        registry_rows = [
-            ("AnnualEPS", "Cache", 1, "annual_eps_history", 0, 1000, "csv/json", "P0", 1, "年度EPS快取"),
-            ("AnnualEPS", "LocalFile", 2, "annual_eps_history", 0, 1000, "csv/json/xls/xlsx", "P0", 1, "本機114Q4/2025Q4檔"),
-            ("AnnualEPS", "OfficialOpenAPI_Q4", 3, "annual_eps_history", 5000, 1000, "json", "P0", 1, "Official EPS OpenAPI Q4"),
-            ("AnnualEPS", "Index05Selenium", 4, "annual_eps_history", 5000, 1000, "zip/xls/xlsx", "P0", 1, "TWSE index05 Selenium"),
-            ("AnnualEPS", "MOPS", 5, "annual_eps_history", 5000, 1000, "html", "P0", 1, "MOPS t163sb04"),
-            ("QuarterlyEPS", "OfficialEPSOpenAPI", 1, "quarterly_financial_history", 5000, 1000, "json", "P0", 1, "季度EPS OpenAPI"),
-            ("Revenue", "TWSE_TPEX_MonthlyRevenue", 1, "external_revenue_history", 5000, 1000, "json/csv", "P0", 1, "月營收資料"),
-            ("Classification", "LocalCSV_OpenAPI", 1, "stocks_master", 0, 2000, "csv/json", "P1", 1, "官方分類"),
-            ("MarketSnapshot", "TWSE_MI_INDEX", 1, "market_snapshot", 3000, 1000, "json/csv", "P1", 1, "大盤/個股市場快照"),
-            ("PriceHistory", "TWSE_TPEX_Yahoo", 1, "price_history", 3000, 1000, "json/csv", "P1", 1, "歷史價格"),
-        ]
+        # R5J：registry_rows 不再只列 EPS/Revenue/Classification 十項。
+        # 由 get_r5j_registry_rows() 合併：
+        # 1) ExternalSourceConfig.SOURCES（market/institutional/margin/macro/revenue/valuation/event）
+        # 2) R5I AnnualEPS/QuarterlyEPS/Classification/PriceHistory
+        # 3) 主程式掃描與規劃 Excel 補列的 Universe/DailyPrice/MOPS/Goodinfo/Yahoo/cache。
+        try:
+            registry_rows = get_r5j_registry_rows()
+        except Exception as exc:
+            log_warning(f"[R5J][REGISTRY] fallback to R5I registry_rows｜{exc}")
+            registry_rows = [
+                ("AnnualEPS", "Cache", 1, "annual_eps_history", 0, 1000, "csv/json", "P0", 1, "年度EPS快取"),
+                ("AnnualEPS", "LocalFile", 2, "annual_eps_history", 0, 1000, "csv/json/xls/xlsx", "P0", 1, "本機114Q4/2025Q4檔"),
+                ("AnnualEPS", "OfficialOpenAPI_Q4", 3, "annual_eps_history", 5000, 1000, "json", "P0", 1, "Official EPS OpenAPI Q4"),
+                ("AnnualEPS", "Index05Selenium", 4, "annual_eps_history", 5000, 1000, "zip/xls/xlsx", "P0", 1, "TWSE index05 Selenium"),
+                ("AnnualEPS", "MOPS", 5, "annual_eps_history", 5000, 1000, "html", "P0", 1, "MOPS t163sb04"),
+                ("QuarterlyEPS", "OfficialEPSOpenAPI", 1, "quarterly_financial_history", 5000, 1000, "json", "P0", 1, "季度EPS OpenAPI"),
+                ("Revenue", "TWSE_TPEX_MonthlyRevenue", 1, "external_revenue_history", 5000, 1000, "json/csv", "P0", 1, "月營收資料"),
+                ("Classification", "LocalCSV_OpenAPI", 1, "stocks_master", 0, 2000, "csv/json", "P1", 1, "官方分類"),
+                ("MarketSnapshot", "TWSE_MI_INDEX", 1, "market_snapshot", 3000, 1000, "json/csv", "P1", 1, "大盤/個股市場快照"),
+                ("PriceHistory", "TWSE_TPEX_Yahoo", 1, "price_history", 3000, 1000, "json/csv", "P1", 1, "歷史價格"),
+            ]
+
         cur.executemany("""
             INSERT INTO external_data_source_registry(module, source_name, priority_order, target_table, min_bytes, min_rows, expected_type, severity, enabled, note, update_time)
             VALUES(?,?,?,?,?,?,?,?,?,?,?)
@@ -2888,6 +2982,36 @@ class DBManager:
                 note=excluded.note,
                 update_time=excluded.update_time
         """, [(m, s, p, t, mb, mr, et, sev, en, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S")) for m, s, p, t, mb, mr, et, sev, en, note in registry_rows])
+        try:
+            r5j_rows = get_r5j_registry_v2_rows()
+            cur.executemany("""
+                INSERT INTO system_external_source_registry_v2(
+                    module, source_key, source_name, source_type, priority_order,
+                    official_url, request_template, target_table, expected_format,
+                    min_rows, min_bytes, mandatory_level, fallback_allowed,
+                    enabled, parser, source_group, note, update_time
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(module, source_key) DO UPDATE SET
+                    source_name=excluded.source_name,
+                    source_type=excluded.source_type,
+                    priority_order=excluded.priority_order,
+                    official_url=excluded.official_url,
+                    request_template=excluded.request_template,
+                    target_table=excluded.target_table,
+                    expected_format=excluded.expected_format,
+                    min_rows=excluded.min_rows,
+                    min_bytes=excluded.min_bytes,
+                    mandatory_level=excluded.mandatory_level,
+                    fallback_allowed=excluded.fallback_allowed,
+                    enabled=excluded.enabled,
+                    parser=excluded.parser,
+                    source_group=excluded.source_group,
+                    note=excluded.note,
+                    update_time=excluded.update_time
+            """, r5j_rows)
+        except Exception as exc:
+            log_warning(f"[R5J][REGISTRY_V2] sync failed｜{exc}")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_plan (
@@ -3066,6 +3190,8 @@ class DBManager:
             "CREATE INDEX IF NOT EXISTS idx_external_trace_run ON external_data_trace_event(run_id, module, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_external_trace_fail ON external_data_trace_event(fail_reason_code, status)",
             "CREATE INDEX IF NOT EXISTS idx_external_health_status ON external_data_health_summary(final_status, module)",
+            "CREATE INDEX IF NOT EXISTS idx_registry_v2_module ON system_external_source_registry_v2(module, enabled, mandatory_level)",
+            "CREATE INDEX IF NOT EXISTS idx_health_history_status ON external_health_run_history(final_status, module, report_time)",
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_gate_state ON trade_plan(trade_allowed, market_gate_state, flow_gate_state, fundamental_gate_state)",
         ]:
             cur.execute(sql)
@@ -3363,7 +3489,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5h_openapi_q4_annual_eps_first",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5j_external_data_health_report",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3829,6 +3955,7 @@ class ExternalDataTraceEngine:
             with self.db.lock:
                 pd.DataFrame([row]).to_sql("external_data_trace_event", self.db.conn, if_exists="append", index=False)
                 self.db.conn.commit()
+            append_external_trace_text_log(row)
             log_info(
                 f"[EXTERNAL_TRACE] run_id={self.run_id} module={module} source={source_name} "
                 f"stage={stage} status={norm_status} target={target_table} rows_parsed={row['rows_parsed']} "
@@ -4040,6 +4167,495 @@ class ExternalDataTraceEngine:
                 "trace_status": status,
             })
         return pd.DataFrame(rows)
+
+
+
+# ==========================================================
+# R5J_EXTERNAL_DATA_HEALTH_REPORT_20260607
+# 全系統外部資料健康報表：獨立於 High Growth EPS 報表。
+# 來源：ExternalSourceConfig.SOURCES + R5I Registry + 主程式URL掃描規劃表。
+# ==========================================================
+
+def _r5j_make_source_key(value: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "").strip())
+    return s.strip("_")[:80] or "source"
+
+
+def get_r5j_registry_v2_rows() -> list[tuple]:
+    """R5J：建立 system_external_source_registry_v2 寫入列。
+    欄位：
+    module, source_key, source_name, source_type, priority_order, official_url,
+    request_template, target_table, expected_format, min_rows, min_bytes,
+    mandatory_level, fallback_allowed, enabled, parser, source_group, note, update_time
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+
+    def add(module, source_key, source_name, source_type, priority, official_url, request_template,
+            target_table, expected_format, min_rows, min_bytes, mandatory_level,
+            fallback_allowed=1, enabled=1, parser="", source_group="", note=""):
+        rows.append((
+            str(module), _r5j_make_source_key(source_key), str(source_name), str(source_type),
+            int(priority or 0), str(official_url or ""), str(request_template or ""),
+            str(target_table or ""), str(expected_format or ""), int(min_rows or 0),
+            int(min_bytes or 0), str(mandatory_level or ""), int(fallback_allowed),
+            int(enabled), str(parser or ""), str(source_group or ""), str(note or ""), now
+        ))
+
+    # 1) ExternalSourceConfig.SOURCES（主程式本身的全系統外部資料配置）
+    try:
+        for module, cfg in ExternalSourceConfig.SOURCES.items():
+            request_templates = cfg.get("request_templates") or [cfg.get("request_template", "")]
+            for idx, req in enumerate(request_templates, start=1):
+                add(
+                    module=module,
+                    source_key=f"{module}_{idx}",
+                    source_name=cfg.get("source_name", module),
+                    source_type="API",
+                    priority=idx,
+                    official_url=cfg.get("official_url", ""),
+                    request_template=req,
+                    target_table=cfg.get("target_table", ""),
+                    expected_format="json/csv/html",
+                    min_rows=1000 if cfg.get("mandatory", False) else 1,
+                    min_bytes=3000,
+                    mandatory_level="P0" if cfg.get("mandatory", False) else "P1/P2",
+                    fallback_allowed=1,
+                    enabled=1,
+                    parser=cfg.get("parser", ""),
+                    source_group="ExternalSourceConfig",
+                    note=cfg.get("source_priority", ""),
+                )
+    except Exception as exc:
+        log_warning(f"[R5J][REGISTRY_V2] ExternalSourceConfig scan failed｜{exc}")
+
+    # 2) R5J依主程式掃描補強來源：classification/universe/price/EPS/revenue/MOPS/Goodinfo/Yahoo/cache。
+    extra_sources = [
+        ("Classification", "TWSE_t187ap03_L", "TWSE上市官方產業分類", "API", 1, CLASSIFICATION_DOWNLOAD_URL_TWSE, CLASSIFICATION_DOWNLOAD_URL_TWSE, "stocks_master", "json/csv", 1000, 5000, "P1", 1, "classification", "主程式CLASSIFICATION_DOWNLOAD_URL_TWSE"),
+        ("Classification", "TPEX_t187ap03_O", "TPEx上櫃官方產業分類", "API", 2, CLASSIFICATION_DOWNLOAD_URL_TPEX, CLASSIFICATION_DOWNLOAD_URL_TPEX, "stocks_master", "json/csv", 700, 5000, "P1", 1, "classification", "主程式CLASSIFICATION_DOWNLOAD_URL_TPEX"),
+        ("Classification", "TPEX_t187ap03_R", "TPEx興櫃官方產業分類", "API", 3, CLASSIFICATION_DOWNLOAD_URL_TPEX_R, CLASSIFICATION_DOWNLOAD_URL_TPEX_R, "stocks_master", "json/csv", 1, 1000, "P2", 1, "classification", "興櫃可WARN"),
+        ("Classification", "LocalCSV", "本機官方分類CSV", "LOCAL_FILE", 0, "", str(CLASSIFICATION_CACHE_DIR), "stocks_master", "csv/json", 1000, 0, "P1", 1, "classification", "data/classification本機檔"),
+        ("Universe", "TWSE_STOCK_DAY_ALL", "TWSE上市全市場股票清單", "API", 1, "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", "stocks_master", "json", 900, 3000, "P1", 1, "universe", "fetch_twse_universe"),
+        ("Universe", "TWSE_STOCK_DAY_ALL_FALLBACK", "TWSE上市股票清單fallback", "API", 2, "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json", "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json", "stocks_master", "json", 900, 3000, "P1", 1, "universe", "fetch_twse_universe fallback"),
+        ("Universe", "TPEX_MAINBOARD_QUOTES", "TPEx上櫃股票清單", "API", 1, "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", "stocks_master", "json", 700, 3000, "P1", 1, "universe", "fetch_tpex_universe"),
+        ("Universe", "TPEX_ESB_QUOTES", "TPEx興櫃股票清單", "API", 2, "https://www.tpex.org.tw/openapi/v1/tpex_esb_quotes", "https://www.tpex.org.tw/openapi/v1/tpex_esb_quotes", "stocks_master", "json", 1, 1000, "P2", 1, "universe", "fetch_tpex_universe"),
+        ("DailyPrice", "TWSE_MI_INDEX_ALLBUT0999", "TWSE上市每日個股行情", "API", 1, "https://www.twse.com.tw/exchangeReport/MI_INDEX", "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={use_date}&type=ALLBUT0999", "price_history", "csv", 900, 3000, "P1", 1, "price", "download_twse_official_daily_csv"),
+        ("PriceHistory", "YahooFinance", "Yahoo Finance歷史價格備援", "API", 3, "https://finance.yahoo.com/", "yfinance.download/Ticker.history", "price_history", "api", 1, 0, "P2", 1, "price", "yf optional fallback"),
+        ("AnnualEPS", "Cache", "年度EPS快取", "LOCAL_CACHE", 1, "", str(EXTERNAL_DATA_DIR / "official_eps_openapi"), "annual_eps_history", "csv/json", 1000, 0, "P0", 1, "annual_eps", "R5H/R5I cache layer"),
+        ("AnnualEPS", "LocalFile", "本機114Q4/2025Q4檔案", "LOCAL_FILE", 2, "", str(EXTERNAL_DATA_DIR / "twse_c05001"), "annual_eps_history", "csv/json/xls/xlsx", 1000, 0, "P0", 1, "annual_eps", "手動下載2025Q4.XLS/XLSX"),
+        ("AnnualEPS", "OfficialOpenAPI_Q4", "官方OpenAPI Q4年度EPS", "API", 3, "https://openapi.twse.com.tw/", "Official EPS OpenAPI 2025Q4", "annual_eps_history", "json", 1000, 5000, "P0", 1, "annual_eps", "Q4 cumulative EPS = full year EPS"),
+        ("AnnualEPS", "Index05Selenium", "TWSE index05 C05001 Selenium", "BROWSER", 4, "https://www.twse.com.tw/en/trading/statistics/index05.html", "select year=2025; Query; download Q4 ZIP", "annual_eps_history", "zip/xls/xlsx", 1000, 5000, "P0", 1, "annual_eps", "browser fallback"),
+        ("AnnualEPS", "MOPS_t163sb04", "MOPS年度EPS fallback", "HTML", 5, "https://mops.twse.com.tw/mops/web/ajax_t163sb04", "https://mops.twse.com.tw/mops/web/ajax_t163sb04", "annual_eps_history", "html", 1000, 5000, "P0", 1, "annual_eps", "requires lxml"),
+        ("QuarterlyEPS", "OfficialEPSOpenAPI", "官方季度EPS OpenAPI", "API", 1, "https://openapi.twse.com.tw/", "TWSE/TPEx EPS OpenAPI", "quarterly_financial_history", "json", 1000, 5000, "P0", 1, "eps", "Q1/Q2/Q3/Q4"),
+        ("Revenue", "TWSE_t187ap05_L", "TWSE上市月營收", "API", 1, "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", "external_revenue_history", "json", 1000, 5000, "P0", 1, "revenue", "上市月營收"),
+        ("Revenue", "TPEX_t187ap05_O", "TPEx上櫃月營收", "API", 2, "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", "external_revenue_history", "json", 700, 5000, "P0", 1, "revenue", "上櫃月營收"),
+        ("Revenue", "TPEX_t187ap05_R", "TPEx興櫃月營收", "API", 3, "https://www.tpex.org.tw/openapi/v1/t187ap05_R", "https://www.tpex.org.tw/openapi/v1/t187ap05_R", "external_revenue_history", "json", 1, 1000, "P2", 1, "revenue", "興櫃可WARN"),
+        ("Valuation", "GoodinfoFallback", "Goodinfo估值fallback only", "WEB", 4, "https://goodinfo.tw/", "https://goodinfo.tw/", "external_valuation", "html", 1, 1000, "P2", 1, "valuation", "需GTC_ENABLE_GOODINFO_FALLBACK=1，不可作主來源"),
+        ("Dependency", "selenium", "Selenium browser dependency", "PYTHON_MODULE", 1, "", "importlib.util.find_spec('selenium')", "", "module", 1, 0, "P0", 0, "dependency", "Index05需要"),
+        ("Dependency", "lxml", "lxml HTML parser dependency", "PYTHON_MODULE", 2, "", "importlib.util.find_spec('lxml')", "", "module", 1, 0, "P0", 0, "dependency", "MOPS/pd.read_html需要"),
+        ("Dependency", "xlrd", "xlrd xls reader dependency", "PYTHON_MODULE", 3, "", "importlib.util.find_spec('xlrd')", "", "module", 1, 0, "P0", 0, "dependency", "xls讀取需要"),
+        ("Dependency", "openpyxl", "openpyxl xlsx reader/writer dependency", "PYTHON_MODULE", 4, "", "importlib.util.find_spec('openpyxl')", "", "module", 1, 0, "P0", 0, "dependency", "xlsx與報表需要"),
+        ("Dependency", "yfinance", "yfinance price fallback dependency", "PYTHON_MODULE", 5, "", "importlib.util.find_spec('yfinance')", "", "module", 1, 0, "P2", 0, "dependency", "Yahoo備援"),
+    ]
+    for row in extra_sources:
+        add(*row)
+
+    # 去重：module + source_key
+    seen = set()
+    unique = []
+    for row in rows:
+        key = (row[0], row[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
+def get_r5j_registry_rows() -> list[tuple]:
+    """R5J：相容舊 external_data_source_registry 的 11欄 registry_rows。"""
+    rows = []
+    for r in get_r5j_registry_v2_rows():
+        module, source_key, source_name, source_type, priority_order, official_url, request_template, target_table, expected_format, min_rows, min_bytes, mandatory_level, fallback_allowed, enabled, parser, source_group, note, update_time = r
+        # 舊表欄位：(module, source_name, priority_order, target_table, min_bytes, min_rows, expected_type, severity, enabled, note)
+        rows.append((module, source_key, priority_order, target_table, min_bytes, min_rows, expected_format, mandatory_level, enabled, f"{source_name}｜{note}"))
+    return rows
+
+
+def sync_external_source_registry_from_code(db: DBManager) -> int:
+    """R5J：將程式實際來源同步到 system_external_source_registry_v2 / external_data_source_registry。"""
+    rows_v2 = get_r5j_registry_v2_rows()
+    rows_legacy = get_r5j_registry_rows()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db.lock:
+        cur = db.conn.cursor()
+        cur.executemany("""
+            INSERT INTO system_external_source_registry_v2(
+                module, source_key, source_name, source_type, priority_order,
+                official_url, request_template, target_table, expected_format,
+                min_rows, min_bytes, mandatory_level, fallback_allowed,
+                enabled, parser, source_group, note, update_time
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(module, source_key) DO UPDATE SET
+                source_name=excluded.source_name,
+                source_type=excluded.source_type,
+                priority_order=excluded.priority_order,
+                official_url=excluded.official_url,
+                request_template=excluded.request_template,
+                target_table=excluded.target_table,
+                expected_format=excluded.expected_format,
+                min_rows=excluded.min_rows,
+                min_bytes=excluded.min_bytes,
+                mandatory_level=excluded.mandatory_level,
+                fallback_allowed=excluded.fallback_allowed,
+                enabled=excluded.enabled,
+                parser=excluded.parser,
+                source_group=excluded.source_group,
+                note=excluded.note,
+                update_time=excluded.update_time
+        """, rows_v2)
+        cur.executemany("""
+            INSERT INTO external_data_source_registry(module, source_name, priority_order, target_table, min_bytes, min_rows, expected_type, severity, enabled, note, update_time)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(module, source_name) DO UPDATE SET
+                priority_order=excluded.priority_order,
+                target_table=excluded.target_table,
+                min_bytes=excluded.min_bytes,
+                min_rows=excluded.min_rows,
+                expected_type=excluded.expected_type,
+                severity=excluded.severity,
+                enabled=excluded.enabled,
+                note=excluded.note,
+                update_time=excluded.update_time
+        """, [(m, s, p, t, mb, mr, et, sev, en, note, now) for m, s, p, t, mb, mr, et, sev, en, note in rows_legacy])
+        db.conn.commit()
+    return len(rows_v2)
+
+
+class ExternalDataHealthReportEngine:
+    """R5J：全系統外部資料健康報表引擎。
+    讀取 DB 中 registry / trace / status / data counts，輸出獨立：
+    reports/External_Data_Health_Report_YYYYMMDD_HHMMSS.xlsx
+    """
+
+    CORE_TABLES = [
+        ("stocks_master", 1000, "股票主檔/分類"),
+        ("price_history", 1000, "歷史價格"),
+        ("market_snapshot", 1, "市場/個股快照"),
+        ("external_revenue", 1, "月營收最新表"),
+        ("external_revenue_history", 1000, "月營收歷史表"),
+        ("external_valuation", 1, "估值/EPS proxy"),
+        ("financial_feature_daily", 1, "財務特徵"),
+        ("quarterly_financial_history", 1000, "正式季度EPS"),
+        ("annual_eps_history", 1000, "正式年度EPS"),
+        ("external_institutional", 1, "三大法人"),
+        ("external_margin", 1, "個股融資融券"),
+        ("external_institutional_history", 1, "法人歷史"),
+        ("external_margin_history", 1, "融資融券歷史"),
+        ("macro_margin_sentiment", 1, "市場融資融券情緒"),
+        ("external_event", 0, "重大訊息/事件"),
+        ("ranking_result", 1, "排行結果"),
+        ("trade_plan", 1, "交易計畫"),
+        ("external_data_trace_event", 1, "R5J Trace明細"),
+        ("external_data_health_summary", 1, "R5J健康摘要"),
+        ("system_external_source_registry_v2", 10, "R5J來源註冊表"),
+    ]
+
+    def __init__(self, db: DBManager, run_id: str | None = None):
+        self.db = db
+        self.run_id = run_id or datetime.now().strftime("health_%Y%m%d_%H%M%S_%f")
+        self.trace = ExternalDataTraceEngine(db, run_id=self.run_id)
+
+    def _read_sql(self, sql: str, params: tuple = ()) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                return pd.read_sql_query(sql, self.db.conn, params=params)
+        except Exception as exc:
+            return pd.DataFrame([{"error": str(exc), "sql": sql[:200]}])
+
+    def source_registry_df(self) -> pd.DataFrame:
+        sync_external_source_registry_from_code(self.db)
+        df = self._read_sql("""
+            SELECT module, source_key, source_name, source_type, priority_order,
+                   official_url, request_template, target_table, expected_format,
+                   min_rows, min_bytes, mandatory_level, fallback_allowed,
+                   enabled, parser, source_group, note, update_time
+            FROM system_external_source_registry_v2
+            ORDER BY module, priority_order, source_key
+        """)
+        return df
+
+    def trace_detail_df(self) -> pd.DataFrame:
+        return self.trace.trace_detail_df(limit=5000)
+
+    def health_summary_df(self) -> pd.DataFrame:
+        df = self.trace.health_summary_df(include_dependency=True)
+        if df is None or df.empty:
+            return df
+        # 補上紅黃綠燈與 P0/P1 判定
+        x = df.copy()
+        x["燈號"] = x.get("final_status", "").astype(str).map(lambda s: "紅燈" if s == "FAIL" else ("黃燈" if s == "WARN" else "綠燈"))
+        return x
+
+    def source_run_status_df(self) -> pd.DataFrame:
+        registry = self.source_registry_df()
+        trace = self.trace_detail_df()
+        if registry is None or registry.empty:
+            return pd.DataFrame()
+        rows = []
+        for _, r in registry.iterrows():
+            module = str(r.get("module", ""))
+            source_key = str(r.get("source_key", ""))
+            source_name = str(r.get("source_name", ""))
+            target_table = str(r.get("target_table", ""))
+            min_rows = int(float(r.get("min_rows", 0) or 0))
+            t = pd.DataFrame()
+            if trace is not None and not trace.empty and "module" in trace.columns:
+                t = trace[trace["module"].astype(str).eq(module)].copy()
+                if "source_name" in t.columns:
+                    t2 = t[t["source_name"].astype(str).str.contains(source_key, na=False) | t["source_name"].astype(str).str.contains(source_name[:20], na=False)]
+                    if not t2.empty:
+                        t = t2
+            status = "NO_TRACE"
+            last_time = ""
+            fail_reason = ""
+            verify_count = 0
+            if t is not None and not t.empty:
+                last = t.sort_values("created_at").tail(1).iloc[-1]
+                status = str(last.get("status", ""))
+                last_time = str(last.get("created_at", ""))
+                fail_reason = str(last.get("fail_reason_code", ""))
+                verify_count = int(float(last.get("verify_count", 0) or 0))
+            elif target_table:
+                verify_count = self.trace.verify_table_count(target_table)
+                if verify_count >= max(1, min_rows):
+                    status = "PASS_DB_ONLY"
+                elif min_rows == 0 and verify_count >= 0:
+                    status = "WARN_OPTIONAL"
+                else:
+                    status = "FAIL_NO_TRACE_OR_DB_ROWS"
+                    fail_reason = "NO_TRACE_EVENT"
+            rows.append({
+                "module": module,
+                "source_key": source_key,
+                "source_name": source_name,
+                "target_table": target_table,
+                "mandatory_level": r.get("mandatory_level", ""),
+                "enabled": r.get("enabled", ""),
+                "last_status": status,
+                "last_time": last_time,
+                "verify_count": verify_count,
+                "min_rows": min_rows,
+                "fail_reason": fail_reason,
+                "request_template": r.get("request_template", ""),
+                "note": r.get("note", ""),
+            })
+        return pd.DataFrame(rows)
+
+    def data_quality_df(self) -> pd.DataFrame:
+        rows = []
+        for table, min_rows, purpose in self.CORE_TABLES:
+            exists = self.trace._table_exists(table)
+            cnt = self.trace.verify_table_count(table) if exists else 0
+            status = "PASS" if exists and cnt >= int(min_rows or 0) else ("WARN" if exists and int(min_rows or 0) == 0 else "FAIL")
+            latest_date = ""
+            date_cols = ["update_time", "source_date", "date", "trade_date", "revenue_month", "feature_date", "snapshot_date"]
+            if exists:
+                try:
+                    with self.db.lock:
+                        cols = [str(c[1]) for c in self.db.conn.cursor().execute(f"PRAGMA table_info({table})").fetchall()]
+                        for dc in date_cols:
+                            if dc in cols:
+                                row = self.db.conn.cursor().execute(f"SELECT MAX({dc}) FROM {table}").fetchone()
+                                latest_date = str(row[0] or "") if row else ""
+                                if latest_date:
+                                    break
+                except Exception:
+                    pass
+            rows.append({
+                "table_name": table,
+                "purpose": purpose,
+                "exists": "YES" if exists else "NO",
+                "row_count": cnt,
+                "min_rows": int(min_rows or 0),
+                "latest_date": latest_date,
+                "status": status,
+                "判定": "可用" if status == "PASS" else ("有表但筆數不足/尚未寫入" if exists else "資料表不存在"),
+            })
+        return pd.DataFrame(rows)
+
+    def fallback_usage_df(self) -> pd.DataFrame:
+        return self._read_sql("""
+            SELECT created_at, run_id, module, source_name, stage, status,
+                   target_table, fallback_used, fail_reason_code,
+                   fail_reason_detail, request_url, source_file
+            FROM external_data_trace_event
+            WHERE COALESCE(fallback_used,'') <> ''
+               OR COALESCE(fail_reason_code,'') IN ('FALLBACK_USED','LOCAL_FILE_MISSING','DEPENDENCY_MISSING','HTML_ERROR_PAGE','HTTP_FAIL')
+            ORDER BY created_at DESC
+            LIMIT 1000
+        """)
+
+    def dependency_df(self) -> pd.DataFrame:
+        return self.trace.dependency_health()
+
+    def fail_reason_df(self) -> pd.DataFrame:
+        return self.trace.fail_reason_summary_df()
+
+    def annual_eps_chain_df(self) -> pd.DataFrame:
+        registry = self.source_registry_df()
+        annual = registry[registry["module"].astype(str).eq("AnnualEPS")].copy() if registry is not None and not registry.empty else pd.DataFrame()
+        trace = self.trace_detail_df()
+        rows = []
+        for _, r in annual.iterrows():
+            source_key = str(r.get("source_key", ""))
+            t = pd.DataFrame()
+            if trace is not None and not trace.empty and "module" in trace.columns:
+                t = trace[trace["module"].astype(str).eq("AnnualEPS")].copy()
+                if "source_name" in t.columns:
+                    t2 = t[t["source_name"].astype(str).str.contains(source_key, na=False)]
+                    if not t2.empty:
+                        t = t2
+            status = "NO_TRACE"
+            parsed = written = verify = 0
+            reason = ""
+            last_time = ""
+            if t is not None and not t.empty:
+                last = t.sort_values("created_at").tail(1).iloc[-1]
+                status = str(last.get("status", ""))
+                parsed = int(float(last.get("rows_parsed", 0) or 0))
+                written = int(float(last.get("rows_written", 0) or 0))
+                verify = int(float(last.get("verify_count", 0) or 0))
+                reason = str(last.get("fail_reason_code", ""))
+                last_time = str(last.get("created_at", ""))
+            rows.append({
+                "priority_order": r.get("priority_order", ""),
+                "source_key": source_key,
+                "source_name": r.get("source_name", ""),
+                "expected_format": r.get("expected_format", ""),
+                "status": status,
+                "rows_parsed": parsed,
+                "rows_written": written,
+                "verify_count": verify,
+                "fail_reason": reason,
+                "last_time": last_time,
+                "request_template": r.get("request_template", ""),
+            })
+        final_cnt = self.trace.verify_table_count("annual_eps_history")
+        rows.append({
+            "priority_order": "FINAL",
+            "source_key": "annual_eps_history",
+            "source_name": "年度EPS最終DB驗證",
+            "expected_format": "sqlite",
+            "status": "PASS" if final_cnt >= 1000 else "FAIL",
+            "rows_parsed": "",
+            "rows_written": "",
+            "verify_count": final_cnt,
+            "fail_reason": "" if final_cnt >= 1000 else "VERIFY_ROWS_ZERO",
+            "last_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "request_template": "SELECT COUNT(*) FROM annual_eps_history",
+        })
+        return pd.DataFrame(rows)
+
+    def revenue_chain_df(self) -> pd.DataFrame:
+        registry = self.source_registry_df()
+        rev = registry[registry["module"].astype(str).eq("Revenue")].copy() if registry is not None and not registry.empty else pd.DataFrame()
+        rows = []
+        for _, r in rev.iterrows():
+            cnt = self.trace.verify_table_count(str(r.get("target_table", ""))) if r.get("target_table", "") else 0
+            rows.append({
+                "priority_order": r.get("priority_order", ""),
+                "source_key": r.get("source_key", ""),
+                "source_name": r.get("source_name", ""),
+                "target_table": r.get("target_table", ""),
+                "status": "PASS" if cnt >= int(float(r.get("min_rows", 0) or 0)) else "FAIL",
+                "verify_count": cnt,
+                "min_rows": r.get("min_rows", ""),
+                "request_template": r.get("request_template", ""),
+            })
+        return pd.DataFrame(rows)
+
+    def build_tables(self) -> Dict[str, pd.DataFrame]:
+        system = self.health_summary_df()
+        registry = self.source_registry_df()
+        run_status = self.source_run_status_df()
+        quality = self.data_quality_df()
+        fallback = self.fallback_usage_df()
+        dependency = self.dependency_df()
+        annual_chain = self.annual_eps_chain_df()
+        revenue_chain = self.revenue_chain_df()
+        trace = self.trace_detail_df()
+        fail = self.fail_reason_df()
+        url_list = registry[["module", "source_key", "official_url", "request_template", "target_table", "mandatory_level"]].copy() if registry is not None and not registry.empty else pd.DataFrame()
+        summary = pd.DataFrame([
+            {"項目": "報表類型", "內容": "R5J 全系統外部資料健康監控報表"},
+            {"項目": "產出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            {"項目": "DB路徑", "內容": str(self.db.db_path)},
+            {"項目": "Trace文字Log", "內容": str(EXTERNAL_TRACE_TEXT_LOG_PATH)},
+            {"項目": "來源註冊筆數", "內容": len(registry) if isinstance(registry, pd.DataFrame) else 0},
+            {"項目": "Trace事件筆數", "內容": len(trace) if isinstance(trace, pd.DataFrame) else 0},
+            {"項目": "STRICT_EXTERNAL_HEALTH_GATE", "內容": str(STRICT_EXTERNAL_HEALTH_GATE)},
+        ])
+        return {
+            "00_總覽": summary,
+            "00_System_Health": system,
+            "01_Source_Registry": registry,
+            "02_Source_Run_Status": run_status,
+            "03_Data_Quality": quality,
+            "04_Fallback_Usage": fallback,
+            "05_Dependency_Check": dependency,
+            "06_Annual_EPS_Chain": annual_chain,
+            "07_Revenue_Chain": revenue_chain,
+            "08_Trace_Detail": trace,
+            "09_Fail_Reason_Summary": fail,
+            "10_URL_List": url_list,
+        }
+
+    def export_excel(self, output_path: Path | None = None) -> Path:
+        output_path = output_path or (EXTERNAL_HEALTH_REPORT_DIR / f"External_Data_Health_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        tables = self.build_tables()
+        engine = available_excel_engine()
+        if not engine:
+            raise RuntimeError("目前環境沒有可用Excel輸出引擎（xlsxwriter/openpyxl）。")
+        with pd.ExcelWriter(output_path, engine=engine) as writer:
+            for name, df in tables.items():
+                out_df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+                if out_df.empty:
+                    out_df = pd.DataFrame([{"狀態": "NO_DATA"}])
+                out_df.to_excel(writer, sheet_name=safe_sheet_name(name), index=False)
+        # 寫入執行歷史
+        try:
+            health = tables.get("00_System_Health", pd.DataFrame())
+            rows = []
+            if isinstance(health, pd.DataFrame) and not health.empty:
+                for _, r in health.iterrows():
+                    rows.append({
+                        "run_id": self.run_id,
+                        "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "module": str(r.get("module", "")),
+                        "final_status": str(r.get("final_status", "")),
+                        "target_table": str(r.get("target_table", "")),
+                        "verify_count": int(float(r.get("verify_count", 0) or 0)),
+                        "fail_reason_code": str(r.get("fail_reason_code", "")),
+                        "fail_reason_detail": str(r.get("fail_reason_detail", ""))[:2000],
+                        "action_required": str(r.get("action_required", "")),
+                        "report_path": str(output_path),
+                    })
+            if rows:
+                with self.db.lock:
+                    pd.DataFrame(rows).to_sql("external_health_run_history", self.db.conn, if_exists="append", index=False)
+                    self.db.conn.commit()
+        except Exception as exc:
+            log_warning(f"[R5J][HEALTH_HISTORY_WRITE_FAIL] {exc}")
+        log_info(f"[R5J][EXTERNAL_HEALTH_REPORT] exported={output_path}")
+        return Path(output_path)
+
+
+def export_external_data_health_report(db: DBManager, output_path: Path | None = None) -> Path:
+    """R5J：外部資料健康報表一鍵輸出函式。"""
+    return ExternalDataHealthReportEngine(db).export_excel(output_path=output_path)
+
 
 
 def normalize_fiscal_quarter(value) -> tuple[int | None, int | None, str, str]:
@@ -9784,6 +10400,37 @@ class ExternalSourceConfig:
             rows.append(row)
         return pd.DataFrame(rows)
 
+    @classmethod
+    def to_registry_rows(cls) -> list[tuple]:
+        """R5J：將 ExternalSourceConfig.SOURCES 轉為 system_external_source_registry_v2 相容列。"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
+        for module, cfg in cls.SOURCES.items():
+            templates = cfg.get("request_templates") or [cfg.get("request_template", "")]
+            for i, req in enumerate(templates, start=1):
+                rows.append((
+                    module,
+                    _r5j_make_source_key(f"{module}_{i}"),
+                    str(cfg.get("source_name", module)),
+                    "API",
+                    i,
+                    str(cfg.get("official_url", "")),
+                    str(req or ""),
+                    str(cfg.get("target_table", "")),
+                    "json/csv/html",
+                    1000 if cfg.get("mandatory", False) else 1,
+                    3000,
+                    "P0" if cfg.get("mandatory", False) else "P1/P2",
+                    1,
+                    1,
+                    str(cfg.get("parser", "")),
+                    "ExternalSourceConfig",
+                    str(cfg.get("source_priority", "")),
+                    now,
+                ))
+        return rows
+
+
 
 class ExternalPipelineResult:
     """統一外部資料Pipeline結果，避免UI只有pending卻宣告完成。"""
@@ -11371,6 +12018,30 @@ class ExternalDataFetcher:
             blocking_reason="" if result.data_ready else (result.error_message or msg), source_level=result.source_level,
         )
         self.db.log_system_run(event="external_pipeline", status=result.status, message=f"module={module}; rows={result.rows_count}; ready={result.data_ready}; error={result.error_message}", run_id=run_id, step="write", module=module, duration_ms=(time.time()-t0)*1000)
+        # R5J_TRACE_PIPELINE_RESULT：所有 ExternalSourceConfig module 執行後都必須進 Trace/Health。
+        # 這補足 R5I 只在 EPS 部分有 trace，valuation / margin / institutional / macro / event 可能漏列的問題。
+        try:
+            trace = ExternalDataTraceEngine(self.db, run_id=run_id)
+            verify_count = trace.verify_table_count(result.target_table) if result.target_table else int(result.rows_count or 0)
+            trace.event(
+                module=module,
+                source_name=str(result.source_name or cfg.get("source_name", module)),
+                stage="SOURCE",
+                status="PASS" if int(result.data_ready or 0) == 1 else "FAIL",
+                target_table=result.target_table,
+                request_url=result.request_url or str(cfg.get("request_template", "")),
+                http_status=result.http_status,
+                rows_downloaded=result.rows_count,
+                rows_parsed=result.rows_count,
+                rows_written=result.rows_count if int(result.data_ready or 0) == 1 else 0,
+                verify_count=verify_count,
+                fallback_used="fallback" if result.status == "fallback" else "",
+                fail_reason_detail="" if int(result.data_ready or 0) == 1 else (result.error_message or msg),
+                source_date=result.source_date,
+                elapsed_ms=(time.time() - t0) * 1000,
+            )
+        except Exception as trace_exc:
+            log_warning(f"[R5J_TRACE_PIPELINE_RESULT][SKIP] module={module}｜{trace_exc}")
         return result
 
     def sync_fundamental_local_cache(self, modules: list[str] | tuple[str, ...] | None = None, run_id: str | None = None, log_cb=None) -> dict:
@@ -15953,6 +16624,7 @@ class AppUI:
             "同步外部資料",
             "重整外部資料狀態顯示",
             "查看外部原始資料",
+            "產出外部資料健康報表",
             "中斷作業",
             "匯出分析Excel",
             "開啟圖表",
@@ -16887,6 +17559,7 @@ class AppUI:
             "同步外部資料": self.sync_external_data,
             "重整外部資料狀態顯示": self.refresh_external_data_status,
             "查看外部原始資料": self.export_external_raw_sample,
+            "產出外部資料健康報表": self.on_external_data_health_report,
             "AI選股TOP20": self.show_top20,
             "AI投資組合引擎": self.show_ai_portfolio_engine,
             "主攻5": self.show_top5,
@@ -16901,6 +17574,23 @@ class AppUI:
             return messagebox.showwarning("提醒", "請先選擇功能。")
         func()
 
+
+    def on_external_data_health_report(self):
+        """R5J：手動一鍵產出全系統 External_Data_Health_Report.xlsx。"""
+        try:
+            path = export_external_data_health_report(self.db)
+            self.append_log(f"外部資料健康報表已產生：{path}")
+            try:
+                messagebox.showinfo("完成", f"已產生外部資料健康報表：\n{path}")
+            except Exception:
+                pass
+            return path
+        except Exception as exc:
+            try:
+                self.append_log(f"外部資料健康報表產出失敗：{exc}", "ERROR")
+            except Exception:
+                pass
+            return messagebox.showerror("輸出失敗", f"外部資料健康報表產出失敗：\n{exc}")
 
     def export_external_raw_sample(self):
         """V9.4：依外部資料監控中心選取module匯出原始落表資料，讓使用者可查核是否真寫DB。"""
