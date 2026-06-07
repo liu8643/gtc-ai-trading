@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5J_EXTERNAL_DATA_HEALTH_REPORT"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5K_OPENAPI_REGISTRY_HEALTH"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2893,10 +2893,51 @@ class DBManager:
             parser TEXT,
             source_group TEXT,
             note TEXT,
+            license_url TEXT,
+            swagger_url TEXT,
+            endpoint_key TEXT,
+            endpoint_exist INTEGER DEFAULT 0,
+            endpoint_status TEXT,
+            schema_hash TEXT,
+            last_scan_time TEXT,
             update_time TEXT,
             PRIMARY KEY(module, source_key)
         )
         """)
+        # R5K_OPENAPI_REGISTRY_HEALTH_20260607：TWSE OpenAPI 授權/OAS/Endpoint 版本追蹤。
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS twse_openapi_registry (
+            api_source TEXT,
+            endpoint_key TEXT,
+            endpoint_path TEXT,
+            summary TEXT,
+            method TEXT,
+            license_url TEXT,
+            swagger_url TEXT,
+            swagger_status TEXT,
+            endpoint_exist INTEGER DEFAULT 0,
+            schema_hash TEXT,
+            last_scan_time TEXT,
+            status TEXT,
+            fail_reason TEXT,
+            update_time TEXT,
+            PRIMARY KEY(api_source, endpoint_key)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS twse_openapi_endpoint_version (
+            endpoint_key TEXT PRIMARY KEY,
+            first_seen TEXT,
+            last_seen TEXT,
+            previous_hash TEXT,
+            current_hash TEXT,
+            schema_changed INTEGER DEFAULT 0,
+            status TEXT,
+            change_note TEXT,
+            update_time TEXT
+        )
+        """)
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS external_health_run_history (
             run_id TEXT,
@@ -3192,6 +3233,9 @@ class DBManager:
             "CREATE INDEX IF NOT EXISTS idx_external_health_status ON external_data_health_summary(final_status, module)",
             "CREATE INDEX IF NOT EXISTS idx_registry_v2_module ON system_external_source_registry_v2(module, enabled, mandatory_level)",
             "CREATE INDEX IF NOT EXISTS idx_health_history_status ON external_health_run_history(final_status, module, report_time)",
+            "CREATE INDEX IF NOT EXISTS idx_twse_openapi_registry_status ON twse_openapi_registry(status, endpoint_key)",
+            "CREATE INDEX IF NOT EXISTS idx_twse_openapi_version_changed ON twse_openapi_endpoint_version(schema_changed, status)",
+
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_gate_state ON trade_plan(trade_allowed, market_gate_state, flow_gate_state, fundamental_gate_state)",
         ]:
             cur.execute(sql)
@@ -3343,6 +3387,18 @@ class DBManager:
         ]:
             _add("financial_feature_daily", col, ddl)
 
+        # R5K_OPENAPI_REGISTRY_HEALTH_20260607：補強來源註冊表欄位，讓授權/OAS/Endpoint版本不是備註，而是可查核欄位。
+        for col, ddl in [
+            ("license_url", "license_url TEXT"),
+            ("swagger_url", "swagger_url TEXT"),
+            ("endpoint_key", "endpoint_key TEXT"),
+            ("endpoint_exist", "endpoint_exist INTEGER DEFAULT 0"),
+            ("endpoint_status", "endpoint_status TEXT"),
+            ("schema_hash", "schema_hash TEXT"),
+            ("last_scan_time", "last_scan_time TEXT"),
+        ]:
+            _add("system_external_source_registry_v2", col, ddl)
+
         # PREBREAKOUT_FULL_RULE_ENGINE_V6：補強技術特徵與完整選股規則欄位，避免舊 DB schema 寫入失敗。
         for col, ddl in [
             ("vol_ma3", "vol_ma3 REAL"), ("vol_ma5", "vol_ma5 REAL"), ("vol_ma20", "vol_ma20 REAL"), ("volume_ratio", "volume_ratio REAL"),
@@ -3489,7 +3545,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5j_external_data_health_report",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5k_openapi_registry_health",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -4333,6 +4389,272 @@ def sync_external_source_registry_from_code(db: DBManager) -> int:
     return len(rows_v2)
 
 
+
+class TWSEOpenAPIRegistryEngine:
+    """R5K_OPENAPI_REGISTRY_HEALTH_20260607：TWSE OpenAPI 授權/OAS/Endpoint 版本追蹤。
+
+    目的：
+    - 將 data.gov.tw license 與 TWSE OAS/Swagger 寫入 DB，不只當備註。
+    - 自動掃描 swagger.json，確認 t187ap05_L、EPS、分類等 API 是否仍存在。
+    - endpoint schema_hash 若變更，External_Data_Health_Report 直接顯示 WARN/CHANGED。
+    """
+
+    LICENSE_URL = TWSE_OPENAPI_LICENSE_URL
+    SWAGGER_URL = TWSE_OPENAPI_SWAGGER_URL
+    CRITICAL_ENDPOINTS = {
+        "t187ap05_L": {"type": "Revenue", "keyword": "t187ap05_L", "target_table": "external_revenue_history", "note": "上市公司月營收資料"},
+        "t187ap15_L": {"type": "Revenue", "keyword": "t187ap15_L", "target_table": "external_revenue_history", "note": "上市公司月營收OpenAPI備援/新版"},
+        "t187ap06_L_ci": {"type": "QuarterlyEPS", "keyword": "t187ap06_L_ci", "target_table": "quarterly_financial_history", "note": "上市一般業EPS/季報統計"},
+        "t187ap03_L": {"type": "Classification", "keyword": "t187ap03_L", "target_table": "stocks_master", "note": "上市官方產業分類"},
+        "STOCK_DAY_ALL": {"type": "Universe", "keyword": "STOCK_DAY_ALL", "target_table": "stocks_master", "note": "上市全市場股票清單"},
+        "MI_INDEX": {"type": "DailyPrice", "keyword": "MI_INDEX", "target_table": "price_history", "note": "上市每日行情/大盤資料"},
+    }
+
+    def __init__(self, db: DBManager, trace: ExternalDataTraceEngine | None = None):
+        self.db = db
+        self.trace = trace or ExternalDataTraceEngine(db)
+
+    @staticmethod
+    def _hash_obj(obj) -> str:
+        try:
+            raw = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            raw = str(obj)
+        return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+    def fetch_swagger(self, timeout: int = 15) -> tuple[dict, str, str, int, int]:
+        started = time.time()
+        try:
+            resp = requests.get(
+                self.SWAGGER_URL,
+                timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"},
+            )
+            content_type = resp.headers.get("Content-Type", "")
+            bytes_len = len(resp.content or b"")
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict) or "paths" not in data:
+                raise ValueError("swagger.json格式異常：缺少paths")
+            elapsed = (time.time() - started) * 1000.0
+            self.trace.success(
+                module="OpenAPIRegistry", source_name="TWSE_SWAGGER", stage="DOWNLOAD",
+                target_table="twse_openapi_registry", request_url=self.SWAGGER_URL,
+                http_status=str(resp.status_code), content_type=content_type,
+                bytes_count=bytes_len, rows_downloaded=len(data.get("paths", {}) or {}),
+                rows_parsed=len(data.get("paths", {}) or {}), elapsed_ms=elapsed,
+            )
+            return data, content_type, "PASS", resp.status_code, bytes_len
+        except Exception as exc:
+            elapsed = (time.time() - started) * 1000.0
+            self.trace.fail(
+                module="OpenAPIRegistry", source_name="TWSE_SWAGGER", stage="DOWNLOAD",
+                target_table="twse_openapi_registry", request_url=self.SWAGGER_URL,
+                fail_reason_detail=str(exc), elapsed_ms=elapsed,
+            )
+            return {}, "", "FAIL", 0, 0
+
+    def _find_endpoint(self, swagger: dict, keyword: str) -> tuple[str, str, dict]:
+        paths = swagger.get("paths", {}) if isinstance(swagger, dict) else {}
+        if not isinstance(paths, dict):
+            return "", "", {}
+        key_l = str(keyword or "").lower()
+        for path, spec in paths.items():
+            path_s = str(path or "")
+            spec_text = json.dumps(spec, ensure_ascii=False).lower() if isinstance(spec, (dict, list)) else str(spec).lower()
+            if key_l in path_s.lower() or key_l in spec_text:
+                method = ""
+                if isinstance(spec, dict):
+                    for m in ("get", "post", "put", "delete"):
+                        if m in spec:
+                            method = m.upper()
+                            break
+                return path_s, method, spec if isinstance(spec, dict) else {}
+        return "", "", {}
+
+    def scan(self, force_network: bool = True) -> pd.DataFrame:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        swagger = {}
+        swagger_status = "SKIP"
+        if force_network:
+            swagger, _ctype, swagger_status, _http, _bytes = self.fetch_swagger()
+        rows = []
+        for endpoint_key, cfg in self.CRITICAL_ENDPOINTS.items():
+            path, method, spec = self._find_endpoint(swagger, cfg.get("keyword", endpoint_key)) if swagger else ("", "", {})
+            exists = bool(path)
+            schema_hash = self._hash_obj(spec) if exists else ""
+            status = "PASS" if exists else ("FAIL" if swagger_status == "PASS" else "WARN")
+            fail_reason = "" if exists else ("ENDPOINT_NOT_FOUND" if swagger_status == "PASS" else "SWAGGER_DOWNLOAD_FAIL_OR_SKIPPED")
+            rows.append({
+                "api_source": "TWSE_OPENAPI",
+                "endpoint_key": endpoint_key,
+                "endpoint_path": path,
+                "summary": cfg.get("note", ""),
+                "method": method,
+                "license_url": self.LICENSE_URL,
+                "swagger_url": self.SWAGGER_URL,
+                "swagger_status": swagger_status,
+                "endpoint_exist": 1 if exists else 0,
+                "schema_hash": schema_hash,
+                "last_scan_time": now,
+                "status": status,
+                "fail_reason": fail_reason,
+                "update_time": now,
+            })
+        df = pd.DataFrame(rows)
+        self.write_registry(df)
+        self.sync_system_source_registry(df)
+        return df
+
+    def write_registry(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                for _, r in df.iterrows():
+                    endpoint_key = str(r.get("endpoint_key", ""))
+                    current_hash = str(r.get("schema_hash", ""))
+                    old = cur.execute(
+                        "SELECT current_hash, first_seen FROM twse_openapi_endpoint_version WHERE endpoint_key=?",
+                        (endpoint_key,),
+                    ).fetchone()
+                    previous_hash = str(old[0] or "") if old else ""
+                    first_seen = str(old[1] or now) if old else now
+                    schema_changed = 1 if previous_hash and current_hash and previous_hash != current_hash else 0
+                    change_note = "schema_changed" if schema_changed else "no_change_or_first_seen"
+                    cur.execute("""
+                        INSERT INTO twse_openapi_registry(
+                            api_source, endpoint_key, endpoint_path, summary, method,
+                            license_url, swagger_url, swagger_status, endpoint_exist,
+                            schema_hash, last_scan_time, status, fail_reason, update_time
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(api_source, endpoint_key) DO UPDATE SET
+                            endpoint_path=excluded.endpoint_path,
+                            summary=excluded.summary,
+                            method=excluded.method,
+                            license_url=excluded.license_url,
+                            swagger_url=excluded.swagger_url,
+                            swagger_status=excluded.swagger_status,
+                            endpoint_exist=excluded.endpoint_exist,
+                            schema_hash=excluded.schema_hash,
+                            last_scan_time=excluded.last_scan_time,
+                            status=excluded.status,
+                            fail_reason=excluded.fail_reason,
+                            update_time=excluded.update_time
+                    """, tuple(r.get(c, "") for c in [
+                        "api_source", "endpoint_key", "endpoint_path", "summary", "method",
+                        "license_url", "swagger_url", "swagger_status", "endpoint_exist",
+                        "schema_hash", "last_scan_time", "status", "fail_reason", "update_time"
+                    ]))
+                    cur.execute("""
+                        INSERT INTO twse_openapi_endpoint_version(
+                            endpoint_key, first_seen, last_seen, previous_hash, current_hash,
+                            schema_changed, status, change_note, update_time
+                        ) VALUES(?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(endpoint_key) DO UPDATE SET
+                            last_seen=excluded.last_seen,
+                            previous_hash=twse_openapi_endpoint_version.current_hash,
+                            current_hash=excluded.current_hash,
+                            schema_changed=excluded.schema_changed,
+                            status=excluded.status,
+                            change_note=excluded.change_note,
+                            update_time=excluded.update_time
+                    """, (
+                        endpoint_key, first_seen, now, previous_hash, current_hash,
+                        schema_changed, str(r.get("status", "")), change_note, now
+                    ))
+                self.db.conn.commit()
+        except Exception as exc:
+            log_warning(f"[R5K][OPENAPI_REGISTRY_WRITE_FAIL] {exc}")
+
+    def sync_system_source_registry(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                # 所有 TWSE OpenAPI 來源都補 license/swagger。
+                cur.execute("""
+                    UPDATE system_external_source_registry_v2
+                    SET license_url=?, swagger_url=?, last_scan_time=?, endpoint_status=COALESCE(endpoint_status,'TRACKED')
+                    WHERE official_url LIKE '%openapi.twse.com.tw%'
+                       OR request_template LIKE '%openapi.twse.com.tw%'
+                       OR source_group LIKE '%OpenAPI%'
+                       OR source_name LIKE '%OpenAPI%'
+                """, (self.LICENSE_URL, self.SWAGGER_URL, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                for _, r in df.iterrows():
+                    ek = str(r.get("endpoint_key", ""))
+                    cur.execute("""
+                        UPDATE system_external_source_registry_v2
+                        SET license_url=?, swagger_url=?, endpoint_key=?, endpoint_exist=?, endpoint_status=?,
+                            schema_hash=?, last_scan_time=?
+                        WHERE official_url LIKE ? OR request_template LIKE ? OR source_key LIKE ? OR note LIKE ?
+                    """, (
+                        self.LICENSE_URL, self.SWAGGER_URL, ek, int(r.get("endpoint_exist", 0) or 0),
+                        str(r.get("status", "")), str(r.get("schema_hash", "")), str(r.get("last_scan_time", "")),
+                        f"%{ek}%", f"%{ek}%", f"%{ek}%", f"%{ek}%"
+                    ))
+                self.db.conn.commit()
+        except Exception as exc:
+            log_warning(f"[R5K][OPENAPI_REGISTRY_SYNC_FAIL] {exc}")
+
+    def registry_df(self, auto_scan: bool = False) -> pd.DataFrame:
+        if auto_scan:
+            try:
+                self.scan(force_network=True)
+            except Exception as exc:
+                log_warning(f"[R5K][OPENAPI_AUTO_SCAN_FAIL] {exc}")
+        try:
+            with self.db.lock:
+                df = pd.read_sql_query("""
+                    SELECT endpoint_key, endpoint_path, summary, method, license_url, swagger_url,
+                           swagger_status, endpoint_exist, status, fail_reason, schema_hash, last_scan_time
+                    FROM twse_openapi_registry
+                    ORDER BY endpoint_key
+                """, self.db.conn)
+        except Exception:
+            df = pd.DataFrame()
+        if df is None or df.empty:
+            rows = []
+            for ek, cfg in self.CRITICAL_ENDPOINTS.items():
+                rows.append({
+                    "endpoint_key": ek,
+                    "endpoint_path": "",
+                    "summary": cfg.get("note", ""),
+                    "method": "",
+                    "license_url": self.LICENSE_URL,
+                    "swagger_url": self.SWAGGER_URL,
+                    "swagger_status": "NOT_SCANNED",
+                    "endpoint_exist": 0,
+                    "status": "WARN",
+                    "fail_reason": "NOT_SCANNED",
+                    "schema_hash": "",
+                    "last_scan_time": "",
+                })
+            df = pd.DataFrame(rows)
+        return df
+
+    def license_df(self) -> pd.DataFrame:
+        return pd.DataFrame([
+            {"項目": "Data.gov.tw授權說明網址", "內容": self.LICENSE_URL, "用途": "證明TWSE OpenAPI政府開放資料授權合法，可快取/DB儲存/報表輸出"},
+            {"項目": "TWSE OAS/Swagger標準API說明文件", "內容": self.SWAGGER_URL, "用途": "自動比對TWSE OpenAPI endpoint是否改版、改名或移除"},
+            {"項目": "納入DB表", "內容": "system_external_source_registry_v2 / twse_openapi_registry / twse_openapi_endpoint_version", "用途": "不是備註，而是正式追蹤欄位"},
+        ])
+
+    def version_df(self) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                return pd.read_sql_query("""
+                    SELECT endpoint_key, first_seen, last_seen, previous_hash, current_hash,
+                           schema_changed, status, change_note, update_time
+                    FROM twse_openapi_endpoint_version
+                    ORDER BY schema_changed DESC, endpoint_key
+                """, self.db.conn)
+        except Exception:
+            return pd.DataFrame([{"狀態": "NO_VERSION_TABLE_OR_NO_DATA"}])
+
 class ExternalDataHealthReportEngine:
     """R5J：全系統外部資料健康報表引擎。
     讀取 DB 中 registry / trace / status / data counts，輸出獨立：
@@ -4576,6 +4898,24 @@ class ExternalDataHealthReportEngine:
             })
         return pd.DataFrame(rows)
 
+    def openapi_registry_df(self) -> pd.DataFrame:
+        try:
+            return TWSEOpenAPIRegistryEngine(self.db, self.trace).registry_df(auto_scan=False)
+        except Exception as exc:
+            return pd.DataFrame([{"狀態": "OPENAPI_REGISTRY_READ_FAIL", "錯誤": str(exc)}])
+
+    def openapi_license_df(self) -> pd.DataFrame:
+        try:
+            return TWSEOpenAPIRegistryEngine(self.db, self.trace).license_df()
+        except Exception as exc:
+            return pd.DataFrame([{"狀態": "OPENAPI_LICENSE_READ_FAIL", "錯誤": str(exc), "license_url": TWSE_OPENAPI_LICENSE_URL, "swagger_url": TWSE_OPENAPI_SWAGGER_URL}])
+
+    def source_version_tracking_df(self) -> pd.DataFrame:
+        try:
+            return TWSEOpenAPIRegistryEngine(self.db, self.trace).version_df()
+        except Exception as exc:
+            return pd.DataFrame([{"狀態": "SOURCE_VERSION_READ_FAIL", "錯誤": str(exc)}])
+
     def build_tables(self) -> Dict[str, pd.DataFrame]:
         system = self.health_summary_df()
         registry = self.source_registry_df()
@@ -4587,15 +4927,21 @@ class ExternalDataHealthReportEngine:
         revenue_chain = self.revenue_chain_df()
         trace = self.trace_detail_df()
         fail = self.fail_reason_df()
-        url_list = registry[["module", "source_key", "official_url", "request_template", "target_table", "mandatory_level"]].copy() if registry is not None and not registry.empty else pd.DataFrame()
+        openapi_registry = self.openapi_registry_df()
+        openapi_license = self.openapi_license_df()
+        source_version = self.source_version_tracking_df()
+        url_cols = [c for c in ["module", "source_key", "source_name", "official_url", "request_template", "target_table", "mandatory_level", "license_url", "swagger_url", "endpoint_key", "endpoint_status", "last_scan_time"] if registry is not None and not registry.empty and c in registry.columns]
+        url_list = registry[url_cols].copy() if url_cols else pd.DataFrame()
         summary = pd.DataFrame([
-            {"項目": "報表類型", "內容": "R5J 全系統外部資料健康監控報表"},
+            {"項目": "報表類型", "內容": "R5K 全系統外部資料健康監控報表（含TWSE OpenAPI Registry/授權/OAS/版本追蹤）"},
             {"項目": "產出時間", "內容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
             {"項目": "DB路徑", "內容": str(self.db.db_path)},
             {"項目": "Trace文字Log", "內容": str(EXTERNAL_TRACE_TEXT_LOG_PATH)},
             {"項目": "來源註冊筆數", "內容": len(registry) if isinstance(registry, pd.DataFrame) else 0},
             {"項目": "Trace事件筆數", "內容": len(trace) if isinstance(trace, pd.DataFrame) else 0},
             {"項目": "STRICT_EXTERNAL_HEALTH_GATE", "內容": str(STRICT_EXTERNAL_HEALTH_GATE)},
+            {"項目": "TWSE OpenAPI License", "內容": TWSE_OPENAPI_LICENSE_URL},
+            {"項目": "TWSE OpenAPI Swagger", "內容": TWSE_OPENAPI_SWAGGER_URL},
         ])
         return {
             "00_總覽": summary,
@@ -4607,13 +4953,21 @@ class ExternalDataHealthReportEngine:
             "05_Dependency_Check": dependency,
             "06_Annual_EPS_Chain": annual_chain,
             "07_Revenue_Chain": revenue_chain,
-            "08_Trace_Detail": trace,
-            "09_Fail_Reason_Summary": fail,
-            "10_URL_List": url_list,
+            "08_OpenAPI_Registry": openapi_registry,
+            "08A_OpenAPI_License": openapi_license,
+            "08B_Source_Version_Tracking": source_version,
+            "09_Trace_Detail": trace,
+            "10_Fail_Reason_Summary": fail,
+            "11_URL_List": url_list,
         }
 
     def export_excel(self, output_path: Path | None = None) -> Path:
         output_path = output_path or (EXTERNAL_HEALTH_REPORT_DIR / f"External_Data_Health_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        # R5K：產出健康報表前先掃描 TWSE Swagger，更新 OpenAPI Registry/Version。
+        try:
+            TWSEOpenAPIRegistryEngine(self.db, self.trace).scan(force_network=True)
+        except Exception as exc:
+            log_warning(f"[R5K][OPENAPI_SCAN_BEFORE_EXPORT_FAIL] {exc}")
         tables = self.build_tables()
         engine = available_excel_engine()
         if not engine:
