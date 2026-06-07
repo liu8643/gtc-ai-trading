@@ -4954,6 +4954,261 @@ class RevenueOpenAPICacheDownloader:
         return cache_df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
 
+
+class AnnualEPSCacheEngine:
+    """
+    R5G_ANNUAL_EPS_CACHE_ENGINE_20260607
+    目的：
+    - annual_eps_history 不再依賴單一 index05 / MOPS / OpenAPI。
+    - 建立五層備援：Cache -> Local File -> OpenAPI -> Index05 Selenium -> MOPS。
+    - 任一來源成功後，立即回寫 data/annual_eps_cache/annual_eps_{year}.csv，
+      下次啟動可直接由 cache 補回 annual_eps_history，降低網站改版與 EXE 環境風險。
+    """
+
+    SUCCESS_STATUS = {"exists", "imported"}
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.cache_dir = RUNTIME_DIR / "data" / "annual_eps_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _count_db_rows(self, fiscal_year: int) -> int:
+        try:
+            if not self.owner._table_exists("annual_eps_history"):
+                return 0
+            with self.owner.db.lock:
+                row = self.owner.db.conn.cursor().execute(
+                    "SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
+                    (int(fiscal_year),)
+                ).fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CACHE] count_db_rows failed fiscal_year={fiscal_year}｜{exc}")
+            return 0
+
+    def _cache_paths(self, fiscal_year: int) -> list[Path]:
+        fiscal_year = int(fiscal_year)
+        roc_year = fiscal_year - 1911
+        roots = [
+            RUNTIME_DIR / "data" / "annual_eps_cache",
+            RUNTIME_DIR / "data" / "eps_cache",
+            RUNTIME_DIR / "data" / "eps",
+            BASE_DIR / "data" / "annual_eps_cache",
+            BASE_DIR / "data" / "eps_cache",
+            BASE_DIR / "data" / "eps",
+        ]
+        names = [
+            f"annual_eps_{fiscal_year}.csv",
+            f"annual_eps_{fiscal_year}.json",
+            f"annual_eps_history_{fiscal_year}.csv",
+            f"annual_eps_history_{fiscal_year}.json",
+            f"{fiscal_year}Q4_annual_eps_cache.csv",
+            f"{fiscal_year}Q4_annual_eps_cache.json",
+            f"{roc_year}Q4_annual_eps_cache.csv",
+            f"{roc_year}Q4_annual_eps_cache.json",
+            f"114Q4_annual_eps_cache.csv" if fiscal_year == 2025 else "",
+            f"2025Q4_annual_eps_cache.csv" if fiscal_year == 2025 else "",
+        ]
+        out = []
+        seen = set()
+        for root in roots:
+            try:
+                for name in names:
+                    if not name:
+                        continue
+                    path = Path(root) / name
+                    key = str(path)
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(path)
+            except Exception:
+                continue
+        return out
+
+    @staticmethod
+    def _pick_column(df: pd.DataFrame, aliases: list[str]) -> str | None:
+        if df is None or df.empty:
+            return None
+        norm_map = {str(c).strip().lower().replace(" ", "").replace("_", ""): c for c in df.columns}
+        for alias in aliases:
+            key = str(alias).strip().lower().replace(" ", "").replace("_", "")
+            if key in norm_map:
+                return norm_map[key]
+        for c in df.columns:
+            s = str(c).strip().lower()
+            if any(str(a).strip().lower() in s for a in aliases):
+                return c
+        return None
+
+    def _read_cache_file(self, path: Path, fiscal_year: int) -> pd.DataFrame:
+        path = Path(path)
+        if not path.exists() or path.stat().st_size <= 0:
+            return pd.DataFrame()
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            raw = safe_read_json_auto(path)
+        elif suffix == ".csv":
+            raw = safe_read_csv_auto(path)
+        else:
+            return pd.DataFrame()
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+
+        stock_col = self._pick_column(raw, ["stock_id", "公司代號", "證券代號", "代號", "Code"])
+        name_col = self._pick_column(raw, ["stock_name", "公司名稱", "公司簡稱", "證券名稱", "Name"])
+        eps_col = self._pick_column(raw, ["eps_full_year", "annual_eps", "eps_cumulative", "基本每股盈餘", "EPS", "basic_eps"])
+        year_col = self._pick_column(raw, ["fiscal_year", "年度", "year"])
+        q_col = self._pick_column(raw, ["quarter", "季別", "season"])
+
+        if stock_col is None or eps_col is None:
+            raise ValueError(f"cache格式不符，找不到 stock_id/eps 欄位：{path}")
+
+        out = pd.DataFrame()
+        out["stock_id"] = raw[stock_col].map(normalize_stock_id)
+        out["stock_name"] = raw[name_col].astype(str).str.strip() if name_col in raw.columns else ""
+        out["eps_full_year"] = pd.to_numeric(raw[eps_col], errors="coerce")
+
+        if year_col in raw.columns:
+            y = pd.to_numeric(raw[year_col], errors="coerce")
+            valid_year = (y == int(fiscal_year)) | (y == int(fiscal_year) - 1911)
+            if valid_year.notna().any():
+                out = out.loc[valid_year.fillna(False)].copy()
+        if q_col in raw.columns:
+            q = pd.to_numeric(raw[q_col], errors="coerce")
+            # R5G：cache 原則上只收 Q4 年度 EPS；若舊 cache 沒 quarter 欄位，視為已整理年度檔。
+            out = out.loc[q.fillna(4).eq(4)].copy()
+
+        out["fiscal_year"] = int(fiscal_year)
+        out["fiscal_year_roc"] = int(fiscal_year) - 1911
+        out["quarter"] = 4
+        out["eps_cumulative"] = out["eps_full_year"]
+        out["eps_quarter"] = np.nan
+        out["eps_prev_cumulative"] = np.nan
+        out["eps_calc_method"] = "R5G_CACHE_ANNUAL_EPS"
+        out["source_type"] = "ANNUAL_EPS_CACHE"
+        out["source_url"] = "LOCAL_CACHE"
+        out["source_file"] = str(path)
+        out["source_date"] = f"{int(fiscal_year)}Q4"
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        out = out.dropna(subset=["stock_id", "eps_full_year"])
+        out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
+        out = out.drop_duplicates(subset=["stock_id", "fiscal_year"], keep="last")
+        return out
+
+    def try_import_cache(self, fiscal_year: int, force: bool = False) -> dict:
+        result = {"status": "skip", "rows": 0, "source": "ANNUAL_EPS_CACHE", "source_file": "", "message": ""}
+        try:
+            existing = self._count_db_rows(fiscal_year)
+            if existing > 0 and not force:
+                self.save_cache_from_db(fiscal_year)
+                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料，已同步確認 cache"})
+                return result
+
+            errors = []
+            for path in self._cache_paths(fiscal_year):
+                if not path.exists():
+                    continue
+                try:
+                    parsed = self._read_cache_file(path, fiscal_year)
+                    rows = self.owner._write_annual_eps_history(parsed, fiscal_year, source_label="ANNUAL_EPS_CACHE")
+                    if rows > 0:
+                        result.update({"status": "imported", "rows": rows, "source_file": str(path), "message": "已由年度EPS Cache補入 annual_eps_history"})
+                        log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CACHE] imported rows={rows} file={path}")
+                        return result
+                    errors.append(f"write_zero:{path}")
+                except Exception as exc:
+                    errors.append(f"{path}:{exc}")
+                    log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CACHE] cache candidate failed file={path}｜{exc}")
+
+            result.update({"status": "missing_cache", "rows": 0, "message": "; ".join(errors[:5]) if errors else "找不到可用年度EPS cache"})
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CACHE] try_import_cache failed fiscal_year={fiscal_year}｜{exc}")
+            return result
+
+    def save_cache_from_db(self, fiscal_year: int) -> dict:
+        result = {"status": "skip", "rows": 0, "cache_file": "", "message": ""}
+        try:
+            if not self.owner._table_exists("annual_eps_history"):
+                result.update({"status": "missing_table", "message": "annual_eps_history 不存在"})
+                return result
+            df = self.owner._read_sql(
+                "SELECT stock_id, fiscal_year, fiscal_year_roc, quarter, eps_full_year, eps_cumulative, eps_quarter, "
+                "eps_prev_cumulative, eps_calc_method, source_type, source_url, source_file, source_date, update_time "
+                "FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
+                [int(fiscal_year)]
+            )
+            if df is None or df.empty:
+                result.update({"status": "no_data", "message": "annual_eps_history 無可寫入 cache 資料"})
+                return result
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = self.cache_dir / f"annual_eps_{int(fiscal_year)}.csv"
+            df.to_csv(cache_file, index=False, encoding="utf-8-sig")
+            result.update({"status": "saved", "rows": int(len(df)), "cache_file": str(cache_file), "message": "年度EPS已寫入cache"})
+            log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CACHE] saved rows={len(df)} file={cache_file}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CACHE] save_cache_from_db failed fiscal_year={fiscal_year}｜{exc}")
+            return result
+
+    def _run_source(self, source_name: str, fn, fiscal_year: int, force: bool = False) -> dict:
+        try:
+            log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] start source={source_name} fiscal_year={fiscal_year}")
+            result = fn(fiscal_year, force=force)
+            if not isinstance(result, dict):
+                result = {"status": "unknown", "rows": 0, "message": str(result)}
+            log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] done source={source_name} result={result}")
+            if str(result.get("status", "")).lower() in self.SUCCESS_STATUS or int(result.get("rows", 0) or 0) > 0:
+                cache_result = self.save_cache_from_db(fiscal_year)
+                result["cache_result"] = cache_result
+            return result
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] source={source_name} failed｜{exc}")
+            return {"status": "error", "rows": 0, "source": source_name, "message": str(exc)}
+
+    def ensure(self, fiscal_year: int, force: bool = False) -> dict:
+        fiscal_year = int(fiscal_year)
+        trace = []
+        log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] start fiscal_year={fiscal_year} order=Cache>LocalFile>OpenAPI>Index05Selenium>MOPS")
+
+        chain = [
+            ("CACHE", self.try_import_cache),
+            ("LOCAL_FILE_114Q4_2025Q4", self.owner.ensure_annual_eps_from_local_114q4_file),
+            ("TWSE_OPENAPI", self.owner.ensure_annual_eps_from_twse_openapi),
+            ("INDEX05_SELENIUM_C05001", self.owner.ensure_annual_eps_from_twse_c05001),
+            ("MOPS_T163SB04", self.owner.ensure_annual_eps_from_mops),
+        ]
+
+        for source_name, fn in chain:
+            result = self._run_source(source_name, fn, fiscal_year, force=force)
+            result["source_name"] = source_name
+            trace.append(result)
+            status = str(result.get("status", "")).lower()
+            rows = int(result.get("rows", 0) or 0)
+            if status in self.SUCCESS_STATUS or rows > 0:
+                final = {
+                    "status": "success",
+                    "rows": rows,
+                    "winning_source": source_name,
+                    "trace": trace,
+                    "message": f"R5G年度EPS五層備援成功：{source_name}",
+                }
+                log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] success winning_source={source_name} rows={rows}")
+                return final
+
+        final = {
+            "status": "failed",
+            "rows": 0,
+            "winning_source": "",
+            "trace": trace,
+            "message": "R5G五層備援皆未取得年度EPS",
+        }
+        log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] failed fiscal_year={fiscal_year} trace={trace}")
+        return final
+
+
 class EPSForecastEngine:
     """EPS 實績/預測引擎（V4.7 官方年度EPS雙來源修正版）。
 
@@ -6877,17 +7132,15 @@ class EPSForecastEngine:
         注意：EPS_TTM 不在此函式使用，避免把 TTM 誤當年度 EPS。
         V4.3：若 DB 尚未有 annual_eps_history，會先嘗試使用本機 TWSE C05001 2025Q4 Excel/ZIP 補入。
         """
-        # R5E：年度EPS來源順序改為「本機114Q4/2025Q4 CSV/JSON」→「TWSE index05 C05001 Q4 ZIP/XLS」→OpenAPI→MOPS→QFH回補。
-        local_result = self.ensure_annual_eps_from_local_114q4_file(self.base_year, force=False)
-        if str(local_result.get("status", "")).lower() not in ("exists", "imported"):
-            c05001_result = self.ensure_annual_eps_from_twse_c05001(self.base_year, force=False)
-            if str(c05001_result.get("status", "")).lower() not in ("exists", "imported"):
-                openapi_result = self.ensure_annual_eps_from_twse_openapi(self.base_year, force=False)
-                if str(openapi_result.get("status", "")).lower() not in ("exists", "imported"):
-                    mops_result = self.ensure_annual_eps_from_mops(self.base_year, force=False)
-                    if str(mops_result.get("status", "")).lower() not in ("exists", "imported"):
-                        # R4F：最後官方/準官方 DB 回補；只使用 Q4 累計 EPS，不用 TTM 代理年度 EPS。
-                        self.ensure_annual_eps_from_quarterly_history(self.base_year, force=False)
+        # R5G：年度EPS匯入改為 AnnualEPSCacheEngine 五層備援：
+        # Cache -> Local File -> OpenAPI -> Index05 Selenium -> MOPS。
+        # 任一來源成功後會回寫 data/annual_eps_cache/annual_eps_{year}.csv，
+        # 避免 annual_eps_history 因單一網站改版或 EXE 環境缺件而再次整批空白。
+        r5g_result = AnnualEPSCacheEngine(self).ensure(self.base_year, force=False)
+        if str(r5g_result.get("status", "")).lower() != "success":
+            # R4F：最後 DB 回補；只使用 Q4 累計 EPS，不用 TTM 代理年度 EPS。
+            # 此層不列入 R5G 五層官方/本機來源，只作為保命用 DB fallback。
+            self.ensure_annual_eps_from_quarterly_history(self.base_year, force=False)
         parts = []
         if self._table_exists("annual_eps_history"):
             # V4.15-R2：相容舊DB annual_eps_history 尚未有 source_type 欄位的情境。
