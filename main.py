@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5F_INDEX05_SELENIUM_QUERY_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5H_OPENAPI_Q4_ANNUAL_EPS_FIRST"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3241,7 +3241,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5f_index05_selenium_query_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5h_openapi_q4_annual_eps_first",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -4960,7 +4960,7 @@ class AnnualEPSCacheEngine:
     R5G_ANNUAL_EPS_CACHE_ENGINE_20260607
     目的：
     - annual_eps_history 不再依賴單一 index05 / MOPS / OpenAPI。
-    - 建立五層備援：Cache -> Local File -> OpenAPI -> Index05 Selenium -> MOPS。
+    - 建立五層備援：Cache -> Local File -> Official EPS OpenAPI 2025Q4 -> Index05 Selenium -> MOPS。
     - 任一來源成功後，立即回寫 data/annual_eps_cache/annual_eps_{year}.csv，
       下次啟動可直接由 cache 補回 annual_eps_history，降低網站改版與 EXE 環境風險。
     """
@@ -5171,12 +5171,17 @@ class AnnualEPSCacheEngine:
     def ensure(self, fiscal_year: int, force: bool = False) -> dict:
         fiscal_year = int(fiscal_year)
         trace = []
-        log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] start fiscal_year={fiscal_year} order=Cache>LocalFile>OpenAPI>Index05Selenium>MOPS")
+        log_info(f"[HIGH_GROWTH][R5H_ANNUAL_EPS_CHAIN] start fiscal_year={fiscal_year} order=Cache>LocalFile>OfficialOpenAPI_Q4>Index05Selenium>MOPS")
 
+        # R5H_OPENAPI_Q4_ANNUAL_EPS_FIRST_20260607：
+        # 使用者實測 official_eps_openapi 可穩定下載 2025Q1/2026Q1 JSON。
+        # 因此年度EPS鏈改為優先嘗試 Official EPS OpenAPI 2025Q4；
+        # 若成功，直接將 2025Q4 的累計/基本 EPS 視為全年 EPS 寫入 annual_eps_history。
+        # index05 Selenium 僅保留為 OpenAPI Q4 失敗後的備援，不再作主要來源。
         chain = [
             ("CACHE", self.try_import_cache),
             ("LOCAL_FILE_114Q4_2025Q4", self.owner.ensure_annual_eps_from_local_114q4_file),
-            ("TWSE_OPENAPI", self.owner.ensure_annual_eps_from_twse_openapi),
+            ("OFFICIAL_EPS_OPENAPI_2025Q4", self.owner.ensure_annual_eps_from_official_openapi_q4),
             ("INDEX05_SELENIUM_C05001", self.owner.ensure_annual_eps_from_twse_c05001),
             ("MOPS_T163SB04", self.owner.ensure_annual_eps_from_mops),
         ]
@@ -6726,28 +6731,121 @@ class EPSForecastEngine:
         out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return out.drop_duplicates(subset=["stock_id", "fiscal_year"], keep="last")
 
-    def ensure_annual_eps_from_twse_openapi(self, fiscal_year: int | None = None, force: bool = False) -> dict:
+    def _openapi_q4_to_annual_eps_df(self, q4_df: pd.DataFrame, fiscal_year: int) -> pd.DataFrame:
+        """R5H：將 Official EPS OpenAPI 2025Q4 轉為 annual_eps_history 寫入格式。
+
+        原則：2025Q4 / 114Q4 的「基本每股盈餘」即全年累計 EPS，
+        可直接作為 annual_eps_history.eps_full_year。
+        注意：此函式不使用 EPS_TTM，不用預估值，不混入 2026Q1。
+        """
+        fiscal_year = int(fiscal_year)
+        if q4_df is None or q4_df.empty:
+            return pd.DataFrame()
+        x = q4_df.copy()
+        for c in ["stock_id", "eps_quarter"]:
+            if c not in x.columns:
+                return pd.DataFrame()
+        x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+        x["eps_full_year"] = pd.to_numeric(x["eps_quarter"], errors="coerce")
+        x = x.dropna(subset=["stock_id", "eps_full_year"])
+        x = x[x["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
+        if x.empty:
+            return pd.DataFrame()
+        out = pd.DataFrame({
+            "stock_id": x["stock_id"].astype(str),
+            "stock_name": x["stock_name"].astype(str).str.strip() if "stock_name" in x.columns else "",
+            "fiscal_year": fiscal_year,
+            "fiscal_year_roc": fiscal_year - 1911,
+            "quarter": 4,
+            "eps_full_year": x["eps_full_year"],
+            "eps_cumulative": x["eps_full_year"],
+            "eps_quarter": x["eps_full_year"],
+            "eps_prev_cumulative": np.nan,
+            "eps_calc_method": "R5H_OPENAPI_Q4_BASIC_EPS_AS_FULL_YEAR",
+            "source_type": "OFFICIAL_EPS_OPENAPI_Q4_ANNUAL_EPS",
+            "source_url": x["source_url"].astype(str) if "source_url" in x.columns else "TWSE_TPEX_T187AP06_OPENAPI",
+            "source_file": "official_eps_openapi",
+            "source_date": f"{fiscal_year}Q4",
+            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        return out.drop_duplicates(subset=["stock_id", "fiscal_year"], keep="last")
+
+    def ensure_official_eps_openapi_quarters(self, fiscal_year: int | None = None, quarters=(1, 2, 3, 4), force: bool = False) -> dict:
+        """R5H：用 official_eps_openapi 同一套方法批次抓 Q1~Q4。
+
+        目的：既然 official_eps_openapi 已可成功建立 2025Q1/2026Q1 JSON，
+        則年度EPS不再只依賴 index05；先嘗試取得 2025Q4，並保留 Q1~Q3 作追溯/交叉驗證。
+        """
         fiscal_year = int(fiscal_year or self.base_year)
-        result = {"status": "skip", "rows": 0, "source": "TWSE_OPENAPI_T187AP06", "message": ""}
+        results = []
+        total_rows = 0
+        for q in quarters:
+            try:
+                res = self.ensure_quarterly_eps_from_openapi(fiscal_year, int(q), force=force, include_tpex=True)
+                results.append({"quarter": int(q), **(res if isinstance(res, dict) else {"status": "unknown", "message": str(res)})})
+                total_rows += int((res or {}).get("rows", 0) or 0) if isinstance(res, dict) else 0
+            except Exception as exc:
+                results.append({"quarter": int(q), "status": "error", "rows": 0, "message": str(exc)})
+                log_warning(f"[HIGH_GROWTH][R5H_OPENAPI_Q_ALL] q={q} failed fiscal_year={fiscal_year}｜{exc}")
+        log_info(f"[HIGH_GROWTH][R5H_OPENAPI_Q_ALL] fiscal_year={fiscal_year} total_rows={total_rows} results={results}")
+        return {"status": "done", "rows": total_rows, "results": results, "source": "OFFICIAL_EPS_OPENAPI_Q1_Q4"}
+
+    def ensure_annual_eps_from_official_openapi_q4(self, fiscal_year: int | None = None, force: bool = False) -> dict:
+        """R5H：優先使用 Official EPS OpenAPI 2025Q4 建立 annual_eps_history。
+
+        流程：
+        1. 先用 official_eps_openapi 同步/下載 Q1~Q4（以 Q4 為年度 EPS 主目標）。
+        2. 從 2025Q4 解析出的 EPS 直接寫入 annual_eps_history.eps_full_year。
+        3. 成功後由 AnnualEPSCacheEngine 回寫 data/annual_eps_cache/annual_eps_2025.csv。
+        """
+        fiscal_year = int(fiscal_year or self.base_year)
+        result = {"status": "skip", "rows": 0, "source": "OFFICIAL_EPS_OPENAPI_Q4_ANNUAL_EPS", "message": ""}
         try:
             with self.db.lock:
-                row = self.db.conn.cursor().execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,)).fetchone()
+                row = self.db.conn.cursor().execute(
+                    "SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
+                    (fiscal_year,)
+                ).fetchone()
                 existing = int(row[0] or 0) if row else 0
             if existing > 0 and not force:
                 result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
                 return result
-            df = self.load_twse_openapi_annual_eps(fiscal_year, season=4)
-            rows = self._write_annual_eps_history(df, fiscal_year, source_label="TWSE_OPENAPI_T187AP06_ANNUAL_EPS")
+
+            # 先嘗試建立 Q1~Q4 的 official_eps_openapi cache 與 quarterly_financial_history。
+            q_results = self.ensure_official_eps_openapi_quarters(fiscal_year, quarters=(1, 2, 3, 4), force=force)
+
+            # 直接載入 Q4；OpenAPI 可能為即時快照型，若年度/季別不符，parse 會 rejected 並回空。
+            q4_df = self.load_openapi_eps_all_sources(fiscal_year, 4, include_tpex=True)
+            if q4_df is None or q4_df.empty:
+                result.update({
+                    "status": "no_data",
+                    "rows": 0,
+                    "message": f"Official EPS OpenAPI 無符合 {fiscal_year}Q4/114Q4 資料；q_results={q_results}",
+                })
+                log_warning(f"[HIGH_GROWTH][R5H_OPENAPI_Q4_ANNUAL] no_data fiscal_year={fiscal_year} q_results={q_results}")
+                return result
+
+            annual_df = self._openapi_q4_to_annual_eps_df(q4_df, fiscal_year)
+            rows = self._write_annual_eps_history(annual_df, fiscal_year, source_label="OFFICIAL_EPS_OPENAPI_Q4_ANNUAL_EPS")
             if rows > 0:
-                result.update({"status": "imported", "rows": rows, "message": "已由TWSE OpenAPI補入全年EPS"})
+                result.update({"status": "imported", "rows": rows, "message": f"已由 official_eps_openapi {fiscal_year}Q4 建立 annual_eps_history"})
+                log_info(f"[HIGH_GROWTH][R5H_OPENAPI_Q4_ANNUAL] imported fiscal_year={fiscal_year} rows={rows}")
             else:
-                result.update({"status": "no_data", "rows": 0, "message": "TWSE OpenAPI無可寫入年度EPS"})
-            log_info(f"[HIGH_GROWTH][TWSE_OPENAPI_EPS] annual_eps_history result={result}")
+                result.update({"status": "write_zero", "rows": 0, "message": "OpenAPI Q4 有資料但 annual_eps_history 寫入 0 筆"})
+                log_warning(f"[HIGH_GROWTH][R5H_OPENAPI_Q4_ANNUAL] write_zero fiscal_year={fiscal_year} q4_rows={len(q4_df)}")
             return result
         except Exception as exc:
             result.update({"status": "error", "rows": 0, "message": str(exc)})
-            log_warning(f"[HIGH_GROWTH][TWSE_OPENAPI_EPS] 補入annual_eps_history失敗：{exc}")
+            log_warning(f"[HIGH_GROWTH][R5H_OPENAPI_Q4_ANNUAL] failed fiscal_year={fiscal_year}｜{exc}")
             return result
+
+    def ensure_annual_eps_from_twse_openapi(self, fiscal_year: int | None = None, force: bool = False) -> dict:
+        """R5H 相容入口：年度 EPS OpenAPI 改走 official_eps_openapi 2025Q4 優先流程。
+
+        舊版只讀 TWSE 上市六大產業端點，且容易把最新季別/非 Q4 資料排除；
+        R5H 改為 TWSE+TPEx official_eps_openapi Q1~Q4，同時以 Q4 建立 annual_eps_history。
+        """
+        return self.ensure_annual_eps_from_official_openapi_q4(fiscal_year=fiscal_year, force=force)
 
     def _validate_twse_c05001_download_content(self, content: bytes, url: str = "", ctype: str = "") -> tuple[bool, str]:
         """R5F：統一驗證 index05 下載內容，避免 HTML/security/error page 被當成 ZIP。"""
@@ -7132,10 +7230,10 @@ class EPSForecastEngine:
         注意：EPS_TTM 不在此函式使用，避免把 TTM 誤當年度 EPS。
         V4.3：若 DB 尚未有 annual_eps_history，會先嘗試使用本機 TWSE C05001 2025Q4 Excel/ZIP 補入。
         """
-        # R5G：年度EPS匯入改為 AnnualEPSCacheEngine 五層備援：
-        # Cache -> Local File -> OpenAPI -> Index05 Selenium -> MOPS。
-        # 任一來源成功後會回寫 data/annual_eps_cache/annual_eps_{year}.csv，
-        # 避免 annual_eps_history 因單一網站改版或 EXE 環境缺件而再次整批空白。
+        # R5H：年度EPS匯入改為 AnnualEPSCacheEngine 五層備援：
+        # Cache -> Local File -> Official EPS OpenAPI 2025Q4 -> Index05 Selenium -> MOPS。
+        # 核心修正：用 official_eps_openapi 抓 2025Q1~Q4，並把 2025Q4 EPS 直接寫入 annual_eps_history.eps_full_year。
+        # index05 Selenium 改為 OpenAPI Q4 失敗後的備援。
         r5g_result = AnnualEPSCacheEngine(self).ensure(self.base_year, force=False)
         if str(r5g_result.get("status", "")).lower() != "success":
             # R4F：最後 DB 回補；只使用 Q4 累計 EPS，不用 TTM 代理年度 EPS。
