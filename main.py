@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5H_OPENAPI_Q4_ANNUAL_EPS_FIRST"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5I_EXTERNAL_DATA_TRACE_ENGINE"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2771,6 +2771,124 @@ class DBManager:
             PRIMARY KEY (run_id, module, source_key, attempt_no)
         )
         """)
+        # R5I_EXTERNAL_DATA_TRACE_ENGINE_20260607：
+        # 全外部資料來源 Trace / Health Check 基礎資料表。
+        # 目的：所有連外來源均記錄 SCAN/DOWNLOAD/PARSE/WRITE/VERIFY，
+        # 避免 HTTP 200 錯誤頁、rows=0、表存在但無資料等問題被誤判為成功。
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS external_data_trace_event (
+            trace_id TEXT PRIMARY KEY,
+            run_id TEXT,
+            module TEXT,
+            source_name TEXT,
+            request_url TEXT,
+            source_file TEXT,
+            target_table TEXT,
+            stage TEXT,
+            status TEXT,
+            http_status TEXT,
+            content_type TEXT,
+            bytes INTEGER DEFAULT 0,
+            rows_downloaded INTEGER DEFAULT 0,
+            rows_parsed INTEGER DEFAULT 0,
+            rows_written INTEGER DEFAULT 0,
+            verify_count INTEGER DEFAULT 0,
+            fallback_used TEXT,
+            fail_reason_code TEXT,
+            fail_reason_detail TEXT,
+            source_date TEXT,
+            elapsed_ms REAL DEFAULT 0,
+            created_at TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS external_data_health_summary (
+            run_id TEXT,
+            module TEXT,
+            final_status TEXT,
+            target_table TEXT,
+            last_success_time TEXT,
+            fallback_used TEXT,
+            verify_count INTEGER DEFAULT 0,
+            fail_reason_code TEXT,
+            fail_reason_detail TEXT,
+            action_required TEXT,
+            updated_at TEXT,
+            PRIMARY KEY(run_id, module)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS external_data_source_registry (
+            module TEXT,
+            source_name TEXT,
+            priority_order INTEGER DEFAULT 0,
+            target_table TEXT,
+            min_bytes INTEGER DEFAULT 0,
+            min_rows INTEGER DEFAULT 0,
+            expected_type TEXT,
+            severity TEXT,
+            enabled INTEGER DEFAULT 1,
+            note TEXT,
+            update_time TEXT,
+            PRIMARY KEY(module, source_name)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS external_data_fail_reason_dict (
+            fail_reason_code TEXT PRIMARY KEY,
+            severity TEXT,
+            suggested_fix TEXT,
+            update_time TEXT
+        )
+        """)
+        fail_rows = [
+            ("HTTP_FAIL", "P0/P1", "檢查網址、HTTP狀態、是否被阻擋；啟用下一層備援。"),
+            ("BYTES_TOO_SMALL", "P0", "下載內容過小，常見為錯誤頁或空回應；不得寫入DB。"),
+            ("HTML_ERROR_PAGE", "P0", "預期 JSON/CSV/XLS/ZIP 卻取得 HTML；需保存前500字與切備援。"),
+            ("PARSE_ROWS_ZERO", "P0", "解析0筆；檢查欄位名、年份/季別、格式是否改版。"),
+            ("WRITE_ROWS_ZERO", "P0", "解析有資料但寫入0筆；檢查欄位 mapping / DB schema / UPSERT。"),
+            ("VERIFY_ROWS_ZERO", "P0", "核心表驗證0筆；報表首頁紅燈，不可宣稱完成。"),
+            ("STALE_DATA", "P1", "資料日期過舊；標黃並顯示最後成功時間。"),
+            ("FALLBACK_USED", "P1", "已使用備援來源；需標示 source_level，不可混為正式來源。"),
+            ("LOCAL_FILE_MISSING", "P0/P1", "本機檔案未找到；列出搜尋路徑與候選檔名。"),
+            ("DEPENDENCY_MISSING", "P0", "EXE或環境缺 selenium/lxml/xlrd/openpyxl 等套件。"),
+            ("MATCHED_ROWS_ZERO", "P0", "下載有資料但 fiscal_year/quarter matched=0；需輸出 matched/rejected。"),
+        ]
+        cur.executemany("""
+            INSERT INTO external_data_fail_reason_dict(fail_reason_code, severity, suggested_fix, update_time)
+            VALUES(?,?,?,?)
+            ON CONFLICT(fail_reason_code) DO UPDATE SET
+                severity=excluded.severity,
+                suggested_fix=excluded.suggested_fix,
+                update_time=excluded.update_time
+        """, [(code, sev, fix, datetime.now().strftime("%Y-%m-%d %H:%M:%S")) for code, sev, fix in fail_rows])
+        registry_rows = [
+            ("AnnualEPS", "Cache", 1, "annual_eps_history", 0, 1000, "csv/json", "P0", 1, "年度EPS快取"),
+            ("AnnualEPS", "LocalFile", 2, "annual_eps_history", 0, 1000, "csv/json/xls/xlsx", "P0", 1, "本機114Q4/2025Q4檔"),
+            ("AnnualEPS", "OfficialOpenAPI_Q4", 3, "annual_eps_history", 5000, 1000, "json", "P0", 1, "Official EPS OpenAPI Q4"),
+            ("AnnualEPS", "Index05Selenium", 4, "annual_eps_history", 5000, 1000, "zip/xls/xlsx", "P0", 1, "TWSE index05 Selenium"),
+            ("AnnualEPS", "MOPS", 5, "annual_eps_history", 5000, 1000, "html", "P0", 1, "MOPS t163sb04"),
+            ("QuarterlyEPS", "OfficialEPSOpenAPI", 1, "quarterly_financial_history", 5000, 1000, "json", "P0", 1, "季度EPS OpenAPI"),
+            ("Revenue", "TWSE_TPEX_MonthlyRevenue", 1, "external_revenue_history", 5000, 1000, "json/csv", "P0", 1, "月營收資料"),
+            ("Classification", "LocalCSV_OpenAPI", 1, "stocks_master", 0, 2000, "csv/json", "P1", 1, "官方分類"),
+            ("MarketSnapshot", "TWSE_MI_INDEX", 1, "market_snapshot", 3000, 1000, "json/csv", "P1", 1, "大盤/個股市場快照"),
+            ("PriceHistory", "TWSE_TPEX_Yahoo", 1, "price_history", 3000, 1000, "json/csv", "P1", 1, "歷史價格"),
+        ]
+        cur.executemany("""
+            INSERT INTO external_data_source_registry(module, source_name, priority_order, target_table, min_bytes, min_rows, expected_type, severity, enabled, note, update_time)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(module, source_name) DO UPDATE SET
+                priority_order=excluded.priority_order,
+                target_table=excluded.target_table,
+                min_bytes=excluded.min_bytes,
+                min_rows=excluded.min_rows,
+                expected_type=excluded.expected_type,
+                severity=excluded.severity,
+                enabled=excluded.enabled,
+                note=excluded.note,
+                update_time=excluded.update_time
+        """, [(m, s, p, t, mb, mr, et, sev, en, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S")) for m, s, p, t, mb, mr, et, sev, en, note in registry_rows])
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_plan (
             run_id TEXT,
@@ -2944,6 +3062,10 @@ class DBManager:
             "CREATE INDEX IF NOT EXISTS idx_revenue_stock_month ON external_revenue(stock_id, revenue_month)",
             "CREATE INDEX IF NOT EXISTS idx_financial_feature_stock_date ON financial_feature_daily(stock_id, feature_date)",
             "CREATE INDEX IF NOT EXISTS idx_external_detail_module ON external_source_status_detail(module, source_key, source_date)",
+            "CREATE INDEX IF NOT EXISTS idx_external_trace_module_stage ON external_data_trace_event(module, stage, status)",
+            "CREATE INDEX IF NOT EXISTS idx_external_trace_run ON external_data_trace_event(run_id, module, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_external_trace_fail ON external_data_trace_event(fail_reason_code, status)",
+            "CREATE INDEX IF NOT EXISTS idx_external_health_status ON external_data_health_summary(final_status, module)",
             "CREATE INDEX IF NOT EXISTS idx_trade_plan_gate_state ON trade_plan(trade_allowed, market_gate_state, flow_gate_state, fundamental_gate_state)",
         ]:
             cur.execute(sql)
@@ -3556,6 +3678,368 @@ class DBManager:
         with self.lock:
             return pd.read_sql_query(q, self.conn)
 
+
+
+
+class ExternalDataTraceEngine:
+    """R5I_EXTERNAL_DATA_TRACE_ENGINE_20260607：全外部資料來源追蹤與健康檢查。
+
+    此模組不是只記錄 Exception，而是記錄完整資料鏈：
+    SCAN -> DOWNLOAD -> PARSE -> WRITE -> VERIFY。
+    目的：避免表存在但0筆、HTTP 200 錯誤頁、缺套件、解析0筆等問題被誤判成功。
+    """
+
+    CORE_TABLE_MIN_ROWS = {
+        "annual_eps_history": 1000,
+        "quarterly_financial_history": 1000,
+        "external_revenue_history": 1000,
+        "market_snapshot": 1000,
+        "stocks_master": 1000,
+        "price_history": 1000,
+    }
+
+    def __init__(self, db: DBManager, run_id: str | None = None):
+        self.db = db
+        self.run_id = run_id or datetime.now().strftime("trace_%Y%m%d_%H%M%S_%f")
+
+    @staticmethod
+    def _norm_status(status: str) -> str:
+        s = str(status or "").strip().upper()
+        if s in ("OK", "SUCCESS", "IMPORTED", "EXISTS", "PASS"):
+            return "PASS"
+        if s in ("WARN", "WARNING", "SKIP", "MISSING_FILE"):
+            return "WARN"
+        if s in ("FAIL", "FAILED", "ERROR", "NO_DATA", "PARSE_FAILED", "WRITE_ZERO"):
+            return "FAIL"
+        return s or "WARN"
+
+    @staticmethod
+    def infer_fail_reason(stage: str = "", status: str = "", http_status: str = "", bytes_count=None,
+                          content_type: str = "", rows_parsed=None, rows_written=None, verify_count=None,
+                          detail: str = "") -> str:
+        detail_l = str(detail or "").lower()
+        ctype_l = str(content_type or "").lower()
+        stage_u = str(stage or "").upper()
+        status_u = str(status or "").upper()
+        try:
+            http_i = int(str(http_status).strip()) if str(http_status or "").strip().isdigit() else 0
+        except Exception:
+            http_i = 0
+        if "no module named" in detail_l or "missing optional dependency" in detail_l:
+            return "DEPENDENCY_MISSING"
+        if http_i and http_i not in (200, 304):
+            return "HTTP_FAIL"
+        if bytes_count is not None:
+            try:
+                if int(bytes_count or 0) > 0 and int(bytes_count or 0) < 1000 and stage_u in ("DOWNLOAD", "SOURCE"):
+                    return "BYTES_TOO_SMALL"
+            except Exception:
+                pass
+        if "html" in ctype_l and stage_u in ("DOWNLOAD", "SOURCE"):
+            return "HTML_ERROR_PAGE"
+        try:
+            if rows_parsed is not None and int(rows_parsed or 0) == 0 and stage_u in ("PARSE", "SOURCE"):
+                return "PARSE_ROWS_ZERO"
+        except Exception:
+            pass
+        try:
+            if rows_written is not None and int(rows_written or 0) == 0 and stage_u in ("WRITE", "SOURCE"):
+                return "WRITE_ROWS_ZERO"
+        except Exception:
+            pass
+        try:
+            if verify_count is not None and int(verify_count or 0) == 0 and stage_u in ("VERIFY", "SOURCE"):
+                return "VERIFY_ROWS_ZERO"
+        except Exception:
+            pass
+        if "matched=0" in detail_l or "matched_rows_zero" in detail_l:
+            return "MATCHED_ROWS_ZERO"
+        if "missing_file" in detail_l or "找不到" in detail_l:
+            return "LOCAL_FILE_MISSING"
+        if status_u in ("FAIL", "FAILED", "ERROR", "NO_DATA"):
+            return "UNKNOWN_EXTERNAL_DATA_FAIL"
+        return ""
+
+    def _table_exists(self, table_name: str) -> bool:
+        try:
+            with self.db.lock:
+                row = self.db.conn.cursor().execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (str(table_name),)
+                ).fetchone()
+            return bool(row)
+        except Exception:
+            return False
+
+    def verify_table_count(self, table_name: str, where_sql: str = "", params: tuple = ()) -> int:
+        try:
+            safe = re.sub(r"[^A-Za-z0-9_]", "", str(table_name or ""))
+            if not safe or not self._table_exists(safe):
+                return 0
+            sql = f"SELECT COUNT(*) FROM {safe}"
+            if where_sql:
+                sql += " WHERE " + str(where_sql)
+            with self.db.lock:
+                row = self.db.conn.cursor().execute(sql, tuple(params or ())).fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception as exc:
+            log_warning(f"[EXTERNAL_TRACE][VERIFY_COUNT_FAIL] table={table_name}｜{exc}")
+            return 0
+
+    def event(self, module: str, source_name: str, stage: str, status: str, target_table: str = "",
+              request_url: str = "", source_file: str = "", http_status: str = "", content_type: str = "",
+              bytes_count=None, rows_downloaded=None, rows_parsed=None, rows_written=None, verify_count=None,
+              fallback_used: str = "", fail_reason_code: str = "", fail_reason_detail: str = "",
+              source_date: str = "", elapsed_ms: float = 0.0) -> str:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        norm_status = self._norm_status(status)
+        if not fail_reason_code and norm_status == "FAIL":
+            fail_reason_code = self.infer_fail_reason(
+                stage=stage, status=norm_status, http_status=http_status,
+                bytes_count=bytes_count, content_type=content_type,
+                rows_parsed=rows_parsed, rows_written=rows_written,
+                verify_count=verify_count, detail=fail_reason_detail
+            )
+        trace_id = f"{self.run_id}_{module}_{source_name}_{stage}_{int(time.time()*1000)}_{abs(hash((module, source_name, stage, now))) % 100000}"
+        row = {
+            "trace_id": trace_id,
+            "run_id": self.run_id,
+            "module": str(module or ""),
+            "source_name": str(source_name or ""),
+            "request_url": str(request_url or ""),
+            "source_file": str(source_file or ""),
+            "target_table": str(target_table or ""),
+            "stage": str(stage or ""),
+            "status": norm_status,
+            "http_status": str(http_status or ""),
+            "content_type": str(content_type or ""),
+            "bytes": int(bytes_count or 0),
+            "rows_downloaded": int(rows_downloaded or 0),
+            "rows_parsed": int(rows_parsed or 0),
+            "rows_written": int(rows_written or 0),
+            "verify_count": int(verify_count or 0),
+            "fallback_used": str(fallback_used or ""),
+            "fail_reason_code": str(fail_reason_code or ""),
+            "fail_reason_detail": str(fail_reason_detail or "")[:2000],
+            "source_date": str(source_date or ""),
+            "elapsed_ms": float(elapsed_ms or 0.0),
+            "created_at": now,
+        }
+        try:
+            with self.db.lock:
+                pd.DataFrame([row]).to_sql("external_data_trace_event", self.db.conn, if_exists="append", index=False)
+                self.db.conn.commit()
+            log_info(
+                f"[EXTERNAL_TRACE] run_id={self.run_id} module={module} source={source_name} "
+                f"stage={stage} status={norm_status} target={target_table} rows_parsed={row['rows_parsed']} "
+                f"rows_written={row['rows_written']} verify={row['verify_count']} reason={row['fail_reason_code']}"
+            )
+        except Exception as exc:
+            log_warning(f"[EXTERNAL_TRACE][WRITE_FAIL] {module}/{source_name}/{stage}｜{exc}")
+
+        self.update_health_summary(
+            module=module,
+            target_table=target_table,
+            status=norm_status,
+            fallback_used=fallback_used,
+            verify_count=int(verify_count or 0),
+            fail_reason_code=fail_reason_code,
+            fail_reason_detail=fail_reason_detail,
+        )
+        return trace_id
+
+    def success(self, module: str, source_name: str, stage: str, **kwargs) -> str:
+        return self.event(module, source_name, stage, "PASS", **kwargs)
+
+    def warn(self, module: str, source_name: str, stage: str, reason_code: str = "", reason_detail: str = "", **kwargs) -> str:
+        return self.event(module, source_name, stage, "WARN", fail_reason_code=reason_code, fail_reason_detail=reason_detail, **kwargs)
+
+    def fail(self, module: str, source_name: str, stage: str, reason_code: str = "", reason_detail: str = "", **kwargs) -> str:
+        return self.event(module, source_name, stage, "FAIL", fail_reason_code=reason_code, fail_reason_detail=reason_detail, **kwargs)
+
+    def update_health_summary(self, module: str, target_table: str = "", status: str = "WARN",
+                              fallback_used: str = "", verify_count: int = 0,
+                              fail_reason_code: str = "", fail_reason_detail: str = ""):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        norm_status = self._norm_status(status)
+        action = ""
+        if norm_status == "FAIL":
+            action = f"需立即處理：{fail_reason_code or 'UNKNOWN'}"
+        elif norm_status == "WARN":
+            action = "需確認備援/資料新鮮度"
+        elif norm_status == "PASS":
+            action = "無"
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.execute("""
+                    INSERT INTO external_data_health_summary(
+                        run_id,module,final_status,target_table,last_success_time,fallback_used,
+                        verify_count,fail_reason_code,fail_reason_detail,action_required,updated_at
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(run_id,module) DO UPDATE SET
+                        final_status=CASE
+                            WHEN excluded.final_status='FAIL' THEN 'FAIL'
+                            WHEN external_data_health_summary.final_status='FAIL' THEN external_data_health_summary.final_status
+                            WHEN excluded.final_status='WARN' THEN 'WARN'
+                            ELSE excluded.final_status
+                        END,
+                        target_table=excluded.target_table,
+                        last_success_time=CASE WHEN excluded.final_status='PASS' THEN excluded.last_success_time ELSE external_data_health_summary.last_success_time END,
+                        fallback_used=CASE WHEN excluded.fallback_used<>'' THEN excluded.fallback_used ELSE external_data_health_summary.fallback_used END,
+                        verify_count=MAX(COALESCE(external_data_health_summary.verify_count,0), COALESCE(excluded.verify_count,0)),
+                        fail_reason_code=CASE WHEN excluded.fail_reason_code<>'' THEN excluded.fail_reason_code ELSE external_data_health_summary.fail_reason_code END,
+                        fail_reason_detail=CASE WHEN excluded.fail_reason_detail<>'' THEN excluded.fail_reason_detail ELSE external_data_health_summary.fail_reason_detail END,
+                        action_required=excluded.action_required,
+                        updated_at=excluded.updated_at
+                """, (
+                    self.run_id, module, norm_status, target_table,
+                    now if norm_status == "PASS" else "",
+                    fallback_used, int(verify_count or 0),
+                    fail_reason_code, str(fail_reason_detail or "")[:2000],
+                    action, now
+                ))
+                self.db.conn.commit()
+        except Exception as exc:
+            log_warning(f"[EXTERNAL_TRACE][HEALTH_WRITE_FAIL] {module}｜{exc}")
+
+    def verify_core_table(self, module: str, table_name: str, where_sql: str = "", params: tuple = (),
+                          min_rows: int | None = None) -> int:
+        cnt = self.verify_table_count(table_name, where_sql=where_sql, params=params)
+        threshold = int(min_rows if min_rows is not None else self.CORE_TABLE_MIN_ROWS.get(str(table_name), 1))
+        status = "PASS" if cnt >= threshold else "FAIL"
+        self.event(
+            module=module,
+            source_name="DB_VERIFY",
+            stage="VERIFY",
+            status=status,
+            target_table=table_name,
+            verify_count=cnt,
+            fail_reason_code="" if status == "PASS" else "VERIFY_ROWS_ZERO",
+            fail_reason_detail="" if status == "PASS" else f"{table_name} verify_count={cnt} min_required={threshold}",
+        )
+        return cnt
+
+    def dependency_health(self) -> pd.DataFrame:
+        rows = []
+        modules = [
+            ("selenium", "Index05 Selenium"),
+            ("lxml", "MOPS/pd.read_html"),
+            ("xlrd", ".xls reader"),
+            ("openpyxl", ".xlsx writer/reader"),
+            ("requests", "HTTP downloader"),
+        ]
+        for mod, purpose in modules:
+            ok = importlib.util.find_spec(mod) is not None
+            rows.append({
+                "module": "Dependency",
+                "source_name": mod,
+                "target_table": "",
+                "final_status": "PASS" if ok else "FAIL",
+                "verify_count": 1 if ok else 0,
+                "fail_reason_code": "" if ok else "DEPENDENCY_MISSING",
+                "fail_reason_detail": purpose,
+                "action_required": "無" if ok else f"EXE build/requirements 加入 {mod}",
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        return pd.DataFrame(rows)
+
+    def health_summary_df(self, include_dependency: bool = True) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                df = pd.read_sql_query("""
+                    SELECT module, final_status, target_table, verify_count, fallback_used,
+                           fail_reason_code, fail_reason_detail, action_required,
+                           last_success_time, updated_at, run_id
+                    FROM external_data_health_summary
+                    ORDER BY CASE final_status WHEN 'FAIL' THEN 1 WHEN 'WARN' THEN 2 ELSE 3 END, module
+                """, self.db.conn)
+        except Exception:
+            df = pd.DataFrame()
+        if include_dependency:
+            dep = self.dependency_health()
+            if df is None or df.empty:
+                df = dep
+            else:
+                df = pd.concat([df, dep], ignore_index=True, sort=False)
+        if df is None or df.empty:
+            df = pd.DataFrame([{
+                "module": "TraceEngine",
+                "final_status": "WARN",
+                "target_table": "",
+                "verify_count": 0,
+                "fallback_used": "",
+                "fail_reason_code": "NO_TRACE_EVENT",
+                "fail_reason_detail": "尚未產生外部資料Trace事件",
+                "action_required": "執行資料匯入或報表產生後再檢查",
+                "last_success_time": "",
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "run_id": self.run_id,
+            }])
+        return df
+
+    def trace_detail_df(self, limit: int = 1000) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                return pd.read_sql_query(f"""
+                    SELECT created_at, run_id, module, source_name, stage, status, target_table,
+                           http_status, content_type, bytes, rows_downloaded, rows_parsed,
+                           rows_written, verify_count, fallback_used, fail_reason_code,
+                           fail_reason_detail, request_url, source_file, elapsed_ms
+                    FROM external_data_trace_event
+                    ORDER BY created_at DESC
+                    LIMIT {int(limit)}
+                """, self.db.conn)
+        except Exception:
+            return pd.DataFrame([{"狀態": "NO_TRACE_TABLE_OR_NO_DATA", "說明": "external_data_trace_event 尚無資料"}])
+
+    def fail_reason_summary_df(self) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                return pd.read_sql_query("""
+                    SELECT COALESCE(e.fail_reason_code,'') AS fail_reason_code,
+                           COUNT(*) AS count,
+                           GROUP_CONCAT(DISTINCT e.module) AS modules,
+                           MAX(d.severity) AS severity,
+                           MAX(d.suggested_fix) AS suggested_fix
+                    FROM external_data_trace_event e
+                    LEFT JOIN external_data_fail_reason_dict d
+                      ON e.fail_reason_code=d.fail_reason_code
+                    WHERE COALESCE(e.fail_reason_code,'') <> ''
+                    GROUP BY COALESCE(e.fail_reason_code,'')
+                    ORDER BY count DESC
+                """, self.db.conn)
+        except Exception:
+            return pd.DataFrame()
+
+    def database_health_df(self) -> pd.DataFrame:
+        tables = [
+            ("stocks_master", "stock_id", "輔助/基本資料"),
+            ("external_revenue", "stock_id", "月營收最新/備援來源"),
+            ("external_revenue_history", "stock_id", "月營收歷史首選來源"),
+            ("external_valuation", "stock_id", "EPS proxy，不可當嚴格季EPS"),
+            ("financial_feature_daily", "stock_id", "財務EPS矩陣/每日特徵"),
+            ("quarterly_financial_history", "stock_id", "正式季度EPS首選來源"),
+            ("annual_eps_history", "stock_id", "正式年度EPS首選來源"),
+            ("technical_feature_daily", "stock_id", "技術/價格特徵"),
+            ("market_snapshot", "stock_id", "市場/個股快照"),
+        ]
+        rows = []
+        for table, key_col, purpose in tables:
+            exists = self._table_exists(table)
+            count = self.verify_table_count(table) if exists else 0
+            status = "PASS" if (exists and count > 0) else ("FAIL" if table in ("annual_eps_history", "quarterly_financial_history", "external_revenue_history") else "WARN")
+            rows.append({
+                "資料表": table,
+                "是否存在": "YES" if exists else "NO",
+                "筆數": count,
+                "主要欄位": key_col,
+                "用途": purpose,
+                "判定": "可用" if status == "PASS" else ("有表但目前無資料" if exists else "不存在"),
+                "trace_status": status,
+            })
+        return pd.DataFrame(rows)
 
 
 def normalize_fiscal_quarter(value) -> tuple[int | None, int | None, str, str]:
@@ -4320,6 +4804,10 @@ HIGH_GROWTH_COLUMN_MAP.update({
 
 HIGH_GROWTH_SHEET_MAP = {
     "00_結論摘要": {"zh": "00_結論摘要", "en": "00_Summary"},
+    "00A_外部資料健康檢查": {"zh": "00A_外部資料健康檢查", "en": "00A_External_Data_Health"},
+    "00B_外部資料Trace明細": {"zh": "00B_外部資料Trace明細", "en": "00B_External_Data_Trace"},
+    "00C_資料來源失敗原因": {"zh": "00C_資料來源失敗原因", "en": "00C_Fail_Reason_Summary"},
+    "00D_資料庫健康度": {"zh": "00D_資料庫健康度", "en": "00D_DB_Health"},
     "01_DB可用性盤點": {"zh": "01_DB可用性盤點", "en": "01_DB_Availability"},
     "01A_月營收月份覆蓋": {"zh": "01A_月營收月份覆蓋", "en": "01A_Revenue_Month_Coverage"},
     "04A_正式EPS驗證KPI": {"zh": "04A_正式EPS驗證KPI", "en": "04A_Official_EPS_Validation_KPI"},
@@ -5171,13 +5659,16 @@ class AnnualEPSCacheEngine:
     def ensure(self, fiscal_year: int, force: bool = False) -> dict:
         fiscal_year = int(fiscal_year)
         trace = []
+        trace_engine = ExternalDataTraceEngine(self.owner.db, run_id=f"AnnualEPS_{fiscal_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        trace_engine.event(
+            "AnnualEPS", "R5H_CHAIN", "START", "PASS",
+            target_table="annual_eps_history",
+            source_date=f"{fiscal_year}Q4",
+            fail_reason_detail="Cache>LocalFile>OfficialOpenAPI_Q4>Index05Selenium>MOPS"
+        )
         log_info(f"[HIGH_GROWTH][R5H_ANNUAL_EPS_CHAIN] start fiscal_year={fiscal_year} order=Cache>LocalFile>OfficialOpenAPI_Q4>Index05Selenium>MOPS")
 
-        # R5H_OPENAPI_Q4_ANNUAL_EPS_FIRST_20260607：
-        # 使用者實測 official_eps_openapi 可穩定下載 2025Q1/2026Q1 JSON。
-        # 因此年度EPS鏈改為優先嘗試 Official EPS OpenAPI 2025Q4；
-        # 若成功，直接將 2025Q4 的累計/基本 EPS 視為全年 EPS 寫入 annual_eps_history。
-        # index05 Selenium 僅保留為 OpenAPI Q4 失敗後的備援，不再作主要來源。
+        # R5I：每層來源都寫入 external_data_trace_event，並在最後做 annual_eps_history verify。
         chain = [
             ("CACHE", self.try_import_cache),
             ("LOCAL_FILE_114Q4_2025Q4", self.owner.ensure_annual_eps_from_local_114q4_file),
@@ -5187,30 +5678,69 @@ class AnnualEPSCacheEngine:
         ]
 
         for source_name, fn in chain:
+            start_ts = time.time()
             result = self._run_source(source_name, fn, fiscal_year, force=force)
+            elapsed_ms = round((time.time() - start_ts) * 1000, 2)
             result["source_name"] = source_name
             trace.append(result)
-            status = str(result.get("status", "")).lower()
+            status_raw = str(result.get("status", "")).lower()
             rows = int(result.get("rows", 0) or 0)
-            if status in self.SUCCESS_STATUS or rows > 0:
+            verify_count = self._count_db_rows(fiscal_year)
+            event_status = "PASS" if (status_raw in self.SUCCESS_STATUS or rows > 0 or verify_count > 0) else ("WARN" if status_raw in ("skip", "missing_file", "no_data") else "FAIL")
+            reason = "" if event_status == "PASS" else ExternalDataTraceEngine.infer_fail_reason(
+                stage="SOURCE",
+                status=event_status,
+                rows_written=rows,
+                verify_count=verify_count,
+                detail=str(result.get("message", ""))
+            )
+            trace_engine.event(
+                "AnnualEPS", source_name, "SOURCE", event_status,
+                target_table="annual_eps_history",
+                rows_parsed=rows,
+                rows_written=rows,
+                verify_count=verify_count,
+                fail_reason_code=reason,
+                fail_reason_detail=str(result.get("message", "")),
+                source_file=str(result.get("source_file", "")),
+                source_date=f"{fiscal_year}Q4",
+                elapsed_ms=elapsed_ms,
+            )
+            if status_raw in self.SUCCESS_STATUS or rows > 0 or verify_count > 0:
                 final = {
                     "status": "success",
-                    "rows": rows,
+                    "rows": rows or verify_count,
                     "winning_source": source_name,
                     "trace": trace,
-                    "message": f"R5G年度EPS五層備援成功：{source_name}",
+                    "message": f"R5I年度EPS備援成功：{source_name}",
+                    "trace_run_id": trace_engine.run_id,
                 }
-                log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] success winning_source={source_name} rows={rows}")
+                trace_engine.verify_core_table(
+                    "AnnualEPS", "annual_eps_history",
+                    "fiscal_year=? AND eps_full_year IS NOT NULL",
+                    (fiscal_year,), min_rows=1
+                )
+                log_info(f"[HIGH_GROWTH][R5I_ANNUAL_EPS_CHAIN] success winning_source={source_name} rows={rows} verify={verify_count}")
                 return final
 
+        verify_count = self._count_db_rows(fiscal_year)
+        trace_engine.fail(
+            "AnnualEPS", "R5H_CHAIN", "VERIFY",
+            reason_code="VERIFY_ROWS_ZERO",
+            reason_detail=f"R5H/R5I五層備援皆未取得年度EPS；annual_eps_history fiscal_year={fiscal_year} verify_count={verify_count}",
+            target_table="annual_eps_history",
+            verify_count=verify_count,
+            source_date=f"{fiscal_year}Q4",
+        )
         final = {
             "status": "failed",
             "rows": 0,
             "winning_source": "",
             "trace": trace,
-            "message": "R5G五層備援皆未取得年度EPS",
+            "message": "R5I五層備援皆未取得年度EPS；請看00A_外部資料健康檢查/00B_外部資料Trace明細",
+            "trace_run_id": trace_engine.run_id,
         }
-        log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] failed fiscal_year={fiscal_year} trace={trace}")
+        log_warning(f"[HIGH_GROWTH][R5I_ANNUAL_EPS_CHAIN] failed fiscal_year={fiscal_year} trace={trace}")
         return final
 
 
@@ -6296,8 +6826,9 @@ class EPSForecastEngine:
         return out
 
     def ensure_annual_eps_from_local_114q4_file(self, fiscal_year: int | None = None, force: bool = False) -> dict:
-        """R5E：本機 114Q4/2025Q4 CSV/JSON 優先補入 annual_eps_history。"""
+        """R5E/R5I：本機 114Q4/2025Q4 CSV/JSON/XLS/XLSX 優先補入 annual_eps_history，並寫入Trace。"""
         fiscal_year = int(fiscal_year or self.base_year)
+        trace = ExternalDataTraceEngine(self.db, run_id=f"AnnualEPS_Local_{fiscal_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         result = {"status": "skip", "rows": 0, "source_file": "", "source": "LOCAL_114Q4_EPS_FILE", "message": ""}
         try:
             with self.db.lock:
@@ -6305,13 +6836,46 @@ class EPSForecastEngine:
                 existing = int(row[0] or 0) if row else 0
             if existing > 0 and not force:
                 result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                trace.success("AnnualEPS", "LocalFile", "VERIFY", target_table="annual_eps_history", verify_count=existing, source_date=f"{fiscal_year}Q4")
                 return result
             candidates = self._annual_eps_local_candidate_paths(fiscal_year, "Q4")
+            trace.event(
+                "AnnualEPS", "LocalFile", "SCAN",
+                "PASS" if candidates else "WARN",
+                target_table="annual_eps_history",
+                rows_downloaded=len(candidates),
+                fail_reason_code="" if candidates else "LOCAL_FILE_MISSING",
+                fail_reason_detail="" if candidates else "找不到本機114Q4/2025Q4 EPS CSV/JSON/XLS/XLSX",
+                source_date=f"{fiscal_year}Q4",
+            )
             errors = []
             for cand in candidates:
                 try:
                     parsed = self._parse_annual_eps_local_table(cand, fiscal_year, quarter=4)
+                    parse_rows = 0 if parsed is None else len(parsed)
+                    trace.event(
+                        "AnnualEPS", "LocalFile", "PARSE",
+                        "PASS" if parse_rows > 0 else "FAIL",
+                        target_table="annual_eps_history",
+                        rows_parsed=parse_rows,
+                        source_file=str(cand),
+                        source_date=f"{fiscal_year}Q4",
+                        fail_reason_code="" if parse_rows > 0 else "PARSE_ROWS_ZERO",
+                        fail_reason_detail="" if parse_rows > 0 else f"parsed_rows=0 file={cand}",
+                    )
                     rows = self._write_annual_eps_history(parsed, fiscal_year, source_label="LOCAL_114Q4_EPS_FILE")
+                    verify = trace.verify_table_count("annual_eps_history", "fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,))
+                    trace.event(
+                        "AnnualEPS", "LocalFile", "WRITE",
+                        "PASS" if rows > 0 and verify > 0 else "FAIL",
+                        target_table="annual_eps_history",
+                        rows_written=rows,
+                        verify_count=verify,
+                        source_file=str(cand),
+                        source_date=f"{fiscal_year}Q4",
+                        fail_reason_code="" if rows > 0 and verify > 0 else "WRITE_ROWS_ZERO",
+                        fail_reason_detail="" if rows > 0 and verify > 0 else f"write_rows={rows} verify_count={verify} file={cand}",
+                    )
                     if rows > 0:
                         result.update({"status": "imported", "rows": rows, "source_file": str(cand), "message": "已由本機114Q4/2025Q4 EPS檔補入年度EPS"})
                         log_info(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] annual_eps_history imported rows={rows} file={cand}")
@@ -6319,11 +6883,13 @@ class EPSForecastEngine:
                     errors.append(f"write_zero:{cand}")
                 except Exception as exc:
                     errors.append(f"{cand}:{exc}")
+                    trace.fail("AnnualEPS", "LocalFile", "PARSE", reason_code=ExternalDataTraceEngine.infer_fail_reason("PARSE", "FAIL", detail=str(exc)), reason_detail=str(exc), target_table="annual_eps_history", source_file=str(cand), source_date=f"{fiscal_year}Q4")
                     log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] candidate failed file={cand}｜{exc}")
-            result.update({"status": "missing_file" if not candidates else "parse_failed", "rows": 0, "message": "; ".join(errors[:5]) if errors else "找不到本機114Q4/2025Q4 EPS CSV/JSON"})
+            result.update({"status": "missing_file" if not candidates else "parse_failed", "rows": 0, "message": "; ".join(errors[:5]) if errors else "找不到本機114Q4/2025Q4 EPS CSV/JSON/XLS/XLSX"})
             return result
         except Exception as exc:
             result.update({"status": "error", "rows": 0, "message": str(exc)})
+            trace.fail("AnnualEPS", "LocalFile", "SOURCE", reason_code=ExternalDataTraceEngine.infer_fail_reason("SOURCE", "FAIL", detail=str(exc)), reason_detail=str(exc), target_table="annual_eps_history", source_date=f"{fiscal_year}Q4")
             log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] 補入annual_eps_history失敗：{exc}")
             return result
 
@@ -6807,14 +7373,9 @@ class EPSForecastEngine:
         return {"status": "done", "rows": total_rows, "results": results, "source": "OFFICIAL_EPS_OPENAPI_Q1_Q4"}
 
     def ensure_annual_eps_from_official_openapi_q4(self, fiscal_year: int | None = None, force: bool = False) -> dict:
-        """R5H：優先使用 Official EPS OpenAPI 2025Q4 建立 annual_eps_history。
-
-        流程：
-        1. 先用 official_eps_openapi 同步/下載 Q1~Q4（以 Q4 為年度 EPS 主目標）。
-        2. 從 2025Q4 解析出的 EPS 直接寫入 annual_eps_history.eps_full_year。
-        3. 成功後由 AnnualEPSCacheEngine 回寫 data/annual_eps_cache/annual_eps_2025.csv。
-        """
+        """R5H/R5I：優先使用 Official EPS OpenAPI 2025Q4 建立 annual_eps_history，並記錄 matched/parsed/write/verify Trace。"""
         fiscal_year = int(fiscal_year or self.base_year)
+        trace = ExternalDataTraceEngine(self.db, run_id=f"AnnualEPS_OpenAPIQ4_{fiscal_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         result = {"status": "skip", "rows": 0, "source": "OFFICIAL_EPS_OPENAPI_Q4_ANNUAL_EPS", "message": ""}
         try:
             with self.db.lock:
@@ -6825,13 +7386,31 @@ class EPSForecastEngine:
                 existing = int(row[0] or 0) if row else 0
             if existing > 0 and not force:
                 result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                trace.success("AnnualEPS", "OfficialOpenAPI_Q4", "VERIFY", target_table="annual_eps_history", verify_count=existing, source_date=f"{fiscal_year}Q4")
                 return result
 
             # 先嘗試建立 Q1~Q4 的 official_eps_openapi cache 與 quarterly_financial_history。
             q_results = self.ensure_official_eps_openapi_quarters(fiscal_year, quarters=(1, 2, 3, 4), force=force)
+            trace.event(
+                "AnnualEPS", "OfficialOpenAPI_Q4", "DOWNLOAD", "PASS",
+                target_table="annual_eps_history",
+                rows_downloaded=sum(int((v or {}).get("rows", 0) or 0) for v in (q_results or {}).values()) if isinstance(q_results, dict) else 0,
+                fail_reason_detail=f"q_results={q_results}",
+                source_date=f"{fiscal_year}Q4",
+            )
 
             # 直接載入 Q4；OpenAPI 可能為即時快照型，若年度/季別不符，parse 會 rejected 並回空。
             q4_df = self.load_openapi_eps_all_sources(fiscal_year, 4, include_tpex=True)
+            q4_rows = 0 if q4_df is None else len(q4_df)
+            trace.event(
+                "AnnualEPS", "OfficialOpenAPI_Q4", "PARSE",
+                "PASS" if q4_rows > 0 else "FAIL",
+                target_table="annual_eps_history",
+                rows_parsed=q4_rows,
+                source_date=f"{fiscal_year}Q4",
+                fail_reason_code="" if q4_rows > 0 else "MATCHED_ROWS_ZERO",
+                fail_reason_detail="" if q4_rows > 0 else f"Official EPS OpenAPI 無符合 {fiscal_year}Q4/114Q4 資料；q_results={q_results}",
+            )
             if q4_df is None or q4_df.empty:
                 result.update({
                     "status": "no_data",
@@ -6843,6 +7422,17 @@ class EPSForecastEngine:
 
             annual_df = self._openapi_q4_to_annual_eps_df(q4_df, fiscal_year)
             rows = self._write_annual_eps_history(annual_df, fiscal_year, source_label="OFFICIAL_EPS_OPENAPI_Q4_ANNUAL_EPS")
+            verify = trace.verify_table_count("annual_eps_history", "fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,))
+            trace.event(
+                "AnnualEPS", "OfficialOpenAPI_Q4", "WRITE",
+                "PASS" if rows > 0 and verify > 0 else "FAIL",
+                target_table="annual_eps_history",
+                rows_written=rows,
+                verify_count=verify,
+                source_date=f"{fiscal_year}Q4",
+                fail_reason_code="" if rows > 0 and verify > 0 else "WRITE_ROWS_ZERO",
+                fail_reason_detail="" if rows > 0 and verify > 0 else f"OpenAPI Q4 q4_rows={len(q4_df)} write_rows={rows} verify_count={verify}",
+            )
             if rows > 0:
                 result.update({"status": "imported", "rows": rows, "message": f"已由 official_eps_openapi {fiscal_year}Q4 建立 annual_eps_history"})
                 log_info(f"[HIGH_GROWTH][R5H_OPENAPI_Q4_ANNUAL] imported fiscal_year={fiscal_year} rows={rows}")
@@ -6852,6 +7442,7 @@ class EPSForecastEngine:
             return result
         except Exception as exc:
             result.update({"status": "error", "rows": 0, "message": str(exc)})
+            trace.fail("AnnualEPS", "OfficialOpenAPI_Q4", "SOURCE", reason_code=ExternalDataTraceEngine.infer_fail_reason("SOURCE", "FAIL", detail=str(exc)), reason_detail=str(exc), target_table="annual_eps_history", source_date=f"{fiscal_year}Q4")
             log_warning(f"[HIGH_GROWTH][R5H_OPENAPI_Q4_ANNUAL] failed fiscal_year={fiscal_year}｜{exc}")
             return result
 
@@ -8360,8 +8951,26 @@ class HighGrowthEPSEngine:
                 "rule_version": HIGH_GROWTH_RULE_VERSION,
             }
         ])
+        # R5I_EXTERNAL_DATA_TRACE_ENGINE：報表首頁新增外部資料健康檢查與Trace明細。
+        trace_engine = ExternalDataTraceEngine(self.db, run_id=f"HighGrowthReport_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        try:
+            # 核心表即時驗證，避免「有表但0筆」繼續被當成成功。
+            trace_engine.verify_core_table("AnnualEPS", "annual_eps_history", "fiscal_year=? AND eps_full_year IS NOT NULL", (self.eps_engine.base_year,), min_rows=1)
+            trace_engine.verify_core_table("QuarterlyEPS", "quarterly_financial_history", min_rows=1)
+            trace_engine.verify_core_table("Revenue", "external_revenue_history", min_rows=1)
+        except Exception as _trace_verify_exc:
+            log_warning(f"[EXTERNAL_TRACE][REPORT_VERIFY_FAIL] {_trace_verify_exc}")
+        external_health_df = trace_engine.health_summary_df(include_dependency=True)
+        external_trace_detail_df = trace_engine.trace_detail_df(limit=1000)
+        external_fail_reason_df = trace_engine.fail_reason_summary_df()
+        database_health_df = trace_engine.database_health_df()
+
         tables = {
             "00_結論摘要": summary,
+            "00A_外部資料健康檢查": external_health_df,
+            "00B_外部資料Trace明細": external_trace_detail_df,
+            "00C_資料來源失敗原因": external_fail_reason_df,
+            "00D_資料庫健康度": database_health_df,
             "01_DB可用性盤點": assets,
             "01A_月營收月份覆蓋": revenue_month_coverage,
             "02_領先預測通過黑馬池": leading_df.head(500),
@@ -8715,6 +9324,19 @@ class DataEngine:
         self._save_no_data_blacklist(no_data_blacklist)
         if log_cb:
             log_cb(f"[BUILD_HISTORY][DONE] success={success} failed={failed} skipped={skipped} rows={rows} failure_summary={failure_summary}")
+        try:
+            trace = ExternalDataTraceEngine(self.db, run_id=f"PriceHistory_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            trace.event(
+                "PriceHistory", "TWSE_TPEX_Yahoo", "VERIFY",
+                "PASS" if rows > 0 and success > 0 else "WARN",
+                target_table="price_history",
+                rows_written=rows,
+                verify_count=self.db.get_total_price_rows(),
+                fail_reason_code="" if rows > 0 and success > 0 else "PARSE_ROWS_ZERO",
+                fail_reason_detail=f"success={success} failed={failed} skipped={skipped} failure_summary={dict(failure_summary)}",
+            )
+        except Exception:
+            pass
         return success, failed, rows
 
     def update_incremental(self, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
@@ -8783,6 +9405,20 @@ class DataEngine:
         if log_cb:
             log_cb(f"每日更新彙總｜官方 {source_summary['official']} 檔｜Yahoo備援 {source_summary['yahoo']} 檔｜未取到 {source_summary['none']} 檔")
             log_cb(f"[UPDATE_DAILY][DONE] success={success} failed={failed} rows={rows} source_summary={source_summary}")
+        try:
+            trace = ExternalDataTraceEngine(self.db, run_id=f"MarketSnapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            trace.event(
+                "MarketSnapshot", "TWSE_TPEX_Yahoo", "VERIFY",
+                "PASS" if rows > 0 and success > 0 else "WARN",
+                target_table="price_history",
+                rows_written=rows,
+                verify_count=self.db.get_total_price_rows(),
+                fallback_used="Yahoo" if source_summary.get("yahoo", 0) else "",
+                fail_reason_code="" if rows > 0 and success > 0 else "PARSE_ROWS_ZERO",
+                fail_reason_detail=f"success={success} failed={failed} source_summary={source_summary}",
+            )
+        except Exception:
+            pass
         return success, failed, rows
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
