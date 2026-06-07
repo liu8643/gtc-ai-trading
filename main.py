@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R10_MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5F_INDEX05_SELENIUM_QUERY_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3241,7 +3241,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5e_annual_eps_index05_import_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.2_r5f_index05_selenium_query_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -6494,17 +6494,259 @@ class EPSForecastEngine:
             log_warning(f"[HIGH_GROWTH][TWSE_OPENAPI_EPS] 補入annual_eps_history失敗：{exc}")
             return result
 
-    def _download_twse_c05001_from_index(self, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
-        """R5E：從 TWSE index05 頁面解析 Q4 ZIP 真實連結，失敗才嘗試靜態候選。
+    def _validate_twse_c05001_download_content(self, content: bytes, url: str = "", ctype: str = "") -> tuple[bool, str]:
+        """R5F：統一驗證 index05 下載內容，避免 HTML/security/error page 被當成 ZIP。"""
+        try:
+            if not content or len(content) < 128:
+                return False, "too_small"
+            head = content[:1024].lower()
+            if (
+                b"<html" in head or b"<!doctype" in head or
+                b"for security reasons" in head or b"page can not be accessed" in head or
+                b"access denied" in head or b"error" in head[:256]
+            ):
+                return False, "html_or_security_page"
+            low = str(url or "").lower()
+            ctype_l = str(ctype or "").lower()
+            if content[:2] == b"PK" or "zip" in ctype_l or low.endswith(".zip"):
+                try:
+                    with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
+                        names = zf.namelist()
+                    has_excel = any(str(n).lower().endswith((".xls", ".xlsx")) for n in names)
+                    return (has_excel, "zip_has_excel" if has_excel else f"zip_no_excel names={names[:8]}")
+                except Exception as exc:
+                    return False, f"zip_invalid:{exc}"
+            if content.startswith(b"\xd0\xcf\x11\xe0") or low.endswith((".xls", ".xlsx")):
+                return True, "excel_binary_or_named_excel"
+            return False, "unknown_file_signature"
+        except Exception as exc:
+            return False, f"validate_exception:{exc}"
 
-        修正點：舊版用猜測路徑下載，Log 曾出現 status=200 bytes=747，實際是錯誤/空HTML，
-        不是有效 ZIP。新版必須驗證 ZIP magic/zipfile 或有效 xls/xlsx 檔頭，避免把錯誤頁當檔案。
+    def _save_twse_c05001_download_content(self, content: bytes, out_dir: Path, url: str = "", fiscal_year: int | None = None, quarter: str = "Q4", ctype: str = "") -> Path | None:
+        """R5F：驗證並保存 TWSE index05 下載內容。"""
+        fiscal_year = int(fiscal_year or self.base_year)
+        q = str(quarter or "Q4").upper().replace(" ", "")
+        ok, reason = self._validate_twse_c05001_download_content(content, url=url, ctype=ctype)
+        if not ok:
+            log_warning(f"[HIGH_GROWTH][C05001][R5F_VALIDATE_REJECT] bytes={len(content) if content else 0} reason={reason} url={url}")
+            return None
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        clean_url = str(url or "").split("?", 1)[0]
+        suffix = ".zip" if (content[:2] == b"PK" or "zip" in str(ctype or "").lower() or clean_url.lower().endswith(".zip")) else (".xlsx" if clean_url.lower().endswith(".xlsx") else ".xls")
+        name = Path(clean_url).name or f"{fiscal_year}{q}_C05001{suffix}"
+        if not name.lower().endswith((".zip", ".xls", ".xlsx")):
+            name = f"{fiscal_year}{q}_C05001{suffix}"
+        target = out_dir / name
+        target.write_bytes(content)
+        log_info(f"[HIGH_GROWTH][C05001][R5F_DOWNLOAD_SAVED] file={target} bytes={len(content)} reason={reason} url={url}")
+        return target
+
+    def _download_twse_c05001_url(self, url: str, out_dir: Path, fiscal_year: int | None = None, quarter: str = "Q4", headers: dict | None = None, cookies: dict | None = None) -> Path | None:
+        """R5F：下載 Q4 ZIP/XLS/XLSX 真實 href，支援 Selenium cookies。"""
+        if not url:
+            return None
+        fiscal_year = int(fiscal_year or self.base_year)
+        q = str(quarter or "Q4").upper().replace(" ", "")
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome Safari",
+            "Referer": "https://www.twse.com.tw/en/trading/statistics/index05.html",
+            "Accept": "application/zip,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+        }
+        if headers:
+            req_headers.update(headers)
+        try:
+            resp = requests.get(url, timeout=(10, 60), headers=req_headers, cookies=cookies or {})
+            content = resp.content or b""
+            ctype = resp.headers.get("content-type", "")
+            if resp.status_code != 200:
+                log_warning(f"[HIGH_GROWTH][C05001][R5F_URL_DOWNLOAD_REJECT] status={resp.status_code} bytes={len(content)} url={url}")
+                return None
+            return self._save_twse_c05001_download_content(content, out_dir, url=url, fiscal_year=fiscal_year, quarter=q, ctype=ctype)
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][C05001][R5F_URL_DOWNLOAD_FAIL] url={url}｜{exc}")
+            return None
+
+    def _download_twse_c05001_by_selenium_index05(self, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
+        """R5F：使用 Selenium 真正模擬 index05 網站操作：選年度 -> Query -> 取得 Q4 ZIP。"""
+        fiscal_year = int(fiscal_year or self.base_year)
+        q = str(quarter or "Q4").upper().replace(" ", "")
+        out_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{fiscal_year}{q}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        url = "https://www.twse.com.tw/en/trading/statistics/index05.html"
+        driver = None
+        try:
+            try:
+                from selenium import webdriver
+                from selenium.webdriver.common.by import By
+                from selenium.webdriver.support.ui import Select, WebDriverWait
+                from selenium.webdriver.support import expected_conditions as EC
+                from selenium.common.exceptions import TimeoutException
+            except Exception as import_exc:
+                log_warning(f"[HIGH_GROWTH][C05001][R5F_SELENIUM_UNAVAILABLE] {import_exc}")
+                return None
+
+            options = webdriver.ChromeOptions()
+            if os.getenv("GTC_TWSE_INDEX05_HEADLESS", "1").strip() != "0":
+                # Chrome 109+ 支援 --headless=new；舊版若不支援，會由 Selenium/Chrome 回報並走 fallback。
+                options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--window-size=1280,900")
+            options.add_argument("--lang=en-US")
+            options.add_experimental_option("prefs", {
+                "download.default_directory": str(out_dir),
+                "download.prompt_for_download": False,
+                "download.directory_upgrade": True,
+                "safebrowsing.enabled": True,
+            })
+
+            log_info(f"[HIGH_GROWTH][C05001][R5F_SELENIUM_START] url={url} fiscal_year={fiscal_year} quarter={q}")
+            driver = webdriver.Chrome(options=options)
+            wait = WebDriverWait(driver, 30)
+            driver.get(url)
+
+            select_el = wait.until(EC.presence_of_element_located((By.TAG_NAME, "select")))
+            selected = False
+            for method_name, fn in [
+                ("visible_text", lambda: Select(select_el).select_by_visible_text(str(fiscal_year))),
+                ("value", lambda: Select(select_el).select_by_value(str(fiscal_year))),
+                ("roc_value", lambda: Select(select_el).select_by_value(str(fiscal_year - 1911))),
+            ]:
+                try:
+                    fn()
+                    selected = True
+                    log_info(f"[HIGH_GROWTH][C05001][R5F_YEAR_SELECTED] method={method_name} fiscal_year={fiscal_year}")
+                    break
+                except Exception:
+                    continue
+            if not selected:
+                options_text = [o.text for o in Select(select_el).options]
+                log_warning(f"[HIGH_GROWTH][C05001][R5F_YEAR_SELECT_FAIL] fiscal_year={fiscal_year} options={options_text[:20]}")
+                return None
+
+            query_selectors = [
+                "//button[contains(normalize-space(.), 'Query')]",
+                "//input[@type='button' and translate(@value,'QUERY','query')='query']",
+                "//input[@type='submit' and translate(@value,'QUERY','query')='query']",
+                "//button[contains(translate(normalize-space(.),'QUERY','query'), 'query')]",
+            ]
+            clicked = False
+            for xp in query_selectors:
+                try:
+                    btn = wait.until(EC.element_to_be_clickable((By.XPATH, xp)))
+                    btn.click()
+                    clicked = True
+                    log_info(f"[HIGH_GROWTH][C05001][R5F_QUERY_CLICKED] xpath={xp}")
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                log_warning("[HIGH_GROWTH][C05001][R5F_QUERY_BUTTON_NOT_FOUND]")
+                return None
+
+            # 等待查詢結果產生。TWSE 此頁常為前端動態渲染，不可只抓初始 HTML。
+            try:
+                wait.until(lambda d: len(d.find_elements(By.TAG_NAME, "a")) > 0 and ("Q4" in d.page_source.upper() or ".ZIP" in d.page_source.upper()))
+            except TimeoutException:
+                log_warning(f"[HIGH_GROWTH][C05001][R5F_RESULT_TIMEOUT] fiscal_year={fiscal_year} source_size={len(driver.page_source or '')}")
+
+            links = driver.execute_script("""
+                return Array.from(document.querySelectorAll('a')).map(a => ({
+                    text: (a.innerText || a.textContent || '').trim(),
+                    href: a.href || a.getAttribute('href') || '',
+                    title: a.getAttribute('title') || '',
+                    aria: a.getAttribute('aria-label') || ''
+                }));
+            """) or []
+            log_info(f"[HIGH_GROWTH][C05001][R5F_LINKS] count={len(links)} sample={links[:8]}")
+
+            q4_links = []
+            for item in links:
+                text_blob = " ".join(str(item.get(k, "")) for k in ("text", "href", "title", "aria")).upper()
+                href = str(item.get("href") or "").strip()
+                if not href:
+                    continue
+                if (q in text_blob or "4Q" in text_blob or "Q 4" in text_blob) and ("ZIP" in text_blob or href.lower().endswith((".zip", ".xls", ".xlsx"))):
+                    q4_links.append(href)
+            # 若文字只有 Download/icon，href 可能含 fiscal_year/Q4/C05001。
+            if not q4_links:
+                for item in links:
+                    href = str(item.get("href") or "").strip()
+                    h = href.upper()
+                    if href and (q in h or str(fiscal_year) in h or str(fiscal_year - 1911) in h) and h.lower().endswith((".zip", ".xls", ".xlsx")):
+                        q4_links.append(href)
+
+            selenium_cookies = {}
+            try:
+                selenium_cookies = {c.get("name"): c.get("value") for c in driver.get_cookies() if c.get("name")}
+            except Exception:
+                selenium_cookies = {}
+
+            for href in q4_links:
+                downloaded = self._download_twse_c05001_url(href, out_dir, fiscal_year=fiscal_year, quarter=q, cookies=selenium_cookies)
+                if downloaded is not None and Path(downloaded).exists():
+                    log_info(f"[HIGH_GROWTH][C05001][R5F_SELENIUM_DOWNLOAD_OK] href={href} file={downloaded}")
+                    return Path(downloaded)
+
+            # href 若是 javascript 或下載由 click 觸發，直接點 Q4 元素並等待檔案落地。
+            try:
+                before = {p.name for p in out_dir.glob('*') if p.is_file()}
+                q4_xpath = "//a[contains(translate(normalize-space(.),'q','Q'),'Q4') or contains(translate(@href,'q','Q'),'Q4') or contains(translate(@title,'q','Q'),'Q4') or contains(translate(@aria-label,'q','Q'),'Q4')]"
+                elems = driver.find_elements(By.XPATH, q4_xpath)
+                for elem in elems:
+                    try:
+                        elem.click()
+                        log_info("[HIGH_GROWTH][C05001][R5F_Q4_CLICK_TRIGGERED]")
+                        deadline = time.time() + 45
+                        while time.time() < deadline:
+                            files = [p for p in out_dir.glob('*') if p.is_file() and not p.name.endswith('.crdownload')]
+                            new_files = [p for p in files if p.name not in before and p.suffix.lower() in ('.zip', '.xls', '.xlsx')]
+                            for nf in sorted(new_files, key=lambda x: x.stat().st_mtime, reverse=True):
+                                content = nf.read_bytes()
+                                saved = self._save_twse_c05001_download_content(content, out_dir, url=str(nf), fiscal_year=fiscal_year, quarter=q)
+                                if saved is not None:
+                                    log_info(f"[HIGH_GROWTH][C05001][R5F_CLICK_DOWNLOAD_OK] file={nf}")
+                                    return nf
+                            time.sleep(1)
+                    except Exception as click_exc:
+                        log_warning(f"[HIGH_GROWTH][C05001][R5F_Q4_CLICK_FAIL] {click_exc}")
+            except Exception as click_outer_exc:
+                log_warning(f"[HIGH_GROWTH][C05001][R5F_CLICK_DOWNLOAD_STAGE_FAIL] {click_outer_exc}")
+
+            log_warning(f"[HIGH_GROWTH][C05001][R5F_NO_Q4_LINK] fiscal_year={fiscal_year} links={links[:12]}")
+            return None
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][C05001][R5F_SELENIUM_FAIL] {exc}")
+            return None
+        finally:
+            try:
+                if driver is not None:
+                    driver.quit()
+            except Exception:
+                pass
+
+    def _download_twse_c05001_from_index(self, fiscal_year: int | None = None, quarter: str = "Q4") -> Path | None:
+        """R5F：先用 Selenium 真正操作 index05（選年度→Query→Q4 ZIP），失敗才回到 requests 靜態備援。
+
+        R5E 問題：只用 requests.get(index05.html) 掃 href / 猜 static path，沒有觸發 Year=2025 + Query，
+        造成頁面雖然有 Q4 ZIP，但程式抓不到，annual_eps_history 仍空白。
+        R5F 修正：新增 Selenium Browser 模式，並保留原本 HTML 掃描與 static_guess 作備援。
         """
         fiscal_year = int(fiscal_year or self.base_year)
         q = str(quarter or "Q4").upper().replace(" ", "")
         from urllib.parse import urljoin
         out_dir = RUNTIME_DIR / "data" / "twse_c05001" / f"{fiscal_year}{q}"
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # P0：先真正模擬網站操作，不再只掃靜態首頁。
+        selenium_file = self._download_twse_c05001_by_selenium_index05(fiscal_year, q)
+        if selenium_file is not None and Path(selenium_file).exists():
+            return Path(selenium_file)
+
+        log_warning(f"[HIGH_GROWTH][C05001][R5F_SELENIUM_FALLBACK_TO_REQUESTS] fiscal_year={fiscal_year} quarter={q}")
+
         index_urls = [
             f"https://www.twse.com.tw/en/trading/statistics/index05.html?year={fiscal_year}",
             "https://www.twse.com.tw/en/trading/statistics/index05.html",
@@ -6521,7 +6763,7 @@ class EPSForecastEngine:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/zip,*/*;q=0.8",
         }
         candidate_urls: list[str] = []
-        href_re = re.compile(r"(?:href|src)=['\"]([^'\"]+)['\"]", re.I)
+        href_re = re.compile(r'(?:href|src)=[\'"]([^\'"]+)[\'"]', re.I)
 
         def _add_candidate(u: str, reason: str = ""):
             if not u:
@@ -6529,9 +6771,9 @@ class EPSForecastEngine:
             low = u.lower()
             if not low.endswith((".zip", ".xls", ".xlsx")):
                 return
-            # index05 真實連結可能不含 C05001，但通常位在 index05/statistics 路徑；放寬條件後再用檔案內容驗證。
             score_hit = (
                 str(fiscal_year).lower() in low or
+                str(fiscal_year - 1911).lower() in low or
                 q.lower() in low or
                 "c05001" in low or
                 "index05" in low or
@@ -6551,8 +6793,7 @@ class EPSForecastEngine:
                 html = resp.text
                 for m in href_re.finditer(html):
                     _add_candidate(urljoin(base_url, m.group(1)), reason="href")
-                # 有些新頁面把下載路徑塞在 JS 字串，不一定是 href。
-                for m in re.finditer(r"['\"]([^'\"]+\.(?:zip|xls|xlsx)(?:\?[^'\"]*)?)['\"]", html, flags=re.I):
+                for m in re.finditer(r'[\'"]([^\'"]+\.(?:zip|xls|xlsx)(?:\?[^\'"]*)?)[\'"]', html, flags=re.I):
                     _add_candidate(urljoin(base_url, m.group(1)), reason="js_string")
             except Exception as exc:
                 log_warning(f"[HIGH_GROWTH][C05001] index scan fail {base_url}｜{exc}")
@@ -6572,48 +6813,14 @@ class EPSForecastEngine:
             for n in static_names:
                 _add_candidate(urljoin(b, n), reason="static_guess")
 
-        def _valid_download(content: bytes, url: str, ctype: str) -> tuple[bool, str]:
-            if not content or len(content) < 128:
-                return False, "too_small"
-            head = content[:512].lower()
-            if b"<html" in head or b"<!doctype" in head or b"for security reasons" in head or b"page can not be accessed" in head:
-                return False, "html_or_security_page"
-            low = url.lower()
-            if content[:2] == b"PK" or "zip" in ctype.lower() or low.endswith(".zip"):
-                try:
-                    with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
-                        names = zf.namelist()
-                    has_excel = any(str(n).lower().endswith((".xls", ".xlsx")) for n in names)
-                    return (has_excel, "zip_has_excel" if has_excel else f"zip_no_excel names={names[:5]}")
-                except Exception as exc:
-                    return False, f"zip_invalid:{exc}"
-            # xls Compound File / xlsx zip 已涵蓋；部分舊 xls 以 D0 CF 開頭。
-            if content.startswith(b"\xd0\xcf\x11\xe0") or low.endswith((".xls", ".xlsx")):
-                return True, "excel_binary_or_named_excel"
-            return False, "unknown_file_signature"
-
         seen = set()
         for url in candidate_urls:
             if url in seen:
                 continue
             seen.add(url)
-            try:
-                resp = requests.get(url, timeout=(10, 60), headers=headers)
-                ctype = resp.headers.get("content-type", "")
-                content = resp.content or b""
-                ok, reason = _valid_download(content, url, ctype) if resp.status_code == 200 else (False, f"http_{resp.status_code}")
-                if ok:
-                    suffix = ".zip" if content[:2] == b"PK" or "zip" in ctype.lower() or url.lower().endswith(".zip") else (".xlsx" if url.lower().endswith(".xlsx") else ".xls")
-                    name = Path(url.split("?", 1)[0]).name or f"{fiscal_year}{q}_C05001{suffix}"
-                    if not name.lower().endswith((".zip", ".xls", ".xlsx")):
-                        name = f"{fiscal_year}{q}_C05001{suffix}"
-                    target = out_dir / name
-                    target.write_bytes(content)
-                    log_info(f"[HIGH_GROWTH][C05001] online download success url={url} file={target} bytes={len(content)} reason={reason}")
-                    return target
-                log_warning(f"[HIGH_GROWTH][C05001] online candidate rejected status={resp.status_code} bytes={len(content)} reason={reason} url={url}")
-            except Exception as exc:
-                log_warning(f"[HIGH_GROWTH][C05001] online download fail url={url}｜{exc}")
+            downloaded = self._download_twse_c05001_url(url, out_dir, fiscal_year=fiscal_year, quarter=q, headers=headers)
+            if downloaded is not None and Path(downloaded).exists():
+                return Path(downloaded)
         return None
 
     def ensure_annual_eps_from_twse_c05001(self, fiscal_year: int | None = None, force: bool = False) -> dict:
