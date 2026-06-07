@@ -6141,7 +6141,7 @@ class EPSForecastEngine:
         return results
 
     def _annual_eps_local_candidate_paths(self, fiscal_year: int | None = None, quarter: str = "Q4") -> list[Path]:
-        """R5E：尋找使用者手動下載的 114Q4/2025Q4 EPS CSV/JSON。
+        """R5E/R5H：尋找使用者手動下載的 114Q4/2025Q4 EPS CSV/JSON/XLS/XLSX。
 
         目的：TWSE index05 的 ZIP 可能因頁面/路徑調整而下載失敗；若使用者已從官方頁面
         手動下載 2025 Q4 或 114Q4 EPS 檔，程式應優先吃本機檔並寫入 annual_eps_history。
@@ -6178,6 +6178,10 @@ class EPSForecastEngine:
                 _add(home / sub)
         except Exception:
             pass
+        # R5H-LOCAL-XLS-FIX_20260607：本機年度EPS第一層來源納入官方 C05001 Excel。
+        # 使用者手動下載的 2025Q4.XLS / 2025Q4.xlsx 必須優先被掃到，
+        # 再交由既有 _parse_twse_c05001_eps_xlsx() 解析並寫入 annual_eps_history。
+        excel_exts = ["xls", "xlsx", "XLS", "XLSX"]
         patterns = [
             f"{roc_year}Q4_eps.csv", f"{roc_year}Q4_eps.json", f"{roc_year}Q4*.csv", f"{roc_year}Q4*.json",
             f"{fiscal_year}Q4_eps.csv", f"{fiscal_year}Q4_eps.json", f"{fiscal_year}Q4*.csv", f"{fiscal_year}Q4*.json",
@@ -6185,6 +6189,13 @@ class EPSForecastEngine:
             f"*{fiscal_year}*Q4*EPS*.csv", f"*{fiscal_year}*Q4*EPS*.json",
             f"annual_eps_history_{fiscal_year}.csv", f"annual_eps_history_{fiscal_year}.json",
         ]
+        for ext in excel_exts:
+            patterns.extend([
+                f"{roc_year}Q4*.{ext}",
+                f"{fiscal_year}Q4*.{ext}",
+                f"*{roc_year}*Q4*EPS*.{ext}",
+                f"*{fiscal_year}*Q4*EPS*.{ext}",
+            ])
         out, seen = [], set()
         for root in roots:
             for pat in patterns:
@@ -6202,11 +6213,11 @@ class EPSForecastEngine:
         if out:
             log_info(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] candidates found={len(out)} first={out[0]}")
         else:
-            log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] no local CSV/JSON candidate for fiscal_year={fiscal_year} roc={roc_year} {q}")
+            log_warning(f"[HIGH_GROWTH][ANNUAL_EPS_LOCAL] no local CSV/JSON/XLS/XLSX candidate for fiscal_year={fiscal_year} roc={roc_year} {q}")
         return out
 
     def _parse_annual_eps_local_table(self, path: Path, fiscal_year: int | None = None, quarter: int = 4) -> pd.DataFrame:
-        """R5E：解析本機 114Q4/2025Q4 EPS CSV/JSON，輸出 annual_eps_history-ready DataFrame。"""
+        """R5E/R5H：解析本機 114Q4/2025Q4 EPS CSV/JSON/XLS/XLSX，輸出 annual_eps_history-ready DataFrame。"""
         fiscal_year = int(fiscal_year or self.base_year)
         q = int(quarter or 4)
         roc_year = fiscal_year - 1911
@@ -6221,6 +6232,11 @@ class EPSForecastEngine:
             raw = pd.DataFrame(data)
         elif ext == ".csv":
             raw = safe_read_csv_auto(p)
+        elif ext in (".xls", ".xlsx"):
+            # R5H-LOCAL-XLS-FIX_20260607：本機官方 C05001 Excel 直接走既有 C05001 parser。
+            # 讓 2025Q4.XLS / 2025Q4.xlsx 可作為 local annual EPS 第一層來源，
+            # 不再被 _parse_annual_eps_local_table() 當成未知副檔名略過。
+            return self._parse_twse_c05001_eps_xlsx(p, fiscal_year)
         else:
             return pd.DataFrame()
         if raw is None or raw.empty:
