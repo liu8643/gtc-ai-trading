@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.3-R5N_REVENUE_CACHE_UI_MONTH_SELECTOR"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.3-R5N2_TWSE_INDEX04_BACKEND_ZIP_DOWNLOAD_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -5885,6 +5885,16 @@ REVENUE_CACHE_APPEND_ONLY_POLICY = (
 TWSE_INDEX04_PAGE_URL = "https://www.twse.com.tw/zh/trading/statistics/index04.html"
 TWSE_INDEX04_C04003_CACHE_DIR = REVENUE_CACHE_DIR / "index04_c04003"
 TWSE_INDEX04_C04003_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# R5N2_TWSE_INDEX04_BACKEND_ZIP_DOWNLOAD_FIX_20260609：
+# 正式新增 TWSE index04 後端 ZIP 下載方式，不再只靠猜 staticFiles 路徑。
+# 來源參數：download=zip&type=C&year=YYYY&month=MM，並以 ZIP 檔固定 PK 開頭作為有效檔案判斷。
+TWSE_INDEX04_BACKEND_ZIP_URLS = [
+    "https://www.twse.com.tw",
+    "https://twse.com.tw",
+]
+TWSE_INDEX04_BACKEND_REPORT_TYPE = "C"
+TWSE_INDEX04_BACKEND_DELETE_ZIP_AFTER_EXTRACT = True
+# 舊 hard-code staticFiles URL 保留為最後備援，主流程不得優先使用。
 TWSE_INDEX04_C04003_URL_TEMPLATES = [
     "https://www.twse.com.tw/staticFiles/statistics/statisticsList/04/{month}_C04003.zip",
     "https://www.twse.com.tw/staticFiles/statistics/statisticsList/{month}_C04003.zip",
@@ -6545,14 +6555,82 @@ class RevenueOpenAPICacheDownloader:
             log_warning(f"[R5M][TWSE_INDEX04][DISCOVER_FAIL] month={m}｜{exc}")
         return ""
 
+    def _is_valid_zip_bytes(self, content: bytes) -> bool:
+        """R5N2：確認下載內容是否真為 ZIP。TWSE 無資料時可能 HTTP 200 但回 HTML，不能直接解壓。"""
+        try:
+            return bool(content) and len(content) >= 1024 and bytes(content[:4]).startswith(b"PK")
+        except Exception:
+            return False
+
+    def _download_twse_index04_backend_zip(self, target_month: str) -> tuple[Path | None, str, str]:
+        """R5N2：使用 TWSE index04 後端參數下載國內上市公司營業收入彙總表 ZIP。
+
+        正式主來源：GET https://www.twse.com.tw?download=zip&type=C&year=YYYY&month=MM
+        - year 使用西元年 YYYY，不使用民國年。
+        - month 使用兩位數 MM。
+        - response.content 必須以 PK 開頭才寫檔。
+        """
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return None, "", "invalid month"
+        year_ad = int(m[:4])
+        month_str = m[4:6]
+        params = {
+            "download": "zip",
+            "type": TWSE_INDEX04_BACKEND_REPORT_TYPE,
+            "year": str(year_ad),
+            "month": month_str,
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            "Accept": "application/zip,application/octet-stream,*/*",
+            "Referer": TWSE_INDEX04_PAGE_URL,
+        }
+        errors = []
+        out = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
+        for base_url in TWSE_INDEX04_BACKEND_ZIP_URLS:
+            try:
+                resp = requests.get(base_url, params=params, headers=headers, timeout=45)
+                request_url = getattr(resp, "url", base_url)
+                if resp.status_code != 200:
+                    errors.append(f"{request_url}:HTTP{resp.status_code}")
+                    continue
+                content = resp.content or b""
+                if not self._is_valid_zip_bytes(content):
+                    snippet = ""
+                    try:
+                        snippet = (resp.text or "")[:160].replace("\n", " ").replace("\r", " ")
+                    except Exception:
+                        snippet = ""
+                    errors.append(f"{request_url}:not_zip_or_too_small bytes={len(content)} content_type={resp.headers.get('Content-Type','')} snippet={snippet}")
+                    continue
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(content)
+                log_info(f"[R5N2][TWSE_INDEX04_BACKEND][ZIP_DOWNLOAD_OK] month={m} file={out} bytes={len(content)} url={request_url}")
+                return out, request_url, ""
+            except Exception as exc:
+                errors.append(f"{base_url}:{exc}")
+        return None, " | ".join(TWSE_INDEX04_BACKEND_ZIP_URLS), " ; ".join(errors)
+
     def _download_twse_index04_c04003_zip(self, target_month: str) -> tuple[Path | None, str, str]:
-        """R5M：下載/取得 TWSE index04 C04003 ZIP。回傳(zip_path, url, error)。"""
+        """R5N2：下載/取得 TWSE index04 C04003 ZIP。回傳(zip_path, url, error)。
+
+        優先順序：
+        1. 本機已存在 ZIP（人工下載或前次快取）。
+        2. TWSE index04 後端 ZIP 參數下載：download=zip&type=C&year=YYYY&month=MM。
+        3. index04 HTML 探測連結。
+        4. 舊 staticFiles hard-code URL（只作最後備援）。
+        """
         m = RevenueAccelerationEngine.normalize_month(target_month)
         if not m:
             return None, "", "invalid month"
         for p in self._candidate_local_c04003_zip_paths(m):
             try:
                 if p.exists() and p.stat().st_size > 0:
+                    raw = p.read_bytes()[:4]
+                    if not raw.startswith(b"PK"):
+                        log_warning(f"[R5N2][TWSE_INDEX04][LOCAL_ZIP_INVALID] month={m} file={p} head={raw!r}")
+                        continue
                     target = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
                     if p.resolve() != target.resolve():
                         target.parent.mkdir(parents=True, exist_ok=True)
@@ -6564,6 +6642,11 @@ class RevenueOpenAPICacheDownloader:
                     return p, "LOCAL_FILE:" + str(p), ""
             except Exception:
                 continue
+
+        backend_zip, backend_url, backend_error = self._download_twse_index04_backend_zip(m)
+        if backend_zip is not None and Path(backend_zip).exists():
+            return backend_zip, "OFFICIAL_TWSE_INDEX04_BACKEND_DOWNLOAD:" + backend_url, ""
+
         urls = []
         discovered = self._discover_twse_index04_c04003_url(m)
         if discovered:
@@ -6575,7 +6658,7 @@ class RevenueOpenAPICacheDownloader:
                     urls.append(u)
             except Exception:
                 continue
-        errors = []
+        errors = ["BACKEND:" + backend_error] if backend_error else []
         out = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
         for url in urls:
             try:
@@ -6587,15 +6670,15 @@ class RevenueOpenAPICacheDownloader:
                 if resp.status_code != 200:
                     errors.append(f"{url}:HTTP{resp.status_code}"); continue
                 content = resp.content or b""
-                if len(content) < 1024 or not content[:4].startswith(b"PK"):
+                if not self._is_valid_zip_bytes(content):
                     errors.append(f"{url}:not_zip_or_too_small bytes={len(content)}"); continue
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_bytes(content)
-                log_info(f"[R5M][TWSE_INDEX04][ZIP_DOWNLOAD] month={m} file={out} bytes={len(content)} url={url}")
+                log_info(f"[R5N2][TWSE_INDEX04][ZIP_DOWNLOAD_FALLBACK_OK] month={m} file={out} bytes={len(content)} url={url}")
                 return out, url, ""
             except Exception as exc:
                 errors.append(f"{url}:{exc}")
-        return None, " | ".join(urls), " ; ".join(errors)
+        return None, " | ".join([backend_url] + urls), " ; ".join(errors)
 
     def _parse_twse_c04003_excel(self, excel_path: Path, target_month: str, source_url: str = "") -> pd.DataFrame:
         """R5M：解析 TWSE C04003 國內上市公司營業收入彙總表。
@@ -6688,6 +6771,11 @@ class RevenueOpenAPICacheDownloader:
                 extract_dir.mkdir(parents=True, exist_ok=True)
                 zf.extract(member, extract_dir)
                 xls_path = extract_dir / member
+            should_delete_zip = (
+                TWSE_INDEX04_BACKEND_DELETE_ZIP_AFTER_EXTRACT
+                and str(source_url or "").startswith("OFFICIAL_TWSE_INDEX04_BACKEND_DOWNLOAD:")
+                and Path(zip_path).exists()
+            )
             converted_path = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.xlsx"
             if xls_path.suffix.lower() == ".xls":
                 converted = convert_xls_to_xlsx_force(xls_path, converted_path, log_cb=lambda msg: log_info(f"[R5M][TWSE_INDEX04] {msg}"))
@@ -6701,7 +6789,13 @@ class RevenueOpenAPICacheDownloader:
             month_cache_path = self.write_month_cache(df, m, source_url=f"OFFICIAL_TWSE_INDEX04_C04003_CACHE:{zip_path}")
             df["source_url"] = "OFFICIAL_TWSE_INDEX04_C04003_CACHE:" + str(month_cache_path or zip_path)
             self._emit_cache_trace(m, "INDEX04_PARSE", "PASS", len(df), zip_path)
-            log_info(f"[R5M][TWSE_INDEX04][C04003_OK] month={m} rows={len(df)} zip={zip_path}")
+            log_info(f"[R5N2][TWSE_INDEX04][C04003_OK] month={m} rows={len(df)} zip={zip_path} source={source_url}")
+            if should_delete_zip:
+                try:
+                    Path(zip_path).unlink()
+                    log_info(f"[R5N2][TWSE_INDEX04_BACKEND][ZIP_DELETED_AFTER_EXTRACT] month={m} file={zip_path}")
+                except Exception as _del_exc:
+                    log_warning(f"[R5N2][TWSE_INDEX04_BACKEND][ZIP_DELETE_FAIL] month={m} file={zip_path}｜{_del_exc}")
             return df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
         except Exception as exc:
             self._emit_cache_trace(m, "INDEX04_PARSE", "FAIL", 0, zip_path, "PARSE_FAILED", str(exc))
@@ -6755,7 +6849,7 @@ class RevenueOpenAPICacheDownloader:
         summary = pd.DataFrame(summary_rows)
         try:
             manifest = {
-                "version": "R5N_REVENUE_CACHE_UI_MONTH_SELECTOR_20260608",
+                "version": "R5N2_TWSE_INDEX04_BACKEND_ZIP_DOWNLOAD_FIX_20260609",
                 "months": norm_months,
                 "force_download": bool(force_download),
                 "write_db": bool(write_db),
