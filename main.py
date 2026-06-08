@@ -4108,7 +4108,9 @@ class ExternalDataTraceEngine:
         rows = []
         modules = [
             ("selenium", "Index05 Selenium"),
-            ("lxml", "MOPS/pd.read_html"),
+            ("lxml", "MOPS/pd.read_html primary parser"),
+            ("html5lib", "MOPS/pd.read_html fallback parser"),
+            ("bs4", "BeautifulSoup parser for MOPS fallback"),
             ("xlrd", ".xls reader"),
             ("openpyxl", ".xlsx writer/reader"),
             ("requests", "HTTP downloader"),
@@ -5858,6 +5860,11 @@ HIGH_GROWTH_QUARTER_REVENUE_MONTHS = {
 # R4A_REVENUE_OPENAPI_CACHE_APPEND_ONLY_20260604：官方月營收快取層。
 # 設計原則：只作備援/補缺，不取代 R4 原本月營收主流程；快取資料只允許 append/repair，禁止覆蓋既有有效 history。
 REVENUE_CACHE_DIR = RUNTIME_DIR / "data" / "revenue_cache"
+# R5L.1_REVENUE_MONTHLY_CACHE_LAYER_20260608：本機逐月月營收 Cache Layer。
+# 固定檔名 revenue_YYYYMM.csv，與既有 revenue_openapi_*.csv 批次快取並存；
+# Required months 必須逐月 cache verify + DB verify，全數 PASS 才可視為 Revenue 成功。
+REVENUE_MONTHLY_CACHE_DIR = REVENUE_CACHE_DIR
+REVENUE_MONTHLY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 REVENUE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 REVENUE_OPENAPI_ENDPOINTS = {
     "TWSE_REVENUE_L": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
@@ -5871,6 +5878,34 @@ REVENUE_CACHE_APPEND_ONLY_POLICY = (
     "只補缺漏 stock_id+revenue_month，不覆蓋 external_revenue_history 既有有效資料；"
     "revenue<=0 或月份無法正規化者禁止寫入。"
 )
+
+
+def safe_read_html_tables(html_text, source_label: str = "") -> tuple[list[pd.DataFrame], str, str]:
+    """R5L：安全 HTML 表格解析。
+
+    MOPS ajax_t21sc04 歷史月營收常透過 pd.read_html 解析。舊版只依賴
+    環境預設 lxml，EXE 內缺 lxml 時會造成 202602/202603 補抓 0 筆。
+    此函式依序嘗試 lxml / bs4 / html5lib，並回傳使用 parser 與完整錯誤，
+    供 Trace/報表判斷 DEPENDENCY_MISSING 或 PARSE_ROWS_ZERO。
+    """
+    html = str(html_text or "")
+    if not html.strip():
+        return [], "", "EMPTY_HTML"
+    errors = []
+    for flavor in (["lxml"], ["bs4"], ["html5lib"]):
+        parser_name = flavor[0]
+        try:
+            tables = pd.read_html(io.StringIO(html), flavor=flavor)
+            if tables:
+                log_info(f"[R5L][SAFE_READ_HTML] source={source_label} parser={parser_name} tables={len(tables)}")
+                return tables, parser_name, ""
+            errors.append(f"{parser_name}:tables=0")
+        except Exception as exc:
+            errors.append(f"{parser_name}:{exc}")
+    err = " | ".join(errors)
+    log_warning(f"[R5L][SAFE_READ_HTML][FAIL] source={source_label} error={err}")
+    return [], "", err
+
 
 
 def get_high_growth_report_path(date_str: str | None = None, quarters: list[str] | None = None) -> Path:
@@ -6067,9 +6102,12 @@ class RevenueOpenAPICacheDownloader:
     - 寫入 history 時必須由呼叫端使用 INSERT OR IGNORE / append-only，禁止覆蓋既有有效資料。
     """
 
-    def __init__(self, cache_dir: Path | None = None):
+    def __init__(self, cache_dir: Path | None = None, trace_engine=None):
         self.cache_dir = Path(cache_dir or REVENUE_CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.monthly_cache_dir = Path(REVENUE_MONTHLY_CACHE_DIR)
+        self.monthly_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.trace_engine = trace_engine
         self.endpoints = dict(REVENUE_OPENAPI_ENDPOINTS)
         self.optional_endpoints = dict(REVENUE_OPENAPI_OPTIONAL_ENDPOINTS)
 
@@ -6108,6 +6146,107 @@ class RevenueOpenAPICacheDownloader:
             elif ("累計" in cs and "增減" in cs) or cs in ("累計營業收入-前期比較增減(%)", "累計增減(%)"):
                 col_map.setdefault("cumulative_yoy", c)
         return col_map
+
+    def cache_path_for_month(self, month: str) -> Path:
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            raise ValueError(f"invalid revenue month: {month}")
+        return self.monthly_cache_dir / f"revenue_{m}.csv"
+
+    def _emit_cache_trace(self, month: str, stage: str, status: str, rows: int = 0, cache_path: Path | None = None, reason_code: str = "", reason_detail: str = ""):
+        try:
+            if self.trace_engine is not None:
+                self.trace_engine.event(
+                    module="Revenue",
+                    source_name="RevenueMonthlyCache",
+                    stage=stage,
+                    status=status,
+                    target_table="external_revenue_history",
+                    source_file=str(cache_path or ""),
+                    rows_downloaded=rows,
+                    rows_parsed=rows,
+                    rows_written=rows if str(status).upper() == "PASS" and stage == "CACHE_WRITE" else 0,
+                    verify_count=rows if stage == "CACHE_VERIFY" else 0,
+                    fail_reason_code=reason_code,
+                    fail_reason_detail=reason_detail,
+                    source_date=str(month or ""),
+                )
+            else:
+                log_info(f"[EXTERNAL_TRACE][R5L_CACHE] month={month} stage={stage} status={status} rows={rows} file={cache_path} reason={reason_code} detail={reason_detail}")
+        except Exception as exc:
+            log_warning(f"[R5L][CACHE_TRACE][SKIP] month={month} stage={stage}｜{exc}")
+
+    def _normalize_month_cache_df(self, df: pd.DataFrame, month: str, source_url: str = "") -> pd.DataFrame:
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if df is None or df.empty or not m:
+            return pd.DataFrame()
+        x = df.copy().fillna("")
+        if "stock_id" not in x.columns or "revenue" not in x.columns:
+            return pd.DataFrame()
+        if "revenue_month" not in x.columns:
+            x["revenue_month"] = m
+        x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+        x["revenue_month"] = x["revenue_month"].map(RevenueAccelerationEngine.normalize_month).fillna("").astype(str)
+        for c in ["revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy"]:
+            if c not in x.columns:
+                x[c] = np.nan
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+        if "source_date" not in x.columns:
+            x["source_date"] = f"{m[:4]}-{m[4:6]}"
+        if "source_url" not in x.columns:
+            x["source_url"] = source_url
+        if "update_time" not in x.columns:
+            x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        x = x[(x["stock_id"].astype(str).ne("")) & x["revenue_month"].eq(m) & (x["revenue"] > 0)].copy()
+        if x.empty:
+            return pd.DataFrame()
+        keep = ["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]
+        return x[keep].drop_duplicates(["stock_id", "revenue_month"], keep="last")
+
+    def write_month_cache(self, df: pd.DataFrame, month: str, source_url: str = "") -> Path | None:
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            return None
+        cache_path = self.cache_path_for_month(m)
+        x = self._normalize_month_cache_df(df, m, source_url=source_url)
+        if x.empty:
+            self._emit_cache_trace(m, "CACHE_WRITE", "FAIL", 0, cache_path, "WRITE_ROWS_ZERO", "month cache rows=0 after normalize")
+            return None
+        try:
+            x.to_csv(cache_path, index=False, encoding="utf-8-sig")
+            self._emit_cache_trace(m, "CACHE_WRITE", "PASS", len(x), cache_path)
+            log_info(f"[R5L][REVENUE_MONTH_CACHE][WRITE] month={m} rows={len(x)} file={cache_path}")
+            return cache_path
+        except Exception as exc:
+            self._emit_cache_trace(m, "CACHE_WRITE", "FAIL", 0, cache_path, "LOCAL_FILE_WRITE_FAIL", str(exc))
+            log_warning(f"[R5L][REVENUE_MONTH_CACHE][WRITE_FAIL] month={m} file={cache_path}｜{exc}")
+            return None
+
+    def load_month_cache(self, month: str) -> pd.DataFrame:
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            return pd.DataFrame()
+        cache_path = self.cache_path_for_month(m)
+        if not cache_path.exists() or cache_path.stat().st_size <= 0:
+            self._emit_cache_trace(m, "CACHE_VERIFY", "FAIL", 0, cache_path, "LOCAL_FILE_MISSING", "monthly revenue cache missing or empty")
+            return pd.DataFrame()
+        try:
+            raw = safe_read_csv_auto(cache_path)
+            x = self._normalize_month_cache_df(raw, m, source_url="OFFICIAL_MONTHLY_CACHE:" + str(cache_path))
+            if x.empty:
+                self._emit_cache_trace(m, "CACHE_VERIFY", "FAIL", 0, cache_path, "PARSE_ROWS_ZERO", "cache exists but valid rows=0 or month mismatch")
+                return pd.DataFrame()
+            month_match = bool(x["revenue_month"].astype(str).eq(m).all())
+            if not month_match:
+                self._emit_cache_trace(m, "CACHE_VERIFY", "FAIL", len(x), cache_path, "MONTH_MISMATCH", f"cache revenue_month not all {m}")
+                return pd.DataFrame()
+            self._emit_cache_trace(m, "CACHE_VERIFY", "PASS", len(x), cache_path)
+            log_info(f"[R5L][REVENUE_MONTH_CACHE][VERIFY] month={m} rows={len(x)} file={cache_path}")
+            return x
+        except Exception as exc:
+            self._emit_cache_trace(m, "CACHE_VERIFY", "FAIL", 0, cache_path, "PARSE_FAILED", str(exc))
+            log_warning(f"[R5L][REVENUE_MONTH_CACHE][VERIFY_FAIL] month={m} file={cache_path}｜{exc}")
+            return pd.DataFrame()
 
     def _read_remote_json_df(self, url: str, referer: str = "") -> tuple[pd.DataFrame, str]:
         resp = requests.get(
@@ -6175,7 +6314,11 @@ class RevenueOpenAPICacheDownloader:
                 return None
             out = self.cache_dir / f"revenue_openapi_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{source_tag}.csv"
             x.to_csv(out, index=False, encoding="utf-8-sig")
-            log_info(f"[REVENUE][OPENAPI_CACHE] saved cache={out} rows={len(x)} months={sorted(x['revenue_month'].astype(str).unique().tolist())}")
+            months = sorted(x['revenue_month'].astype(str).unique().tolist())
+            # R5L.1：批次快取之外，同步拆出 revenue_YYYYMM.csv 逐月 cache。
+            for m in months:
+                self.write_month_cache(x[x['revenue_month'].astype(str).eq(str(m))].copy(), m, source_url="OFFICIAL_OPENAPI_BATCH_CACHE:" + str(out))
+            log_info(f"[REVENUE][OPENAPI_CACHE] saved cache={out} rows={len(x)} months={months}")
             return out
         except Exception as exc:
             log_warning(f"[REVENUE][OPENAPI_CACHE] save cache failed：{exc}")
@@ -6222,7 +6365,11 @@ class RevenueOpenAPICacheDownloader:
         原 R4A 只讀 latest cache，若最新官方 OpenAPI 只有 202604，就永遠補不到
         202602/202603。此處只讀本機既有快取，不覆蓋 DB，仍維持 append-only。
         """
-        files = sorted(self.cache_dir.glob("revenue_openapi_*.csv"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:int(max_files or 80)]
+        files = sorted(
+            list(self.cache_dir.glob("revenue_*.csv")) + list(self.cache_dir.glob("revenue_openapi_*.csv")),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )[:int(max_files or 80)]
         parts = []
         for p in files:
             for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
@@ -6320,11 +6467,13 @@ class RevenueOpenAPICacheDownloader:
                 if not html.strip() or ("查無資料" in html and "公司代號" not in html):
                     errors.append(f"{market_label}:{m}:empty_html")
                     continue
-                try:
-                    tables = pd.read_html(io.StringIO(html))
-                except Exception as read_exc:
-                    errors.append(f"{market_label}:{m}:read_html:{read_exc}")
+                tables, parser_used, read_err = safe_read_html_tables(html, source_label=f"MOPS_T21SC04_{market_label}_{m}")
+                if not tables:
+                    reason_code = "DEPENDENCY_MISSING" if "No module named" in read_err or "Missing optional dependency" in read_err else "PARSE_ROWS_ZERO"
+                    errors.append(f"{market_label}:{m}:read_html:{read_err}")
+                    self._emit_cache_trace(m, "PARSE", "FAIL", 0, None, reason_code, read_err)
                     continue
+                self._emit_cache_trace(m, "PARSE", "PASS", len(tables), None, "", f"parser={parser_used}")
                 parsed_parts = []
                 for t in tables:
                     ft = self._flatten_revenue_html_table(t)
@@ -6350,7 +6499,9 @@ class RevenueOpenAPICacheDownloader:
         df = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
         df["source_date"] = f"{year}-{month:02d}"
         df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cache_path = self.save_cache_df(df, source_tag=f"mops_t21sc04_{m}")
+        monthly_cache_path = self.write_month_cache(df, m, source_url=f"OFFICIAL_MOPS_T21SC04_HISTORY:{m}")
+        batch_cache_path = self.save_cache_df(df, source_tag=f"mops_t21sc04_{m}")
+        cache_path = monthly_cache_path or batch_cache_path
         df["source_url"] = "OFFICIAL_MOPS_T21SC04_HISTORY_CACHE:" + str(cache_path or f"{m}")
         return df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
 
@@ -6407,7 +6558,8 @@ class RevenueOpenAPICacheDownloader:
         if cache_df.empty:
             return pd.DataFrame()
         cache_df["source_url"] = cache_df.get("source_url", "").fillna("").astype(str)
-        cache_df.loc[~cache_df["source_url"].str.contains("OFFICIAL_OPENAPI_CACHE", na=False), "source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(self.latest_cache_file() or "download_memory")
+        no_source_mask = cache_df["source_url"].astype(str).str.strip().eq("")
+        cache_df.loc[no_source_mask, "source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(self.latest_cache_file() or "download_memory")
         log_info(f"[REVENUE][OPENAPI_CACHE][APPEND_ONLY] required_months={required} append_rows={len(cache_df)} months={sorted(cache_df['revenue_month'].astype(str).unique().tolist())} zero_rejected=1 policy=INSERT_OR_IGNORE_ONLY")
         return cache_df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
@@ -9731,12 +9883,41 @@ class HighGrowthEPSEngine:
                 part = pd.DataFrame()
             available_rows = int(len(part))
             available_stock_count = int(part["stock_id"].nunique()) if "stock_id" in part.columns and not part.empty else 0
+            cache_file = str(REVENUE_MONTHLY_CACHE_DIR / f"revenue_{m}.csv") if m else ""
+            cache_exists = False
+            cache_rows = 0
+            cache_month_match = "NO"
+            cache_verify_status = "MISSING"
+            try:
+                cp = Path(cache_file)
+                cache_exists = cp.exists() and cp.stat().st_size > 0
+                if cache_exists:
+                    cdf = safe_read_csv_auto(cp)
+                    if "revenue_month" in cdf.columns:
+                        cdf["revenue_month_norm"] = cdf["revenue_month"].map(self.revenue_engine.normalize_month)
+                        cache_rows = int(len(cdf[cdf["revenue_month_norm"].astype(str).eq(str(m))]))
+                        cache_month_match = "YES" if cache_rows > 0 and cdf["revenue_month_norm"].astype(str).eq(str(m)).all() else "NO"
+                    else:
+                        cache_rows = int(len(cdf))
+                        cache_month_match = "NO_REVENUE_MONTH_COL"
+                    cache_verify_status = "PASS" if cache_rows > 0 and cache_month_match == "YES" else "FAIL"
+            except Exception as cache_exc:
+                cache_verify_status = "FAIL"
+                cache_month_match = f"ERROR:{str(cache_exc)[:120]}"
             rows.append({
                 "required_month": m,
                 "available_rows": available_rows,
                 "available_stock_count": available_stock_count,
                 "coverage_status": "OK" if available_rows > 0 else "MISSING",
                 "missing_months": "" if available_rows > 0 else m,
+                "cache_file": cache_file,
+                "cache_exists": "YES" if cache_exists else "NO",
+                "cache_rows": cache_rows,
+                "cache_month_match": cache_month_match,
+                "cache_verify_status": cache_verify_status,
+                "db_verify_status": "PASS" if available_rows > 0 else "FAIL",
+                "fail_reason_code": "" if available_rows > 0 and cache_verify_status == "PASS" else ("VERIFY_ROWS_ZERO" if available_rows <= 0 else "CACHE_VERIFY_FAIL"),
+                "fail_reason_detail": "" if available_rows > 0 and cache_verify_status == "PASS" else f"cache={cache_verify_status};db_rows={available_rows}",
                 "available_months_in_db_last12": available_months_text,
                 "latest_available_month": latest_available_month,
                 "diagnosis": "" if available_rows > 0 else ("DB有月營收但缺指定月份，需補歷史月或檢查月份格式" if available_months_text else "DB沒有可辨識月營收月份"),
@@ -9748,6 +9929,14 @@ class HighGrowthEPSEngine:
                 "available_stock_count": 0,
                 "coverage_status": "NO_REQUIRED_MONTH",
                 "missing_months": "",
+                "cache_file": "",
+                "cache_exists": "NO",
+                "cache_rows": 0,
+                "cache_month_match": "NO",
+                "cache_verify_status": "NO_REQUIRED_MONTH",
+                "db_verify_status": "NO_REQUIRED_MONTH",
+                "fail_reason_code": "",
+                "fail_reason_detail": "",
             })
         return pd.DataFrame(rows)
 
@@ -10915,8 +11104,43 @@ class ExternalDataWriter:
                 else:
                     raise ValueError(f"未知target_table：{result.target_table}")
                 self.db.conn.commit()
+            # R5L.1：Revenue 寫入後立即做 required_months DB Verify。
+            # 任一月份缺資料，不可讓 202604 成功掩蓋 202602/202603 缺月。
+            if result.target_table == "external_revenue":
+                try:
+                    required_months = RevenueAccelerationEngine(self.db).required_months(HIGH_GROWTH_DEFAULT_QUARTERS)
+                    missing_required = []
+                    verify_parts = []
+                    cur = self.db.conn.cursor()
+                    for m in required_months:
+                        mm = RevenueAccelerationEngine.normalize_month(m)
+                        if not mm:
+                            continue
+                        row = cur.execute("SELECT COUNT(*) FROM external_revenue_history WHERE revenue_month=? AND revenue>0", (mm,)).fetchone()
+                        cnt = int(row[0] or 0) if row else 0
+                        verify_parts.append(f"{mm}:{cnt}")
+                        if cnt <= 0:
+                            missing_required.append(mm)
+                    if missing_required:
+                        result.status = "fail"
+                        result.data_ready = 0
+                        result.error_message = (
+                            "R5L_REVENUE_REQUIRED_MONTHS_FAIL：required_months 未全部入庫；"
+                            f"missing={','.join(missing_required)}；verify={';'.join(verify_parts)}"
+                        )
+                        log_warning("[R5L][REVENUE_DB_VERIFY][FAIL] " + result.error_message)
+                    else:
+                        log_info(f"[R5L][REVENUE_DB_VERIFY][PASS] required_months={','.join(required_months)} verify={';'.join(verify_parts)}")
+                except Exception as verify_exc:
+                    result.status = "fail"
+                    result.data_ready = 0
+                    result.error_message = f"R5L_REVENUE_DB_VERIFY_EXCEPTION：{verify_exc}"
+                    log_warning("[R5L][REVENUE_DB_VERIFY][EXCEPTION] " + str(verify_exc))
             result.rows_count = int(len(df))
-            result.data_ready = 1 if len(df) > 0 else 0
+            if result.target_table != "external_revenue":
+                result.data_ready = 1 if len(df) > 0 else 0
+            elif result.status != "fail":
+                result.data_ready = 1 if len(df) > 0 else 0
             return result
         except Exception as exc:
             result.status = "fail"
