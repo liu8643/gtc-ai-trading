@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.3-R5N2_TWSE_INDEX04_BACKEND_ZIP_DOWNLOAD_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.3-R5N3_TWSE_INDEX04_HTML_LINK_DISCOVERY"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -5885,20 +5885,44 @@ REVENUE_CACHE_APPEND_ONLY_POLICY = (
 TWSE_INDEX04_PAGE_URL = "https://www.twse.com.tw/zh/trading/statistics/index04.html"
 TWSE_INDEX04_C04003_CACHE_DIR = REVENUE_CACHE_DIR / "index04_c04003"
 TWSE_INDEX04_C04003_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-# R5N2_TWSE_INDEX04_BACKEND_ZIP_DOWNLOAD_FIX_20260609：
-# 正式新增 TWSE index04 後端 ZIP 下載方式，不再只靠猜 staticFiles 路徑。
-# 來源參數：download=zip&type=C&year=YYYY&month=MM，並以 ZIP 檔固定 PK 開頭作為有效檔案判斷。
-TWSE_INDEX04_BACKEND_ZIP_URLS = [
-    "https://www.twse.com.tw",
-    "https://twse.com.tw",
-]
-TWSE_INDEX04_BACKEND_REPORT_TYPE = "C"
-TWSE_INDEX04_BACKEND_DELETE_ZIP_AFTER_EXTRACT = True
+# R5N3_TWSE_INDEX04_HTML_LINK_DISCOVERY_20260609：
+# 正式改用 TWSE 月報左下角驗證到的 rwd/zh/statistics/count 下載入口。
+# 已驗證規則範例：
+# https://www.twse.com.tw/rwd/zh/statistics/count?l1=上市公司月報&l2=【集中交易市場募集資金相關資訊】月報&url=/staticFiles/inspection/inspection/04/002/202605_C04002.zip
+# 設計原則：
+# 1) 選到月份後，先下載該月份上市公司月報全部內容檔 C04001~C04004 到本機。
+# 2) C04003 = 國內上市公司營業收入彙總表，供 Revenue Cache / DB 寫入。
+# 3) 非 ZIP 一律保存 fail html/txt，不再靜默失敗。
+TWSE_INDEX04_RWD_COUNT_URL = "https://www.twse.com.tw/rwd/zh/statistics/count"
+TWSE_INDEX04_L1 = "上市公司月報"
+TWSE_INDEX04_REPORT_DEFINITIONS = {
+    "C04001": {
+        "seq": "001",
+        "name": "大盤、各產業類股及上市股票本益比、殖利率及股價淨值比",
+    },
+    "C04002": {
+        "seq": "002",
+        "name": "集中交易市場募集資金相關資訊",
+    },
+    "C04003": {
+        "seq": "003",
+        "name": "國內上市公司營業收入彙總表",
+    },
+    "C04004": {
+        "seq": "004",
+        "name": "上市證券概況",
+    },
+}
+TWSE_INDEX04_REVENUE_REPORT_CODE = "C04003"
+TWSE_INDEX04_RWD_DOWNLOAD_ALL_REPORTS = True
+TWSE_INDEX04_BACKEND_REPORT_TYPE = "C"  # backward compatibility only
+TWSE_INDEX04_BACKEND_DELETE_ZIP_AFTER_EXTRACT = False  # R5N3：保留 ZIP 供本機查核，避免「本機什麼都沒有」。
+TWSE_INDEX04_ALL_REPORTS_CACHE_DIR = REVENUE_CACHE_DIR / "index04_monthly_reports"
+TWSE_INDEX04_ALL_REPORTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # 舊 hard-code staticFiles URL 保留為最後備援，主流程不得優先使用。
 TWSE_INDEX04_C04003_URL_TEMPLATES = [
-    "https://www.twse.com.tw/staticFiles/statistics/statisticsList/04/{month}_C04003.zip",
-    "https://www.twse.com.tw/staticFiles/statistics/statisticsList/{month}_C04003.zip",
-    "https://www.twse.com.tw/staticFiles/statistics/statisticsList/04/{year}/{month}_C04003.zip",
+    "https://www.twse.com.tw/rwd/zh/statistics/count?l1=上市公司月報&l2=【國內上市公司營業收入彙總表】月報&url=/staticFiles/inspection/inspection/04/003/{month}_C04003.zip",
+    "https://www.twse.com.tw/staticFiles/inspection/inspection/04/003/{month}_C04003.zip",
 ]
 
 
@@ -6530,96 +6554,210 @@ class RevenueOpenAPICacheDownloader:
                 continue
         return out
 
-    def _discover_twse_index04_c04003_url(self, target_month: str) -> str:
-        """R5M：從 index04 HTML 找出指定月份 C04003 ZIP 連結。"""
+    def _twse_index04_report_info(self, report_code: str) -> dict:
+        """R5N3：取得上市公司月報定義。"""
+        code = str(report_code or "").strip().upper()
+        return dict(TWSE_INDEX04_REPORT_DEFINITIONS.get(code, {}))
+
+    def _build_twse_index04_rwd_count_url(self, target_month: str, report_code: str) -> str:
+        """R5N3：依 TWSE index04 左下角真實下載規則建立 count 下載 URL。
+
+        規則來自實際瀏覽器左下角下載網址：
+        /rwd/zh/statistics/count?l1=上市公司月報&l2=【xxx】月報&url=/staticFiles/inspection/inspection/04/NNN/YYYYMM_C0400N.zip
+        """
         m = RevenueAccelerationEngine.normalize_month(target_month)
-        if not m:
+        info = self._twse_index04_report_info(report_code)
+        if not m or not info:
             return ""
+        code = str(report_code).strip().upper()
+        seq = str(info.get("seq") or "").strip()
+        name = str(info.get("name") or "").strip()
+        if not seq or not name:
+            return ""
+        static_path = f"/staticFiles/inspection/inspection/04/{seq}/{m}_{code}.zip"
+        params = {
+            "l1": TWSE_INDEX04_L1,
+            "l2": f"【{name}】月報",
+            "url": static_path,
+        }
+        req = requests.Request("GET", TWSE_INDEX04_RWD_COUNT_URL, params=params).prepare()
+        return str(req.url or "")
+
+    def _save_non_zip_debug_file(self, target_month: str, report_code: str, response, label: str = "") -> Path | None:
+        """R5N3：非 ZIP 回應必須落檔，避免現場只看到 FAIL 沒有證據。"""
         try:
-            resp = requests.get(
-                TWSE_INDEX04_PAGE_URL,
-                timeout=30,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,*/*"},
-            )
-            resp.raise_for_status()
-            html = resp.text or ""
-            pattern = re.compile("href=[\"']([^\"']*" + re.escape(m) + r"_C04003\.zip[^\"']*)[\"']", re.I)
-            match = pattern.search(html)
-            if match:
-                return requests.compat.urljoin(TWSE_INDEX04_PAGE_URL, html_lib.unescape(match.group(1)))
-            pattern2 = re.compile(r"([A-Za-z0-9_./?=&:%\-]+" + re.escape(m) + r"_C04003\.zip)", re.I)
-            match2 = pattern2.search(html)
-            if match2:
-                return requests.compat.urljoin(TWSE_INDEX04_PAGE_URL, html_lib.unescape(match2.group(1)))
+            m = RevenueAccelerationEngine.normalize_month(target_month) or str(target_month or "unknown")
+            code = str(report_code or "unknown").upper()
+            debug_dir = TWSE_INDEX04_ALL_REPORTS_CACHE_DIR / m / "_fail_debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            suffix = "html"
+            ctype = ""
+            try:
+                ctype = str(response.headers.get("Content-Type", "") or "")
+            except Exception:
+                pass
+            if "json" in ctype.lower():
+                suffix = "json"
+            elif "text" in ctype.lower() or "html" in ctype.lower():
+                suffix = "html"
+            else:
+                suffix = "bin"
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_label = re.sub(r"[^A-Za-z0-9_\-]", "_", str(label or "not_zip"))[:40]
+            out = debug_dir / f"{m}_{code}_{safe_label}_{stamp}.{suffix}"
+            content = getattr(response, "content", b"") or b""
+            out.write_bytes(content)
+            meta = debug_dir / f"{m}_{code}_{safe_label}_{stamp}.txt"
+            try:
+                meta.write_text(
+                    "url=" + str(getattr(response, "url", "")) + "\n" +
+                    "status=" + str(getattr(response, "status_code", "")) + "\n" +
+                    "content_type=" + ctype + "\n" +
+                    "bytes=" + str(len(content)) + "\n" +
+                    "head=" + repr(content[:64]) + "\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            log_warning(f"[R5N3][TWSE_INDEX04][NON_ZIP_SAVED] month={m} report={code} file={out}")
+            return out
+        except Exception:
+            return None
+
+    def _download_twse_index04_report_zip(self, target_month: str, report_code: str) -> tuple[Path | None, str, str]:
+        """R5N3：下載指定月份/指定月報代號 ZIP 到本機。
+
+        主方法：TWSE rwd/zh/statistics/count + url=/staticFiles/inspection/inspection/04/NNN/YYYYMM_C0400N.zip。
+        成功條件：HTTP 200 且 response.content 以 PK 開頭。
+        """
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        code = str(report_code or "").strip().upper()
+        info = self._twse_index04_report_info(code)
+        if not m:
+            return None, "", "invalid month"
+        if not info:
+            return None, "", f"unknown report_code={report_code}"
+
+        month_dir = TWSE_INDEX04_ALL_REPORTS_CACHE_DIR / m
+        month_dir.mkdir(parents=True, exist_ok=True)
+        out = month_dir / f"{m}_{code}.zip"
+        if out.exists() and out.stat().st_size > 0:
+            try:
+                if out.read_bytes()[:4].startswith(b"PK"):
+                    return out, "LOCAL_MONTHLY_REPORT:" + str(out), ""
+                else:
+                    log_warning(f"[R5N3][TWSE_INDEX04][LOCAL_INVALID] month={m} report={code} file={out}")
+            except Exception:
+                pass
+
+        url = self._build_twse_index04_rwd_count_url(m, code)
+        if not url:
+            return None, "", f"build count url failed report={code}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            "Accept": "application/zip,application/octet-stream,*/*",
+            "Referer": TWSE_INDEX04_PAGE_URL,
+        }
+        try:
+            resp = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+            request_url = str(getattr(resp, "url", url) or url)
+            if resp.status_code != 200:
+                self._save_non_zip_debug_file(m, code, resp, label=f"HTTP{resp.status_code}")
+                return None, request_url, f"HTTP{resp.status_code}"
+            content = resp.content or b""
+            if not self._is_valid_zip_bytes(content):
+                self._save_non_zip_debug_file(m, code, resp, label="not_zip")
+                return None, request_url, f"not_zip_or_too_small bytes={len(content)} content_type={resp.headers.get('Content-Type','')}"
+            out.write_bytes(content)
+            log_info(f"[R5N3][TWSE_INDEX04][ZIP_OK] month={m} report={code} file={out} bytes={len(content)} url={request_url}")
+            return out, request_url, ""
         except Exception as exc:
-            log_warning(f"[R5M][TWSE_INDEX04][DISCOVER_FAIL] month={m}｜{exc}")
-        return ""
+            return None, url, str(exc)
+
+    def _extract_twse_index04_report_zip(self, zip_path: Path, target_month: str, report_code: str) -> list[Path]:
+        """R5N3：解壓指定月報 ZIP，回傳解壓出的檔案清單。"""
+        files: list[Path] = []
+        try:
+            m = RevenueAccelerationEngine.normalize_month(target_month)
+            code = str(report_code or "").strip().upper()
+            extract_dir = TWSE_INDEX04_ALL_REPORTS_CACHE_DIR / m / code
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_path) as zf:
+                for member in zf.namelist():
+                    zf.extract(member, extract_dir)
+                    files.append(extract_dir / member)
+            log_info(f"[R5N3][TWSE_INDEX04][ZIP_EXTRACT_OK] month={m} report={code} files={len(files)} dir={extract_dir}")
+        except Exception as exc:
+            log_warning(f"[R5N3][TWSE_INDEX04][ZIP_EXTRACT_FAIL] month={target_month} report={report_code} file={zip_path}｜{exc}")
+        return files
+
+    def download_twse_index04_all_reports_for_month(self, target_month: str, force_download: bool = False) -> pd.DataFrame:
+        """R5N3：當 UI 選到月份時，下載該月份上市公司月報全部內容 ZIP（C04001~C04004）。
+
+        回傳下載明細 DataFrame；C04003 仍會由既有 Revenue Cache 流程解析。
+        """
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        rows = []
+        if not m:
+            return pd.DataFrame()
+        for code, info in TWSE_INDEX04_REPORT_DEFINITIONS.items():
+            month_zip = TWSE_INDEX04_ALL_REPORTS_CACHE_DIR / m / f"{m}_{code}.zip"
+            if force_download and month_zip.exists():
+                try:
+                    month_zip.unlink()
+                except Exception:
+                    pass
+            zip_path, url, err = self._download_twse_index04_report_zip(m, code)
+            extracted = []
+            if zip_path is not None and Path(zip_path).exists():
+                extracted = self._extract_twse_index04_report_zip(Path(zip_path), m, code)
+            rows.append({
+                "月份": m,
+                "報表代號": code,
+                "報表名稱": str(info.get("name") or ""),
+                "下載狀態": "PASS" if zip_path is not None and Path(zip_path).exists() else "FAIL",
+                "ZIP路徑": str(zip_path or ""),
+                "解壓檔數": len(extracted),
+                "解壓路徑": str((TWSE_INDEX04_ALL_REPORTS_CACHE_DIR / m / code) if extracted else ""),
+                "下載網址": url,
+                "錯誤訊息": err,
+                "下載時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        manifest = pd.DataFrame(rows)
+        try:
+            out = TWSE_INDEX04_ALL_REPORTS_CACHE_DIR / m / f"index04_all_reports_{m}.csv"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            manifest.to_csv(out, index=False, encoding="utf-8-sig")
+            log_info(f"[R5N3][TWSE_INDEX04][ALL_REPORTS_MANIFEST] month={m} file={out}")
+        except Exception as exc:
+            log_warning(f"[R5N3][TWSE_INDEX04][ALL_REPORTS_MANIFEST_FAIL] month={m}｜{exc}")
+        return manifest
+
+    def _discover_twse_index04_c04003_url(self, target_month: str) -> str:
+        """R5N3：保留舊方法名稱，但改為產生已驗證的 rwd/zh/statistics/count C04003 URL。"""
+        return self._build_twse_index04_rwd_count_url(target_month, TWSE_INDEX04_REVENUE_REPORT_CODE)
 
     def _is_valid_zip_bytes(self, content: bytes) -> bool:
-        """R5N2：確認下載內容是否真為 ZIP。TWSE 無資料時可能 HTTP 200 但回 HTML，不能直接解壓。"""
+        """R5N3：確認下載內容是否真為 ZIP。TWSE 無資料時可能 HTTP 200 但回 HTML，不能直接解壓。"""
         try:
             return bool(content) and len(content) >= 1024 and bytes(content[:4]).startswith(b"PK")
         except Exception:
             return False
 
     def _download_twse_index04_backend_zip(self, target_month: str) -> tuple[Path | None, str, str]:
-        """R5N2：使用 TWSE index04 後端參數下載國內上市公司營業收入彙總表 ZIP。
+        """R5N3：backward-compatible wrapper。
 
-        正式主來源：GET https://www.twse.com.tw?download=zip&type=C&year=YYYY&month=MM
-        - year 使用西元年 YYYY，不使用民國年。
-        - month 使用兩位數 MM。
-        - response.content 必須以 PK 開頭才寫檔。
-        """
-        m = RevenueAccelerationEngine.normalize_month(target_month)
-        if not m:
-            return None, "", "invalid month"
-        year_ad = int(m[:4])
-        month_str = m[4:6]
-        params = {
-            "download": "zip",
-            "type": TWSE_INDEX04_BACKEND_REPORT_TYPE,
-            "year": str(year_ad),
-            "month": month_str,
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-            "Accept": "application/zip,application/octet-stream,*/*",
-            "Referer": TWSE_INDEX04_PAGE_URL,
-        }
-        errors = []
-        out = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
-        for base_url in TWSE_INDEX04_BACKEND_ZIP_URLS:
-            try:
-                resp = requests.get(base_url, params=params, headers=headers, timeout=45)
-                request_url = getattr(resp, "url", base_url)
-                if resp.status_code != 200:
-                    errors.append(f"{request_url}:HTTP{resp.status_code}")
-                    continue
-                content = resp.content or b""
-                if not self._is_valid_zip_bytes(content):
-                    snippet = ""
-                    try:
-                        snippet = (resp.text or "")[:160].replace("\n", " ").replace("\r", " ")
-                    except Exception:
-                        snippet = ""
-                    errors.append(f"{request_url}:not_zip_or_too_small bytes={len(content)} content_type={resp.headers.get('Content-Type','')} snippet={snippet}")
-                    continue
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_bytes(content)
-                log_info(f"[R5N2][TWSE_INDEX04_BACKEND][ZIP_DOWNLOAD_OK] month={m} file={out} bytes={len(content)} url={request_url}")
-                return out, request_url, ""
-            except Exception as exc:
-                errors.append(f"{base_url}:{exc}")
-        return None, " | ".join(TWSE_INDEX04_BACKEND_ZIP_URLS), " ; ".join(errors)
+        舊版 R5N2 使用 https://twse.com.tw?download=zip&type=C... 已確認會回首頁/解析失敗。
+        現改為下載 C04003 的 rwd count ZIP。此函式保留名稱，避免其他呼叫點失效。"""
+        return self._download_twse_index04_report_zip(target_month, TWSE_INDEX04_REVENUE_REPORT_CODE)
 
     def _download_twse_index04_c04003_zip(self, target_month: str) -> tuple[Path | None, str, str]:
-        """R5N2：下載/取得 TWSE index04 C04003 ZIP。回傳(zip_path, url, error)。
+        """R5N3：下載/取得 TWSE index04 C04003 ZIP。回傳(zip_path, url, error)。
 
         優先順序：
         1. 本機已存在 ZIP（人工下載或前次快取）。
-        2. TWSE index04 後端 ZIP 參數下載：download=zip&type=C&year=YYYY&month=MM。
-        3. index04 HTML 探測連結。
-        4. 舊 staticFiles hard-code URL（只作最後備援）。
+        2. TWSE rwd/zh/statistics/count 真實下載入口；並同步下載同月份 C04001~C04004 全部內容檔。
+        3. 舊 staticFiles hard-code URL（只作最後備援）。
         """
         m = RevenueAccelerationEngine.normalize_month(target_month)
         if not m:
@@ -6629,7 +6767,7 @@ class RevenueOpenAPICacheDownloader:
                 if p.exists() and p.stat().st_size > 0:
                     raw = p.read_bytes()[:4]
                     if not raw.startswith(b"PK"):
-                        log_warning(f"[R5N2][TWSE_INDEX04][LOCAL_ZIP_INVALID] month={m} file={p} head={raw!r}")
+                        log_warning(f"[R5N3][TWSE_INDEX04][LOCAL_ZIP_INVALID] month={m} file={p} head={raw!r}")
                         continue
                     target = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
                     if p.resolve() != target.resolve():
@@ -6643,9 +6781,41 @@ class RevenueOpenAPICacheDownloader:
             except Exception:
                 continue
 
-        backend_zip, backend_url, backend_error = self._download_twse_index04_backend_zip(m)
+        all_manifest = pd.DataFrame()
+        if TWSE_INDEX04_RWD_DOWNLOAD_ALL_REPORTS:
+            try:
+                all_manifest = self.download_twse_index04_all_reports_for_month(m, force_download=False)
+            except Exception as exc:
+                log_warning(f"[R5N3][TWSE_INDEX04][ALL_REPORTS_DOWNLOAD_FAIL] month={m}｜{exc}")
+        r = None
+        if all_manifest is not None and not all_manifest.empty:
+            try:
+                r = all_manifest[(all_manifest["報表代號"].astype(str) == TWSE_INDEX04_REVENUE_REPORT_CODE) & (all_manifest["下載狀態"].astype(str) == "PASS")].tail(1)
+            except Exception:
+                r = None
+        if r is not None and not r.empty:
+            zip_file = Path(str(r.iloc[-1].get("ZIP路徑") or ""))
+            if zip_file.exists():
+                target = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(zip_file, target)
+                    zip_file = target
+                except Exception:
+                    pass
+                return zip_file, "OFFICIAL_TWSE_INDEX04_RWD_COUNT_DOWNLOAD:" + str(r.iloc[-1].get("下載網址") or ""), ""
+
+        # 直接再抓一次 C04003，避免 all reports 有單一檔案失敗時沒有二次機會。
+        backend_zip, backend_url, backend_error = self._download_twse_index04_report_zip(m, TWSE_INDEX04_REVENUE_REPORT_CODE)
         if backend_zip is not None and Path(backend_zip).exists():
-            return backend_zip, "OFFICIAL_TWSE_INDEX04_BACKEND_DOWNLOAD:" + backend_url, ""
+            target = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(backend_zip, target)
+                backend_zip = target
+            except Exception:
+                pass
+            return backend_zip, "OFFICIAL_TWSE_INDEX04_RWD_COUNT_DOWNLOAD:" + backend_url, ""
 
         urls = []
         discovered = self._discover_twse_index04_c04003_url(m)
@@ -6658,27 +6828,29 @@ class RevenueOpenAPICacheDownloader:
                     urls.append(u)
             except Exception:
                 continue
-        errors = ["BACKEND:" + backend_error] if backend_error else []
+        errors = ["RWD_COUNT:" + backend_error] if backend_error else []
         out = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
         for url in urls:
             try:
                 resp = requests.get(
                     url,
-                    timeout=45,
+                    timeout=60,
                     headers={"User-Agent": "Mozilla/5.0", "Accept": "application/zip,application/octet-stream,*/*", "Referer": TWSE_INDEX04_PAGE_URL},
                 )
                 if resp.status_code != 200:
+                    self._save_non_zip_debug_file(m, TWSE_INDEX04_REVENUE_REPORT_CODE, resp, label=f"HTTP{resp.status_code}")
                     errors.append(f"{url}:HTTP{resp.status_code}"); continue
                 content = resp.content or b""
                 if not self._is_valid_zip_bytes(content):
+                    self._save_non_zip_debug_file(m, TWSE_INDEX04_REVENUE_REPORT_CODE, resp, label="not_zip_fallback")
                     errors.append(f"{url}:not_zip_or_too_small bytes={len(content)}"); continue
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_bytes(content)
-                log_info(f"[R5N2][TWSE_INDEX04][ZIP_DOWNLOAD_FALLBACK_OK] month={m} file={out} bytes={len(content)} url={url}")
+                log_info(f"[R5N3][TWSE_INDEX04][ZIP_DOWNLOAD_FALLBACK_OK] month={m} file={out} bytes={len(content)} url={url}")
                 return out, url, ""
             except Exception as exc:
                 errors.append(f"{url}:{exc}")
-        return None, " | ".join([backend_url] + urls), " ; ".join(errors)
+        return None, " | ".join(urls), " ; ".join(errors)
 
     def _parse_twse_c04003_excel(self, excel_path: Path, target_month: str, source_url: str = "") -> pd.DataFrame:
         """R5M：解析 TWSE C04003 國內上市公司營業收入彙總表。
