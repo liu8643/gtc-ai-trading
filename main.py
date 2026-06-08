@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R5K_OPENAPI_REGISTRY_HEALTH"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.3-R5N_REVENUE_CACHE_UI_MONTH_SELECTOR"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -5880,6 +5880,63 @@ REVENUE_CACHE_APPEND_ONLY_POLICY = (
 )
 
 
+# R5M_TWSE_INDEX04_C04003_HISTORY_20260608：TWSE index04 歷史月報 ZIP。
+# C04003 = 國內上市公司營業收入彙總表；可補 OpenAPI 只回最新月導致 202602/202603 缺月問題。
+TWSE_INDEX04_PAGE_URL = "https://www.twse.com.tw/zh/trading/statistics/index04.html"
+TWSE_INDEX04_C04003_CACHE_DIR = REVENUE_CACHE_DIR / "index04_c04003"
+TWSE_INDEX04_C04003_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+TWSE_INDEX04_C04003_URL_TEMPLATES = [
+    "https://www.twse.com.tw/staticFiles/statistics/statisticsList/04/{month}_C04003.zip",
+    "https://www.twse.com.tw/staticFiles/statistics/statisticsList/{month}_C04003.zip",
+    "https://www.twse.com.tw/staticFiles/statistics/statisticsList/04/{year}/{month}_C04003.zip",
+]
+
+
+# R5N_REVENUE_CACHE_UI_MONTH_SELECTOR_20260608：UI 指定月份區間下載，不再寫死 202602/202603/202604。
+# 位置決議：高成長 EPS 分頁第二排最右側。
+def normalize_yyyymm(value) -> str:
+    """R5N：將 UI/設定輸入正規化為 YYYYMM。"""
+    return RevenueAccelerationEngine.normalize_month(value)
+
+
+def build_month_range(start_month: str, end_month: str) -> list[str]:
+    """R5N：由起始/結束月份建立 YYYYMM 清單，避免每月改程式。
+
+    Example:
+        build_month_range("202601", "202604")
+        -> ["202601", "202602", "202603", "202604"]
+    """
+    start = normalize_yyyymm(start_month)
+    end = normalize_yyyymm(end_month)
+    if not start or not end:
+        raise ValueError(f"月份格式錯誤，需為 YYYYMM；start={start_month}, end={end_month}")
+    sy, sm = int(start[:4]), int(start[4:6])
+    ey, em = int(end[:4]), int(end[4:6])
+    if (sy, sm) > (ey, em):
+        raise ValueError(f"起始月份不可大於結束月份：{start} > {end}")
+    months = []
+    y, m = sy, sm
+    while (y, m) <= (ey, em):
+        months.append(f"{y:04d}{m:02d}")
+        m += 1
+        if m > 12:
+            y += 1
+            m = 1
+    return months
+
+
+def revenue_month_options(back_years: int = 2, forward_months: int = 0) -> list[str]:
+    """R5N：產生 UI 下拉月份選項。預設提供近兩年到本月。"""
+    today = datetime.now()
+    start_y = today.year - int(back_years or 0)
+    start_m = 1
+    end_y, end_m = today.year, today.month + int(forward_months or 0)
+    while end_m > 12:
+        end_y += 1
+        end_m -= 12
+    return build_month_range(f"{start_y:04d}{start_m:02d}", f"{end_y:04d}{end_m:02d}")
+
+
 def safe_read_html_tables(html_text, source_label: str = "") -> tuple[list[pd.DataFrame], str, str]:
     """R5L：安全 HTML 表格解析。
 
@@ -6441,6 +6498,381 @@ class RevenueOpenAPICacheDownloader:
         x = x.loc[:, [c for c in x.columns if str(c).strip()]]
         return x.fillna("")
 
+    def _candidate_local_c04003_zip_paths(self, target_month: str) -> list[Path]:
+        """R5M：尋找已手動下載或已快取的 TWSE index04 C04003 ZIP。"""
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return []
+        names = [f"{m}_C04003.zip", f"{m}_c04003.zip"]
+        folders = [TWSE_INDEX04_C04003_CACHE_DIR, self.cache_dir, RUNTIME_DIR, BASE_DIR, Path.cwd()]
+        try:
+            folders.append(Path("/mnt/data"))  # 測試環境用；正式 EXE 不依賴。
+        except Exception:
+            pass
+        out, seen = [], set()
+        for folder in folders:
+            try:
+                for name in names:
+                    p = Path(folder) / name
+                    if str(p) not in seen:
+                        seen.add(str(p)); out.append(p)
+            except Exception:
+                continue
+        return out
+
+    def _discover_twse_index04_c04003_url(self, target_month: str) -> str:
+        """R5M：從 index04 HTML 找出指定月份 C04003 ZIP 連結。"""
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return ""
+        try:
+            resp = requests.get(
+                TWSE_INDEX04_PAGE_URL,
+                timeout=30,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,*/*"},
+            )
+            resp.raise_for_status()
+            html = resp.text or ""
+            pattern = re.compile("href=[\"']([^\"']*" + re.escape(m) + r"_C04003\.zip[^\"']*)[\"']", re.I)
+            match = pattern.search(html)
+            if match:
+                return requests.compat.urljoin(TWSE_INDEX04_PAGE_URL, html_lib.unescape(match.group(1)))
+            pattern2 = re.compile(r"([A-Za-z0-9_./?=&:%\-]+" + re.escape(m) + r"_C04003\.zip)", re.I)
+            match2 = pattern2.search(html)
+            if match2:
+                return requests.compat.urljoin(TWSE_INDEX04_PAGE_URL, html_lib.unescape(match2.group(1)))
+        except Exception as exc:
+            log_warning(f"[R5M][TWSE_INDEX04][DISCOVER_FAIL] month={m}｜{exc}")
+        return ""
+
+    def _download_twse_index04_c04003_zip(self, target_month: str) -> tuple[Path | None, str, str]:
+        """R5M：下載/取得 TWSE index04 C04003 ZIP。回傳(zip_path, url, error)。"""
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return None, "", "invalid month"
+        for p in self._candidate_local_c04003_zip_paths(m):
+            try:
+                if p.exists() and p.stat().st_size > 0:
+                    target = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
+                    if p.resolve() != target.resolve():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            shutil.copy2(p, target)
+                            p = target
+                        except Exception:
+                            pass
+                    return p, "LOCAL_FILE:" + str(p), ""
+            except Exception:
+                continue
+        urls = []
+        discovered = self._discover_twse_index04_c04003_url(m)
+        if discovered:
+            urls.append(discovered)
+        for tpl in TWSE_INDEX04_C04003_URL_TEMPLATES:
+            try:
+                u = tpl.format(month=m, year=m[:4])
+                if u not in urls:
+                    urls.append(u)
+            except Exception:
+                continue
+        errors = []
+        out = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.zip"
+        for url in urls:
+            try:
+                resp = requests.get(
+                    url,
+                    timeout=45,
+                    headers={"User-Agent": "Mozilla/5.0", "Accept": "application/zip,application/octet-stream,*/*", "Referer": TWSE_INDEX04_PAGE_URL},
+                )
+                if resp.status_code != 200:
+                    errors.append(f"{url}:HTTP{resp.status_code}"); continue
+                content = resp.content or b""
+                if len(content) < 1024 or not content[:4].startswith(b"PK"):
+                    errors.append(f"{url}:not_zip_or_too_small bytes={len(content)}"); continue
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(content)
+                log_info(f"[R5M][TWSE_INDEX04][ZIP_DOWNLOAD] month={m} file={out} bytes={len(content)} url={url}")
+                return out, url, ""
+            except Exception as exc:
+                errors.append(f"{url}:{exc}")
+        return None, " | ".join(urls), " ; ".join(errors)
+
+    def _parse_twse_c04003_excel(self, excel_path: Path, target_month: str, source_url: str = "") -> pd.DataFrame:
+        """R5M：解析 TWSE C04003 國內上市公司營業收入彙總表。
+
+        A欄 = 股票代號+股票名稱；B欄 = 上月營收；C欄 = 本月營收；
+        D欄 = 本年度累計；E欄 = 去年同月；F欄 = 去年累計；H欄 = 累計增減%。
+        月增率與單月 YoY 由 B/C/E 欄計算。
+        """
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return pd.DataFrame()
+        excel_path = Path(excel_path)
+        try:
+            raw = safe_read_excel(excel_path)
+        except Exception:
+            converted = convert_xls_to_xlsx_force(excel_path, TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.xlsx")
+            if converted is None:
+                raise
+            raw = pd.read_excel(converted, sheet_name=0, header=None, engine="openpyxl")
+        try:
+            converted_path = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.xlsx"
+            if converted_path.exists():
+                raw = pd.read_excel(converted_path, sheet_name=0, header=None, engine="openpyxl")
+        except Exception:
+            pass
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        x = raw.copy().fillna("")
+        rows = []
+        for _, r in x.iterrows():
+            first = str(r.iloc[0] if len(r) > 0 else "").strip()
+            mt = re.match(r"^\s*(\d{4,5})\s+(.+?)\s*$", first)
+            if not mt:
+                continue
+            sid = normalize_stock_id(mt.group(1))
+            if not sid or not re.fullmatch(r"\d{4,5}", sid):
+                continue
+            prev_month_rev = self._num(r.iloc[1] if len(r) > 1 else np.nan, default=np.nan)
+            cur_month_rev = self._num(r.iloc[2] if len(r) > 2 else np.nan, default=np.nan)
+            cumulative_rev = self._num(r.iloc[3] if len(r) > 3 else np.nan, default=np.nan)
+            last_year_month_rev = self._num(r.iloc[4] if len(r) > 4 else np.nan, default=np.nan)
+            last_year_cum_rev = self._num(r.iloc[5] if len(r) > 5 else np.nan, default=np.nan)
+            cumulative_yoy = self._num(r.iloc[7] if len(r) > 7 else np.nan, default=np.nan)
+            if not np.isfinite(cur_month_rev) or cur_month_rev <= 0:
+                continue
+            mom = np.nan
+            if np.isfinite(prev_month_rev) and prev_month_rev != 0:
+                mom = round((cur_month_rev - prev_month_rev) / abs(prev_month_rev) * 100.0, 4)
+            yoy = np.nan
+            if np.isfinite(last_year_month_rev) and last_year_month_rev != 0:
+                yoy = round((cur_month_rev - last_year_month_rev) / abs(last_year_month_rev) * 100.0, 4)
+            if (not np.isfinite(cumulative_yoy)) and np.isfinite(cumulative_rev) and np.isfinite(last_year_cum_rev) and last_year_cum_rev != 0:
+                cumulative_yoy = round((cumulative_rev - last_year_cum_rev) / abs(last_year_cum_rev) * 100.0, 4)
+            rows.append({
+                "stock_id": sid,
+                "revenue_month": m,
+                "revenue": float(cur_month_rev),
+                "mom": mom,
+                "yoy": yoy,
+                "cumulative_revenue": cumulative_rev if np.isfinite(cumulative_rev) else np.nan,
+                "cumulative_yoy": cumulative_yoy if np.isfinite(cumulative_yoy) else np.nan,
+                "source_date": f"{m[:4]}-{m[4:6]}",
+                "source_url": source_url or f"TWSE_INDEX04_C04003:{m}",
+                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out
+        out = out.drop_duplicates(["stock_id", "revenue_month"], keep="last")
+        return out[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
+
+    def download_twse_index04_c04003_month_cache(self, target_month: str) -> pd.DataFrame:
+        """R5M：用 TWSE index04 C04003 歷史 ZIP 補指定月份上市公司月營收。"""
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return pd.DataFrame()
+        zip_path, source_url, zip_error = self._download_twse_index04_c04003_zip(m)
+        if zip_path is None or not Path(zip_path).exists():
+            self._emit_cache_trace(m, "INDEX04_ZIP_DOWNLOAD", "FAIL", 0, None, "HTTP_FAIL", zip_error)
+            log_warning(f"[R5M][TWSE_INDEX04][ZIP_FAIL] month={m}｜{zip_error}")
+            return pd.DataFrame()
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                names = [n for n in zf.namelist() if n.lower().endswith((".xls", ".xlsx"))]
+                if not names:
+                    self._emit_cache_trace(m, "INDEX04_ZIP_PARSE", "FAIL", 0, zip_path, "PARSE_ROWS_ZERO", "zip has no xls/xlsx")
+                    return pd.DataFrame()
+                member = names[0]
+                extract_dir = TWSE_INDEX04_C04003_CACHE_DIR / m
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                zf.extract(member, extract_dir)
+                xls_path = extract_dir / member
+            converted_path = TWSE_INDEX04_C04003_CACHE_DIR / f"{m}_C04003.xlsx"
+            if xls_path.suffix.lower() == ".xls":
+                converted = convert_xls_to_xlsx_force(xls_path, converted_path, log_cb=lambda msg: log_info(f"[R5M][TWSE_INDEX04] {msg}"))
+                excel_path = converted if converted is not None else xls_path
+            else:
+                excel_path = xls_path
+            df = self._parse_twse_c04003_excel(excel_path, m, source_url=f"OFFICIAL_TWSE_INDEX04_C04003:{source_url}")
+            if df is None or df.empty:
+                self._emit_cache_trace(m, "INDEX04_PARSE", "FAIL", 0, zip_path, "PARSE_ROWS_ZERO", "C04003 parsed rows=0")
+                return pd.DataFrame()
+            month_cache_path = self.write_month_cache(df, m, source_url=f"OFFICIAL_TWSE_INDEX04_C04003_CACHE:{zip_path}")
+            df["source_url"] = "OFFICIAL_TWSE_INDEX04_C04003_CACHE:" + str(month_cache_path or zip_path)
+            self._emit_cache_trace(m, "INDEX04_PARSE", "PASS", len(df), zip_path)
+            log_info(f"[R5M][TWSE_INDEX04][C04003_OK] month={m} rows={len(df)} zip={zip_path}")
+            return df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
+        except Exception as exc:
+            self._emit_cache_trace(m, "INDEX04_PARSE", "FAIL", 0, zip_path, "PARSE_FAILED", str(exc))
+            log_warning(f"[R5M][TWSE_INDEX04][C04003_FAIL] month={m} zip={zip_path}｜{exc}")
+            return pd.DataFrame()
+
+    def ensure_c04003_revenue_cache(self, months: list[str], force_download: bool = False, write_db: bool = False, db: DBManager | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """R5N：依 UI 選取月份逐月建立 TWSE index04/C04003 本機 Revenue Cache。
+
+        - 不再寫死 202602/202603/202604。
+        - 先讀 data/revenue_cache/revenue_YYYYMM.csv。
+        - 缺檔或 force_download=True 時，自動下載 index04 C04003 ZIP、解析 XLS/XLSX、轉 CSV Cache。
+        - write_db=True 時，以 append-only 寫入 external_revenue_history。
+        - 回傳：summary_df, combined_df。
+        """
+        norm_months = []
+        for m in (months or []):
+            mm = RevenueAccelerationEngine.normalize_month(m)
+            if mm and mm not in norm_months:
+                norm_months.append(mm)
+        summary_rows = []
+        data_parts = []
+        for mm in norm_months:
+            cache_path = self.cache_path_for_month(mm)
+            source = "CACHE"
+            df = pd.DataFrame()
+            if (not force_download) and cache_path.exists() and cache_path.stat().st_size > 0:
+                df = self.load_month_cache(mm)
+            if df is None or df.empty:
+                source = "TWSE_INDEX04_C04003"
+                df = self.download_twse_index04_c04003_month_cache(mm)
+            rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+            status = "PASS" if rows > 0 else "FAIL"
+            if rows > 0:
+                data_parts.append(df.copy())
+            summary_rows.append({
+                "月份": mm,
+                "狀態": status,
+                "資料筆數": rows,
+                "來源": source,
+                "Cache檔案": str(cache_path),
+                "說明": "已建立逐月Cache" if rows > 0 else "未取得有效 C04003 月營收資料",
+                "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if data_parts else pd.DataFrame()
+        if write_db and db is not None and combined is not None and not combined.empty:
+            inserted = self.upsert_external_revenue_history(db, combined, append_only=True)
+            for row in summary_rows:
+                row["DB寫入模式"] = "INSERT_OR_IGNORE"
+                row["DB寫入總筆數"] = inserted
+        summary = pd.DataFrame(summary_rows)
+        try:
+            manifest = {
+                "version": "R5N_REVENUE_CACHE_UI_MONTH_SELECTOR_20260608",
+                "months": norm_months,
+                "force_download": bool(force_download),
+                "write_db": bool(write_db),
+                "summary": summary_rows,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            (self.monthly_cache_dir / "revenue_cache_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log_warning(f"[R5N][REVENUE_CACHE_MANIFEST][WRITE_FAIL] {exc}")
+        return summary, combined
+
+    def upsert_external_revenue_history(self, db: DBManager, df: pd.DataFrame, append_only: bool = True) -> int:
+        """R5N：將逐月 Cache 寫入 external_revenue_history。
+
+        append_only=True 時使用 INSERT OR IGNORE，不覆蓋既有有效資料。
+        """
+        if db is None or df is None or df.empty:
+            return 0
+        # 多月份 DataFrame 必須逐月正規化；不可用第一個月份過濾整批資料，否則只會寫入第一個月。
+        parts = []
+        if "revenue_month" not in df.columns:
+            return 0
+        norm_month_series = df["revenue_month"].astype(str).map(RevenueAccelerationEngine.normalize_month)
+        for mm in sorted(set(norm_month_series.tolist())):
+            if not mm:
+                continue
+            part_raw = df[norm_month_series.eq(mm)].copy()
+            part = self._normalize_month_cache_df(part_raw, mm, source_url="R5N_CACHE_DB_WRITE")
+            if part is not None and not part.empty:
+                parts.append(part)
+        x = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+        if x.empty:
+            return 0
+        rows = []
+        for _, r in x.iterrows():
+            rows.append((
+                str(r.get("stock_id", "")),
+                str(r.get("revenue_month", "")),
+                float(r.get("revenue")) if pd.notna(r.get("revenue")) else None,
+                float(r.get("mom")) if pd.notna(r.get("mom")) else None,
+                float(r.get("yoy")) if pd.notna(r.get("yoy")) else None,
+                float(r.get("cumulative_revenue")) if pd.notna(r.get("cumulative_revenue")) else None,
+                float(r.get("cumulative_yoy")) if pd.notna(r.get("cumulative_yoy")) else None,
+                str(r.get("source_url", "")),
+                str(r.get("source_date", "")),
+                str(r.get("update_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))),
+            ))
+        sql_insert_ignore = """
+            INSERT OR IGNORE INTO external_revenue_history(
+                stock_id, revenue_month, revenue, mom, yoy, cumulative_revenue, cumulative_yoy,
+                source_url, source_date, update_time
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """
+        sql_upsert_repair = """
+            INSERT INTO external_revenue_history(
+                stock_id, revenue_month, revenue, mom, yoy, cumulative_revenue, cumulative_yoy,
+                source_url, source_date, update_time
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(stock_id, revenue_month) DO UPDATE SET
+                revenue=CASE WHEN COALESCE(external_revenue_history.revenue,0)<=0 THEN excluded.revenue ELSE external_revenue_history.revenue END,
+                mom=CASE WHEN external_revenue_history.mom IS NULL THEN excluded.mom ELSE external_revenue_history.mom END,
+                yoy=CASE WHEN external_revenue_history.yoy IS NULL THEN excluded.yoy ELSE external_revenue_history.yoy END,
+                cumulative_revenue=CASE WHEN external_revenue_history.cumulative_revenue IS NULL THEN excluded.cumulative_revenue ELSE external_revenue_history.cumulative_revenue END,
+                cumulative_yoy=CASE WHEN external_revenue_history.cumulative_yoy IS NULL THEN excluded.cumulative_yoy ELSE external_revenue_history.cumulative_yoy END,
+                source_url=CASE WHEN COALESCE(external_revenue_history.source_url,'')='' THEN excluded.source_url ELSE external_revenue_history.source_url END,
+                source_date=CASE WHEN COALESCE(external_revenue_history.source_date,'')='' THEN excluded.source_date ELSE external_revenue_history.source_date END,
+                update_time=excluded.update_time
+        """
+        before = 0
+        after = 0
+        try:
+            with db.lock:
+                cur = db.conn.cursor()
+                before = int(cur.execute("SELECT COUNT(*) FROM external_revenue_history").fetchone()[0] or 0)
+                cur.executemany(sql_insert_ignore if append_only else sql_upsert_repair, rows)
+                db.conn.commit()
+                after = int(cur.execute("SELECT COUNT(*) FROM external_revenue_history").fetchone()[0] or 0)
+            log_info(f"[R5N][EXTERNAL_REVENUE_HISTORY][WRITE] rows_input={len(rows)} inserted_or_existing_delta={after-before} append_only={append_only}")
+            return int(after - before)
+        except Exception as exc:
+            log_warning(f"[R5N][EXTERNAL_REVENUE_HISTORY][WRITE_FAIL] {exc}")
+            return 0
+
+    def validate_selected_revenue_months(self, months: list[str], db: DBManager | None = None) -> pd.DataFrame:
+        """R5N：驗證 UI 選取月份的 Cache 與 DB 覆蓋情況。"""
+        norm_months = []
+        for m in (months or []):
+            mm = RevenueAccelerationEngine.normalize_month(m)
+            if mm and mm not in norm_months:
+                norm_months.append(mm)
+        rows = []
+        for mm in norm_months:
+            cache_path = self.cache_path_for_month(mm)
+            cache_df = self.load_month_cache(mm) if cache_path.exists() else pd.DataFrame()
+            cache_rows = int(len(cache_df)) if cache_df is not None else 0
+            db_rows = 0
+            if db is not None:
+                try:
+                    with db.lock:
+                        row = db.conn.cursor().execute(
+                            "SELECT COUNT(*) FROM external_revenue_history WHERE revenue_month=? AND COALESCE(revenue,0)>0",
+                            (mm,)
+                        ).fetchone()
+                    db_rows = int(row[0] or 0) if row else 0
+                except Exception as exc:
+                    log_warning(f"[R5N][VALIDATE_DB_FAIL] month={mm}｜{exc}")
+            rows.append({
+                "月份": mm,
+                "Cache檔案": str(cache_path),
+                "Cache存在": "YES" if cache_path.exists() and cache_path.stat().st_size > 0 else "NO",
+                "Cache有效筆數": cache_rows,
+                "DB有效筆數": db_rows,
+                "驗收結果": "PASS" if cache_rows > 0 and (db is None or db_rows > 0) else "FAIL",
+                "驗收說明": "Cache與DB均有有效月營收" if cache_rows > 0 and (db is None or db_rows > 0) else "缺少Cache或DB有效資料",
+            })
+        return pd.DataFrame(rows)
+
     def download_mops_history_month_cache(self, target_month: str) -> pd.DataFrame:
         """R4F：補指定歷史月份月營收（例如 202602/202603）。
 
@@ -6544,11 +6976,31 @@ class RevenueOpenAPICacheDownloader:
         cache_df = cache_df[cache_df["revenue_month"].astype(str).isin(required)].copy()
         missing_after_cache = [m for m in required if m not in set(cache_df.get("revenue_month", pd.Series(dtype=str)).astype(str).tolist())]
         if missing_after_cache:
-            # R4F：latest OpenAPI 只提供最新月時，改用 MOPS 指定月份歷史資料補 202602/202603。
+            # R5M：latest OpenAPI 只提供最新月時，先用 TWSE index04/C04003 歷史 ZIP 補上市月營收；
+            # 若仍缺，再沿用 R4F MOPS t21sc04 補上市/上櫃。
+            index04_parts = []
+            for mm in missing_after_cache:
+                try:
+                    part = self.download_twse_index04_c04003_month_cache(mm)
+                    if part is not None and not part.empty:
+                        index04_parts.append(part)
+                except Exception as exc:
+                    log_warning(f"[REVENUE][INDEX04_C04003_HISTORY] month={mm} failed｜{exc}")
+            if index04_parts:
+                index04_df = pd.concat(index04_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+                cache_df = pd.concat([cache_df, index04_df], ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+                log_warning(f"[REVENUE][HISTORY_BACKFILL][R5M_INDEX04] missing_after_cache={missing_after_cache} index04_rows={len(index04_df)} months={sorted(index04_df['revenue_month'].astype(str).unique().tolist())}")
+            # R5M：C04003 只涵蓋上市公司；仍嘗試 MOPS t21sc04 補上櫃/興櫃同月份，
+            # 但以上市 C04003 為優先，不讓 MOPS 解析異常覆蓋已成功的上市快取。
             hist_df = self.download_required_history_caches(missing_after_cache)
             if hist_df is not None and not hist_df.empty:
-                cache_df = pd.concat([cache_df, hist_df], ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
-                log_warning(f"[REVENUE][HISTORY_BACKFILL][R4F] missing_after_cache={missing_after_cache} hist_rows={len(hist_df)} months={sorted(hist_df['revenue_month'].astype(str).unique().tolist())}")
+                before_rows = len(cache_df)
+                cache_df = pd.concat([cache_df, hist_df], ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="first")
+                log_warning(f"[REVENUE][HISTORY_BACKFILL][R4F_MOPS_SUPPLEMENT] missing_after_cache={missing_after_cache} hist_rows={len(hist_df)} combined_rows_before={before_rows} combined_rows_after={len(cache_df)} months={sorted(hist_df['revenue_month'].astype(str).unique().tolist())}")
+            else:
+                still_missing = [m for m in missing_after_cache if m not in set(cache_df.get("revenue_month", pd.Series(dtype=str)).astype(str).tolist())]
+                if still_missing:
+                    log_warning(f"[REVENUE][HISTORY_BACKFILL][PARTIAL] C04003已補上市但仍可能缺上櫃/興櫃月份資料：{still_missing}")
         if cache_df.empty:
             return pd.DataFrame()
         if not existing.empty and {"stock_id", "revenue_month"}.issubset(existing.columns):
@@ -10012,6 +10464,10 @@ class HighGrowthEPSEngine:
         effective_valuation_count = int(pd.to_numeric(df.get("effective_valuation_weight"), errors="coerce").fillna(0).gt(0).sum()) if df is not None and not df.empty and "effective_valuation_weight" in df.columns else 0
         required_months = self.revenue_engine.required_months(self.tracking_quarters)
         revenue_month_coverage = self._build_revenue_month_coverage(required_months, rev_raw)
+        try:
+            r5n_revenue_month_validation = RevenueOpenAPICacheDownloader(REVENUE_CACHE_DIR).validate_selected_revenue_months(required_months, db=self.db)
+        except Exception as _r5n_val_exc:
+            r5n_revenue_month_validation = pd.DataFrame([{"月份": "", "驗收結果": "FAIL", "驗收說明": f"R5N validate exception: {_r5n_val_exc}"}])
         missing_required_months = ",".join(revenue_month_coverage.loc[revenue_month_coverage["coverage_status"].ne("OK"), "required_month"].astype(str).tolist()) if not revenue_month_coverage.empty else ""
         run_evidence = self._build_same_run_evidence(df, revenue_month_coverage)
         # Debug診斷保留，但不放在中文首頁主KPI，避免和新版選股主結果混淆。
@@ -10132,6 +10588,7 @@ class HighGrowthEPSEngine:
             "00D_資料庫健康度": database_health_df,
             "01_DB可用性盤點": assets,
             "01A_月營收月份覆蓋": revenue_month_coverage,
+            "01B_R5N月份下載驗收": r5n_revenue_month_validation,
             "02_領先預測通過黑馬池": leading_df.head(500),
             "02A_UI畫面同源候選池": ui_same_source_df.head(300),
             "03_EPS_TTM代理追蹤池": ttm_only_df.head(500),
@@ -11122,15 +11579,18 @@ class ExternalDataWriter:
                         if cnt <= 0:
                             missing_required.append(mm)
                     if missing_required:
-                        result.status = "fail"
-                        result.data_ready = 0
+                        # R5N Partial Pass Policy：缺歷史月份只標示健康警告，不得把已成功下載/寫入的月份歸零，
+                        # 也不得讓 High Growth EPS / Quality Gate / BUY 流程整批被資料健康檢查擋死。
+                        result.status = "partial"
+                        result.data_ready = 1 if len(df) > 0 else 0
                         result.error_message = (
-                            "R5L_REVENUE_REQUIRED_MONTHS_FAIL：required_months 未全部入庫；"
-                            f"missing={','.join(missing_required)}；verify={';'.join(verify_parts)}"
+                            "R5N_REVENUE_REQUIRED_MONTHS_PARTIAL：required_months 未全部入庫；"
+                            f"missing={','.join(missing_required)}；verify={';'.join(verify_parts)}；"
+                            "policy=PARTIAL_PASS_NO_CLEAR_EXISTING_DATA"
                         )
-                        log_warning("[R5L][REVENUE_DB_VERIFY][FAIL] " + result.error_message)
+                        log_warning("[R5N][REVENUE_DB_VERIFY][PARTIAL] " + result.error_message)
                     else:
-                        log_info(f"[R5L][REVENUE_DB_VERIFY][PASS] required_months={','.join(required_months)} verify={';'.join(verify_parts)}")
+                        log_info(f"[R5N][REVENUE_DB_VERIFY][PASS] required_months={','.join(required_months)} verify={';'.join(verify_parts)}")
                 except Exception as verify_exc:
                     result.status = "fail"
                     result.data_ready = 0
@@ -17838,6 +18298,71 @@ class AppUI:
         except Exception:
             return list(HIGH_GROWTH_DEFAULT_QUARTERS)
 
+    def _default_revenue_month_bounds(self) -> tuple[str, str]:
+        """R5N：高成長 EPS 營收月份 UI 預設值，本年1月到目前月份。"""
+        today = datetime.now()
+        return f"{today.year:04d}01", f"{today.year:04d}{today.month:02d}"
+
+    def _selected_revenue_months_from_ui(self) -> list[str]:
+        """R5N：讀取第二排最右側 UI 的起始/結束月份。"""
+        start = getattr(self, "revenue_start_month_var", tk.StringVar(value="")).get()
+        end = getattr(self, "revenue_end_month_var", tk.StringVar(value="")).get()
+        return build_month_range(start, end)
+
+    def on_download_historical_revenue_clicked(self):
+        """R5N UI按鈕：下載指定月份區間的 TWSE index04/C04003 歷史營收。"""
+        try:
+            months = self._selected_revenue_months_from_ui()
+        except Exception as exc:
+            return messagebox.showerror("月份設定錯誤", f"請確認起始/結束月份格式為 YYYYMM，且起始不可大於結束。\n\n{exc}")
+
+        def worker():
+            label = "下載歷史營收"
+            try:
+                self.ui_call(self.start_task, label, max(len(months), 1) + 2)
+                self.ui_call(self.update_task, label, 1, max(len(months), 1) + 2, item=f"月份={','.join(months)}")
+                trace = None
+                try:
+                    trace = ExternalDataTraceEngine(self.db, run_id=f"R5N_REVENUE_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                except Exception:
+                    trace = None
+                downloader = RevenueOpenAPICacheDownloader(trace_engine=trace)
+                summary, combined = downloader.ensure_c04003_revenue_cache(months, force_download=False, write_db=True, db=self.db)
+                validate_df = downloader.validate_selected_revenue_months(months, db=self.db)
+                pass_count = int((validate_df.get("驗收結果", pd.Series(dtype=str)).astype(str) == "PASS").sum()) if validate_df is not None and not validate_df.empty else 0
+                out_dir = HIGH_GROWTH_REPORT_DIR / "revenue_cache_reports"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"R5N_revenue_cache_validate_{months[0]}_{months[-1]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                engine = available_excel_engine()
+                if engine:
+                    with pd.ExcelWriter(out_path, engine=engine) as writer:
+                        pd.DataFrame([{
+                            "項目": "R5N 歷史營收下載與驗收",
+                            "起始月份": months[0],
+                            "結束月份": months[-1],
+                            "月份數": len(months),
+                            "合併資料筆數": int(len(combined)) if isinstance(combined, pd.DataFrame) else 0,
+                            "PASS月份數": pass_count,
+                            "輸出時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "資料來源": TWSE_INDEX04_PAGE_URL,
+                        }]).to_excel(writer, sheet_name="00_摘要", index=False)
+                        summary.to_excel(writer, sheet_name="01_下載Cache結果", index=False)
+                        validate_df.to_excel(writer, sheet_name="02_逐月驗收", index=False)
+                        if isinstance(combined, pd.DataFrame) and not combined.empty:
+                            combined.head(5000).to_excel(writer, sheet_name="03_營收資料樣本", index=False)
+                self.last_revenue_cache_report_path = Path(out_path)
+                if hasattr(self, "highgrowth_status_var"):
+                    self.ui_call(self.highgrowth_status_var.set, f"歷史營收下載完成：{months[0]}~{months[-1]}｜PASS {pass_count}/{len(months)}｜{out_path}")
+                self.ui_call(self.append_log, f"[R5N] 歷史營收下載完成：months={months} pass={pass_count}/{len(months)} report={out_path}")
+                self.ui_call(self.update_task, label, max(len(months), 1) + 2, max(len(months), 1) + 2, success=pass_count, item="完成")
+                self.ui_call(self.finish_task, label, f"完成：PASS {pass_count}/{len(months)}｜{out_path}")
+                self.ui_call(messagebox.showinfo, "完成", f"歷史營收下載完成：\n月份：{months[0]} ~ {months[-1]}\nPASS：{pass_count}/{len(months)}\n\n驗收報告：\n{out_path}")
+            except Exception as exc:
+                self.ui_call(self.append_log, f"[R5N] 歷史營收下載失敗：{exc}", "ERROR")
+                self.ui_call(self.finish_task, label, f"失敗：{exc}")
+                self.ui_call(messagebox.showerror, "下載失敗", f"歷史營收下載失敗：\n{exc}")
+        self._run_in_thread(worker, "r5n_download_historical_revenue")
+
     def _build_highgrowth_tab(self):
         """HIGH_GROWTH_EPS_ENGINE_V4：高成長EPS加速度分頁，可選Q1~Q4追蹤。"""
         control = ttk.Frame(self.tab_highgrowth, padding=6)
@@ -17853,14 +18378,34 @@ class AppUI:
         self.highgrowth_q4_var = tk.BooleanVar(value=False)
         for q, var in [("Q1", self.highgrowth_q1_var), ("Q2", self.highgrowth_q2_var), ("Q3", self.highgrowth_q3_var), ("Q4", self.highgrowth_q4_var)]:
             ttk.Checkbutton(control, text=q, variable=var).pack(side="left", padx=2)
-        ttk.Label(control, text="模式").pack(side="left", padx=(10, 2))
-        self.highgrowth_mode_var = tk.StringVar(value="HYBRID")
-        mode_cb = ttk.Combobox(control, textvariable=self.highgrowth_mode_var, width=16, state="readonly")
-        mode_cb["values"] = ["HYBRID", "STRICT_ACTUAL_ONLY", "FORECAST_PROXY"]
-        mode_cb.pack(side="left", padx=2)
+        # R5N：模式與營收月份選擇器移到第二排最右側，避免第一排按鈕過擠。
         # V4.15：UI固定中文，不提供語言切換；中文/英文只在匯出Excel各產生一份。
         self.highgrowth_status_var = tk.StringVar(value=f"V4.15報表輸出：{HIGH_GROWTH_REPORT_DIR}｜Excel中文/英文各一份")
         ttk.Label(control, textvariable=self.highgrowth_status_var).pack(side="left", padx=12)
+
+        control2 = ttk.Frame(self.tab_highgrowth, padding=(6, 0, 6, 4))
+        control2.pack(fill="x")
+        self.highgrowth_mode_var = tk.StringVar(value="HYBRID")
+        self.revenue_start_month_var = tk.StringVar()
+        self.revenue_end_month_var = tk.StringVar()
+        start_m, end_m = self._default_revenue_month_bounds()
+        self.revenue_start_month_var.set(start_m)
+        self.revenue_end_month_var.set(end_m)
+        month_values = revenue_month_options(back_years=2, forward_months=0)
+        ttk.Button(control2, text="下載歷史營收", command=self.on_download_historical_revenue_clicked).pack(side="right", padx=(6, 2))
+        end_cb = ttk.Combobox(control2, textvariable=self.revenue_end_month_var, width=8, state="readonly")
+        end_cb["values"] = month_values
+        end_cb.pack(side="right", padx=(2, 6))
+        ttk.Label(control2, text="結束").pack(side="right", padx=(6, 2))
+        start_cb = ttk.Combobox(control2, textvariable=self.revenue_start_month_var, width=8, state="readonly")
+        start_cb["values"] = month_values
+        start_cb.pack(side="right", padx=(2, 6))
+        ttk.Label(control2, text="起始").pack(side="right", padx=(6, 2))
+        ttk.Label(control2, text="營收月份").pack(side="right", padx=(10, 4))
+        mode_cb = ttk.Combobox(control2, textvariable=self.highgrowth_mode_var, width=16, state="readonly")
+        mode_cb["values"] = ["HYBRID", "STRICT_ACTUAL_ONLY", "FORECAST_PROXY"]
+        mode_cb.pack(side="right", padx=(2, 10))
+        ttk.Label(control2, text="模式").pack(side="right", padx=(10, 2))
         cols = ("status", "rank", "id", "name", "industry", "quarters", "actual_q1_eps", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "pe_ratio", "peg_ratio", "v412_total_score", "eps_source", "rev_hit", "rev_stair", "close", "rsi", "trend", "risk", "action", "gap")
         headers = dict(UI_HIGH_GROWTH_HEADERS)
         self.highgrowth_tree = self._make_tree(self.tab_highgrowth, cols, headers)
