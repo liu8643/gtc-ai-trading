@@ -24,10 +24,7 @@ jobs:
       - name: Verify HTML parser dependencies
         shell: pwsh
         run: |
-          python - <<'PY'
-          import lxml, html5lib, bs4
-          print("R5N5 dependency check PASS: lxml/html5lib/bs4 installed")
-          PY
+          python -c "import lxml, html5lib, bs4; print('R5N5 dependency check PASS: lxml/html5lib/bs4 installed')"
 
       - name: Build EXE
         shell: pwsh
