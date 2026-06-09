@@ -1,17 +1,40 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = collect_submodules("yfinance")
+# R5N5 FIX:
+# - Add lxml / html5lib / bs4 for pandas.read_html() and MOPS HTML table fallback.
+# - Keep yfinance hidden imports.
+# - Include data/charts only when folders exist to avoid GitHub Actions packaging failure.
+
+hiddenimports = []
+for pkg in ("yfinance", "lxml", "html5lib", "bs4"):
+    try:
+        hiddenimports += collect_submodules(pkg)
+    except Exception:
+        hiddenimports.append(pkg)
+
+hiddenimports += [
+    "xlrd",
+    "openpyxl",
+    "lxml.etree",
+    "lxml.html",
+    "html5lib",
+    "bs4",
+]
+
+datas = []
+if Path("data").exists():
+    datas.append(("data", "data"))
+if Path("charts").exists():
+    datas.append(("charts", "charts"))
 
 a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[
-        ("data/stocks_master.csv", "data"),
-        ("charts", "charts"),
-    ],
-    hiddenimports=hiddenimports,
+    datas=datas,
+    hiddenimports=sorted(set(hiddenimports)),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -32,6 +55,6 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    console=True,
     disable_windowed_traceback=False,
 )
