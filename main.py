@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.3-R5N3_TWSE_INDEX04_HTML_LINK_DISCOVERY"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.4-R5N5_REVENUE_ENGINE_FINAL_PATCH"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3145,6 +3145,38 @@ class DBManager:
             PRIMARY KEY(stock_id, revenue_month)
         )
         """)
+        # R5N4/R5N5：即時公告與完整性驗證表，支援 6/1~6/10 提前公告與 202602~202604 PASS Gate。
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS external_revenue_announce (
+            stock_id TEXT,
+            stock_name TEXT,
+            revenue_month TEXT,
+            announce_date TEXT,
+            market TEXT,
+            revenue REAL,
+            mom REAL,
+            yoy REAL,
+            source_url TEXT,
+            source_date TEXT,
+            update_time TEXT,
+            PRIMARY KEY(stock_id, revenue_month)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS revenue_completeness_check (
+            check_date TEXT,
+            stock_id TEXT,
+            stock_name TEXT,
+            required_months TEXT,
+            hit_months TEXT,
+            missing_months TEXT,
+            pass_flag INTEGER DEFAULT 0,
+            pass_status TEXT,
+            source_priority TEXT,
+            update_time TEXT,
+            PRIMARY KEY(check_date, stock_id, required_months)
+        )
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS external_institutional_history (
             stock_id TEXT, trade_date TEXT, foreign_buy_sell REAL, trust_buy_sell REAL, dealer_buy_sell REAL, total_inst REAL,
@@ -3211,6 +3243,8 @@ class DBManager:
         for sql in [
             "CREATE INDEX IF NOT EXISTS idx_qfh_stock_quarter ON quarterly_financial_history(stock_id, fiscal_year, quarter)",
             "CREATE INDEX IF NOT EXISTS idx_revenue_history_stock_month ON external_revenue_history(stock_id, revenue_month)",
+            "CREATE INDEX IF NOT EXISTS idx_revenue_announce_month ON external_revenue_announce(revenue_month, announce_date)",
+            "CREATE INDEX IF NOT EXISTS idx_revenue_completeness_date ON revenue_completeness_check(check_date, pass_status)",
             "CREATE INDEX IF NOT EXISTS idx_inst_history_stock_date ON external_institutional_history(stock_id, trade_date)",
             "CREATE INDEX IF NOT EXISTS idx_margin_history_stock_date ON external_margin_history(stock_id, trade_date)",
             "CREATE INDEX IF NOT EXISTS idx_technical_feature_date ON technical_feature_daily(feature_date)",
@@ -5866,6 +5900,13 @@ REVENUE_CACHE_DIR = RUNTIME_DIR / "data" / "revenue_cache"
 REVENUE_MONTHLY_CACHE_DIR = REVENUE_CACHE_DIR
 REVENUE_MONTHLY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 REVENUE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# R5N5_FINAL_REVENUE_ENGINE_20260609：三層本機 Cache 管理。
+# raw：保留官方原始回應；normalized：保留標準化後 CSV；archive：保留舊批次與錯誤頁，方便追溯。
+REVENUE_RAW_CACHE_DIR = REVENUE_CACHE_DIR / "raw"
+REVENUE_NORMALIZED_CACHE_DIR = REVENUE_CACHE_DIR / "normalized"
+REVENUE_ARCHIVE_CACHE_DIR = REVENUE_CACHE_DIR / "archive"
+for _revenue_cache_dir in (REVENUE_RAW_CACHE_DIR, REVENUE_NORMALIZED_CACHE_DIR, REVENUE_ARCHIVE_CACHE_DIR):
+    _revenue_cache_dir.mkdir(parents=True, exist_ok=True)
 REVENUE_OPENAPI_ENDPOINTS = {
     "TWSE_REVENUE_L": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
     "TPEX_REVENUE_O": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
@@ -6182,6 +6223,225 @@ class RevenueAccelerationEngine:
         base["revenue_acceleration_score"] = np.clip(40 + base["avg_revenue_yoy"].fillna(0) * 0.6 + base["revenue_month_count_hit"] * 3, 0, 100).round(2)
         base["revenue_data_quality"] = np.where(base["revenue_strict_gate"], "STRICT", np.where(base["revenue_month_count_hit"] > 0, "PARTIAL_OR_PROXY", "MISSING"))
         return base, rev
+
+
+class RevenueCacheManager:
+    """R5N5_FINAL：月營收本機 Cache 管理器。
+
+    職責：
+    1. 建立 raw / normalized / archive 三層目錄。
+    2. 提供逐月 normalized cache 路徑與讀取。
+    3. 回報 cache 健康度，供 01F 營收完整性驗證 Sheet 使用。
+    """
+
+    def __init__(self, cache_dir: Path | None = None):
+        self.cache_dir = Path(cache_dir or REVENUE_CACHE_DIR)
+        self.raw_dir = REVENUE_RAW_CACHE_DIR
+        self.normalized_dir = REVENUE_NORMALIZED_CACHE_DIR
+        self.archive_dir = REVENUE_ARCHIVE_CACHE_DIR
+        self.monthly_dir = REVENUE_MONTHLY_CACHE_DIR
+        for folder in [self.cache_dir, self.raw_dir, self.normalized_dir, self.archive_dir, self.monthly_dir]:
+            folder.mkdir(parents=True, exist_ok=True)
+
+    def monthly_cache_path(self, month: str) -> Path:
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            raise ValueError(f"invalid revenue month: {month}")
+        return self.monthly_dir / f"revenue_{m}.csv"
+
+    def normalized_cache_path(self, month: str) -> Path:
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            raise ValueError(f"invalid revenue month: {month}")
+        return self.normalized_dir / f"revenue_{m}_normalized.csv"
+
+    def read_month_cache(self, month: str) -> pd.DataFrame:
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            return pd.DataFrame()
+        for path in [self.monthly_cache_path(m), self.normalized_cache_path(m)]:
+            try:
+                if path.exists() and path.stat().st_size > 0:
+                    df = safe_read_csv_auto(path)
+                    if "revenue_month" in df.columns:
+                        df["revenue_month"] = df["revenue_month"].map(RevenueAccelerationEngine.normalize_month)
+                        df = df[df["revenue_month"].astype(str).eq(m)].copy()
+                    return df
+            except Exception as exc:
+                log_warning(f"[RevenueCacheManager][READ_FAIL] month={m} path={path}｜{exc}")
+        return pd.DataFrame()
+
+    def health_df(self, months: list[str]) -> pd.DataFrame:
+        rows = []
+        for month in months or []:
+            m = RevenueAccelerationEngine.normalize_month(month)
+            if not m:
+                continue
+            monthly_path = self.monthly_cache_path(m)
+            normalized_path = self.normalized_cache_path(m)
+            df = self.read_month_cache(m)
+            rows.append({
+                "月份": m,
+                "MonthlyCache": str(monthly_path),
+                "MonthlyCache存在": "YES" if monthly_path.exists() and monthly_path.stat().st_size > 0 else "NO",
+                "NormalizedCache": str(normalized_path),
+                "NormalizedCache存在": "YES" if normalized_path.exists() and normalized_path.stat().st_size > 0 else "NO",
+                "Cache有效筆數": int(len(df)) if df is not None else 0,
+                "Cache驗收": "PASS" if df is not None and len(df) > 0 else "FAIL",
+            })
+        return pd.DataFrame(rows)
+
+
+class RevenueHybridCoveragePolicy:
+    """R5N5_FINAL：Hybrid 覆蓋規則集中定義。
+
+    優先順序：DB正式表 > DB即時公告表 > 本機逐月Cache > 重新下載官方來源。
+    正式 TWSE/TPEx 月報覆蓋即時公告，但不得覆蓋既有有效 history 值。
+    """
+
+    PRIORITY_TEXT = "DB:external_revenue_history > DB:external_revenue_announce > Cache:revenue_YYYYMM.csv > OfficialDownload"
+
+    @staticmethod
+    def describe() -> pd.DataFrame:
+        return pd.DataFrame([
+            {"順序": 1, "來源": "external_revenue_history", "規則": "正式月報首選；已有有效 revenue 時不得被即時/Cache 覆蓋"},
+            {"順序": 2, "來源": "external_revenue_announce", "規則": "6/1~6/10 即時公告追蹤；只補正式月報尚未出現的 stock_id+month"},
+            {"順序": 3, "來源": "RevenueCacheManager", "規則": "讀本機逐月 cache；cache 月份必須等於 required_month，不可用最新月假補"},
+            {"順序": 4, "來源": "OfficialDownload", "規則": "Cache/DB 缺月時才抓 TWSE Index04 / MOPS t21sc04 / OpenAPI"},
+            {"順序": 5, "來源": "Completeness Gate", "規則": "202602/202603/202604 全月 PASS 才允許正式EPS+營收雙驗證"},
+        ])
+
+
+class RevenueCompletenessValidator:
+    """R5N5_FINAL：營收完整性驗證器。
+
+    預設驗證 202602 / 202603 / 202604，對應使用者要求的 R5L 全部 PASS。
+    產出供 Excel 01F_營收完整性驗證 Sheet 與 DB revenue_completeness_check 使用。
+    """
+
+    DEFAULT_REQUIRED_MONTHS = ["202602", "202603", "202604"]
+
+    def __init__(self, db: DBManager, cache_manager: RevenueCacheManager | None = None):
+        self.db = db
+        self.cache_manager = cache_manager or RevenueCacheManager(REVENUE_CACHE_DIR)
+
+    def _read_master(self) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                return pd.read_sql_query("SELECT stock_id, stock_name FROM stocks_master WHERE is_active=1", self.db.conn)
+        except Exception:
+            return pd.DataFrame(columns=["stock_id", "stock_name"])
+
+    def _read_revenue_source(self, table: str, months: list[str]) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                exists = self.db.conn.cursor().execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                if not exists:
+                    return pd.DataFrame()
+                placeholders = ",".join(["?"] * len(months))
+                return pd.read_sql_query(
+                    f"SELECT stock_id, revenue_month, revenue, yoy, source_date, update_time FROM {table} WHERE revenue_month IN ({placeholders})",
+                    self.db.conn,
+                    params=months,
+                )
+        except Exception as exc:
+            log_warning(f"[RevenueCompletenessValidator][READ_FAIL] table={table}｜{exc}")
+            return pd.DataFrame()
+
+    def validate(self, required_months: list[str] | None = None, persist: bool = True) -> pd.DataFrame:
+        months = [RevenueAccelerationEngine.normalize_month(m) for m in (required_months or self.DEFAULT_REQUIRED_MONTHS)]
+        months = [m for m in months if m]
+        master = self._read_master()
+        if master is None or master.empty:
+            master = pd.DataFrame(columns=["stock_id", "stock_name"])
+        master["stock_id"] = master.get("stock_id", "").map(normalize_stock_id)
+        master = master[master["stock_id"].astype(str).ne("")].drop_duplicates("stock_id")
+
+        source_parts = []
+        for table, source_name in [("external_revenue_history", "正式月報"), ("external_revenue_announce", "即時公告")]:
+            part = self._read_revenue_source(table, months)
+            if part is not None and not part.empty:
+                part["stock_id"] = part["stock_id"].map(normalize_stock_id)
+                part["revenue_month"] = part["revenue_month"].map(RevenueAccelerationEngine.normalize_month)
+                part["revenue"] = pd.to_numeric(part.get("revenue"), errors="coerce")
+                part["source_priority"] = source_name
+                source_parts.append(part)
+        revenue = pd.concat(source_parts, ignore_index=True) if source_parts else pd.DataFrame(columns=["stock_id", "revenue_month", "revenue", "source_priority"])
+        if not revenue.empty:
+            revenue = revenue[pd.to_numeric(revenue.get("revenue"), errors="coerce").fillna(0).gt(0)].copy()
+            revenue = revenue.sort_values(["stock_id", "revenue_month", "source_priority"], ascending=[True, True, True])
+            revenue = revenue.drop_duplicates(["stock_id", "revenue_month"], keep="first")
+
+        # 若 DB 沒有資料，至少用 cache 做月別層驗證；不把 cache 股票清單寫成正式通過，但能顯示缺口來源。
+        cache_health = self.cache_manager.health_df(months)
+        rows = []
+        for _, r in master.iterrows():
+            sid = normalize_stock_id(r.get("stock_id"))
+            sname = str(r.get("stock_name", ""))
+            hit = sorted(revenue.loc[revenue["stock_id"].astype(str).eq(sid), "revenue_month"].dropna().astype(str).unique().tolist()) if not revenue.empty else []
+            missing = [m for m in months if m not in hit]
+            pass_flag = len(missing) == 0 and len(months) > 0
+            rows.append({
+                "stock_id": sid,
+                "stock_name": sname,
+                "required_months": ",".join(months),
+                "hit_months": ",".join(hit),
+                "missing_months": ",".join(missing),
+                "202602": "PASS" if "202602" in hit else ("N/A" if "202602" not in months else "FAIL"),
+                "202603": "PASS" if "202603" in hit else ("N/A" if "202603" not in months else "FAIL"),
+                "202604": "PASS" if "202604" in hit else ("N/A" if "202604" not in months else "FAIL"),
+                "pass_flag": int(pass_flag),
+                "pass_status": "PASS" if pass_flag else "FAIL",
+                "source_priority": RevenueHybridCoveragePolicy.PRIORITY_TEXT,
+                "cache_month_pass_count": int(cache_health[cache_health["Cache驗收"].eq("PASS")]["月份"].nunique()) if not cache_health.empty else 0,
+                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        out = pd.DataFrame(rows)
+        if out.empty:
+            out = pd.DataFrame([{
+                "stock_id": "", "stock_name": "NO_MASTER", "required_months": ",".join(months),
+                "hit_months": "", "missing_months": ",".join(months),
+                "202602": "FAIL", "202603": "FAIL", "202604": "FAIL",
+                "pass_flag": 0, "pass_status": "FAIL", "source_priority": RevenueHybridCoveragePolicy.PRIORITY_TEXT,
+                "cache_month_pass_count": 0, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }])
+        if persist and not out.empty:
+            self.persist(out)
+        return out
+
+    def persist(self, df: pd.DataFrame) -> int:
+        if df is None or df.empty:
+            return 0
+        check_date = datetime.now().strftime("%Y-%m-%d")
+        rows = []
+        for _, r in df.iterrows():
+            rows.append((
+                check_date, str(r.get("stock_id", "")), str(r.get("stock_name", "")),
+                str(r.get("required_months", "")), str(r.get("hit_months", "")), str(r.get("missing_months", "")),
+                int(r.get("pass_flag", 0) or 0), str(r.get("pass_status", "")), str(r.get("source_priority", "")),
+                str(r.get("update_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))),
+            ))
+        sql = """
+            INSERT INTO revenue_completeness_check(
+                check_date,stock_id,stock_name,required_months,hit_months,missing_months,pass_flag,pass_status,source_priority,update_time
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(check_date, stock_id, required_months) DO UPDATE SET
+                stock_name=excluded.stock_name,
+                hit_months=excluded.hit_months,
+                missing_months=excluded.missing_months,
+                pass_flag=excluded.pass_flag,
+                pass_status=excluded.pass_status,
+                source_priority=excluded.source_priority,
+                update_time=excluded.update_time
+        """
+        try:
+            with self.db.lock:
+                self.db.conn.cursor().executemany(sql, rows)
+                self.db.conn.commit()
+            return len(rows)
+        except Exception as exc:
+            log_warning(f"[RevenueCompletenessValidator][PERSIST_FAIL] {exc}")
+            return 0
 
 
 class RevenueOpenAPICacheDownloader:
@@ -10734,6 +10994,20 @@ class HighGrowthEPSEngine:
             r5n_revenue_month_validation = RevenueOpenAPICacheDownloader(REVENUE_CACHE_DIR).validate_selected_revenue_months(required_months, db=self.db)
         except Exception as _r5n_val_exc:
             r5n_revenue_month_validation = pd.DataFrame([{"月份": "", "驗收結果": "FAIL", "驗收說明": f"R5N validate exception: {_r5n_val_exc}"}])
+        # R5N5_FINAL：01F 營收完整性驗證。固定支援 202602/202603/202604 全月 PASS 查核。
+        try:
+            revenue_completeness_01f = RevenueCompletenessValidator(self.db).validate(["202602", "202603", "202604"], persist=True)
+        except Exception as _r5n5_comp_exc:
+            revenue_completeness_01f = pd.DataFrame([{
+                "stock_id": "", "stock_name": "VALIDATOR_EXCEPTION", "required_months": "202602,202603,202604",
+                "missing_months": "202602,202603,202604", "pass_status": "FAIL",
+                "fail_reason": f"RevenueCompletenessValidator exception: {_r5n5_comp_exc}"
+            }])
+        try:
+            revenue_cache_health_01f = RevenueCacheManager(REVENUE_CACHE_DIR).health_df(["202602", "202603", "202604"])
+        except Exception as _cache_health_exc:
+            revenue_cache_health_01f = pd.DataFrame([{"月份": "", "Cache驗收": "FAIL", "說明": str(_cache_health_exc)}])
+        hybrid_policy_01f = RevenueHybridCoveragePolicy.describe()
         missing_required_months = ",".join(revenue_month_coverage.loc[revenue_month_coverage["coverage_status"].ne("OK"), "required_month"].astype(str).tolist()) if not revenue_month_coverage.empty else ""
         run_evidence = self._build_same_run_evidence(df, revenue_month_coverage)
         # Debug診斷保留，但不放在中文首頁主KPI，避免和新版選股主結果混淆。
@@ -10757,6 +11031,8 @@ class HighGrowthEPSEngine:
             {"項目": "追蹤季度", "內容": "+".join(self.tracking_quarters)},
             {"項目": "對應營收月份", "內容": ",".join(required_months)},
             {"項目": "營收月份覆蓋狀態", "內容": "OK" if not missing_required_months else f"缺月：{missing_required_months}"},
+            {"項目": "R5N5_01F營收完整性驗證", "內容": "PASS" if (isinstance(revenue_completeness_01f, pd.DataFrame) and not revenue_completeness_01f.empty and revenue_completeness_01f.get("pass_status", pd.Series(dtype=str)).astype(str).eq("PASS").any()) else "FAIL/待補資料"},
+            {"項目": "R5N5_Hybrid覆蓋規則", "內容": RevenueHybridCoveragePolicy.PRIORITY_TEXT},
             {"項目": "正式報表狀態", "內容": "FORMAL_OK" if formal_report_allowed else "FORMAL_04_BLOCKED_ONLY_LEADING_02_RETAINED"},
             {"項目": "年度EPS Gate", "內容": f"annual_eps_history_{self.eps_engine.base_year} rows={annual_eps_rows}; min_required={HIGH_GROWTH_MIN_ANNUAL_EPS_ROWS_FOR_FORMAL_REPORT}"},
             {"項目": "主選股模型", "內容": high_growth_model_definition_text("ZH")},
@@ -10811,6 +11087,11 @@ class HighGrowthEPSEngine:
             {"序號": 8, "模組": "Run Evidence", "新增/修改": "新增", "程式位置": "HighGrowthEPSEngine._build_same_run_evidence", "驗收點": "Excel含同一run DB/log/Universe與缺月資訊"},
             {"序號": 9, "模組": "R5D Formal Gate Scope", "新增/修改": "修改", "程式位置": "HighGrowthEPSEngine.export_report / _apply_formal_block_if_needed", "驗收點": "formal_report_allowed 只阻斷04 official_df；02 leading_df 保留 forecast/proxy/value-candidate，避免 UI 有值但 Engine 02 空白"},
             {"序號": 10, "模組": "No Touch Guard", "新增/修改": "查核", "程式位置": "分類/Universe/Bootstrap/主UI", "驗收點": "不得修改分類、Universe、Bootstrap、主UI架構"},
+            {"序號": 11, "模組": "RevenueCompletenessValidator", "新增/修改": "新增", "程式位置": "RevenueCompletenessValidator.validate / 01F_營收完整性驗證", "驗收點": "202602/202603/202604 逐檔驗證；全部命中才 PASS"},
+            {"序號": 12, "模組": "RevenueCacheManager", "新增/修改": "新增", "程式位置": "RevenueCacheManager.health_df / 01G_RevenueCache健康度", "驗收點": "raw/normalized/archive/monthly cache 目錄建立並可逐月查核"},
+            {"序號": 13, "模組": "RevenueAccelerationEngine", "新增/修改": "保留+整合", "程式位置": "RevenueAccelerationEngine.build_revenue_features", "驗收點": "營收月數、YoY、階梯、revenue_acceleration_score 持續供 HighGrowth EPS 使用"},
+            {"序號": 14, "模組": "Hybrid 覆蓋規則", "新增/修改": "新增", "程式位置": "RevenueHybridCoveragePolicy.describe", "驗收點": "正式月報 > 即時公告 > Cache > 官方下載，不得用最新月假補歷史月"},
+            {"序號": 15, "模組": "Excel 01F", "新增/修改": "新增", "程式位置": "HighGrowthEPSEngine.export_report tables", "驗收點": "Excel 新增 01F_營收完整性驗證 Sheet"},
         ])
         if leading_df.empty:
             leading_df = pd.DataFrame([{"狀態": "NO_LEADING_FORECAST_PASS", "說明": "目前沒有領先預測通過候選。"}])
@@ -10855,6 +11136,9 @@ class HighGrowthEPSEngine:
             "01_DB可用性盤點": assets,
             "01A_月營收月份覆蓋": revenue_month_coverage,
             "01B_R5N月份下載驗收": r5n_revenue_month_validation,
+            "01F_營收完整性驗證": revenue_completeness_01f.head(5000) if isinstance(revenue_completeness_01f, pd.DataFrame) else pd.DataFrame(),
+            "01G_RevenueCache健康度": revenue_cache_health_01f,
+            "01H_Hybrid覆蓋規則": hybrid_policy_01f,
             "02_領先預測通過黑馬池": leading_df.head(500),
             "02A_UI畫面同源候選池": ui_same_source_df.head(300),
             "03_EPS_TTM代理追蹤池": ttm_only_df.head(500),
