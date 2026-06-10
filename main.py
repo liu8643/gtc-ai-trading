@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.4-R5N5_REVENUE_ENGINE_FINAL_PATCH"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.5-R5N6_OTC_EPS_FINAL_PATCH"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3095,6 +3095,7 @@ class DBManager:
         CREATE TABLE IF NOT EXISTS quarterly_financial_history (
             stock_id TEXT, fiscal_year INTEGER, quarter INTEGER, fiscal_year_quarter TEXT, western_quarter TEXT,
             eps REAL, eps_cumulative REAL, eps_quarter REAL, eps_prev_cumulative REAL, eps_calc_method TEXT,
+            source_type TEXT,
             gross_margin REAL, operating_margin REAL, net_margin REAL, cfo REAL, ni REAL, fcf REAL,
             source_url TEXT, source_date TEXT, update_time TEXT,
             PRIMARY KEY(stock_id, fiscal_year, quarter)
@@ -3242,6 +3243,7 @@ class DBManager:
         self._ensure_external_schema_columns(cur)
         for sql in [
             "CREATE INDEX IF NOT EXISTS idx_qfh_stock_quarter ON quarterly_financial_history(stock_id, fiscal_year, quarter)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_qfh_stock_fyq ON quarterly_financial_history(stock_id, fiscal_year_quarter)",
             "CREATE INDEX IF NOT EXISTS idx_revenue_history_stock_month ON external_revenue_history(stock_id, revenue_month)",
             "CREATE INDEX IF NOT EXISTS idx_revenue_announce_month ON external_revenue_announce(revenue_month, announce_date)",
             "CREATE INDEX IF NOT EXISTS idx_revenue_completeness_date ON revenue_completeness_check(check_date, pass_status)",
@@ -3392,6 +3394,12 @@ class DBManager:
             ("proxy_reason", "proxy_reason TEXT"),
         ]:
             _add("market_snapshot", col, ddl)
+
+        # R5N6_FIX_3：quarterly_financial_history 增加 source_type，供 MOPS_SII/MOPS_OTC/OPENAPI/TWSE_C05001 追溯。
+        for col, ddl in [
+            ("source_type", "source_type TEXT"),
+        ]:
+            _add("quarterly_financial_history", col, ddl)
 
         for col, ddl in [
             ("close_price", "close_price REAL"),
@@ -5639,7 +5647,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5A_EPS_DATA_GAP_FIX_20260606"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N6_OTC_EPS_FINAL_PATCH_20260610"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -7924,11 +7932,16 @@ class EPSForecastEngine:
                     ("eps_quarter", "eps_quarter REAL"),
                     ("eps_prev_cumulative", "eps_prev_cumulative REAL"),
                     ("eps_calc_method", "eps_calc_method TEXT"),
+                    ("source_type", "source_type TEXT"),
                 ]:
                     try:
                         cur.execute(f"ALTER TABLE quarterly_financial_history ADD COLUMN {_ddl}")
                     except Exception:
                         pass
+                try:
+                    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_qfh_stock_fyq ON quarterly_financial_history(stock_id, fiscal_year_quarter)")
+                except Exception:
+                    pass
                 self.db.conn.commit()
         except Exception as exc:
             log_warning(f"[EPSForecastEngine] annual_eps_history schema建立失敗：{exc}")
@@ -8162,8 +8175,10 @@ class EPSForecastEngine:
             if current is None or current.empty:
                 result.update({"status": "no_data", "message": f"OpenAPI無符合年度季別資料 {fiscal_year}Q{q}"})
                 return result
+            if "source_type" not in current.columns:
+                current["source_type"] = "OPENAPI"
             write = current.dropna(subset=["eps_quarter"])[[
-                "stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_url", "source_date", "update_time"
+                "stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"
             ]].copy()
             if write.empty:
                 result.update({"status": "parse_failed", "message": f"OpenAPI資料無可寫入EPS {fiscal_year}Q{q}"})
@@ -8171,8 +8186,8 @@ class EPSForecastEngine:
             with self.db.lock:
                 cur = self.db.conn.cursor()
                 cur.executemany("""
-                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_url, source_date, update_time)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(stock_id, fiscal_year, quarter) DO UPDATE SET
                         fiscal_year_quarter=excluded.fiscal_year_quarter,
                         western_quarter=excluded.western_quarter,
@@ -8181,6 +8196,7 @@ class EPSForecastEngine:
                         eps_quarter=excluded.eps_quarter,
                         eps_prev_cumulative=excluded.eps_prev_cumulative,
                         eps_calc_method=excluded.eps_calc_method,
+                        source_type=excluded.source_type,
                         source_url=excluded.source_url,
                         source_date=excluded.source_date,
                         update_time=excluded.update_time
@@ -8216,17 +8232,35 @@ class EPSForecastEngine:
             raise ValueError(f"season 必須為 1~4 或 Q1~Q4，目前={season}")
 
     @staticmethod
-    def _flatten_mops_columns(columns) -> list[str]:
+    def flatten_multiindex_columns(columns) -> list[str]:
+        """R5N6_FIX_1：扁平化 MOPS/pandas read_html 可能產生的 MultiIndex 欄位。
+
+        MOPS t163sb04 常見欄位可能是 tuple/MultiIndex，例如
+        ('公司代號','公司代號') 或 ('基本每股盈餘（元）','基本每股盈餘（元）')。
+        若不先扁平化，parser 會誤判「找不到公司代號 / 基本每股盈餘」，
+        造成上櫃 actual_q1_eps 缺漏。
+        """
         out = []
         for col in list(columns):
             if isinstance(col, tuple):
-                parts = [str(x).strip() for x in col if str(x).strip() and not str(x).startswith("Unnamed")]
-                name = " ".join(parts)
+                parts = []
+                for x in col:
+                    p = str(x).strip()
+                    if not p or p.lower().startswith("unnamed"):
+                        continue
+                    if p not in parts:
+                        parts.append(p)
+                name = "".join(parts)
             else:
                 name = str(col).strip()
             name = re.sub(r"\s+", "", name)
+            name = name.replace("（", "(").replace("）", ")")
             out.append(name)
-        return out
+        return _coerce_unique_columns(out)
+
+    @staticmethod
+    def _flatten_mops_columns(columns) -> list[str]:
+        return EPSForecastEngine.flatten_multiindex_columns(columns)
 
     @staticmethod
     def _strip_html_cell_text(value) -> str:
@@ -8532,6 +8566,147 @@ class EPSForecastEngine:
         out = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id", "fiscal_year", "quarter"], keep="last")
         return out
 
+
+    def calculate_quarter_eps(self, current: pd.DataFrame, prev: pd.DataFrame | None, fiscal_year: int, quarter: int) -> pd.DataFrame:
+        """R5N6_FIX_2：MOPS 累計 EPS 轉單季 EPS。
+
+        Q1：官方累計 EPS 就是單季 EPS。
+        Q2~Q4：單季 EPS = 本季累計 EPS - 前季累計 EPS。
+        """
+        x = current.copy() if current is not None else pd.DataFrame()
+        if x.empty:
+            return x
+        q = int(quarter)
+        x["eps_cumulative"] = pd.to_numeric(x.get("eps_cumulative"), errors="coerce")
+        if q == 1:
+            x["eps_prev_cumulative"] = 0.0
+            x["eps_quarter"] = x["eps_cumulative"]
+            x["eps_calc_method"] = "DIRECT_Q1_CUMULATIVE_EQUALS_QUARTER"
+            return x
+        p = prev.copy() if prev is not None else pd.DataFrame()
+        if p.empty:
+            x["eps_prev_cumulative"] = np.nan
+            x["eps_quarter"] = np.nan
+            x["eps_calc_method"] = "CUMULATIVE_DIFF_PREV_MISSING"
+            return x
+        p = p[["stock_id", "eps_cumulative"]].copy()
+        p["stock_id"] = p["stock_id"].map(normalize_stock_id)
+        p["eps_prev_cumulative"] = pd.to_numeric(p["eps_cumulative"], errors="coerce")
+        p = p[["stock_id", "eps_prev_cumulative"]].drop_duplicates("stock_id", keep="last")
+        x = x.merge(p, on="stock_id", how="left")
+        x["eps_quarter"] = x["eps_cumulative"] - x["eps_prev_cumulative"]
+        x["eps_calc_method"] = "CUMULATIVE_DIFF_FROM_PREV_QUARTER"
+        return x
+
+    def update_actual_q1_eps_cache(self, fiscal_year: int | None = None, feature_date: str | None = None) -> dict:
+        """R5N6_FIX_4：將 quarterly_financial_history 的 Q1 實際 EPS 同步回 feature cache。
+
+        目的：避免 quarterly_financial_history 已有 115Q1 上市/上櫃 EPS，
+        但 High Growth pipeline 的 actual_q1_eps / selection_eps_nonnull 仍為空。
+        """
+        fiscal_year = int(fiscal_year or self.track_year)
+        feature_date = feature_date or datetime.now().strftime("%Y-%m-%d")
+        result = {"status": "skip", "rows": 0, "message": ""}
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                for ddl in [
+                    "ALTER TABLE financial_feature_daily ADD COLUMN actual_q1_eps REAL",
+                    "ALTER TABLE financial_feature_daily ADD COLUMN actual_q1_eps_source_type TEXT",
+                    "ALTER TABLE financial_feature_daily ADD COLUMN actual_q1_eps_update_time TEXT",
+                ]:
+                    try:
+                        cur.execute(ddl)
+                    except Exception:
+                        pass
+                df = pd.read_sql_query("""
+                    SELECT stock_id, eps_quarter AS actual_q1_eps,
+                           COALESCE(source_type,'') AS actual_q1_eps_source_type
+                    FROM quarterly_financial_history
+                    WHERE fiscal_year=? AND quarter=1 AND eps_quarter IS NOT NULL
+                """, self.db.conn, params=[fiscal_year])
+            if df is None or df.empty:
+                result.update({"status": "no_data", "message": f"quarterly_financial_history no Q1 actual EPS fiscal_year={fiscal_year}"})
+                return result
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows = []
+            for _, r in df.iterrows():
+                rows.append((normalize_stock_id(r.get("stock_id")), feature_date, float(r.get("actual_q1_eps")), str(r.get("actual_q1_eps_source_type") or ""), now))
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.executemany("""
+                    INSERT INTO financial_feature_daily(stock_id, feature_date, actual_q1_eps, actual_q1_eps_source_type, actual_q1_eps_update_time, update_time)
+                    VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(stock_id, feature_date) DO UPDATE SET
+                        actual_q1_eps=excluded.actual_q1_eps,
+                        actual_q1_eps_source_type=excluded.actual_q1_eps_source_type,
+                        actual_q1_eps_update_time=excluded.actual_q1_eps_update_time,
+                        update_time=excluded.update_time
+                """, rows)
+                self.db.conn.commit()
+            result.update({"status": "updated", "rows": len(rows), "message": f"actual_q1_eps cache updated {len(rows)} rows"})
+            log_info(f"[HIGH_GROWTH][R5N6][ACTUAL_Q1_CACHE] fiscal_year={fiscal_year} rows={len(rows)}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[HIGH_GROWTH][R5N6][ACTUAL_Q1_CACHE] failed fiscal_year={fiscal_year}｜{exc}")
+            return result
+
+    def validate_otc_coverage(self, fiscal_year: int | None = None, quarter: int = 1) -> pd.DataFrame:
+        """R5N6_FIX_5：輸出上市/上櫃 EPS 覆蓋率與缺漏清單。
+
+        coverage_status = PASS when actual_q1_eps exists and source_type exists.
+        """
+        fiscal_year = int(fiscal_year or self.track_year)
+        q = int(quarter)
+        try:
+            with self.db.lock:
+                master = pd.read_sql_query("SELECT stock_id, stock_name, market FROM stocks_master WHERE is_active=1", self.db.conn)
+                eps = pd.read_sql_query("""
+                    SELECT stock_id, eps_quarter AS actual_q1_eps, COALESCE(source_type,'') AS source_type
+                    FROM quarterly_financial_history
+                    WHERE fiscal_year=? AND quarter=? AND eps_quarter IS NOT NULL
+                """, self.db.conn, params=[fiscal_year, q])
+        except Exception as exc:
+            return pd.DataFrame([{"market": "ERROR", "coverage_status": "FAIL", "fail_reason": str(exc)}])
+        if master is None or master.empty:
+            return pd.DataFrame([{"market": "ALL", "coverage_status": "FAIL", "fail_reason": "stocks_master empty"}])
+        x = master.copy()
+        x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+        if eps is None:
+            eps = pd.DataFrame(columns=["stock_id", "actual_q1_eps", "source_type"])
+        eps = eps.copy()
+        eps["stock_id"] = eps["stock_id"].map(normalize_stock_id)
+        x = x.merge(eps.drop_duplicates("stock_id", keep="last"), on="stock_id", how="left")
+        x["actual_q1_eps"] = pd.to_numeric(x.get("actual_q1_eps"), errors="coerce")
+        x["source_type"] = x.get("source_type", "").fillna("").astype(str)
+        x["coverage_status"] = np.where(x["actual_q1_eps"].notna() & x["source_type"].ne(""), "PASS", "MISSING")
+        x["fiscal_year"] = fiscal_year
+        x["quarter"] = q
+        x["驗收門檻"] = "market coverage > 95%; actual_q1_eps coverage > 95%"
+        summary = []
+        for market in ["上市", "上櫃", "ALL"]:
+            sub = x if market == "ALL" else x[x["market"].astype(str).eq(market)]
+            total = int(len(sub))
+            hit = int(sub["coverage_status"].eq("PASS").sum()) if total else 0
+            rate = round(hit / total * 100.0, 2) if total else 0.0
+            summary.append({
+                "stock_id": "__SUMMARY__",
+                "stock_name": market,
+                "market": market,
+                "actual_q1_eps": None,
+                "source_type": "",
+                "coverage_status": "PASS" if total and rate > 95 else "FAIL",
+                "coverage_total": total,
+                "coverage_hit": hit,
+                "coverage_rate_pct": rate,
+                "fiscal_year": fiscal_year,
+                "quarter": q,
+                "驗收門檻": "PASS if coverage_rate_pct > 95"
+            })
+        detail_cols = ["stock_id", "stock_name", "market", "actual_q1_eps", "source_type", "coverage_status", "fiscal_year", "quarter", "驗收門檻"]
+        return pd.concat([pd.DataFrame(summary), x[detail_cols].sort_values(["market", "coverage_status", "stock_id"])], ignore_index=True)
+
     def ensure_quarterly_eps_from_mops(self, fiscal_year: int, season, force: bool = False) -> dict:
         """將 MOPS 累積 EPS 轉成季度 EPS 寫入 quarterly_financial_history。Q1 直接使用；Q2~Q4 以本季累積扣前季累積。"""
         fiscal_year = int(fiscal_year)
@@ -8550,34 +8725,26 @@ class EPSForecastEngine:
                 result.update({"status": "no_data", "message": f"MOPS無資料 {fiscal_year}Q{q}"})
                 return result
             current = current.copy()
-            current["eps_cumulative"] = pd.to_numeric(current.get("eps_cumulative"), errors="coerce")
-            if q == 1:
-                # Q1：官方累計EPS就是單季EPS。
-                current["eps_prev_cumulative"] = 0.0
-                current["eps_quarter"] = current["eps_cumulative"]
-                current["eps_calc_method"] = "Q1_CUMULATIVE_EQUALS_QUARTER"
-            else:
+            prev = None
+            if q > 1:
                 prev = self.load_mops_eps_cumulative_all_markets(fiscal_year, q - 1)
                 if prev is None or prev.empty:
                     result.update({"status": "prev_missing", "rows": 0, "message": f"缺前季累積 EPS，不能反推單季 {fiscal_year}Q{q}"})
                     return result
-                prev = prev[["stock_id", "eps_cumulative"]].rename(columns={"eps_cumulative": "eps_prev_cumulative"})
-                prev["eps_prev_cumulative"] = pd.to_numeric(prev["eps_prev_cumulative"], errors="coerce")
-                current = current.merge(prev, on="stock_id", how="left")
-                # Q2~Q4：單季EPS = 本季累計EPS - 前季累計EPS，禁止把累計值當單季加總。
-                current["eps_quarter"] = current["eps_cumulative"] - current["eps_prev_cumulative"]
-                current["eps_calc_method"] = "CUMULATIVE_DIFF_FROM_PREV_QUARTER"
+            current = self.calculate_quarter_eps(current, prev, fiscal_year, q)
             # 相容舊欄位：eps 固定存 eps_quarter。
             current["eps"] = current["eps_quarter"]
-            write = current.dropna(subset=["eps_quarter"])[["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_url", "source_date", "update_time"]].copy()
+            if "source_type" not in current.columns:
+                current["source_type"] = "MOPS_OTC_OR_SII"
+            write = current.dropna(subset=["eps_quarter"])[["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"]].copy()
             if write.empty:
                 result.update({"status": "parse_failed", "message": f"MOPS資料無可寫入EPS {fiscal_year}Q{q}"})
                 return result
             with self.db.lock:
                 cur = self.db.conn.cursor()
                 cur.executemany("""
-                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_url, source_date, update_time)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(stock_id, fiscal_year, quarter) DO UPDATE SET
                         fiscal_year_quarter=excluded.fiscal_year_quarter,
                         western_quarter=excluded.western_quarter,
@@ -8586,6 +8753,7 @@ class EPSForecastEngine:
                         eps_quarter=excluded.eps_quarter,
                         eps_prev_cumulative=excluded.eps_prev_cumulative,
                         eps_calc_method=excluded.eps_calc_method,
+                        source_type=excluded.source_type,
                         source_url=excluded.source_url,
                         source_date=excluded.source_date,
                         update_time=excluded.update_time
@@ -8759,6 +8927,11 @@ class EPSForecastEngine:
             else:
                 results[f"track_Q{q}_mops"] = self.ensure_quarterly_eps_from_mops(self.track_year, q, force=force)
                 results[f"track_Q{q}"] = results[f"track_Q{q}_mops"]
+        try:
+            results["r5n6_actual_q1_eps_cache"] = self.update_actual_q1_eps_cache(self.track_year)
+            results["r5n6_otc_coverage_rows"] = {"status": "computed", "rows": int(len(self.validate_otc_coverage(self.track_year, 1)))}
+        except Exception as _r5n6_sync_exc:
+            log_warning(f"[HIGH_GROWTH][R5N6] actual_q1 cache/coverage sync skipped｜{_r5n6_sync_exc}")
         try:
             debug_dir = RUNTIME_DIR / "data" / "official_eps_openapi"
             debug_dir.mkdir(parents=True, exist_ok=True)
@@ -10956,16 +11129,12 @@ class HighGrowthEPSEngine:
         # 這裡是解決 UI 有值但 Engine 02 空白/BLOCKED 的核心修改點。
         # formal_report_allowed 僅能限制 official_df/04，不能限制 leading_df/02。
         if not df.empty:
-            leading_candidate_mask = (
-                df.get("selection_gate", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-                | df.get("leading_pass", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-                | df.get("forecast_candidate", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-                | df.get("proxy_pass", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-                | df.get("ttm_proxy_candidate", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-                | pd.to_numeric(df.get("selection_eps", pd.Series(np.nan, index=df.index)), errors="coerce").gt(0)
-                | pd.to_numeric(df.get("predicted_q2_eps", pd.Series(np.nan, index=df.index)), errors="coerce").gt(0)
-                | pd.to_numeric(df.get("predicted_q3_eps", pd.Series(np.nan, index=df.index)), errors="coerce").gt(0)
-            )
+            # R5N6_REPORT_GATE_FIX：02_領先預測通過黑馬池只能放「實際通過」候選。
+            # 禁止再用 selection_eps/predicted_q2/predicted_q3 非空就塞入黑馬池，避免 KPI=1462 但真通過=98 的 P0 誤判。
+            selection_mask = df.get("selection_gate", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+            leading_pass_mask = df.get("leading_pass", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+            official_revenue_mask = df.get("official_eps_revenue_pass", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+            leading_candidate_mask = selection_mask | leading_pass_mask | official_revenue_mask
             leading_df = df[leading_candidate_mask].copy()
         else:
             leading_candidate_mask = pd.Series(dtype=bool)
@@ -11007,6 +11176,14 @@ class HighGrowthEPSEngine:
             revenue_cache_health_01f = RevenueCacheManager(REVENUE_CACHE_DIR).health_df(["202602", "202603", "202604"])
         except Exception as _cache_health_exc:
             revenue_cache_health_01f = pd.DataFrame([{"月份": "", "Cache驗收": "FAIL", "說明": str(_cache_health_exc)}])
+        try:
+            eps_otc_coverage_03a = self.eps_engine.validate_otc_coverage(self.track_year, 1)
+        except Exception as _eps_cov_exc:
+            eps_otc_coverage_03a = pd.DataFrame([{
+                "stock_id": "", "stock_name": "VALIDATOR_EXCEPTION", "market": "ALL",
+                "actual_q1_eps": np.nan, "source_type": "", "coverage_status": "FAIL",
+                "fail_reason": f"validate_otc_coverage exception: {_eps_cov_exc}"
+            }])
         hybrid_policy_01f = RevenueHybridCoveragePolicy.describe()
         missing_required_months = ",".join(revenue_month_coverage.loc[revenue_month_coverage["coverage_status"].ne("OK"), "required_month"].astype(str).tolist()) if not revenue_month_coverage.empty else ""
         run_evidence = self._build_same_run_evidence(df, revenue_month_coverage)
@@ -11074,6 +11251,7 @@ class HighGrowthEPSEngine:
             {"validation_metric": "official_eps_revenue_pass", "validation_value": official_eps_revenue_count, "validation_note": "正式EPS + 三月營收完整/YoY/階梯雙驗證通過。"},
             {"validation_metric": "legacy_strict_pass", "validation_value": legacy_strict_count, "validation_note": "舊版相容嚴格通過；不得作首頁主KPI。"},
             {"validation_metric": "selection_gate", "validation_value": leading_count, "validation_note": "新版領先預測主選股Gate。"},
+            {"validation_metric": "kpi_equals_02_blackhorse_count", "validation_value": int(leading_count == len(leading_df)), "validation_note": "R5N6：首頁KPI_領先預測通過筆數必須等於02_領先預測通過黑馬池實際輸出筆數。"},
             {"validation_metric": "missing_required_revenue_months", "validation_value": missing_required_months or "NONE", "validation_note": "若有缺月，正式EPS+營收雙驗證會被壓低。"},
         ])
         rules = pd.DataFrame([
@@ -11092,6 +11270,11 @@ class HighGrowthEPSEngine:
             {"序號": 13, "模組": "RevenueAccelerationEngine", "新增/修改": "保留+整合", "程式位置": "RevenueAccelerationEngine.build_revenue_features", "驗收點": "營收月數、YoY、階梯、revenue_acceleration_score 持續供 HighGrowth EPS 使用"},
             {"序號": 14, "模組": "Hybrid 覆蓋規則", "新增/修改": "新增", "程式位置": "RevenueHybridCoveragePolicy.describe", "驗收點": "正式月報 > 即時公告 > Cache > 官方下載，不得用最新月假補歷史月"},
             {"序號": 15, "模組": "Excel 01F", "新增/修改": "新增", "程式位置": "HighGrowthEPSEngine.export_report tables", "驗收點": "Excel 新增 01F_營收完整性驗證 Sheet"},
+            {"序號": 16, "模組": "R5N6_FIX_1", "新增/修改": "新增", "程式位置": "EPSForecastEngine.flatten_multiindex_columns / _parse_mops_eps_html", "驗收點": "115Q1 sii/otc MultiIndex 表頭可解析，公司代號與基本每股盈餘不漏抓"},
+            {"序號": 17, "模組": "R5N6_FIX_2", "新增/修改": "新增", "程式位置": "EPSForecastEngine.calculate_quarter_eps", "驗收點": "Q1=單季；Q2~Q4=本季累計-前季累計，禁止把累計 EPS 當單季"},
+            {"序號": 18, "模組": "R5N6_FIX_3", "新增/修改": "新增", "程式位置": "quarterly_financial_history.source_type", "驗收點": "MOPS_SII/MOPS_OTC/OPENAPI 來源可追溯且寫入 DB"},
+            {"序號": 19, "模組": "R5N6_FIX_4", "新增/修改": "新增", "程式位置": "EPSForecastEngine.update_actual_q1_eps_cache", "驗收點": "actual_q1_eps 可同步回 feature cache，selection_eps_nonnull 不因 Q1 EPS 未回填失真"},
+            {"序號": 20, "模組": "R5N6_FIX_5", "新增/修改": "新增", "程式位置": "EPSForecastEngine.validate_otc_coverage / 03A_上櫃EPS覆蓋率驗證", "驗收點": "上市/上櫃覆蓋率 >95%；輸出缺漏名單；KPI == 02黑馬池實際數量"},
         ])
         if leading_df.empty:
             leading_df = pd.DataFrame([{"狀態": "NO_LEADING_FORECAST_PASS", "說明": "目前沒有領先預測通過候選。"}])
@@ -11141,6 +11324,7 @@ class HighGrowthEPSEngine:
             "01H_Hybrid覆蓋規則": hybrid_policy_01f,
             "02_領先預測通過黑馬池": leading_df.head(500),
             "02A_UI畫面同源候選池": ui_same_source_df.head(300),
+            "03A_上櫃EPS覆蓋率驗證": eps_otc_coverage_03a.head(5000) if isinstance(eps_otc_coverage_03a, pd.DataFrame) else pd.DataFrame(),
             "03_EPS_TTM代理追蹤池": ttm_only_df.head(500),
             "04_正式EPS驗證通過": official_df.head(500),
             "04A_正式EPS驗證KPI": validation_kpi,
