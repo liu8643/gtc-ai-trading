@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.5-R5N7A_BOOL_FILLNA_REPORT_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.6-R5N7B_EPS_CACHE_MARKET_SPLIT_FINAL_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3402,6 +3402,10 @@ class DBManager:
         # R5N7：上市/上櫃分流欄位。舊 DB 透過 ALTER 補欄，不需重建資料庫。
         for table in ["external_revenue", "external_revenue_history", "external_revenue_announce", "quarterly_financial_history", "annual_eps_history", "financial_feature_daily"]:
             _add(table, "market_type", "market_type TEXT")
+        # R5N7B FIX：外部月營收 writer 會寫 source_url；舊 schema 沒有此欄會造成
+        # table external_revenue has no column named source_url，導致 external_revenue 永遠 0。
+        for _t in ["external_revenue", "external_revenue_history", "external_revenue_announce"]:
+            _add(_t, "source_url", "source_url TEXT")
         _add("financial_feature_daily", "actual_q1_eps_market_type", "actual_q1_eps_market_type TEXT")
 
         # R5N6_FIX_3：quarterly_financial_history 增加 source_type，供 MOPS_SII/MOPS_OTC/OPENAPI/TWSE_C05001 追溯。
@@ -5657,7 +5661,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N6_OTC_EPS_FINAL_PATCH_20260610"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N7B_EPS_CACHE_MARKET_SPLIT_FINAL_FIX_20260612"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -8521,30 +8525,93 @@ class EPSForecastEngine:
         return cache_dir
 
     def _save_openapi_eps_raw_json(self, payload, fiscal_year: int, season: int, market: str, source_key: str, request_url: str, http_status="") -> Path:
+        """R5N7B：OpenAPI EPS raw JSON 同步保存到兩個位置。
+        1) 舊追溯路徑 data/official_eps_openapi/YYYYQn/
+        2) 新分流路徑 data/eps_cache/sii|otc/YYYYQn/
+
+        R5N7A 只建立 eps_cache/sii、eps_cache/otc 資料夾但未寫檔，
+        造成使用者看到資料夾為空；此處補上實際落檔。
+        """
         cache_dir = self._openapi_eps_cache_dir(fiscal_year, season)
         safe_market = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fff-]", "_", str(market or "market"))
         safe_key = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fff-]", "_", str(source_key or "source"))
         json_file = cache_dir / f"openapi_eps_{int(fiscal_year)}Q{int(season)}_{safe_market}_{safe_key}.json"
         meta_file = cache_dir / f"openapi_eps_{int(fiscal_year)}Q{int(season)}_{safe_market}_{safe_key}.meta.json"
+        meta = {
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "request_url": request_url,
+            "http_status": str(http_status or ""),
+            "fiscal_year": int(fiscal_year),
+            "roc_year": int(self._western_to_roc_year(int(fiscal_year))),
+            "season": int(season),
+            "market": str(market or ""),
+            "market_type": normalize_market_type(market),
+            "source_key": str(source_key or ""),
+            "json_file": str(json_file),
+            "record_count": len(payload) if isinstance(payload, list) else None,
+            "validation_rule": "年度/財報年度 must match ROC year and 季別/財報季別 must match quarter before DB upsert",
+        }
         try:
             json_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            meta = {
-                "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "request_url": request_url,
-                "http_status": str(http_status or ""),
-                "fiscal_year": int(fiscal_year),
-                "roc_year": int(self._western_to_roc_year(int(fiscal_year))),
-                "season": int(season),
-                "market": str(market or ""),
-                "source_key": str(source_key or ""),
-                "json_file": str(json_file),
-                "record_count": len(payload) if isinstance(payload, list) else None,
-                "validation_rule": "年度/財報年度 must match ROC year and 季別/財報季別 must match quarter before DB upsert",
-            }
             meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
             log_warning(f"[HIGH_GROWTH][OPENAPI_EPS][DEBUG] raw json save failed file={json_file}｜{exc}")
+
+        # R5N7B：同步寫入使用者指定的 eps_cache/sii|otc 固定結構。
+        try:
+            mt = normalize_market_type(market) or "unknown"
+            split_root = EPS_CACHE_OTC_DIR if mt == "otc" else EPS_CACHE_SII_DIR if mt == "sii" else (EPS_CACHE_DIR / mt)
+            split_dir = split_root / f"{int(fiscal_year)}Q{int(season)}"
+            split_dir.mkdir(parents=True, exist_ok=True)
+            split_json = split_dir / json_file.name
+            split_meta = split_dir / meta_file.name
+            split_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            meta2 = dict(meta)
+            meta2["json_file"] = str(split_json)
+            meta2["split_cache_root"] = str(split_root)
+            split_meta.write_text(json.dumps(meta2, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][R5N7B][EPS_CACHE_SPLIT] raw json split save failed market={market} source={source_key}｜{exc}")
         return json_file
+
+    def _save_eps_split_normalized_cache(self, df: pd.DataFrame, fiscal_year: int, season: int, label: str = "openapi") -> dict:
+        """R5N7B：保存標準化後 EPS CSV 到 data/eps_cache/sii|otc。"""
+        result = {"sii": 0, "otc": 0}
+        try:
+            if df is None or df.empty:
+                return result
+            x = df.copy()
+            if "market_type" not in x.columns:
+                if "source_type" in x.columns:
+                    x["market_type"] = x["source_type"].map(normalize_market_type)
+                else:
+                    x["market_type"] = ""
+            x["market_type"] = x["market_type"].map(normalize_market_type)
+            q = int(season)
+            for mt, root in [("sii", EPS_CACHE_SII_DIR), ("otc", EPS_CACHE_OTC_DIR)]:
+                part = x[x["market_type"].eq(mt)].copy()
+                out_dir = root / f"{int(fiscal_year)}Q{q}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_file = out_dir / f"eps_{int(fiscal_year)}_Q{q}_{mt}.csv"
+                if not part.empty:
+                    part.to_csv(out_file, index=False, encoding="utf-8-sig")
+                    result[mt] = int(len(part))
+                else:
+                    # 留下空白 manifest，讓驗證可明確顯示 no_data，而不是資料夾空白。
+                    pd.DataFrame(columns=["stock_id","fiscal_year","quarter","market_type","eps_quarter","source_type"]).to_csv(out_file, index=False, encoding="utf-8-sig")
+                manifest = {
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "label": label,
+                    "fiscal_year": int(fiscal_year),
+                    "quarter": q,
+                    "market_type": mt,
+                    "rows": int(result[mt]),
+                    "file": str(out_file),
+                }
+                (out_dir / f"eps_{int(fiscal_year)}_Q{q}_{mt}.manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][R5N7B][EPS_CACHE_SPLIT] normalized cache save failed year={fiscal_year} q={season}｜{exc}")
+        return result
 
     def _normalize_openapi_payload_to_records(self, payload) -> list[dict]:
         if isinstance(payload, list):
@@ -8667,6 +8734,8 @@ class EPSForecastEngine:
         out = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id", "fiscal_year", "quarter"], keep="last")
         if "market_type" not in out.columns and "source_type" in out.columns:
             out["market_type"] = out["source_type"].map(normalize_market_type)
+        out["market_type"] = out.get("market_type", pd.Series("", index=out.index)).map(normalize_market_type)
+        self._save_eps_split_normalized_cache(out, fiscal_year, q, label="openapi")
         return out
 
     def ensure_quarterly_eps_from_openapi(self, fiscal_year: int, season, force: bool = False, include_tpex: bool = True, local_json_map: dict | None = None) -> dict:
@@ -8676,10 +8745,27 @@ class EPSForecastEngine:
         try:
             with self.db.lock:
                 cur = self.db.conn.cursor()
-                row = cur.execute("SELECT COUNT(*) FROM quarterly_financial_history WHERE fiscal_year=? AND quarter=? AND eps IS NOT NULL", (fiscal_year, q)).fetchone()
-                existing = int(row[0] or 0) if row else 0
-            if existing > 0 and not force:
-                result.update({"status": "exists", "rows": existing, "message": f"quarterly_financial_history 已有 {fiscal_year}Q{q}"})
+                existing_df = pd.read_sql_query("""
+                    SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                    FROM quarterly_financial_history
+                    WHERE fiscal_year=? AND quarter=? AND eps IS NOT NULL
+                    GROUP BY COALESCE(market_type,'')
+                """, self.db.conn, params=[fiscal_year, q])
+            existing_total = int(existing_df["cnt"].sum()) if existing_df is not None and not existing_df.empty else 0
+            existing_markets = set(existing_df["market_type"].map(normalize_market_type).dropna().astype(str).tolist()) if existing_df is not None and not existing_df.empty else set()
+            # R5N7B：不能只要有上市資料就跳過，否則上櫃永遠不補。
+            # include_tpex=True 時，必須 sii/otc 都有資料才可視為 exists。
+            required_markets = {"sii", "otc"} if include_tpex else {"sii"}
+            if existing_total > 0 and required_markets.issubset(existing_markets) and not force:
+                result.update({"status": "exists", "rows": existing_total, "message": f"quarterly_financial_history 已有 {fiscal_year}Q{q} sii/otc"})
+                try:
+                    existing_cache = pd.read_sql_query("""
+                        SELECT * FROM quarterly_financial_history
+                        WHERE fiscal_year=? AND quarter=? AND eps IS NOT NULL
+                    """, self.db.conn, params=[fiscal_year, q])
+                    self._save_eps_split_normalized_cache(existing_cache, fiscal_year, q, label="db_existing")
+                except Exception:
+                    pass
                 return result
             current = self.load_openapi_eps_all_sources(fiscal_year, q, include_tpex=include_tpex, local_json_map=local_json_map)
             if current is None or current.empty:
@@ -8718,6 +8804,7 @@ class EPSForecastEngine:
                         update_time=excluded.update_time
                 """, list(write.itertuples(index=False, name=None)))
                 self.db.conn.commit()
+            self._save_eps_split_normalized_cache(write, fiscal_year, q, label="openapi_imported")
             result.update({"status": "imported", "rows": int(len(write)), "message": f"OpenAPI已寫入季度EPS {fiscal_year}Q{q}"})
             log_info(f"[HIGH_GROWTH][OPENAPI_EPS] quarterly_financial_history imported year={fiscal_year} q={q} rows={len(write)}")
             if int(q) == 4:
@@ -9129,6 +9216,7 @@ class EPSForecastEngine:
                 for ddl in [
                     "ALTER TABLE financial_feature_daily ADD COLUMN actual_q1_eps REAL",
                     "ALTER TABLE financial_feature_daily ADD COLUMN actual_q1_eps_source_type TEXT",
+                    "ALTER TABLE financial_feature_daily ADD COLUMN actual_q1_eps_market_type TEXT",
                     "ALTER TABLE financial_feature_daily ADD COLUMN actual_q1_eps_update_time TEXT",
                 ]:
                     try:
@@ -9243,10 +9331,27 @@ class EPSForecastEngine:
         try:
             with self.db.lock:
                 cur = self.db.conn.cursor()
-                row = cur.execute("SELECT COUNT(*) FROM quarterly_financial_history WHERE fiscal_year=? AND quarter=? AND eps IS NOT NULL", (fiscal_year, q)).fetchone()
-                existing = int(row[0] or 0) if row else 0
-            if existing > 0 and not force:
-                result.update({"status": "exists", "rows": existing, "message": f"quarterly_financial_history 已有 {fiscal_year}Q{q}"})
+                existing_df = pd.read_sql_query("""
+                    SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                    FROM quarterly_financial_history
+                    WHERE fiscal_year=? AND quarter=? AND eps IS NOT NULL
+                    GROUP BY COALESCE(market_type,'')
+                """, self.db.conn, params=[fiscal_year, q])
+            existing_total = int(existing_df["cnt"].sum()) if existing_df is not None and not existing_df.empty else 0
+            existing_markets = set(existing_df["market_type"].map(normalize_market_type).dropna().astype(str).tolist()) if existing_df is not None and not existing_df.empty else set()
+            # R5N7B：不能只要有上市資料就跳過，否則上櫃永遠不補。
+            # include_tpex=True 時，必須 sii/otc 都有資料才可視為 exists。
+            required_markets = {"sii", "otc"}
+            if existing_total > 0 and required_markets.issubset(existing_markets) and not force:
+                result.update({"status": "exists", "rows": existing_total, "message": f"quarterly_financial_history 已有 {fiscal_year}Q{q} sii/otc"})
+                try:
+                    existing_cache = pd.read_sql_query("""
+                        SELECT * FROM quarterly_financial_history
+                        WHERE fiscal_year=? AND quarter=? AND eps IS NOT NULL
+                    """, self.db.conn, params=[fiscal_year, q])
+                    self._save_eps_split_normalized_cache(existing_cache, fiscal_year, q, label="db_existing")
+                except Exception:
+                    pass
                 return result
             current = self.load_mops_eps_cumulative_all_markets(fiscal_year, q)
             if current is None or current.empty:
@@ -11143,11 +11248,17 @@ class HighGrowthEPSEngine:
 
     def __init__(self, db: DBManager, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID"):
         self.db = db
+        # R5N7B FIX：HighGrowthEPSEngine 本體也必須持有 base_year/track_year。
+        # R5N6FinalSafeIntegrator / validate_otc_coverage 會從 owner.track_year 讀值；
+        # R5N7A 漏補此屬性，導致報表 01I/03A 出現
+        # 'HighGrowthEPSEngine' object has no attribute 'track_year'。
+        self.base_year = int(HIGH_GROWTH_BASE_YEAR)
+        self.track_year = int(HIGH_GROWTH_TRACK_YEAR)
         self.tracking_quarters = normalize_high_growth_quarters(tracking_quarters)
         self.min_yoy = float(min_yoy)
         self.mode = str(mode or "HYBRID").upper()
         self.revenue_engine = RevenueAccelerationEngine(db, min_yoy=self.min_yoy)
-        self.eps_engine = EPSForecastEngine(db)
+        self.eps_engine = EPSForecastEngine(db, base_year=self.base_year, track_year=self.track_year)
 
     def _table_exists(self, table_name: str) -> bool:
         return self.revenue_engine._table_exists(table_name)
@@ -11426,6 +11537,18 @@ class HighGrowthEPSEngine:
         x = master.merge(rev_features, on="stock_id", how="left").merge(eps_features, on="stock_id", how="left", suffixes=("", "_eps"))
         if tech is not None and not tech.empty:
             x = x.merge(tech, on="stock_id", how="left")
+        # R5N7B FIX：報表階段必要欄位保護。
+        # pandas DataFrame.get(col, False) 會在缺欄時回傳 bool，後續 .fillna() 會當機；
+        # 這裡先補齊常用 bool/text/numeric 欄位，避免高成長 EPS 匯出被單一缺欄中斷。
+        for _c in ["revenue_strict_gate", "actual_eps_complete_gate", "eps_gate", "v412_pass", "v412_leading_candidate", "eps_ttm_proxy_gate"]:
+            if _c not in x.columns:
+                x[_c] = False
+        for _c in ["base_eps_quality", "eps_data_quality", "q1_ratio_quality", "prediction_basis", "selection_eps_source"]:
+            if _c not in x.columns:
+                x[_c] = ""
+        for _c in ["selected_actual_eps_cumulative", "revenue_month_count_hit", "avg_revenue_yoy", "trend_score", "rsi14"]:
+            if _c not in x.columns:
+                x[_c] = np.nan
         # V4.15：防止歷史/沙盒資料缺 revenue_data_quality 時導致風險旗標階段中斷。
         if "revenue_data_quality" not in x.columns:
             x["revenue_data_quality"] = np.select(
