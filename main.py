@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.5-R5N6_OTC_EPS_FINAL_PATCH"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.5-R5N7A_BOOL_FILLNA_REPORT_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -8687,8 +8687,13 @@ class EPSForecastEngine:
                 return result
             if "source_type" not in current.columns:
                 current["source_type"] = "OPENAPI"
+            # R5N7A FIX：INSERT 已新增 market_type 欄位，write 欄位也必須同步帶入，
+            # 否則 15 個 placeholders 只收到 14 欄資料，導致 OpenAPI EPS 寫入失敗。
+            if "market_type" not in current.columns:
+                current["market_type"] = current["source_type"].map(normalize_market_type)
+            current["market_type"] = current["market_type"].map(normalize_market_type)
             write = current.dropna(subset=["eps_quarter"])[[
-                "stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"
+                "stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "market_type", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"
             ]].copy()
             if write.empty:
                 result.update({"status": "parse_failed", "message": f"OpenAPI資料無可寫入EPS {fiscal_year}Q{q}"})
@@ -9154,11 +9159,12 @@ class EPSForecastEngine:
             with self.db.lock:
                 cur = self.db.conn.cursor()
                 cur.executemany("""
-                    INSERT INTO financial_feature_daily(stock_id, feature_date, actual_q1_eps, actual_q1_eps_source_type, actual_q1_eps_update_time, update_time)
-                    VALUES(?,?,?,?,?,?)
+                    INSERT INTO financial_feature_daily(stock_id, feature_date, actual_q1_eps, actual_q1_eps_source_type, actual_q1_eps_market_type, actual_q1_eps_update_time, update_time)
+                    VALUES(?,?,?,?,?,?,?)
                     ON CONFLICT(stock_id, feature_date) DO UPDATE SET
                         actual_q1_eps=excluded.actual_q1_eps,
                         actual_q1_eps_source_type=excluded.actual_q1_eps_source_type,
+                        actual_q1_eps_market_type=excluded.actual_q1_eps_market_type,
                         actual_q1_eps_update_time=excluded.actual_q1_eps_update_time,
                         update_time=excluded.update_time
                 """, rows)
@@ -11423,7 +11429,7 @@ class HighGrowthEPSEngine:
         # V4.15：防止歷史/沙盒資料缺 revenue_data_quality 時導致風險旗標階段中斷。
         if "revenue_data_quality" not in x.columns:
             x["revenue_data_quality"] = np.select(
-                [x.get("revenue_strict_gate", False).fillna(False).astype(bool), pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).gt(0)],
+                [x.get("revenue_strict_gate", pd.Series(False, index=x.index)).fillna(False).astype(bool), pd.to_numeric(x.get("revenue_month_count_hit"), errors="coerce").fillna(0).gt(0)],
                 ["STRICT", "PARTIAL_OR_PROXY"],
                 default="MISSING",
             )
@@ -11438,7 +11444,7 @@ class HighGrowthEPSEngine:
         x["official_eps_only_pass"] = (
             x["eps_data_quality"].eq("STRICT")
             & base_quality_strict
-            & x.get("actual_eps_complete_gate", False).fillna(False).astype(bool)
+            & x.get("actual_eps_complete_gate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
             & pd.to_numeric(x.get("selected_actual_eps_cumulative"), errors="coerce").gt(0)
             & x.get("q1_ratio_quality", pd.Series("", index=x.index)).fillna("").astype(str).eq("OK")
             & x["eps_gate"].fillna(False).astype(bool)
@@ -11459,7 +11465,7 @@ class HighGrowthEPSEngine:
         )
 
         # V4.15：領先預測主Gate。strict_pass只代表正式財報驗證；forecast_candidate才是比財報早知道的主選股池。
-        x["v412_pass"] = x.get("v412_pass", x.get("v412_leading_candidate", False)).fillna(False).astype(bool)
+        x["v412_pass"] = x.get("v412_pass", x.get("v412_leading_candidate", pd.Series(False, index=x.index))).fillna(False).astype(bool)
         x["leading_pass"] = x["v412_pass"]
         x["forecast_eps_gate"] = x["v412_pass"]
         # V4.15-R1：selection_gate 是新版主選股 Gate；strict_pass 不再代表主選股結果。
@@ -11472,7 +11478,7 @@ class HighGrowthEPSEngine:
         # EPS_TTM 追蹤候選：DB 已有 EPS_TTM，可作最近四季獲利能力與排序追蹤；
         # 但不可標成 ACTUAL_PASS，也不可直接等同 2025全年EPS或2026Q1單季EPS。
         x["ttm_proxy_candidate"] = (
-            x.get("eps_ttm_proxy_gate", False).fillna(False).astype(bool)
+            x.get("eps_ttm_proxy_gate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
             & x["revenue_partial_yoy_gate"].fillna(False)
         )
 
@@ -11650,7 +11656,7 @@ class HighGrowthEPSEngine:
         if output_dir:
             out_path = Path(output_dir) / out_path.name
         # V4.15-R1：報表摘要語意閉環。strict_pass 不再作為主選股 KPI。
-        official_df = df[df.get("official_eps_verified_pass", df.get("strict_pass", False)).fillna(False).astype(bool)].copy() if not df.empty else pd.DataFrame()
+        official_df = df[df.get("official_eps_verified_pass", df.get("strict_pass", pd.Series(False, index=df.index))).fillna(False).astype(bool)].copy() if not df.empty else pd.DataFrame()
         # R5D FIX：02_領先預測通過黑馬池改用「領先/代理/有預測值」候選口徑。
         # 這裡是解決 UI 有值但 Engine 02 空白/BLOCKED 的核心修改點。
         # formal_report_allowed 僅能限制 official_df/04，不能限制 leading_df/02。
