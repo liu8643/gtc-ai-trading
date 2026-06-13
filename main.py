@@ -41,7 +41,6 @@ import html as html_lib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -157,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.8-R5N8A_REVENUE_PIPELINE_ARCHITECTURE_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.9-R5N8C_CLASSIFICATION_EPS_PREBREAKOUT_DATA_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -1772,6 +1771,7 @@ THEME_RULES = [
     (r"南亞科|華邦電|旺宏|群聯|威剛|十銓|宇瞻|創見", ("半導體", "記憶體", "DRAM/NAND")),
     (r"日月光|京元電子|矽格|精材|頎邦|力成", ("半導體", "先進封裝", "封測")),
     (r"長榮|萬海|陽明|裕民|慧洋|中航|四維航", ("航運業", "運輸", "航運")),
+    (r"潤泰材|國產|亞泥|台泥|嘉泥|信大|環泥|幸福|建材|水泥", ("建材營造", "傳產", "建材/水泥")),
     (r"富邦金|國泰金|中信金|兆豐金|玉山金|元大金|第一金|華南金|永豐金|台新金", ("金融保險", "金融", "金融")),
 ]
 
@@ -3147,7 +3147,7 @@ class DBManager:
         CREATE TABLE IF NOT EXISTS external_revenue_history (
             stock_id TEXT, revenue_month TEXT, market_type TEXT, revenue REAL, mom REAL, yoy REAL, cumulative_revenue REAL, cumulative_yoy REAL,
             source_url TEXT, source_date TEXT, update_time TEXT,
-            PRIMARY KEY(stock_id, revenue_month, market_type)
+            PRIMARY KEY(stock_id, revenue_month)
         )
         """)
         # R5N4/R5N5：即時公告與完整性驗證表，支援 6/1~6/10 提前公告與 202602~202604 PASS Gate。
@@ -3246,7 +3246,6 @@ class DBManager:
         )
         """)
         self._ensure_external_schema_columns(cur)
-        self._migrate_revenue_history_market_type_pk(cur)
         for sql in [
             "CREATE INDEX IF NOT EXISTS idx_qfh_stock_quarter ON quarterly_financial_history(stock_id, fiscal_year, quarter)",
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_qfh_stock_fyq ON quarterly_financial_history(stock_id, fiscal_year_quarter)",
@@ -3565,64 +3564,6 @@ class DBManager:
             ("wave_trade_score", "wave_trade_score REAL"),
         ]:
             _add("trade_plan", col, ddl)
-
-    def _migrate_revenue_history_market_type_pk(self, cur):
-        """R5N8A：重建 external_revenue_history PK 為 (stock_id, revenue_month, market_type)。
-
-        舊版只有 (stock_id, revenue_month)，會讓上市/上櫃互相覆蓋，也會讓 legacy_all 寫入正式 DB。
-        此 migration 會保留舊資料並以 stocks_master.market 回填 market_type；無法判定者標 unknown，
-        但後續 RevenueDbWriter 會禁止 unknown/NULL 新資料寫入。
-        """
-        try:
-            info = cur.execute("PRAGMA table_info(external_revenue_history)").fetchall()
-            if not info:
-                return
-            pk_cols = [str(r[1]) for r in sorted([r for r in info if int(r[5] or 0) > 0], key=lambda r: int(r[5] or 0))]
-            if pk_cols == ["stock_id", "revenue_month", "market_type"]:
-                return
-            backup = "external_revenue_history_legacy_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-            cur.execute(f"ALTER TABLE external_revenue_history RENAME TO {backup}")
-            cur.execute("""
-            CREATE TABLE external_revenue_history (
-                stock_id TEXT,
-                revenue_month TEXT,
-                market_type TEXT,
-                revenue REAL,
-                mom REAL,
-                yoy REAL,
-                cumulative_revenue REAL,
-                cumulative_yoy REAL,
-                source_url TEXT,
-                source_date TEXT,
-                update_time TEXT,
-                PRIMARY KEY(stock_id, revenue_month, market_type)
-            )
-            """)
-            cur.execute(f"""
-            INSERT OR REPLACE INTO external_revenue_history(
-                stock_id,revenue_month,market_type,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_url,source_date,update_time
-            )
-            SELECT
-                h.stock_id,
-                h.revenue_month,
-                CASE
-                    WHEN LOWER(COALESCE(h.market_type,'')) IN ('sii','上市') THEN 'sii'
-                    WHEN LOWER(COALESCE(h.market_type,'')) IN ('otc','上櫃') THEN 'otc'
-                    WHEN sm.market='上市' THEN 'sii'
-                    WHEN sm.market='上櫃' THEN 'otc'
-                    WHEN LOWER(COALESCE(h.source_url,'')) LIKE '%otc%' OR LOWER(COALESCE(h.source_url,'')) LIKE '%tpex%' THEN 'otc'
-                    WHEN LOWER(COALESCE(h.source_url,'')) LIKE '%sii%' OR LOWER(COALESCE(h.source_url,'')) LIKE '%twse%' OR LOWER(COALESCE(h.source_url,'')) LIKE '%c04003%' THEN 'sii'
-                    ELSE 'unknown'
-                END AS market_type,
-                h.revenue,h.mom,h.yoy,h.cumulative_revenue,h.cumulative_yoy,h.source_url,h.source_date,h.update_time
-            FROM {backup} h
-            LEFT JOIN stocks_master sm ON sm.stock_id=h.stock_id
-            WHERE COALESCE(h.stock_id,'')<>'' AND COALESCE(h.revenue_month,'')<>''
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_revenue_history_month_market ON external_revenue_history(revenue_month, market_type)")
-            log_warning(f"[R5N8A][DB_MIGRATION] external_revenue_history PK migrated backup={backup}")
-        except Exception as exc:
-            log_warning(f"[R5N8A][DB_MIGRATION_FAIL] external_revenue_history｜{exc}")
 
     def _safe_sha256(self, path) -> str:
         try:
@@ -5376,12 +5317,12 @@ class PreBreakoutIntegratedEngine:
         quality_date = quality_date or self._latest_feature_date()
         self._copy_snapshot_to_history_if_needed()
         with self.db.lock:
-            master = pd.read_sql_query("SELECT stock_id FROM stocks_master WHERE is_active=1", self.db.conn)
+            master = pd.read_sql_query("SELECT stock_id, stock_name, market, is_etf FROM stocks_master WHERE is_active=1", self.db.conn)
             price_cnt = pd.read_sql_query("SELECT stock_id, COUNT(*) price_history_days FROM price_history GROUP BY stock_id", self.db.conn)
-            eps_cnt = pd.read_sql_query("SELECT stock_id, COUNT(*) eps_quarter_count FROM quarterly_financial_history WHERE eps IS NOT NULL GROUP BY stock_id", self.db.conn)
-            rev_cnt = pd.read_sql_query("SELECT stock_id, COUNT(*) revenue_month_count FROM external_revenue_history GROUP BY stock_id", self.db.conn)
-            inst_cnt = pd.read_sql_query("SELECT stock_id, COUNT(*) institutional_day_count FROM external_institutional_history GROUP BY stock_id", self.db.conn)
-        x = master.copy()
+            eps_cnt = pd.read_sql_query("SELECT stock_id, COUNT(DISTINCT fiscal_year || 'Q' || quarter) eps_quarter_count FROM quarterly_financial_history WHERE COALESCE(eps_quarter, eps) IS NOT NULL GROUP BY stock_id", self.db.conn)
+            rev_cnt = pd.read_sql_query("SELECT stock_id, COUNT(DISTINCT revenue_month) revenue_month_count FROM external_revenue_history WHERE COALESCE(revenue,0)>0 GROUP BY stock_id", self.db.conn)
+            inst_cnt = pd.read_sql_query("SELECT stock_id, COUNT(DISTINCT trade_date) institutional_day_count FROM external_institutional_history GROUP BY stock_id", self.db.conn)
+        x = _r5n8c_filter_strategy_universe(master).copy()
         for df in [price_cnt, eps_cnt, rev_cnt, inst_cnt]:
             if df is not None and not df.empty:
                 x = x.merge(df, on="stock_id", how="left")
@@ -5419,6 +5360,11 @@ class PreBreakoutIntegratedEngine:
         return int(len(x))
 
     def _latest_by_stock(self, table: str, order_col: str, cols: list[str]) -> pd.DataFrame:
+        """R5N8C：讀外部最新資料時必須回傳 stock_id 唯一列。
+
+        原 R5N7D 在 legacy_all / sii / otc 並存時，stock_id+MAX(order_col) 可能取得多列，
+        造成爆發股 merge 後同一 stock_id 同一 signal_date 重複，最後寫入 prebreakout_signal_daily 觸發 UNIQUE。
+        """
         try:
             with self.db.lock:
                 q = f"""
@@ -5427,11 +5373,14 @@ class PreBreakoutIntegratedEngine:
                   ON t.stock_id=m.stock_id AND t.{order_col}=m.max_key
                 """
                 df = pd.read_sql_query(q, self.db.conn)
+                master = pd.read_sql_query("SELECT stock_id, market FROM stocks_master WHERE is_active=1", self.db.conn)
+            df = _r5n8c_prepare_external_latest_df(df, master, table_name=table, order_col=order_col)
             for c in cols:
                 if c not in df.columns:
                     df[c] = np.nan
             return df
-        except Exception:
+        except Exception as exc:
+            log_warning(f"[R5N8C][LATEST_BY_STOCK_FAIL] table={table} order_col={order_col}｜{exc}")
             return pd.DataFrame(columns=["stock_id"] + cols)
 
     def build_prebreakout_signal_daily(self, signal_date: str | None = None, log_cb=None) -> int:
@@ -5439,10 +5388,11 @@ class PreBreakoutIntegratedEngine:
         with self.db.lock:
             tech = pd.read_sql_query("SELECT * FROM technical_feature_daily WHERE feature_date=(SELECT MAX(feature_date) FROM technical_feature_daily)", self.db.conn)
             qual = pd.read_sql_query("SELECT * FROM financial_quality_status WHERE quality_date=(SELECT MAX(quality_date) FROM financial_quality_status)", self.db.conn)
-            master = pd.read_sql_query("SELECT stock_id, stock_name, market, industry, theme, sub_theme FROM stocks_master WHERE is_active=1", self.db.conn)
+            master = pd.read_sql_query("SELECT stock_id, stock_name, market, industry, theme, sub_theme, is_etf FROM stocks_master WHERE is_active=1", self.db.conn)
         if tech is None or tech.empty:
             raise RuntimeError("technical_feature_daily 無資料，請先執行爆發前盤後DB建立。")
-        x = tech.merge(master, on="stock_id", how="left")
+        master = _r5n8c_filter_strategy_universe(master).copy()
+        x = tech.merge(master.drop(columns=["is_etf"], errors="ignore"), on="stock_id", how="inner")
         if qual is not None and not qual.empty:
             qcols = ["stock_id", "data_quality_flag", "data_gap_reason", "revenue_month_count", "institutional_day_count", "eps_quarter_count", "price_history_days"]
             for c in qcols:
@@ -5618,6 +5568,31 @@ class PreBreakoutIntegratedEngine:
             if c not in x.columns:
                 x[c] = np.nan if c not in ("stock_id","signal_date","stock_name","decision","wait_reason","suggested_action","base_filter_status","fail_reason","risk_flag","rule_version","data_quality_flag","data_gap_reason","evidence_json","update_time") else ""
         out = x[keep].copy()
+
+        # R5N8C：寫入前主鍵防呆。prebreakout_signal_daily 主鍵為 stock_id + signal_date；
+        # 若外部資料 merge 導致同日同股多列，先記錄重複來源並依分數/更新時間保留最佳一列。
+        dup_mask = out.duplicated(subset=["stock_id", "signal_date"], keep=False)
+        dup_count = int(dup_mask.sum())
+        if dup_count > 0:
+            try:
+                dup_dir = RUNTIME_DIR / "reports" / "debug"
+                dup_dir.mkdir(parents=True, exist_ok=True)
+                dup_file = dup_dir / f"prebreakout_duplicate_keys_{signal_date.replace('-', '')}.csv"
+                out.loc[dup_mask].sort_values(["stock_id", "prebreakout_total_score"]).to_csv(dup_file, index=False, encoding="utf-8-sig")
+                log_warning(f"[R5N8C][PREBREAKOUT_DUPLICATE_KEY] duplicated_rows={dup_count} saved={dup_file}")
+                if log_cb:
+                    log_cb(f"[R5N8C][PREBREAKOUT_DUPLICATE_KEY] duplicated_rows={dup_count} saved={dup_file}")
+            except Exception as _dup_exc:
+                log_warning(f"[R5N8C][PREBREAKOUT_DUPLICATE_KEY_SAVE_FAIL] {dup_count}｜{_dup_exc}")
+            out["_score_sort"] = pd.to_numeric(out.get("prebreakout_total_score"), errors="coerce").fillna(-9999)
+            out["_update_sort"] = out.get("update_time", "").astype(str)
+            out = (
+                out.sort_values(["stock_id", "signal_date", "_score_sort", "_update_sort"])
+                   .drop_duplicates(subset=["stock_id", "signal_date"], keep="last")
+                   .drop(columns=["_score_sort", "_update_sort"], errors="ignore")
+            )
+        log_info(f"[R5N8C][PREBREAKOUT_WRITE_GUARD] signal_date={signal_date} final_rows={len(out)} duplicate_rows_before={dup_count}")
+
         with self.db.lock:
             self.db.conn.execute("DELETE FROM prebreakout_signal_daily WHERE signal_date=?", (signal_date,))
             out.to_sql("prebreakout_signal_daily", self.db.conn, if_exists="append", index=False)
@@ -5721,7 +5696,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N7D_REVENUE_PIPELINE_CONSISTENCY_FIX_20260613"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N8C_CLASSIFICATION_EPS_PREBREAKOUT_DATA_FIX_20260613"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -6054,16 +6029,7 @@ def _r5n7d_append_manifest(record: dict):
             except Exception:
                 data = []
         rec = dict(record or {})
-        rec.setdefault("pipeline_version", "R5N8A_REVENUE_PIPELINE_ARCHITECTURE_FIX")
-        rec.setdefault("pipeline_run_id", datetime.now().strftime("r5n8a_%Y%m%d"))
         rec.setdefault("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        # R5N8A：manifest 必須可追溯檔案 hash，不能只記路徑。
-        try:
-            _mp = Path(str(rec.get("path", "")))
-            if _mp.exists() and _mp.is_file():
-                rec.setdefault("sha256", _safe_file_sha256(_mp))
-        except Exception:
-            pass
         data.append(rec)
         data = data[-2000:]
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -6085,7 +6051,6 @@ def _r5n7d_save_df_csv(df: pd.DataFrame, path: Path, stage: str, month: str, mar
             "source_key": source_key,
             "path": str(p),
             "rows": int(len(df)),
-            "rows_final" if stage == "final" else ("rows_normalized" if str(stage).startswith("normalized") else "rows_raw"): int(len(df)),
             "bytes": int(p.stat().st_size) if p.exists() else 0,
             "status": "PASS",
         })
@@ -6141,70 +6106,89 @@ def market_type_to_label(value) -> str:
     mt = normalize_market_type(value)
     return "上市" if mt == "sii" else ("上櫃" if mt == "otc" else "")
 
-
-# R5N8A_REVENUE_PIPELINE_ARCHITECTURE_FIX_20260613
-# 統一 Revenue market_type 解析：任何進入 normalized/final/DB 的月營收資料，
-# 都必須先由 source_url/source_label + stocks_master 完成 sii/otc 分流。
-def _r5n8a_stock_market_map() -> dict:
-    mapping = {}
-    try:
-        if 'DB_PATH' in globals() and Path(DB_PATH).exists():
-            conn = sqlite3.connect(str(DB_PATH))
-            try:
-                df = pd.read_sql_query("SELECT stock_id, market FROM stocks_master", conn)
-                if df is not None and not df.empty:
-                    for _, r in df.iterrows():
-                        sid = normalize_stock_id(r.get('stock_id', ''))
-                        mt = normalize_market_type(r.get('market', ''))
-                        if sid and mt:
-                            mapping[sid] = mt
-            finally:
-                conn.close()
-    except Exception:
-        pass
-    try:
-        if not mapping and 'MASTER_CSV' in globals() and Path(MASTER_CSV).exists():
-            df = safe_read_csv_auto(Path(MASTER_CSV))
-            if df is not None and not df.empty and 'stock_id' in df.columns:
-                market_col = 'market' if 'market' in df.columns else ''
-                for _, r in df.iterrows():
-                    sid = normalize_stock_id(r.get('stock_id', ''))
-                    mt = normalize_market_type(r.get(market_col, '')) if market_col else ''
-                    if sid and mt:
-                        mapping[sid] = mt
-    except Exception:
-        pass
-    return mapping
+def _r5n8c_market_label_to_type(value) -> str:
+    """R5N8C：股票主檔 market 欄位轉 market_type，供所有外部資料 merge / gate 共用。"""
+    return normalize_market_type(value)
 
 
-def _r5n8a_apply_market_resolver(df: pd.DataFrame, default_market_type: str = "", source_url: str = "", strict: bool = False) -> pd.DataFrame:
+def _r5n8c_build_market_map(master_df: pd.DataFrame) -> dict:
+    """R5N8C：建立 stock_id -> market_type 對照，避免只靠外部資料 source_url 推測市場別。"""
+    if master_df is None or master_df.empty:
+        return {}
+    x = master_df.copy()
+    if "stock_id" not in x.columns:
+        return {}
+    x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+    if "market_type" in x.columns:
+        mt = x["market_type"].map(normalize_market_type)
+    else:
+        mt = x.get("market", pd.Series("", index=x.index)).map(normalize_market_type)
+    x["_market_type"] = mt
+    x = x[(x["stock_id"] != "") & (x["_market_type"] != "")].drop_duplicates("stock_id", keep="last")
+    return dict(zip(x["stock_id"], x["_market_type"]))
+
+
+def _r5n8c_prepare_external_latest_df(df: pd.DataFrame, master_df: pd.DataFrame | None, table_name: str = "", order_col: str = "") -> pd.DataFrame:
+    """R5N8C：外部表進入策略/爆發股 merge 前，強制收斂成 stock_id 唯一。
+
+    修正重點：
+    1. external_revenue_history 已開始有 market_type，舊版 _latest_by_stock 只用 stock_id+MAX(month)
+       會在 legacy_all / sii / otc 並存時造成同一 stock_id 多列。
+    2. 爆發股寫入 prebreakout_signal_daily 的主鍵是 stock_id + signal_date；
+       若 merge 後一檔股票被放大成多列，就會觸發 UNIQUE constraint。
+    3. 本函式會優先保留 market_type 與 stocks_master.market 相符的列，其次保留最後更新列。
+    """
     if df is None or df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["stock_id"])
     x = df.copy()
-    if 'stock_id' not in x.columns:
-        return pd.DataFrame()
-    x['stock_id'] = x['stock_id'].map(normalize_stock_id)
-    if 'market_type' not in x.columns:
-        x['market_type'] = ''
-    mt0 = normalize_market_type(default_market_type) or normalize_market_type(source_url)
-    x['market_type'] = x['market_type'].map(normalize_market_type)
-    missing = x['market_type'].astype(str).eq('')
-    if missing.any():
-        mapping = _r5n8a_stock_market_map()
-        if mapping:
-            mapped = x.loc[missing, 'stock_id'].map(mapping).fillna('')
-            x.loc[missing, 'market_type'] = mapped.values
-    missing = x['market_type'].astype(str).eq('')
-    if missing.any() and mt0:
-        x.loc[missing, 'market_type'] = mt0
-    x['market_type'] = x['market_type'].map(normalize_market_type)
-    if strict:
-        before = len(x)
-        x = x[x['market_type'].isin(['sii', 'otc'])].copy()
-        dropped = before - len(x)
-        if dropped > 0:
-            log_warning(f"[R5N8A][MARKET_RESOLVER][DROP_UNKNOWN] dropped={dropped} source={source_url}")
+    if "stock_id" not in x.columns:
+        return pd.DataFrame(columns=["stock_id"])
+    x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+    x = x[x["stock_id"] != ""].copy()
+    if x.empty:
+        return x
+
+    market_map = _r5n8c_build_market_map(master_df) if master_df is not None else {}
+    x["_expected_market_type"] = x["stock_id"].map(market_map).fillna("")
+    if "market_type" in x.columns:
+        x["_row_market_type"] = x["market_type"].map(normalize_market_type)
+    elif "source_type" in x.columns:
+        x["_row_market_type"] = x["source_type"].map(normalize_market_type)
+    elif "source_url" in x.columns:
+        x["_row_market_type"] = x["source_url"].map(normalize_market_type)
+    else:
+        x["_row_market_type"] = ""
+
+    # priority: exact market match > unknown > mismatch. Unknown kept as fallback to avoid dropping legacy rows.
+    x["_market_priority"] = np.select(
+        [
+            x["_expected_market_type"].ne("") & x["_row_market_type"].eq(x["_expected_market_type"]),
+            x["_row_market_type"].eq(""),
+        ],
+        [2, 1],
+        default=0,
+    )
+    if order_col and order_col in x.columns:
+        x["_order_key"] = x[order_col].astype(str)
+    else:
+        x["_order_key"] = ""
+    if "update_time" not in x.columns:
+        x["update_time"] = ""
+    dup_before = int(x.duplicated("stock_id", keep=False).sum())
+    x = (
+        x.sort_values(["stock_id", "_market_priority", "_order_key", "update_time"])
+         .drop_duplicates("stock_id", keep="last")
+         .drop(columns=[c for c in ["_expected_market_type", "_row_market_type", "_market_priority", "_order_key"] if c in x.columns])
+    )
+    if dup_before > 0:
+        log_warning(f"[R5N8C][LATEST_BY_STOCK_DEDUP] table={table_name} order_col={order_col} duplicated_rows={dup_before} final_rows={len(x)}")
     return x
+
+
+def _r5n8c_filter_strategy_universe(df: pd.DataFrame) -> pd.DataFrame:
+    """R5N8C：爆發股/高成長候選用普通股母體；ETF/權證/特殊商品不進候選與缺漏統計。"""
+    return _r5n7d_exclude_non_revenue_universe(df)
+
 REVENUE_OPENAPI_ENDPOINTS = {
     "TWSE_REVENUE_L": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
     "TPEX_REVENUE_O": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
@@ -6597,11 +6581,7 @@ class RevenueCacheManager:
                 log_warning(f"[RevenueCacheManager][READ_FAIL] month={m} market={mt or 'all'} path={path}｜{exc}")
         if not parts:
             return pd.DataFrame()
-        out = pd.concat(parts, ignore_index=True)
-        if "market_type" not in out.columns:
-            out["market_type"] = mt if mt else ""
-        out = _r5n8a_apply_market_resolver(out, default_market_type=mt, source_url="RevenueCacheManager.read_month_cache", strict=bool(mt))
-        return out.drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
+        return pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
     def health_df(self, months: list[str]) -> pd.DataFrame:
         rows = []
@@ -6987,7 +6967,7 @@ class R5N6FinalSafeIntegrator:
             except Exception as exc:
                 log_warning(f"[R5N6_SAFE][LOCAL_REVENUE_PARSE_FAIL] file={f}｜{exc}")
         if parts:
-            out = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
+            out = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
             log_info(f"[R5N6_SAFE][LOCAL_REVENUE_OK] month={m} rows={len(out)}")
             return out
         return pd.DataFrame()
@@ -7265,12 +7245,6 @@ class RevenueOpenAPICacheDownloader:
             raise ValueError(f"invalid revenue month: {month}")
         return self.monthly_cache_dir / f"revenue_{m}.csv"
 
-    def monthly_cache_path(self, month: str, market_type: str | None = None) -> Path:
-        return RevenueCacheManager(self.cache_dir).monthly_cache_path(month, market_type)
-
-    def normalized_cache_path(self, month: str, market_type: str | None = None) -> Path:
-        return RevenueCacheManager(self.cache_dir).normalized_cache_path(month, market_type)
-
     def _emit_cache_trace(self, month: str, stage: str, status: str, rows: int = 0, cache_path: Path | None = None, reason_code: str = "", reason_detail: str = ""):
         try:
             if self.trace_engine is not None:
@@ -7315,16 +7289,14 @@ class RevenueOpenAPICacheDownloader:
             x["source_url"] = source_url
         if "market_type" not in x.columns:
             x["market_type"] = normalize_market_type(source_url)
-        # R5N8A：不可只靠 source_url 推斷；需以 stocks_master 補齊上市/上櫃 market_type。
-        x = _r5n8a_apply_market_resolver(x, default_market_type=normalize_market_type(source_url), source_url=source_url, strict=False)
+        x["market_type"] = x["market_type"].map(normalize_market_type)
         if "update_time" not in x.columns:
             x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         x = x[(x["stock_id"].astype(str).ne("")) & x["revenue_month"].eq(m) & (x["revenue"] > 0)].copy()
-        x = _r5n8a_apply_market_resolver(x, default_market_type=normalize_market_type(source_url), source_url=source_url, strict=True)
         if x.empty:
             return pd.DataFrame()
         keep = ["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]
-        return x[keep].drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
+        return x[keep].drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
     def write_month_cache(self, df: pd.DataFrame, month: str, source_url: str = "") -> Path | None:
         """R5N7D：統一月營收 cache 寫入。
@@ -7452,10 +7424,7 @@ class RevenueOpenAPICacheDownloader:
                 "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "cache_source_label": source_label,
             })
-        out = pd.DataFrame(rows) if rows else pd.DataFrame()
-        if out is not None and not out.empty:
-            out = _r5n8a_apply_market_resolver(out, default_market_type=normalize_market_type(source_label), source_url=source_label, strict=True)
-            out = out.drop_duplicates(subset=["stock_id", "revenue_month", "market_type"], keep="last")
+        out = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if rows else pd.DataFrame()
         if out.empty:
             return out, f"{source_label} cache解析後有效 rows=0"
         return out, ""
@@ -7470,7 +7439,6 @@ class RevenueOpenAPICacheDownloader:
             if "revenue" in x.columns:
                 x["revenue"] = pd.to_numeric(x["revenue"], errors="coerce")
             x = x[(x.get("revenue_month", pd.Series(dtype=str)).astype(str).ne("")) & (x.get("revenue", pd.Series(dtype=float)) > 0)].copy()
-            x = _r5n8a_apply_market_resolver(x, source_url=source_tag, strict=True)
             if x.empty:
                 return None
             out = self.cache_dir / f"revenue_openapi_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{source_tag}.csv"
@@ -7513,10 +7481,7 @@ class RevenueOpenAPICacheDownloader:
                     df["source_date"] = datetime.now().strftime("%Y-%m-%d")
                 if "update_time" not in df.columns:
                     df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if "market_type" not in df.columns:
-                    df["market_type"] = ""
-                df = _r5n8a_apply_market_resolver(df, source_url=str(p), strict=True)
-                return df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
+                return df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
             except Exception as exc:
                 last_error = exc
                 continue
@@ -7555,11 +7520,7 @@ class RevenueOpenAPICacheDownloader:
                     if "update_time" not in df.columns:
                         df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(p)
-                    if "market_type" not in df.columns:
-                        df["market_type"] = ""
-                    df = _r5n8a_apply_market_resolver(df, source_url=str(p), strict=True)
-                    if df is not None and not df.empty:
-                        parts.append(df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]])
+                    parts.append(df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]])
                     break
                 except Exception:
                     continue
@@ -7587,7 +7548,7 @@ class RevenueOpenAPICacheDownloader:
             except Exception as exc:
                 errors.append(f"{label}:{exc}")
                 log_warning(f"[REVENUE][OPENAPI_CACHE][{label}] download failed：{exc}")
-        df = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last") if parts else pd.DataFrame()
+        df = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if parts else pd.DataFrame()
         cache_path = self.save_cache_df(df, source_tag="download") if df is not None and not df.empty else None
         if df is not None and not df.empty:
             df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(cache_path or "download_memory")
@@ -8097,7 +8058,7 @@ class RevenueOpenAPICacheDownloader:
                 "說明": "已建立逐月Cache" if rows > 0 else ("月報未到期，非缺資料" if status == "NOT_DUE" else "未取得有效 C04003 月營收資料"),
                 "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
-        combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last") if data_parts else pd.DataFrame()
+        combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if data_parts else pd.DataFrame()
         if write_db and db is not None and combined is not None and not combined.empty:
             inserted = self.upsert_external_revenue_history(db, combined, append_only=True)
             for row in summary_rows:
@@ -8140,11 +8101,6 @@ class RevenueOpenAPICacheDownloader:
         x = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
         if x.empty:
             return 0
-        x = _r5n8a_apply_market_resolver(x, source_url="R5N_CACHE_DB_WRITE", strict=True)
-        if x.empty:
-            log_warning("[R5N8A][REVENUE_DB_WRITE][SKIP] all rows dropped because market_type unresolved")
-            return 0
-        x = x.drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
         rows = []
         for _, r in x.iterrows():
             rows.append((
@@ -8171,7 +8127,7 @@ class RevenueOpenAPICacheDownloader:
                 stock_id, revenue_month, market_type, revenue, mom, yoy, cumulative_revenue, cumulative_yoy,
                 source_url, source_date, update_time
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(stock_id, revenue_month, market_type) DO UPDATE SET
+            ON CONFLICT(stock_id, revenue_month) DO UPDATE SET
                 revenue=CASE WHEN COALESCE(external_revenue_history.revenue,0)<=0 THEN excluded.revenue ELSE external_revenue_history.revenue END,
                 mom=CASE WHEN external_revenue_history.mom IS NULL THEN excluded.mom ELSE external_revenue_history.mom END,
                 yoy=CASE WHEN external_revenue_history.yoy IS NULL THEN excluded.yoy ELSE external_revenue_history.yoy END,
@@ -8190,17 +8146,7 @@ class RevenueOpenAPICacheDownloader:
                 cur.executemany(sql_insert_ignore if append_only else sql_upsert_repair, rows)
                 db.conn.commit()
                 after = int(cur.execute("SELECT COUNT(*) FROM external_revenue_history").fetchone()[0] or 0)
-            try:
-                mm_list = sorted(set([r[1] for r in rows if r[1]]))
-                cnt_rows = []
-                for _mm in mm_list:
-                    for _mt in ("sii", "otc"):
-                        _cnt = int(cur.execute("SELECT COUNT(*) FROM external_revenue_history WHERE revenue_month=? AND market_type=? AND COALESCE(revenue,0)>0", (_mm, _mt)).fetchone()[0] or 0)
-                        cnt_rows.append(f"{_mm}/{_mt}={_cnt}")
-                log_info(f"[R5N8A][EXTERNAL_REVENUE_HISTORY][VERIFY_BY_MARKET] {'; '.join(cnt_rows)}")
-            except Exception:
-                pass
-            log_info(f"[R5N8A][EXTERNAL_REVENUE_HISTORY][WRITE] rows_input={len(rows)} inserted_or_existing_delta={after-before} append_only={append_only}")
+            log_info(f"[R5N][EXTERNAL_REVENUE_HISTORY][WRITE] rows_input={len(rows)} inserted_or_existing_delta={after-before} append_only={append_only}")
             return int(after - before)
         except Exception as exc:
             log_warning(f"[R5N][EXTERNAL_REVENUE_HISTORY][WRITE_FAIL] {exc}")
@@ -9567,12 +9513,12 @@ class EPSForecastEngine:
                     except Exception:
                         pass
                 df = pd.read_sql_query("""
-                    SELECT q.stock_id, q.eps_quarter AS actual_q1_eps,
+                    SELECT q.stock_id, COALESCE(q.eps_quarter, q.eps) AS actual_q1_eps,
                            COALESCE(q.source_type,'') AS actual_q1_eps_source_type,
                            COALESCE(q.market_type, CASE WHEN sm.market='上櫃' THEN 'otc' WHEN sm.market='上市' THEN 'sii' ELSE '' END, '') AS actual_q1_eps_market_type
                     FROM quarterly_financial_history q
                     LEFT JOIN stocks_master sm ON q.stock_id=sm.stock_id
-                    WHERE q.fiscal_year=? AND q.quarter=1 AND q.eps_quarter IS NOT NULL
+                    WHERE q.fiscal_year=? AND q.quarter=1 AND COALESCE(q.eps_quarter, q.eps) IS NOT NULL
                 """, self.db.conn, params=[fiscal_year])
             if df is None or df.empty:
                 result.update({"status": "no_data", "message": f"quarterly_financial_history no Q1 actual EPS fiscal_year={fiscal_year}"})
@@ -9619,9 +9565,9 @@ class EPSForecastEngine:
             with self.db.lock:
                 master = pd.read_sql_query("SELECT stock_id, stock_name, market, is_etf FROM stocks_master WHERE is_active=1", self.db.conn)
                 eps = pd.read_sql_query("""
-                    SELECT stock_id, eps_quarter AS actual_q1_eps, COALESCE(source_type,'') AS source_type, COALESCE(market_type,'') AS market_type
+                    SELECT stock_id, COALESCE(eps_quarter, eps) AS actual_q1_eps, COALESCE(source_type,'') AS source_type, COALESCE(market_type,'') AS market_type
                     FROM quarterly_financial_history
-                    WHERE fiscal_year=? AND quarter=? AND eps_quarter IS NOT NULL
+                    WHERE fiscal_year=? AND quarter=? AND COALESCE(eps_quarter, eps) IS NOT NULL
                 """, self.db.conn, params=[fiscal_year, q])
         except Exception as exc:
             return pd.DataFrame([{"market": "ERROR", "coverage_status": "FAIL", "fail_reason": str(exc)}])
@@ -10447,6 +10393,7 @@ class EPSForecastEngine:
         if "eps_calc_method" not in write.columns:
             write["eps_calc_method"] = "Q4_CUMULATIVE_AS_ANNUAL_EPS"
         for c, default in {
+            "market_type": "",
             "source_type": source_label or "OFFICIAL_ANNUAL_EPS",
             "source_url": "",
             "source_file": "",
@@ -10455,17 +10402,32 @@ class EPSForecastEngine:
         }.items():
             if c not in write.columns:
                 write[c] = default
+        write["market_type"] = write["market_type"].map(normalize_market_type)
+        if write["market_type"].eq("").any():
+            try:
+                with self.db.lock:
+                    market_map_df = pd.read_sql_query("SELECT stock_id, market FROM stocks_master WHERE is_active=1", self.db.conn)
+                market_map = _r5n8c_build_market_map(market_map_df)
+                miss = write["market_type"].eq("")
+                write.loc[miss, "market_type"] = write.loc[miss, "stock_id"].map(market_map).fillna("")
+            except Exception:
+                pass
         write = write.dropna(subset=["stock_id", "eps_full_year"])
         write = write[write["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)]
-        write = write[["stock_id", "fiscal_year", "fiscal_year_roc", "quarter", "eps_full_year", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_file", "source_date", "update_time"]].drop_duplicates(["stock_id", "fiscal_year"], keep="last")
+        write = write[["stock_id", "fiscal_year", "market_type", "fiscal_year_roc", "quarter", "eps_full_year", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_file", "source_date", "update_time"]].drop_duplicates(["stock_id", "fiscal_year"], keep="last")
         if write.empty:
             return 0
         with self.db.lock:
             cur = self.db.conn.cursor()
+            try:
+                cur.execute("ALTER TABLE annual_eps_history ADD COLUMN market_type TEXT")
+            except Exception:
+                pass
             cur.executemany("""
-                INSERT INTO annual_eps_history(stock_id, fiscal_year, fiscal_year_roc, quarter, eps_full_year, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_file, source_date, update_time)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO annual_eps_history(stock_id, fiscal_year, market_type, fiscal_year_roc, quarter, eps_full_year, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_file, source_date, update_time)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                    market_type=CASE WHEN COALESCE(excluded.market_type,'')<>'' THEN excluded.market_type ELSE annual_eps_history.market_type END,
                     fiscal_year_roc=excluded.fiscal_year_roc,
                     quarter=excluded.quarter,
                     eps_full_year=excluded.eps_full_year,
@@ -10590,6 +10552,7 @@ class EPSForecastEngine:
         out = pd.DataFrame({
             "stock_id": x["stock_id"].astype(str),
             "stock_name": x["stock_name"].astype(str).str.strip() if "stock_name" in x.columns else "",
+            "market_type": x["market_type"].map(normalize_market_type) if "market_type" in x.columns else (x["source_type"].map(normalize_market_type) if "source_type" in x.columns else ""),
             "fiscal_year": fiscal_year,
             "fiscal_year_roc": fiscal_year - 1911,
             "quarter": 4,
@@ -10633,15 +10596,21 @@ class EPSForecastEngine:
         result = {"status": "skip", "rows": 0, "source": "OFFICIAL_EPS_OPENAPI_Q4_ANNUAL_EPS", "message": ""}
         try:
             with self.db.lock:
-                row = self.db.conn.cursor().execute(
-                    "SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
-                    (fiscal_year,)
-                ).fetchone()
-                existing = int(row[0] or 0) if row else 0
-            if existing > 0 and not force:
-                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                existing_df = pd.read_sql_query("""
+                    SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                    FROM annual_eps_history
+                    WHERE fiscal_year=? AND eps_full_year IS NOT NULL
+                    GROUP BY COALESCE(market_type,'')
+                """, self.db.conn, params=[fiscal_year])
+                existing = int(existing_df["cnt"].sum()) if existing_df is not None and not existing_df.empty else 0
+                existing_by_market = {normalize_market_type(r.get("market_type")) or "unknown": int(r.get("cnt") or 0) for _, r in existing_df.iterrows()} if existing_df is not None and not existing_df.empty else {}
+            # R5N8C：不能只因 annual_eps_history 有上市資料就跳過；必須上市/上櫃都有年度基準才算 exists。
+            if existing > 0 and not force and existing_by_market.get("sii", 0) > 0 and existing_by_market.get("otc", 0) > 0:
+                result.update({"status": "exists", "rows": existing, "message": f"annual_eps_history 已有分市場資料 {existing_by_market}"})
                 trace.success("AnnualEPS", "OfficialOpenAPI_Q4", "VERIFY", target_table="annual_eps_history", verify_count=existing, source_date=f"{fiscal_year}Q4")
                 return result
+            if existing > 0 and not force:
+                log_warning(f"[R5N8C][ANNUAL_EPS_MARKET_GAP] fiscal_year={fiscal_year} existing_by_market={existing_by_market}，仍繼續補缺市場")
 
             # 先嘗試建立 Q1~Q4 的 official_eps_openapi cache 與 quarterly_financial_history。
             q_results = self.ensure_official_eps_openapi_quarters(fiscal_year, quarters=(1, 2, 3, 4), force=force)
@@ -15500,7 +15469,12 @@ class FinancialFeatureEngine:
         all_df = all_df.sort_values(["stock_id", "revenue_month", "_priority"]).drop_duplicates(subset=["stock_id", "revenue_month"], keep="first")
         latest = sorted(all_df["revenue_month"].astype(str).unique().tolist())[-1]
         out = all_df[all_df["revenue_month"].astype(str).eq(latest)].copy()
-        out = out.drop_duplicates(subset=["stock_id"], keep="first")
+        try:
+            master = self.db.read_table("stocks_master", limit=None)
+            out = _r5n8c_prepare_external_latest_df(out, master, table_name="EPS_MATRIX_REVENUE_HISTORY", order_col="revenue_month")
+        except Exception as _r5n8c_rev_exc:
+            log_warning(f"[R5N8C][EPS_MATRIX_REVENUE_DEDUP_FAIL] {latest}｜{_r5n8c_rev_exc}")
+            out = out.drop_duplicates(subset=["stock_id"], keep="first")
         log_info(f"[EPS MATRIX][REVENUE_HISTORY_FALLBACK] latest_month={latest} rows={len(out)} source_tables={sorted(out.get('source_table', pd.Series(dtype=str)).astype(str).unique().tolist())}")
         return out
 
