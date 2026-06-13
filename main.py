@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.9-R5N8C_CLASSIFICATION_EPS_PREBREAKOUT_DATA_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.10-R5N8D_INDEX04_REVENUE_CLOSED_LOOP_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -5696,7 +5696,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N8C_CLASSIFICATION_EPS_PREBREAKOUT_DATA_FIX_20260613"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N8D_INDEX04_REVENUE_CLOSED_LOOP_FIX_20260613"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -6059,6 +6059,37 @@ def _r5n7d_save_df_csv(df: pd.DataFrame, path: Path, stage: str, month: str, mar
         log_warning(f"[R5N7D][CSV_WRITE_FAIL] stage={stage} month={month} market={market_type} file={path}｜{exc}")
         return None
 
+def _r5n8d_write_official_source_gate_csv(month: str, gate_df: pd.DataFrame | None, gate_name: str = "index04") -> Path | None:
+    """R5N8D：輸出官方資料來源 Gate CSV。
+    專門讓現場查核：download / unzip / parse / cache / db / report 是否閉環。
+    """
+    try:
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            m = str(month or "unknown")
+        if gate_df is None or gate_df.empty:
+            return None
+        out_dir = TWSE_INDEX04_GATE_REPORT_DIR / m
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_\-]", "_", str(gate_name or "gate"))[:60]
+        out = out_dir / f"{m}_{safe_name}_gate.csv"
+        gate_df.to_csv(out, index=False, encoding="utf-8-sig")
+        _r5n7d_append_manifest({
+            "stage": "official_source_gate",
+            "revenue_month": m,
+            "market_type": "all",
+            "source_key": safe_name,
+            "path": str(out),
+            "rows": int(len(gate_df)),
+            "bytes": int(out.stat().st_size) if out.exists() else 0,
+            "status": "PASS",
+        })
+        log_info(f"[R5N8D][OFFICIAL_SOURCE_GATE][WRITE] month={m} gate={safe_name} rows={len(gate_df)} file={out}")
+        return out
+    except Exception as exc:
+        log_warning(f"[R5N8D][OFFICIAL_SOURCE_GATE][WRITE_FAIL] month={month} gate={gate_name}｜{exc}")
+        return None
+
 def _r5n7d_is_revenue_not_due(month: str, today: datetime | None = None) -> bool:
     """月報未到期判斷。對 YYYYMM，下一月10日以前不應列 FAIL。"""
     m = RevenueAccelerationEngine.normalize_month(month)
@@ -6242,6 +6273,13 @@ TWSE_INDEX04_BACKEND_REPORT_TYPE = "C"  # backward compatibility only
 TWSE_INDEX04_BACKEND_DELETE_ZIP_AFTER_EXTRACT = False  # R5N3：保留 ZIP 供本機查核，避免「本機什麼都沒有」。
 TWSE_INDEX04_ALL_REPORTS_CACHE_DIR = REVENUE_CACHE_DIR / "index04_monthly_reports"
 TWSE_INDEX04_ALL_REPORTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# R5N8D_INDEX04_REVENUE_CLOSED_LOOP_FIX_20260613:
+# Official Source Gate 與 C04003 parser 門檻。
+# 目的：避免只下載 raw ZIP 就宣稱完成；必須通過 download/parse/cache/db/report 檢查。
+TWSE_INDEX04_C04003_MIN_VALID_ROWS = int(os.getenv("GTC_INDEX04_C04003_MIN_VALID_ROWS", "900") or "900")
+TWSE_INDEX04_GATE_REPORT_DIR = REVENUE_CACHE_DIR / "official_source_gate"
+TWSE_INDEX04_GATE_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
 # 舊 hard-code staticFiles URL 保留為最後備援，主流程不得優先使用。
 TWSE_INDEX04_C04003_URL_TEMPLATES = [
     "https://www.twse.com.tw/rwd/zh/statistics/count?l1=上市公司月報&l2=【國內上市公司營業收入彙總表】月報&url=/staticFiles/inspection/inspection/04/003/{month}_C04003.zip",
@@ -7749,11 +7787,15 @@ class RevenueOpenAPICacheDownloader:
             extracted = []
             if zip_path is not None and Path(zip_path).exists():
                 extracted = self._extract_twse_index04_report_zip(Path(zip_path), m, code)
+            zip_ok = bool(zip_path is not None and Path(zip_path).exists())
+            zip_bytes = int(Path(zip_path).stat().st_size) if zip_ok else 0
             rows.append({
                 "月份": m,
                 "報表代號": code,
                 "報表名稱": str(info.get("name") or ""),
-                "下載狀態": "PASS" if zip_path is not None and Path(zip_path).exists() else "FAIL",
+                "下載狀態": "PASS" if zip_ok else "FAIL",
+                "ZIP_PK驗證": "PASS" if zip_ok and self._is_valid_zip_bytes(Path(zip_path).read_bytes()) else ("FAIL" if not zip_ok else "WARN"),
+                "ZIP大小bytes": zip_bytes,
                 "ZIP路徑": str(zip_path or ""),
                 "解壓檔數": len(extracted),
                 "解壓路徑": str((TWSE_INDEX04_ALL_REPORTS_CACHE_DIR / m / code) if extracted else ""),
@@ -7766,6 +7808,7 @@ class RevenueOpenAPICacheDownloader:
             out = TWSE_INDEX04_ALL_REPORTS_CACHE_DIR / m / f"index04_all_reports_{m}.csv"
             out.parent.mkdir(parents=True, exist_ok=True)
             manifest.to_csv(out, index=False, encoding="utf-8-sig")
+            _r5n8d_write_official_source_gate_csv(m, manifest, "index04_all_reports_download")
             log_info(f"[R5N3][TWSE_INDEX04][ALL_REPORTS_MANIFEST] month={m} file={out}")
         except Exception as exc:
             log_warning(f"[R5N3][TWSE_INDEX04][ALL_REPORTS_MANIFEST_FAIL] month={m}｜{exc}")
@@ -7957,8 +8000,44 @@ class RevenueOpenAPICacheDownloader:
             })
         out = pd.DataFrame(rows)
         if out.empty:
+            try:
+                debug_dir = TWSE_INDEX04_GATE_REPORT_DIR / m
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                (debug_dir / f"{m}_C04003_parse_zero_rows.txt").write_text(
+                    f"excel_path={excel_path}\nsource_url={source_url}\nraw_shape={getattr(raw, 'shape', '')}\n",
+                    encoding="utf-8"
+                )
+            except Exception:
+                pass
             return out
         out = out.drop_duplicates(["stock_id", "revenue_month"], keep="last")
+        valid_rows = int(len(out))
+        if valid_rows < TWSE_INDEX04_C04003_MIN_VALID_ROWS:
+            try:
+                debug_dir = TWSE_INDEX04_GATE_REPORT_DIR / m
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                reject_path = debug_dir / f"{m}_C04003_parse_rejected_rows.csv"
+                out.to_csv(reject_path, index=False, encoding="utf-8-sig")
+                (debug_dir / f"{m}_C04003_parse_rejected_reason.txt").write_text(
+                    f"valid_rows={valid_rows}\nmin_required={TWSE_INDEX04_C04003_MIN_VALID_ROWS}\nexcel_path={excel_path}\nsource_url={source_url}\n",
+                    encoding="utf-8"
+                )
+            except Exception:
+                pass
+            log_warning(f"[R5N8D][TWSE_INDEX04][C04003_PARSE_REJECT] month={m} rows={valid_rows} min={TWSE_INDEX04_C04003_MIN_VALID_ROWS} file={excel_path}")
+            return pd.DataFrame()
+        gate_df = pd.DataFrame([{
+            "月份": m,
+            "報表代號": "C04003",
+            "階段": "PARSE",
+            "狀態": "PASS",
+            "有效筆數": valid_rows,
+            "最低門檻": TWSE_INDEX04_C04003_MIN_VALID_ROWS,
+            "來源檔案": str(excel_path),
+            "來源網址": source_url,
+            "輸出時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }])
+        _r5n8d_write_official_source_gate_csv(m, gate_df, "c04003_parse")
         return out[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
 
     def download_twse_index04_c04003_month_cache(self, target_month: str) -> pd.DataFrame:
@@ -8037,11 +8116,16 @@ class RevenueOpenAPICacheDownloader:
         summary_rows = []
         data_parts = []
         for mm in norm_months:
-            cache_path = self.cache_path_for_month(mm)
-            source = "CACHE"
+            cache_path = self.monthly_cache_path(mm, "sii")
+            legacy_cache_path = self.cache_path_for_month(mm)
+            source = "CACHE_SII_FINAL"
             df = pd.DataFrame()
-            if (not force_download) and cache_path.exists() and cache_path.stat().st_size > 0:
-                df = self.load_month_cache(mm)
+            if not force_download:
+                df = self.read_month_cache(mm, "sii")
+                if df is None or df.empty:
+                    source = "CACHE_LEGACY_ALL"
+                    if legacy_cache_path.exists() and legacy_cache_path.stat().st_size > 0:
+                        df = self.load_month_cache(mm)
             if df is None or df.empty:
                 source = "TWSE_INDEX04_C04003"
                 df = self.download_twse_index04_c04003_month_cache(mm)
@@ -8055,12 +8139,14 @@ class RevenueOpenAPICacheDownloader:
                 "資料筆數": rows,
                 "來源": source,
                 "Cache檔案": str(cache_path),
+                "Legacy相容Cache": str(legacy_cache_path),
+                "NormalizedCache": str(self.normalized_cache_path(mm, "sii")),
                 "說明": "已建立逐月Cache" if rows > 0 else ("月報未到期，非缺資料" if status == "NOT_DUE" else "未取得有效 C04003 月營收資料"),
                 "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
         combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if data_parts else pd.DataFrame()
         if write_db and db is not None and combined is not None and not combined.empty:
-            inserted = self.upsert_external_revenue_history(db, combined, append_only=True)
+            inserted = self.upsert_external_revenue_history(db, combined, append_only=False)
             for row in summary_rows:
                 row["DB寫入模式"] = "INSERT_OR_IGNORE"
                 row["DB寫入總筆數"] = inserted
@@ -8153,7 +8239,13 @@ class RevenueOpenAPICacheDownloader:
             return 0
 
     def validate_selected_revenue_months(self, months: list[str], db: DBManager | None = None) -> pd.DataFrame:
-        """R5N：驗證 UI 選取月份的 Cache 與 DB 覆蓋情況。"""
+        """R5N8D：驗證 UI 選取月份的 final cache / normalized cache / DB 閉環。
+
+        注意：
+        - SII 上市月營收應由 TWSE Index04 C04003 建立。
+        - OTC 上櫃月營收不是 Index04 範圍；僅列示既有 MOPS/TPEX 閉環狀態，不將其誤判為 Index04 缺口。
+        - legacy revenue_YYYYMM.csv 僅為相容輸出，不再作為正式 PASS 的唯一依據。
+        """
         norm_months = []
         for m in (months or []):
             mm = RevenueAccelerationEngine.normalize_month(m)
@@ -8161,32 +8253,72 @@ class RevenueOpenAPICacheDownloader:
                 norm_months.append(mm)
         rows = []
         for mm in norm_months:
-            cache_path = self.cache_path_for_month(mm)
-            cache_df = self.load_month_cache(mm) if cache_path.exists() else pd.DataFrame()
-            cache_rows = int(len(cache_df)) if cache_df is not None else 0
-            db_rows = 0
+            legacy_cache_path = self.cache_path_for_month(mm)
+            sii_cache_path = self.monthly_cache_path(mm, "sii")
+            otc_cache_path = self.monthly_cache_path(mm, "otc")
+            norm_sii_path = self.normalized_cache_path(mm, "sii")
+            norm_otc_path = self.normalized_cache_path(mm, "otc")
+            sii_cache_df = self.read_month_cache(mm, "sii")
+            otc_cache_df = self.read_month_cache(mm, "otc")
+            legacy_cache_df = self.load_month_cache(mm) if legacy_cache_path.exists() else pd.DataFrame()
+            sii_cache_rows = int(len(sii_cache_df)) if sii_cache_df is not None else 0
+            otc_cache_rows = int(len(otc_cache_df)) if otc_cache_df is not None else 0
+            legacy_rows = int(len(legacy_cache_df)) if legacy_cache_df is not None else 0
+            db_rows = db_sii_rows = db_otc_rows = 0
             if db is not None:
                 try:
                     with db.lock:
-                        row = db.conn.cursor().execute(
+                        cur = db.conn.cursor()
+                        row = cur.execute(
                             "SELECT COUNT(*) FROM external_revenue_history WHERE revenue_month=? AND COALESCE(revenue,0)>0",
                             (mm,)
                         ).fetchone()
-                    db_rows = int(row[0] or 0) if row else 0
+                        db_rows = int(row[0] or 0) if row else 0
+                        row = cur.execute(
+                            "SELECT COUNT(*) FROM external_revenue_history WHERE revenue_month=? AND COALESCE(revenue,0)>0 AND COALESCE(market_type,'')='sii'",
+                            (mm,)
+                        ).fetchone()
+                        db_sii_rows = int(row[0] or 0) if row else 0
+                        row = cur.execute(
+                            "SELECT COUNT(*) FROM external_revenue_history WHERE revenue_month=? AND COALESCE(revenue,0)>0 AND COALESCE(market_type,'')='otc'",
+                            (mm,)
+                        ).fetchone()
+                        db_otc_rows = int(row[0] or 0) if row else 0
                 except Exception as exc:
-                    log_warning(f"[R5N][VALIDATE_DB_FAIL] month={mm}｜{exc}")
-            pass_flag = cache_rows > 0 and (db is None or db_rows > 0)
-            not_due = _r5n7d_is_revenue_not_due(mm) and not pass_flag
+                    log_warning(f"[R5N8D][VALIDATE_DB_FAIL] month={mm}｜{exc}")
+            sii_pass = sii_cache_rows > 0 and (db is None or db_sii_rows > 0)
+            otc_pass = otc_cache_rows > 0 and (db is None or db_otc_rows > 0)
+            not_due = _r5n7d_is_revenue_not_due(mm) and not sii_pass
             rows.append({
                 "月份": mm,
-                "Cache檔案": str(cache_path),
-                "Cache存在": "YES" if cache_path.exists() and cache_path.stat().st_size > 0 else "NO",
-                "Cache有效筆數": cache_rows,
-                "DB有效筆數": db_rows,
-                "驗收結果": "PASS" if pass_flag else ("NOT_DUE" if not_due else "FAIL"),
-                "驗收說明": "Cache與DB均有有效月營收" if pass_flag else ("月報未到期，應等待MOPS即時公告或下月10日後正式月報" if not_due else "缺少Cache或DB有效資料"),
+                "SII_FinalCache": str(sii_cache_path),
+                "SII_FinalCache存在": "YES" if sii_cache_path.exists() and sii_cache_path.stat().st_size > 0 else "NO",
+                "SII_NormalizedCache": str(norm_sii_path),
+                "SII_NormalizedCache存在": "YES" if norm_sii_path.exists() and norm_sii_path.stat().st_size > 0 else "NO",
+                "SII_Cache有效筆數": sii_cache_rows,
+                "SII_DB有效筆數": db_sii_rows,
+                "SII驗收結果": "PASS" if sii_pass else ("NOT_DUE" if not_due else "FAIL"),
+                "OTC_FinalCache": str(otc_cache_path),
+                "OTC_FinalCache存在": "YES" if otc_cache_path.exists() and otc_cache_path.stat().st_size > 0 else "NO",
+                "OTC_NormalizedCache": str(norm_otc_path),
+                "OTC_NormalizedCache存在": "YES" if norm_otc_path.exists() and norm_otc_path.stat().st_size > 0 else "NO",
+                "OTC_Cache有效筆數": otc_cache_rows,
+                "OTC_DB有效筆數": db_otc_rows,
+                "OTC驗收結果": "PASS" if otc_pass else ("NOT_DUE" if _r5n7d_is_revenue_not_due(mm) else "WARN"),
+                "Legacy相容Cache": str(legacy_cache_path),
+                "Legacy有效筆數": legacy_rows,
+                "Cache有效筆數合計": sii_cache_rows + otc_cache_rows,
+                "DB有效筆數合計": db_rows,
+                "驗收結果": "PASS" if sii_pass else ("NOT_DUE" if not_due else "FAIL"),
+                "驗收說明": "SII final/normalized cache 與 DB 均有有效月營收" if sii_pass else ("月報未到期，非正式月報缺失" if not_due else "缺少SII final cache或DB有效資料"),
             })
-        return pd.DataFrame(rows)
+        out_df = pd.DataFrame(rows)
+        try:
+            for mm in norm_months:
+                _r5n8d_write_official_source_gate_csv(mm, out_df[out_df["月份"].astype(str).eq(mm)].copy(), "revenue_cache_db_validate")
+        except Exception:
+            pass
+        return out_df
 
     def download_mops_history_month_cache(self, target_month: str) -> pd.DataFrame:
         """R4F：補指定歷史月份月營收（例如 202602/202603）。
@@ -20063,8 +20195,12 @@ class AppUI:
                         }]).to_excel(writer, sheet_name="00_摘要", index=False)
                         summary.to_excel(writer, sheet_name="01_下載Cache結果", index=False)
                         validate_df.to_excel(writer, sheet_name="02_逐月驗收", index=False)
+                        try:
+                            RevenueCacheManager().health_df(months).to_excel(writer, sheet_name="03_Cache閉環健康", index=False)
+                        except Exception:
+                            pass
                         if isinstance(combined, pd.DataFrame) and not combined.empty:
-                            combined.head(5000).to_excel(writer, sheet_name="03_營收資料樣本", index=False)
+                            combined.head(5000).to_excel(writer, sheet_name="04_營收資料樣本", index=False)
                 self.last_revenue_cache_report_path = Path(out_path)
                 if hasattr(self, "highgrowth_status_var"):
                     self.ui_call(self.highgrowth_status_var.set, f"歷史營收下載完成：{months[0]}~{months[-1]}｜PASS {pass_count}/{len(months)}｜{out_path}")
