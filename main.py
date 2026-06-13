@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.10-R5N8D_INDEX04_REVENUE_CLOSED_LOOP_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.11-R5N8F_REVENUE_LOCAL_CACHE_CLOSED_LOOP_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -6121,16 +6121,32 @@ def _r5n7d_exclude_non_revenue_universe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_market_type(value) -> str:
+    """R5N8F：市場別正規化。
+
+    修正 R5N8D 重大誤判：舊版使用 ``"_o" in low`` 判斷 OTC，
+    導致檔名/路徑如 ``revenue_openapi_20260613...`` 因含 ``_o`` 被整批誤標為 otc。
+    本版只接受明確市場字串、資料夾分隔或官方 endpoint 代碼判斷。
+    """
     s = str(value or "").strip()
     if not s:
         return ""
     if s in MARKET_TYPE_MAP:
         return MARKET_TYPE_MAP[s]
-    low = s.lower()
-    if "otc" in low or "上櫃" in s or "tpex" in low or "_o" in low:
+    low = s.lower().replace("\\", "/")
+
+    # 明確資料夾/欄位/中文市場別。
+    if low in ("otc", "上櫃") or "/otc/" in low or low.endswith("_otc.csv") or low.endswith("_otc"):
         return "otc"
-    if "sii" in low or "上市" in s or "twse" in low or "_l" in low:
+    if low in ("sii", "上市") or "/sii/" in low or low.endswith("_sii.csv") or low.endswith("_sii"):
         return "sii"
+
+    # 官方 OpenAPI / 模組標籤，必須精準到 endpoint 或 label。
+    if "tpex" in low or "mopsfin_t187ap05_o" in low or "t187ap05_o" in low or "t187ap06_o" in low or "tpex_revenue_o" in low or "tpex_revenue_r" in low:
+        return "otc"
+    if "twse" in low or "t187ap05_l" in low or "t187ap06_l" in low or "twse_revenue_l" in low or "index04_c04003" in low or "c04003" in low:
+        return "sii"
+
+    # 禁止再用 generic '_o' / '_l'，避免 revenue_openapi 被誤判。
     return ""
 
 def market_type_to_label(value) -> str:
@@ -7105,15 +7121,17 @@ class R5N6FinalSafeIntegrator:
         rows = []
         for _, r in df.iterrows():
             rows.append((
-                normalize_stock_id(r.get("stock_id")), str(r.get("revenue_month")), float(r.get("revenue")),
+                normalize_stock_id(r.get("stock_id")), str(r.get("revenue_month")),
+                normalize_market_type(r.get("market_type", "") or r.get("source_type", "") or r.get("source_url", "")),
+                float(r.get("revenue")),
                 self._safe_float(r.get("mom"), default=np.nan), self._safe_float(r.get("yoy"), default=np.nan),
                 self._safe_float(r.get("cumulative_revenue"), default=np.nan), self._safe_float(r.get("cumulative_yoy"), default=np.nan),
                 str(r.get("source_url", "")), str(r.get("source_date", "")), str(r.get("source_type", "")),
                 str(r.get("update_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))),
             ))
         sql = """
-            INSERT INTO external_revenue_history(stock_id,revenue_month,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_url,source_date,source_type,update_time)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO external_revenue_history(stock_id,revenue_month,market_type,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_url,source_date,source_type,update_time)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(stock_id, revenue_month) DO UPDATE SET
                 market_type=CASE WHEN COALESCE(external_revenue_history.market_type,'')='' THEN excluded.market_type ELSE external_revenue_history.market_type END,
                 revenue=CASE WHEN COALESCE(external_revenue_history.revenue,0)<=0 THEN excluded.revenue ELSE external_revenue_history.revenue END,
@@ -7283,6 +7301,61 @@ class RevenueOpenAPICacheDownloader:
             raise ValueError(f"invalid revenue month: {month}")
         return self.monthly_cache_dir / f"revenue_{m}.csv"
 
+    def monthly_cache_path(self, month: str, market_type: str | None = None) -> Path:
+        """R5N8F：補回 RevenueCacheManager 同名方法。
+
+        R5N8D 將 write_month_cache / ensure_c04003_revenue_cache 改為呼叫
+        self.monthly_cache_path(...)，但 RevenueOpenAPICacheDownloader 類別未定義，
+        造成 UI 下載歷史營收直接 AttributeError。
+        """
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            raise ValueError(f"invalid revenue month: {month}")
+        mt = normalize_market_type(market_type)
+        if mt == "sii":
+            return REVENUE_CACHE_SII_DIR / f"revenue_{m}_sii.csv"
+        if mt == "otc":
+            return REVENUE_CACHE_OTC_DIR / f"revenue_{m}_otc.csv"
+        return self.cache_path_for_month(m)
+
+    def normalized_cache_path(self, month: str, market_type: str | None = None) -> Path:
+        """R5N8F：補回 normalized cache path，讓寫檔能落到本機。"""
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            raise ValueError(f"invalid revenue month: {month}")
+        mt = normalize_market_type(market_type)
+        if mt in ("sii", "otc"):
+            return _r5n7d_revenue_pipeline_dir("normalized", mt) / f"revenue_{m}_{mt}_normalized.csv"
+        return REVENUE_NORMALIZED_CACHE_DIR / f"revenue_{m}_normalized.csv"
+
+    def read_month_cache(self, month: str, market_type: str | None = None) -> pd.DataFrame:
+        """R5N8F：讀取 final/normalized/legacy cache，供 ensure/validate 共用。"""
+        m = RevenueAccelerationEngine.normalize_month(month)
+        if not m:
+            return pd.DataFrame()
+        mt = normalize_market_type(market_type)
+        if mt in ("sii", "otc"):
+            paths = [self.monthly_cache_path(m, mt), self.normalized_cache_path(m, mt)]
+        else:
+            paths = [
+                self.monthly_cache_path(m, "sii"), self.monthly_cache_path(m, "otc"),
+                self.cache_path_for_month(m), self.normalized_cache_path(m, None),
+            ]
+        parts = []
+        for p in paths:
+            try:
+                p = Path(p)
+                if p.exists() and p.stat().st_size > 0:
+                    raw = safe_read_csv_auto(p)
+                    x = self._normalize_month_cache_df(raw, m, source_url="OFFICIAL_MONTHLY_CACHE:" + str(p))
+                    if x is not None and not x.empty:
+                        parts.append(x)
+            except Exception as exc:
+                log_warning(f"[R5N8F][REVENUE_CACHE_READ_FAIL] month={m} market={mt or 'all'} file={p}｜{exc}")
+        if not parts:
+            return pd.DataFrame()
+        return pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+
     def _emit_cache_trace(self, month: str, stage: str, status: str, rows: int = 0, cache_path: Path | None = None, reason_code: str = "", reason_detail: str = ""):
         try:
             if self.trace_engine is not None:
@@ -7325,9 +7398,14 @@ class RevenueOpenAPICacheDownloader:
             x["source_date"] = f"{m[:4]}-{m[4:6]}"
         if "source_url" not in x.columns:
             x["source_url"] = source_url
+        # R5N8F：保留資料列原本 market_type；若缺漏才由明確來源推斷。
+        # 不可再因 source_url 檔名含 revenue_openapi 而整批變 otc。
         if "market_type" not in x.columns:
-            x["market_type"] = normalize_market_type(source_url)
+            x["market_type"] = ""
         x["market_type"] = x["market_type"].map(normalize_market_type)
+        inferred_market_type = normalize_market_type(source_url)
+        if inferred_market_type:
+            x.loc[x["market_type"].astype(str).eq(""), "market_type"] = inferred_market_type
         if "update_time" not in x.columns:
             x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         x = x[(x["stock_id"].astype(str).ne("")) & x["revenue_month"].eq(m) & (x["revenue"] > 0)].copy()
@@ -8214,6 +8292,7 @@ class RevenueOpenAPICacheDownloader:
                 source_url, source_date, update_time
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(stock_id, revenue_month) DO UPDATE SET
+                market_type=CASE WHEN COALESCE(external_revenue_history.market_type,'')='' THEN excluded.market_type ELSE external_revenue_history.market_type END,
                 revenue=CASE WHEN COALESCE(external_revenue_history.revenue,0)<=0 THEN excluded.revenue ELSE external_revenue_history.revenue END,
                 mom=CASE WHEN external_revenue_history.mom IS NULL THEN excluded.mom ELSE external_revenue_history.mom END,
                 yoy=CASE WHEN external_revenue_history.yoy IS NULL THEN excluded.yoy ELSE external_revenue_history.yoy END,
@@ -8351,6 +8430,18 @@ class RevenueOpenAPICacheDownloader:
                     _r5n7d_append_manifest({"stage": "raw", "source_key": "mops_t21sc03", "revenue_month": m, "market_type": normalize_market_type(typek), "path": str(raw_mops_file), "bytes": int(raw_mops_file.stat().st_size), "status": "PASS", "request_url": url})
                 except Exception as raw_exc:
                     log_warning(f"[R5N7D][REVENUE_RAW_MOPS_SAVE_FAIL] month={m} market={typek}｜{raw_exc}")
+                # R5N8F：MOPS 可能回傳 HTTP 200 但內容是安全阻擋頁，不能當成功 raw。
+                security_block_markers = [
+                    "FOR SECURITY REASONS",
+                    "PAGE CAN NOT BE ACCESSED",
+                    "因為安全性考量",
+                    "錯誤代碼",
+                ]
+                if any(marker in html for marker in security_block_markers):
+                    errors.append(f"{market_label}:{m}:MOPS_SECURITY_BLOCK")
+                    self._emit_cache_trace(m, "DOWNLOAD", "FAIL", 0, raw_mops_file if 'raw_mops_file' in locals() else None, "MOPS_SECURITY_BLOCK", "MOPS returned security block page; raw saved for evidence")
+                    _r5n7d_append_manifest({"stage": "raw_validate", "source_key": "mops_t21sc03", "revenue_month": m, "market_type": normalize_market_type(typek), "path": str(raw_mops_file) if 'raw_mops_file' in locals() else "", "bytes": len(html.encode('utf-8', errors='ignore')), "status": "FAIL", "fail_reason": "MOPS_SECURITY_BLOCK", "request_url": url})
+                    continue
                 if not html.strip() or ("查無資料" in html and "公司代號" not in html):
                     errors.append(f"{market_label}:{m}:empty_html")
                     continue
