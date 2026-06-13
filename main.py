@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.6-R5N7B_EPS_CACHE_MARKET_SPLIT_FINAL_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.7-R5N7D_REVENUE_PIPELINE_CONSISTENCY_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -5661,7 +5661,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N7B_EPS_CACHE_MARKET_SPLIT_FINAL_FIX_20260612"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N7D_REVENUE_PIPELINE_CONSISTENCY_FIX_20260613"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -5942,6 +5942,117 @@ for _revenue_cache_dir in (
     EPS_CACHE_DIR, EPS_CACHE_SII_DIR, EPS_CACHE_OTC_DIR,
 ):
     _revenue_cache_dir.mkdir(parents=True, exist_ok=True)
+
+# R5N7D_REVENUE_PIPELINE_CONSISTENCY_FIX_20260613:
+# 統一月營收資料管線路徑與來源追溯。
+# 原則：raw 保留官方原始回應；normalized 保留清洗後中間檔；sii/otc 為正式可讀取 cache；archive 保留覆蓋前版本。
+def _r5n7d_revenue_pipeline_dir(stage: str, market_type: str | None = None, source_key: str = "") -> Path:
+    stage = str(stage or "").strip().lower()
+    mt = normalize_market_type(market_type)
+    root_map = {
+        "raw": REVENUE_RAW_CACHE_DIR,
+        "normalized": REVENUE_NORMALIZED_CACHE_DIR,
+        "archive": REVENUE_ARCHIVE_CACHE_DIR,
+        "final": REVENUE_CACHE_DIR,
+    }
+    root = root_map.get(stage, REVENUE_CACHE_DIR)
+    if mt in ("sii", "otc"):
+        root = root / mt
+    if source_key:
+        root = root / re.sub(r"[^A-Za-z0-9_\-]", "_", str(source_key))[:60]
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+def _r5n7d_archive_existing_file(path: Path, reason: str = "overwrite") -> Path | None:
+    try:
+        p = Path(path)
+        if not p.exists() or p.stat().st_size <= 0:
+            return None
+        mt = normalize_market_type(p.name)
+        out_dir = _r5n7d_revenue_pipeline_dir("archive", mt)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = out_dir / f"{p.stem}_{reason}_{stamp}{p.suffix}"
+        shutil.copy2(p, out)
+        return out
+    except Exception as exc:
+        log_warning(f"[R5N7D][ARCHIVE_FAIL] file={path}｜{exc}")
+        return None
+
+def _r5n7d_manifest_path() -> Path:
+    return REVENUE_CACHE_DIR / "data_pipeline_manifest.json"
+
+def _r5n7d_append_manifest(record: dict):
+    try:
+        path = _r5n7d_manifest_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = []
+        if path.exists() and path.stat().st_size > 0:
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    data = loaded
+            except Exception:
+                data = []
+        rec = dict(record or {})
+        rec.setdefault("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        data.append(rec)
+        data = data[-2000:]
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log_warning(f"[R5N7D][MANIFEST_WRITE_FAIL] {exc}")
+
+def _r5n7d_save_df_csv(df: pd.DataFrame, path: Path, stage: str, month: str, market_type: str | None, source_key: str = "") -> Path | None:
+    try:
+        if df is None or df.empty:
+            return None
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _r5n7d_archive_existing_file(p, reason=stage)
+        df.to_csv(p, index=False, encoding="utf-8-sig")
+        _r5n7d_append_manifest({
+            "stage": stage,
+            "revenue_month": RevenueAccelerationEngine.normalize_month(month),
+            "market_type": normalize_market_type(market_type) or "all",
+            "source_key": source_key,
+            "path": str(p),
+            "rows": int(len(df)),
+            "bytes": int(p.stat().st_size) if p.exists() else 0,
+            "status": "PASS",
+        })
+        return p
+    except Exception as exc:
+        log_warning(f"[R5N7D][CSV_WRITE_FAIL] stage={stage} month={month} market={market_type} file={path}｜{exc}")
+        return None
+
+def _r5n7d_is_revenue_not_due(month: str, today: datetime | None = None) -> bool:
+    """月報未到期判斷。對 YYYYMM，下一月10日以前不應列 FAIL。"""
+    m = RevenueAccelerationEngine.normalize_month(month)
+    if not m:
+        return False
+    today = today or datetime.now()
+    y, mm = int(m[:4]), int(m[4:6])
+    due_y, due_m = y, mm + 1
+    if due_m > 12:
+        due_y += 1
+        due_m = 1
+    due_date = datetime(due_y, due_m, 10)
+    return today <= due_date
+
+def _r5n7d_exclude_non_revenue_universe(df: pd.DataFrame) -> pd.DataFrame:
+    """EPS/月營收驗證母體排除ETF與特殊商品，避免把不適用標的列為缺漏。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    sid = x.get("stock_id", pd.Series("", index=x.index)).astype(str)
+    name = x.get("stock_name", pd.Series("", index=x.index)).astype(str)
+    market = x.get("market", pd.Series("", index=x.index)).astype(str)
+    is_etf = pd.to_numeric(x.get("is_etf", pd.Series(0, index=x.index)), errors="coerce").fillna(0).astype(int) if "is_etf" in x.columns else pd.Series(0, index=x.index)
+    special = (
+        is_etf.eq(1) | market.eq("ETF") | sid.str.startswith(("00", "01", "02", "91")) |
+        name.str.contains("ETF|ETN|指數|期貨|權證|特別股|受益證券", regex=True, na=False)
+    )
+    return x.loc[~special].copy()
+
 
 def normalize_market_type(value) -> str:
     s = str(value or "").strip()
@@ -6296,7 +6407,16 @@ class RevenueCacheManager:
         self.archive_dir = REVENUE_ARCHIVE_CACHE_DIR
         self.monthly_dir = REVENUE_MONTHLY_CACHE_DIR
         self.market_dirs = {"sii": REVENUE_CACHE_SII_DIR, "otc": REVENUE_CACHE_OTC_DIR}
-        for folder in [self.cache_dir, self.raw_dir, self.normalized_dir, self.archive_dir, self.monthly_dir, REVENUE_CACHE_SII_DIR, REVENUE_CACHE_OTC_DIR, REVENUE_INDEX04_C04003_SII_DIR, REVENUE_MOPS_T21SC03_OTC_DIR]:
+        for folder in [
+            self.cache_dir, self.raw_dir, self.normalized_dir, self.archive_dir, self.monthly_dir,
+            REVENUE_CACHE_SII_DIR, REVENUE_CACHE_OTC_DIR, REVENUE_INDEX04_C04003_SII_DIR, REVENUE_MOPS_T21SC03_OTC_DIR,
+            _r5n7d_revenue_pipeline_dir("raw", "sii", "index04_c04003"),
+            _r5n7d_revenue_pipeline_dir("raw", "otc", "mops_t21sc03"),
+            _r5n7d_revenue_pipeline_dir("normalized", "sii"),
+            _r5n7d_revenue_pipeline_dir("normalized", "otc"),
+            _r5n7d_revenue_pipeline_dir("archive", "sii"),
+            _r5n7d_revenue_pipeline_dir("archive", "otc"),
+        ]:
             folder.mkdir(parents=True, exist_ok=True)
 
     def monthly_cache_path(self, month: str, market_type: str | None = None) -> Path:
@@ -6314,7 +6434,7 @@ class RevenueCacheManager:
             raise ValueError(f"invalid revenue month: {month}")
         mt = normalize_market_type(market_type)
         if mt in ("sii", "otc"):
-            return self.market_dirs[mt] / f"revenue_{m}_{mt}_normalized.csv"
+            return _r5n7d_revenue_pipeline_dir("normalized", mt) / f"revenue_{m}_{mt}_normalized.csv"
         return self.normalized_dir / f"revenue_{m}_normalized.csv"
 
     def read_month_cache(self, month: str, market_type: str | None = None) -> pd.DataFrame:
@@ -6354,6 +6474,8 @@ class RevenueCacheManager:
                 monthly_path = self.monthly_cache_path(m, mt or None)
                 normalized_path = self.normalized_cache_path(m, mt or None)
                 df = self.read_month_cache(m, mt or None)
+                raw_dir = _r5n7d_revenue_pipeline_dir("raw", mt or None) if mt else REVENUE_RAW_CACHE_DIR
+                archive_dir = _r5n7d_revenue_pipeline_dir("archive", mt or None) if mt else REVENUE_ARCHIVE_CACHE_DIR
                 rows.append({
                     "月份": m,
                     "市場": label,
@@ -6362,6 +6484,12 @@ class RevenueCacheManager:
                     "MonthlyCache存在": "YES" if monthly_path.exists() and monthly_path.stat().st_size > 0 else "NO",
                     "NormalizedCache": str(normalized_path),
                     "NormalizedCache存在": "YES" if normalized_path.exists() and normalized_path.stat().st_size > 0 else "NO",
+                    "RawDir": str(raw_dir),
+                    "Raw檔案數": len(list(raw_dir.rglob("*"))) if raw_dir.exists() else 0,
+                    "ArchiveDir": str(archive_dir),
+                    "Archive檔案數": len(list(archive_dir.rglob("*"))) if archive_dir.exists() else 0,
+                    "Manifest": str(_r5n7d_manifest_path()),
+                    "Manifest存在": "YES" if _r5n7d_manifest_path().exists() else "NO",
                     "Cache有效筆數": int(len(df)) if df is not None else 0,
                     "Cache驗收": "PASS" if df is not None and len(df) > 0 else "FAIL",
                 })
@@ -6404,9 +6532,10 @@ class RevenueCompletenessValidator:
     def _read_master(self) -> pd.DataFrame:
         try:
             with self.db.lock:
-                return pd.read_sql_query("SELECT stock_id, stock_name FROM stocks_master WHERE is_active=1", self.db.conn)
+                df = pd.read_sql_query("SELECT stock_id, stock_name, market, is_etf FROM stocks_master WHERE is_active=1", self.db.conn)
+            return _r5n7d_exclude_non_revenue_universe(df)
         except Exception:
-            return pd.DataFrame(columns=["stock_id", "stock_name"])
+            return pd.DataFrame(columns=["stock_id", "stock_name", "market", "is_etf"])
 
     def _read_revenue_source(self, table: str, months: list[str]) -> pd.DataFrame:
         try:
@@ -7051,6 +7180,14 @@ class RevenueOpenAPICacheDownloader:
         return x[keep].drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
     def write_month_cache(self, df: pd.DataFrame, month: str, source_url: str = "") -> Path | None:
+        """R5N7D：統一月營收 cache 寫入。
+
+        寫入規則：
+        1. root revenue_YYYYMM.csv 僅保留舊版相容 all cache。
+        2. final cache 一律分流到 sii/otc/revenue_YYYYMM_market.csv。
+        3. normalized cache 一律分流到 normalized/sii|otc。
+        4. 覆蓋前先複製到 archive，並寫 data_pipeline_manifest.json。
+        """
         m = RevenueAccelerationEngine.normalize_month(month)
         if not m:
             return None
@@ -7060,22 +7197,27 @@ class RevenueOpenAPICacheDownloader:
             self._emit_cache_trace(m, "CACHE_WRITE", "FAIL", 0, cache_path, "WRITE_ROWS_ZERO", "month cache rows=0 after normalize")
             return None
         try:
-            # 相容舊版：保留合併檔 revenue_YYYYMM.csv。
-            x.to_csv(cache_path, index=False, encoding="utf-8-sig")
-            # R5N7：同時拆出上市/上櫃檔，避免資料混流。
+            # 舊版相容 all cache：不得作為市場分流主來源，只作 legacy backup。
+            _r5n7d_save_df_csv(x, cache_path, "legacy_all", m, "all", source_key=str(source_url or "legacy_all"))
+            _r5n7d_save_df_csv(x, self.normalized_cache_path(m, None), "normalized_all", m, "all", source_key=str(source_url or "normalized_all"))
+
+            # 市場分流 final/normalized cache。
             for mt in ("sii", "otc"):
                 sub = x[x.get("market_type", "").astype(str).map(normalize_market_type).eq(mt)].copy() if "market_type" in x.columns else pd.DataFrame()
-                if sub is not None and not sub.empty:
-                    split_path = self.cache_path_for_month(m) if False else (REVENUE_CACHE_SII_DIR if mt == "sii" else REVENUE_CACHE_OTC_DIR) / f"revenue_{m}_{mt}.csv"
-                    split_path.parent.mkdir(parents=True, exist_ok=True)
-                    sub.to_csv(split_path, index=False, encoding="utf-8-sig")
-                    log_info(f"[R5N7][REVENUE_MARKET_CACHE][WRITE] month={m} market={mt} rows={len(sub)} file={split_path}")
+                if sub is None or sub.empty:
+                    continue
+                final_path = (REVENUE_CACHE_SII_DIR if mt == "sii" else REVENUE_CACHE_OTC_DIR) / f"revenue_{m}_{mt}.csv"
+                normalized_path = self.normalized_cache_path(m, mt)
+                _r5n7d_save_df_csv(sub, normalized_path, "normalized", m, mt, source_key=str(source_url or ""))
+                _r5n7d_save_df_csv(sub, final_path, "final", m, mt, source_key=str(source_url or ""))
+                log_info(f"[R5N7D][REVENUE_MARKET_CACHE][WRITE] month={m} market={mt} rows={len(sub)} final={final_path} normalized={normalized_path}")
+
             self._emit_cache_trace(m, "CACHE_WRITE", "PASS", len(x), cache_path)
-            log_info(f"[R5L][REVENUE_MONTH_CACHE][WRITE] month={m} rows={len(x)} file={cache_path}")
+            log_info(f"[R5N7D][REVENUE_MONTH_CACHE][WRITE] month={m} rows={len(x)} legacy={cache_path}")
             return cache_path
         except Exception as exc:
             self._emit_cache_trace(m, "CACHE_WRITE", "FAIL", 0, cache_path, "LOCAL_FILE_WRITE_FAIL", str(exc))
-            log_warning(f"[R5L][REVENUE_MONTH_CACHE][WRITE_FAIL] month={m} file={cache_path}｜{exc}")
+            log_warning(f"[R5N7D][REVENUE_MONTH_CACHE][WRITE_FAIL] month={m} file={cache_path}｜{exc}")
             return None
 
     def load_month_cache(self, month: str) -> pd.DataFrame:
@@ -7116,6 +7258,17 @@ class RevenueOpenAPICacheDownloader:
         )
         status = str(resp.status_code)
         resp.raise_for_status()
+        try:
+            raw_dir = _r5n7d_revenue_pipeline_dir("raw", normalize_market_type(url), "openapi")
+            raw_file = raw_dir / f"openapi_revenue_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
+            raw_file.write_bytes(resp.content or b"")
+            _r5n7d_append_manifest({
+                "stage": "raw", "source_key": "openapi", "market_type": normalize_market_type(url) or "all",
+                "path": str(raw_file), "bytes": int(raw_file.stat().st_size) if raw_file.exists() else 0,
+                "status": "PASS", "request_url": str(url), "http_status": status
+            })
+        except Exception as raw_exc:
+            log_warning(f"[R5N7D][REVENUE_RAW_OPENAPI_SAVE_FAIL] url={url}｜{raw_exc}")
         try:
             payload = resp.json()
         except Exception as exc:
@@ -7700,6 +7853,13 @@ class RevenueOpenAPICacheDownloader:
             log_warning(f"[R5M][TWSE_INDEX04][ZIP_FAIL] month={m}｜{zip_error}")
             return pd.DataFrame()
         try:
+            try:
+                raw_zip_dir = _r5n7d_revenue_pipeline_dir("raw", "sii", "index04_c04003")
+                raw_zip = raw_zip_dir / f"{m}_C04003.zip"
+                shutil.copy2(zip_path, raw_zip)
+                _r5n7d_append_manifest({"stage": "raw", "source_key": "index04_c04003", "revenue_month": m, "market_type": "sii", "path": str(raw_zip), "bytes": int(raw_zip.stat().st_size), "status": "PASS", "request_url": str(source_url or "")})
+            except Exception as raw_exc:
+                log_warning(f"[R5N7D][REVENUE_RAW_INDEX04_SAVE_FAIL] month={m}｜{raw_exc}")
             with zipfile.ZipFile(zip_path) as zf:
                 names = [n for n in zf.namelist() if n.lower().endswith((".xls", ".xlsx"))]
                 if not names:
@@ -7735,7 +7895,7 @@ class RevenueOpenAPICacheDownloader:
                     log_info(f"[R5N2][TWSE_INDEX04_BACKEND][ZIP_DELETED_AFTER_EXTRACT] month={m} file={zip_path}")
                 except Exception as _del_exc:
                     log_warning(f"[R5N2][TWSE_INDEX04_BACKEND][ZIP_DELETE_FAIL] month={m} file={zip_path}｜{_del_exc}")
-            return df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
+            return df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
         except Exception as exc:
             self._emit_cache_trace(m, "INDEX04_PARSE", "FAIL", 0, zip_path, "PARSE_FAILED", str(exc))
             log_warning(f"[R5M][TWSE_INDEX04][C04003_FAIL] month={m} zip={zip_path}｜{exc}")
@@ -7767,7 +7927,7 @@ class RevenueOpenAPICacheDownloader:
                 source = "TWSE_INDEX04_C04003"
                 df = self.download_twse_index04_c04003_month_cache(mm)
             rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
-            status = "PASS" if rows > 0 else "FAIL"
+            status = "PASS" if rows > 0 else ("NOT_DUE" if _r5n7d_is_revenue_not_due(mm) else "FAIL")
             if rows > 0:
                 data_parts.append(df.copy())
             summary_rows.append({
@@ -7776,7 +7936,7 @@ class RevenueOpenAPICacheDownloader:
                 "資料筆數": rows,
                 "來源": source,
                 "Cache檔案": str(cache_path),
-                "說明": "已建立逐月Cache" if rows > 0 else "未取得有效 C04003 月營收資料",
+                "說明": "已建立逐月Cache" if rows > 0 else ("月報未到期，非缺資料" if status == "NOT_DUE" else "未取得有效 C04003 月營收資料"),
                 "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
         combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if data_parts else pd.DataFrame()
@@ -7896,14 +8056,16 @@ class RevenueOpenAPICacheDownloader:
                     db_rows = int(row[0] or 0) if row else 0
                 except Exception as exc:
                     log_warning(f"[R5N][VALIDATE_DB_FAIL] month={mm}｜{exc}")
+            pass_flag = cache_rows > 0 and (db is None or db_rows > 0)
+            not_due = _r5n7d_is_revenue_not_due(mm) and not pass_flag
             rows.append({
                 "月份": mm,
                 "Cache檔案": str(cache_path),
                 "Cache存在": "YES" if cache_path.exists() and cache_path.stat().st_size > 0 else "NO",
                 "Cache有效筆數": cache_rows,
                 "DB有效筆數": db_rows,
-                "驗收結果": "PASS" if cache_rows > 0 and (db is None or db_rows > 0) else "FAIL",
-                "驗收說明": "Cache與DB均有有效月營收" if cache_rows > 0 and (db is None or db_rows > 0) else "缺少Cache或DB有效資料",
+                "驗收結果": "PASS" if pass_flag else ("NOT_DUE" if not_due else "FAIL"),
+                "驗收說明": "Cache與DB均有有效月營收" if pass_flag else ("月報未到期，應等待MOPS即時公告或下月10日後正式月報" if not_due else "缺少Cache或DB有效資料"),
             })
         return pd.DataFrame(rows)
 
@@ -7930,6 +8092,14 @@ class RevenueOpenAPICacheDownloader:
                 )
                 resp.raise_for_status()
                 html = resp.text or ""
+                try:
+                    raw_mops_dir = _r5n7d_revenue_pipeline_dir("raw", normalize_market_type(typek), "mops_t21sc03")
+                    raw_mops_file = raw_mops_dir / f"mops_t21sc03_{m}_{normalize_market_type(typek) or typek}.html"
+                    _r5n7d_archive_existing_file(raw_mops_file, reason="raw")
+                    raw_mops_file.write_text(html, encoding="utf-8")
+                    _r5n7d_append_manifest({"stage": "raw", "source_key": "mops_t21sc03", "revenue_month": m, "market_type": normalize_market_type(typek), "path": str(raw_mops_file), "bytes": int(raw_mops_file.stat().st_size), "status": "PASS", "request_url": url})
+                except Exception as raw_exc:
+                    log_warning(f"[R5N7D][REVENUE_RAW_MOPS_SAVE_FAIL] month={m} market={typek}｜{raw_exc}")
                 if not html.strip() or ("查無資料" in html and "公司代號" not in html):
                     errors.append(f"{market_label}:{m}:empty_html")
                     continue
@@ -7979,7 +8149,7 @@ class RevenueOpenAPICacheDownloader:
         batch_cache_path = self.save_cache_df(df, source_tag=f"mops_t21sc04_{m}")
         cache_path = monthly_cache_path or batch_cache_path
         df["source_url"] = "OFFICIAL_MOPS_T21SC04_HISTORY_CACHE:" + str(cache_path or f"{m}")
-        return df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
+        return df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
 
     def download_required_history_caches(self, required_months: list[str]) -> pd.DataFrame:
         """R4F：逐月補缺歷史月營收，不使用最新月資料假補。"""
@@ -9274,7 +9444,7 @@ class EPSForecastEngine:
         q = int(quarter)
         try:
             with self.db.lock:
-                master = pd.read_sql_query("SELECT stock_id, stock_name, market FROM stocks_master WHERE is_active=1", self.db.conn)
+                master = pd.read_sql_query("SELECT stock_id, stock_name, market, is_etf FROM stocks_master WHERE is_active=1", self.db.conn)
                 eps = pd.read_sql_query("""
                     SELECT stock_id, eps_quarter AS actual_q1_eps, COALESCE(source_type,'') AS source_type, COALESCE(market_type,'') AS market_type
                     FROM quarterly_financial_history
@@ -9284,7 +9454,7 @@ class EPSForecastEngine:
             return pd.DataFrame([{"market": "ERROR", "coverage_status": "FAIL", "fail_reason": str(exc)}])
         if master is None or master.empty:
             return pd.DataFrame([{"market": "ALL", "coverage_status": "FAIL", "fail_reason": "stocks_master empty"}])
-        x = master.copy()
+        x = _r5n7d_exclude_non_revenue_universe(master).copy()
         x["stock_id"] = x["stock_id"].map(normalize_stock_id)
         if eps is None:
             eps = pd.DataFrame(columns=["stock_id", "actual_q1_eps", "source_type", "market_type"])
@@ -9293,6 +9463,7 @@ class EPSForecastEngine:
         x = x.merge(eps.drop_duplicates("stock_id", keep="last"), on="stock_id", how="left")
         x["actual_q1_eps"] = pd.to_numeric(x.get("actual_q1_eps"), errors="coerce")
         x["source_type"] = x.get("source_type", "").fillna("").astype(str)
+        x.loc[x["actual_q1_eps"].notna() & x["source_type"].eq(""), "source_type"] = "DB_QUARTERLY_HISTORY"
         x["eps_market_type"] = x.get("market_type_y", x.get("market_type", "")).fillna("").astype(str).map(normalize_market_type) if "market_type_y" in x.columns or "market_type" in x.columns else ""
         x["expected_market_type"] = x["market"].astype(str).map(normalize_market_type)
         x["market_type_match"] = np.where((x["eps_market_type"].eq("")) | (x["expected_market_type"].eq("")), "UNKNOWN", np.where(x["eps_market_type"].eq(x["expected_market_type"]), "MATCH", "MISMATCH"))
@@ -11982,11 +12153,12 @@ class HighGrowthEPSEngine:
             "01B_R5N月份下載驗收": r5n_revenue_month_validation,
             "01F_營收完整性驗證": revenue_completeness_01f.head(5000) if isinstance(revenue_completeness_01f, pd.DataFrame) else pd.DataFrame(),
             "01G_RevenueCache健康度": revenue_cache_health_01f,
+            "01H_DataPipelineManifest": pd.DataFrame(json.loads(_r5n7d_manifest_path().read_text(encoding="utf-8"))) if _r5n7d_manifest_path().exists() else pd.DataFrame(),
             "01H_Hybrid覆蓋規則": hybrid_policy_01f,
             "01I_R5N6_SAFE_PATCH": r5n6_safe_patch_result.head(5000) if isinstance(r5n6_safe_patch_result, pd.DataFrame) else pd.DataFrame(),
             "02_領先預測通過黑馬池": leading_df.head(500),
             "02A_UI畫面同源候選池": ui_same_source_df.head(300),
-            "03A_上櫃EPS覆蓋率驗證": eps_otc_coverage_03a.head(5000) if isinstance(eps_otc_coverage_03a, pd.DataFrame) else pd.DataFrame(),
+            "03A_正式EPS覆蓋率驗證": eps_otc_coverage_03a.head(5000) if isinstance(eps_otc_coverage_03a, pd.DataFrame) else pd.DataFrame(),
             "03_EPS_TTM代理追蹤池": ttm_only_df.head(500),
             "04_正式EPS驗證通過": official_df.head(500),
             "04A_正式EPS驗證KPI": validation_kpi,
