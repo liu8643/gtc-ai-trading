@@ -41,6 +41,7 @@ import html as html_lib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -156,7 +157,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.7-R5N7D_REVENUE_PIPELINE_CONSISTENCY_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.8-R5N8A_REVENUE_PIPELINE_ARCHITECTURE_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3146,7 +3147,7 @@ class DBManager:
         CREATE TABLE IF NOT EXISTS external_revenue_history (
             stock_id TEXT, revenue_month TEXT, market_type TEXT, revenue REAL, mom REAL, yoy REAL, cumulative_revenue REAL, cumulative_yoy REAL,
             source_url TEXT, source_date TEXT, update_time TEXT,
-            PRIMARY KEY(stock_id, revenue_month)
+            PRIMARY KEY(stock_id, revenue_month, market_type)
         )
         """)
         # R5N4/R5N5：即時公告與完整性驗證表，支援 6/1~6/10 提前公告與 202602~202604 PASS Gate。
@@ -3245,6 +3246,7 @@ class DBManager:
         )
         """)
         self._ensure_external_schema_columns(cur)
+        self._migrate_revenue_history_market_type_pk(cur)
         for sql in [
             "CREATE INDEX IF NOT EXISTS idx_qfh_stock_quarter ON quarterly_financial_history(stock_id, fiscal_year, quarter)",
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_qfh_stock_fyq ON quarterly_financial_history(stock_id, fiscal_year_quarter)",
@@ -3563,6 +3565,64 @@ class DBManager:
             ("wave_trade_score", "wave_trade_score REAL"),
         ]:
             _add("trade_plan", col, ddl)
+
+    def _migrate_revenue_history_market_type_pk(self, cur):
+        """R5N8A：重建 external_revenue_history PK 為 (stock_id, revenue_month, market_type)。
+
+        舊版只有 (stock_id, revenue_month)，會讓上市/上櫃互相覆蓋，也會讓 legacy_all 寫入正式 DB。
+        此 migration 會保留舊資料並以 stocks_master.market 回填 market_type；無法判定者標 unknown，
+        但後續 RevenueDbWriter 會禁止 unknown/NULL 新資料寫入。
+        """
+        try:
+            info = cur.execute("PRAGMA table_info(external_revenue_history)").fetchall()
+            if not info:
+                return
+            pk_cols = [str(r[1]) for r in sorted([r for r in info if int(r[5] or 0) > 0], key=lambda r: int(r[5] or 0))]
+            if pk_cols == ["stock_id", "revenue_month", "market_type"]:
+                return
+            backup = "external_revenue_history_legacy_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+            cur.execute(f"ALTER TABLE external_revenue_history RENAME TO {backup}")
+            cur.execute("""
+            CREATE TABLE external_revenue_history (
+                stock_id TEXT,
+                revenue_month TEXT,
+                market_type TEXT,
+                revenue REAL,
+                mom REAL,
+                yoy REAL,
+                cumulative_revenue REAL,
+                cumulative_yoy REAL,
+                source_url TEXT,
+                source_date TEXT,
+                update_time TEXT,
+                PRIMARY KEY(stock_id, revenue_month, market_type)
+            )
+            """)
+            cur.execute(f"""
+            INSERT OR REPLACE INTO external_revenue_history(
+                stock_id,revenue_month,market_type,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_url,source_date,update_time
+            )
+            SELECT
+                h.stock_id,
+                h.revenue_month,
+                CASE
+                    WHEN LOWER(COALESCE(h.market_type,'')) IN ('sii','上市') THEN 'sii'
+                    WHEN LOWER(COALESCE(h.market_type,'')) IN ('otc','上櫃') THEN 'otc'
+                    WHEN sm.market='上市' THEN 'sii'
+                    WHEN sm.market='上櫃' THEN 'otc'
+                    WHEN LOWER(COALESCE(h.source_url,'')) LIKE '%otc%' OR LOWER(COALESCE(h.source_url,'')) LIKE '%tpex%' THEN 'otc'
+                    WHEN LOWER(COALESCE(h.source_url,'')) LIKE '%sii%' OR LOWER(COALESCE(h.source_url,'')) LIKE '%twse%' OR LOWER(COALESCE(h.source_url,'')) LIKE '%c04003%' THEN 'sii'
+                    ELSE 'unknown'
+                END AS market_type,
+                h.revenue,h.mom,h.yoy,h.cumulative_revenue,h.cumulative_yoy,h.source_url,h.source_date,h.update_time
+            FROM {backup} h
+            LEFT JOIN stocks_master sm ON sm.stock_id=h.stock_id
+            WHERE COALESCE(h.stock_id,'')<>'' AND COALESCE(h.revenue_month,'')<>''
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_revenue_history_month_market ON external_revenue_history(revenue_month, market_type)")
+            log_warning(f"[R5N8A][DB_MIGRATION] external_revenue_history PK migrated backup={backup}")
+        except Exception as exc:
+            log_warning(f"[R5N8A][DB_MIGRATION_FAIL] external_revenue_history｜{exc}")
 
     def _safe_sha256(self, path) -> str:
         try:
@@ -5994,7 +6054,16 @@ def _r5n7d_append_manifest(record: dict):
             except Exception:
                 data = []
         rec = dict(record or {})
+        rec.setdefault("pipeline_version", "R5N8A_REVENUE_PIPELINE_ARCHITECTURE_FIX")
+        rec.setdefault("pipeline_run_id", datetime.now().strftime("r5n8a_%Y%m%d"))
         rec.setdefault("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        # R5N8A：manifest 必須可追溯檔案 hash，不能只記路徑。
+        try:
+            _mp = Path(str(rec.get("path", "")))
+            if _mp.exists() and _mp.is_file():
+                rec.setdefault("sha256", _safe_file_sha256(_mp))
+        except Exception:
+            pass
         data.append(rec)
         data = data[-2000:]
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -6016,6 +6085,7 @@ def _r5n7d_save_df_csv(df: pd.DataFrame, path: Path, stage: str, month: str, mar
             "source_key": source_key,
             "path": str(p),
             "rows": int(len(df)),
+            "rows_final" if stage == "final" else ("rows_normalized" if str(stage).startswith("normalized") else "rows_raw"): int(len(df)),
             "bytes": int(p.stat().st_size) if p.exists() else 0,
             "status": "PASS",
         })
@@ -6070,6 +6140,71 @@ def normalize_market_type(value) -> str:
 def market_type_to_label(value) -> str:
     mt = normalize_market_type(value)
     return "上市" if mt == "sii" else ("上櫃" if mt == "otc" else "")
+
+
+# R5N8A_REVENUE_PIPELINE_ARCHITECTURE_FIX_20260613
+# 統一 Revenue market_type 解析：任何進入 normalized/final/DB 的月營收資料，
+# 都必須先由 source_url/source_label + stocks_master 完成 sii/otc 分流。
+def _r5n8a_stock_market_map() -> dict:
+    mapping = {}
+    try:
+        if 'DB_PATH' in globals() and Path(DB_PATH).exists():
+            conn = sqlite3.connect(str(DB_PATH))
+            try:
+                df = pd.read_sql_query("SELECT stock_id, market FROM stocks_master", conn)
+                if df is not None and not df.empty:
+                    for _, r in df.iterrows():
+                        sid = normalize_stock_id(r.get('stock_id', ''))
+                        mt = normalize_market_type(r.get('market', ''))
+                        if sid and mt:
+                            mapping[sid] = mt
+            finally:
+                conn.close()
+    except Exception:
+        pass
+    try:
+        if not mapping and 'MASTER_CSV' in globals() and Path(MASTER_CSV).exists():
+            df = safe_read_csv_auto(Path(MASTER_CSV))
+            if df is not None and not df.empty and 'stock_id' in df.columns:
+                market_col = 'market' if 'market' in df.columns else ''
+                for _, r in df.iterrows():
+                    sid = normalize_stock_id(r.get('stock_id', ''))
+                    mt = normalize_market_type(r.get(market_col, '')) if market_col else ''
+                    if sid and mt:
+                        mapping[sid] = mt
+    except Exception:
+        pass
+    return mapping
+
+
+def _r5n8a_apply_market_resolver(df: pd.DataFrame, default_market_type: str = "", source_url: str = "", strict: bool = False) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    if 'stock_id' not in x.columns:
+        return pd.DataFrame()
+    x['stock_id'] = x['stock_id'].map(normalize_stock_id)
+    if 'market_type' not in x.columns:
+        x['market_type'] = ''
+    mt0 = normalize_market_type(default_market_type) or normalize_market_type(source_url)
+    x['market_type'] = x['market_type'].map(normalize_market_type)
+    missing = x['market_type'].astype(str).eq('')
+    if missing.any():
+        mapping = _r5n8a_stock_market_map()
+        if mapping:
+            mapped = x.loc[missing, 'stock_id'].map(mapping).fillna('')
+            x.loc[missing, 'market_type'] = mapped.values
+    missing = x['market_type'].astype(str).eq('')
+    if missing.any() and mt0:
+        x.loc[missing, 'market_type'] = mt0
+    x['market_type'] = x['market_type'].map(normalize_market_type)
+    if strict:
+        before = len(x)
+        x = x[x['market_type'].isin(['sii', 'otc'])].copy()
+        dropped = before - len(x)
+        if dropped > 0:
+            log_warning(f"[R5N8A][MARKET_RESOLVER][DROP_UNKNOWN] dropped={dropped} source={source_url}")
+    return x
 REVENUE_OPENAPI_ENDPOINTS = {
     "TWSE_REVENUE_L": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
     "TPEX_REVENUE_O": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
@@ -6462,7 +6597,11 @@ class RevenueCacheManager:
                 log_warning(f"[RevenueCacheManager][READ_FAIL] month={m} market={mt or 'all'} path={path}｜{exc}")
         if not parts:
             return pd.DataFrame()
-        return pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+        out = pd.concat(parts, ignore_index=True)
+        if "market_type" not in out.columns:
+            out["market_type"] = mt if mt else ""
+        out = _r5n8a_apply_market_resolver(out, default_market_type=mt, source_url="RevenueCacheManager.read_month_cache", strict=bool(mt))
+        return out.drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
 
     def health_df(self, months: list[str]) -> pd.DataFrame:
         rows = []
@@ -6848,7 +6987,7 @@ class R5N6FinalSafeIntegrator:
             except Exception as exc:
                 log_warning(f"[R5N6_SAFE][LOCAL_REVENUE_PARSE_FAIL] file={f}｜{exc}")
         if parts:
-            out = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+            out = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
             log_info(f"[R5N6_SAFE][LOCAL_REVENUE_OK] month={m} rows={len(out)}")
             return out
         return pd.DataFrame()
@@ -7126,6 +7265,12 @@ class RevenueOpenAPICacheDownloader:
             raise ValueError(f"invalid revenue month: {month}")
         return self.monthly_cache_dir / f"revenue_{m}.csv"
 
+    def monthly_cache_path(self, month: str, market_type: str | None = None) -> Path:
+        return RevenueCacheManager(self.cache_dir).monthly_cache_path(month, market_type)
+
+    def normalized_cache_path(self, month: str, market_type: str | None = None) -> Path:
+        return RevenueCacheManager(self.cache_dir).normalized_cache_path(month, market_type)
+
     def _emit_cache_trace(self, month: str, stage: str, status: str, rows: int = 0, cache_path: Path | None = None, reason_code: str = "", reason_detail: str = ""):
         try:
             if self.trace_engine is not None:
@@ -7170,14 +7315,16 @@ class RevenueOpenAPICacheDownloader:
             x["source_url"] = source_url
         if "market_type" not in x.columns:
             x["market_type"] = normalize_market_type(source_url)
-        x["market_type"] = x["market_type"].map(normalize_market_type)
+        # R5N8A：不可只靠 source_url 推斷；需以 stocks_master 補齊上市/上櫃 market_type。
+        x = _r5n8a_apply_market_resolver(x, default_market_type=normalize_market_type(source_url), source_url=source_url, strict=False)
         if "update_time" not in x.columns:
             x["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         x = x[(x["stock_id"].astype(str).ne("")) & x["revenue_month"].eq(m) & (x["revenue"] > 0)].copy()
+        x = _r5n8a_apply_market_resolver(x, default_market_type=normalize_market_type(source_url), source_url=source_url, strict=True)
         if x.empty:
             return pd.DataFrame()
         keep = ["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]
-        return x[keep].drop_duplicates(["stock_id", "revenue_month"], keep="last")
+        return x[keep].drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
 
     def write_month_cache(self, df: pd.DataFrame, month: str, source_url: str = "") -> Path | None:
         """R5N7D：統一月營收 cache 寫入。
@@ -7305,7 +7452,10 @@ class RevenueOpenAPICacheDownloader:
                 "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "cache_source_label": source_label,
             })
-        out = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "revenue_month"], keep="last") if rows else pd.DataFrame()
+        out = pd.DataFrame(rows) if rows else pd.DataFrame()
+        if out is not None and not out.empty:
+            out = _r5n8a_apply_market_resolver(out, default_market_type=normalize_market_type(source_label), source_url=source_label, strict=True)
+            out = out.drop_duplicates(subset=["stock_id", "revenue_month", "market_type"], keep="last")
         if out.empty:
             return out, f"{source_label} cache解析後有效 rows=0"
         return out, ""
@@ -7320,6 +7470,7 @@ class RevenueOpenAPICacheDownloader:
             if "revenue" in x.columns:
                 x["revenue"] = pd.to_numeric(x["revenue"], errors="coerce")
             x = x[(x.get("revenue_month", pd.Series(dtype=str)).astype(str).ne("")) & (x.get("revenue", pd.Series(dtype=float)) > 0)].copy()
+            x = _r5n8a_apply_market_resolver(x, source_url=source_tag, strict=True)
             if x.empty:
                 return None
             out = self.cache_dir / f"revenue_openapi_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{source_tag}.csv"
@@ -7362,7 +7513,10 @@ class RevenueOpenAPICacheDownloader:
                     df["source_date"] = datetime.now().strftime("%Y-%m-%d")
                 if "update_time" not in df.columns:
                     df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                return df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
+                if "market_type" not in df.columns:
+                    df["market_type"] = ""
+                df = _r5n8a_apply_market_resolver(df, source_url=str(p), strict=True)
+                return df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
             except Exception as exc:
                 last_error = exc
                 continue
@@ -7401,7 +7555,11 @@ class RevenueOpenAPICacheDownloader:
                     if "update_time" not in df.columns:
                         df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(p)
-                    parts.append(df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]])
+                    if "market_type" not in df.columns:
+                        df["market_type"] = ""
+                    df = _r5n8a_apply_market_resolver(df, source_url=str(p), strict=True)
+                    if df is not None and not df.empty:
+                        parts.append(df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]])
                     break
                 except Exception:
                     continue
@@ -7429,7 +7587,7 @@ class RevenueOpenAPICacheDownloader:
             except Exception as exc:
                 errors.append(f"{label}:{exc}")
                 log_warning(f"[REVENUE][OPENAPI_CACHE][{label}] download failed：{exc}")
-        df = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if parts else pd.DataFrame()
+        df = pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last") if parts else pd.DataFrame()
         cache_path = self.save_cache_df(df, source_tag="download") if df is not None and not df.empty else None
         if df is not None and not df.empty:
             df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(cache_path or "download_memory")
@@ -7939,7 +8097,7 @@ class RevenueOpenAPICacheDownloader:
                 "說明": "已建立逐月Cache" if rows > 0 else ("月報未到期，非缺資料" if status == "NOT_DUE" else "未取得有效 C04003 月營收資料"),
                 "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
-        combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if data_parts else pd.DataFrame()
+        combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last") if data_parts else pd.DataFrame()
         if write_db and db is not None and combined is not None and not combined.empty:
             inserted = self.upsert_external_revenue_history(db, combined, append_only=True)
             for row in summary_rows:
@@ -7982,6 +8140,11 @@ class RevenueOpenAPICacheDownloader:
         x = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
         if x.empty:
             return 0
+        x = _r5n8a_apply_market_resolver(x, source_url="R5N_CACHE_DB_WRITE", strict=True)
+        if x.empty:
+            log_warning("[R5N8A][REVENUE_DB_WRITE][SKIP] all rows dropped because market_type unresolved")
+            return 0
+        x = x.drop_duplicates(["stock_id", "revenue_month", "market_type"], keep="last")
         rows = []
         for _, r in x.iterrows():
             rows.append((
@@ -8008,7 +8171,7 @@ class RevenueOpenAPICacheDownloader:
                 stock_id, revenue_month, market_type, revenue, mom, yoy, cumulative_revenue, cumulative_yoy,
                 source_url, source_date, update_time
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(stock_id, revenue_month) DO UPDATE SET
+            ON CONFLICT(stock_id, revenue_month, market_type) DO UPDATE SET
                 revenue=CASE WHEN COALESCE(external_revenue_history.revenue,0)<=0 THEN excluded.revenue ELSE external_revenue_history.revenue END,
                 mom=CASE WHEN external_revenue_history.mom IS NULL THEN excluded.mom ELSE external_revenue_history.mom END,
                 yoy=CASE WHEN external_revenue_history.yoy IS NULL THEN excluded.yoy ELSE external_revenue_history.yoy END,
@@ -8027,7 +8190,17 @@ class RevenueOpenAPICacheDownloader:
                 cur.executemany(sql_insert_ignore if append_only else sql_upsert_repair, rows)
                 db.conn.commit()
                 after = int(cur.execute("SELECT COUNT(*) FROM external_revenue_history").fetchone()[0] or 0)
-            log_info(f"[R5N][EXTERNAL_REVENUE_HISTORY][WRITE] rows_input={len(rows)} inserted_or_existing_delta={after-before} append_only={append_only}")
+            try:
+                mm_list = sorted(set([r[1] for r in rows if r[1]]))
+                cnt_rows = []
+                for _mm in mm_list:
+                    for _mt in ("sii", "otc"):
+                        _cnt = int(cur.execute("SELECT COUNT(*) FROM external_revenue_history WHERE revenue_month=? AND market_type=? AND COALESCE(revenue,0)>0", (_mm, _mt)).fetchone()[0] or 0)
+                        cnt_rows.append(f"{_mm}/{_mt}={_cnt}")
+                log_info(f"[R5N8A][EXTERNAL_REVENUE_HISTORY][VERIFY_BY_MARKET] {'; '.join(cnt_rows)}")
+            except Exception:
+                pass
+            log_info(f"[R5N8A][EXTERNAL_REVENUE_HISTORY][WRITE] rows_input={len(rows)} inserted_or_existing_delta={after-before} append_only={append_only}")
             return int(after - before)
         except Exception as exc:
             log_warning(f"[R5N][EXTERNAL_REVENUE_HISTORY][WRITE_FAIL] {exc}")
