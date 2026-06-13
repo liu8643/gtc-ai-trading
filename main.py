@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.11-R5N8F_REVENUE_LOCAL_CACHE_CLOSED_LOOP_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.13-R5N10_CONFIGURATION_MANAGER"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -4363,7 +4363,8 @@ def get_r5j_registry_v2_rows() -> list[tuple]:
         ("AnnualEPS", "MOPS_t163sb04", "MOPS年度EPS fallback", "HTML", 5, "https://mops.twse.com.tw/mops/web/ajax_t163sb04", "https://mops.twse.com.tw/mops/web/ajax_t163sb04", "annual_eps_history", "html", 1000, 5000, "P0", 1, "annual_eps", "requires lxml"),
         ("QuarterlyEPS", "OfficialEPSOpenAPI", "官方季度EPS OpenAPI", "API", 1, "https://openapi.twse.com.tw/", "TWSE/TPEx EPS OpenAPI", "quarterly_financial_history", "json", 1000, 5000, "P0", 1, "eps", "Q1/Q2/Q3/Q4"),
         ("Revenue", "TWSE_t187ap05_L", "TWSE上市月營收", "API", 1, "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", "external_revenue_history", "json", 1000, 5000, "P0", 1, "revenue", "上市月營收"),
-        ("Revenue", "TPEX_t187ap05_O", "TPEx上櫃月營收", "API", 2, "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", "external_revenue_history", "json", 700, 5000, "P0", 1, "revenue", "上櫃月營收"),
+        ("Revenue", "TPEX_t187ap05_O", "TPEx上櫃月營收", "API", 2, "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", "external_revenue_history", "json", 700, 5000, "P1", 1, "revenue", "上櫃月營收備援"),
+        ("Revenue", "FINMIND_TaiwanStockMonthRevenue_OTC", "FinMind上櫃月營收Token", "API", 2, "https://finmind.github.io/tutor/TaiwanMarket/Fundamental/", "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue", "external_revenue_history", "json", 700, 5000, "P0", 1, "revenue", "R5N9：OTC正式月營收主補源；token由config/api_keys.json或環境變數提供"),
         ("Revenue", "TPEX_t187ap05_R", "TPEx興櫃月營收", "API", 3, "https://www.tpex.org.tw/openapi/v1/t187ap05_R", "https://www.tpex.org.tw/openapi/v1/t187ap05_R", "external_revenue_history", "json", 1, 1000, "P2", 1, "revenue", "興櫃可WARN"),
         ("Valuation", "GoodinfoFallback", "Goodinfo估值fallback only", "WEB", 4, "https://goodinfo.tw/", "https://goodinfo.tw/", "external_valuation", "html", 1, 1000, "P2", 1, "valuation", "需GTC_ENABLE_GOODINFO_FALLBACK=1，不可作主來源"),
         ("Dependency", "selenium", "Selenium browser dependency", "PYTHON_MODULE", 1, "", "importlib.util.find_spec('selenium')", "", "module", 1, 0, "P0", 0, "dependency", "Index05需要"),
@@ -6153,6 +6154,96 @@ def market_type_to_label(value) -> str:
     mt = normalize_market_type(value)
     return "上市" if mt == "sii" else ("上櫃" if mt == "otc" else "")
 
+
+def ensure_finmind_config_template() -> Path:
+    """R5N9：建立 FinMind Token 設定檔範本；不可把 token 寫死在主程式。"""
+    try:
+        FINMIND_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if not FINMIND_CONFIG_EXAMPLE_PATH.exists():
+            FINMIND_CONFIG_EXAMPLE_PATH.write_text(
+                json.dumps({
+                    "finmind_token": "",
+                    "note": "請將 FinMind API token 寫入 config/api_keys.json；主程式也支援 FINMIND_API_TOKEN 環境變數。"
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+    return FINMIND_CONFIG_EXAMPLE_PATH
+
+
+# ==========================================
+# R5N10A Static Configuration
+# 目的：先試跑資料鏈，FinMind Token 直接內建於主程式，不再要求手動建立 config/api_keys.json。
+# 注意：此版本只供單機測試；若要分享程式碼或上傳公開倉庫，請改回環境變數/設定檔。
+# ==========================================
+FINMIND_STATIC_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoibGl1ODY0M0BnbWFpbC5jb20iLCJlbWFpbCI6ImxpdTg2NDNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6MH0.7v7VcA7BmScCTogWrVtgeUG9J-q-tBgH2ngPzDnb0-4"
+USE_FINMIND_FOR_OTC_REVENUE = True
+USE_INDEX04_FOR_SII_REVENUE = True
+USE_MOPS_REVENUE_FORMAL_PIPELINE = False
+
+
+def load_finmind_api_token() -> str:
+    """R5N10A：FinMind Token 讀取順序。
+
+    0) FINMIND_STATIC_TOKEN：主程式內建 Token，供本機試跑優先使用。
+    1) FINMIND_API_TOKEN 環境變數
+    2) FINMIND_CONFIG_PATH 指定的 json 檔
+    3) RUNTIME_DIR/config/api_keys.json（若不存在會自動建立空白設定檔）
+    """
+    static_token = str(globals().get("FINMIND_STATIC_TOKEN", "") or "").strip()
+    if static_token:
+        log_info(f"[R5N10A][FINMIND][STATIC_TOKEN_LOADED] token={mask_secret(static_token)}")
+        return static_token
+
+    token = str(os.getenv("FINMIND_API_TOKEN", "") or "").strip()
+    if token:
+        return token
+
+    config_candidates = []
+    env_cfg = str(os.getenv("FINMIND_CONFIG_PATH", "") or "").strip()
+    if env_cfg:
+        config_candidates.append(Path(env_cfg))
+    try:
+        r5n10_ensure_config_file()
+    except Exception:
+        ensure_finmind_config_template()
+    config_candidates.append(FINMIND_CONFIG_PATH)
+
+    seen = set()
+    for cfg_path in config_candidates:
+        try:
+            cfg_path = Path(cfg_path)
+            key = str(cfg_path.resolve()) if cfg_path.exists() else str(cfg_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if cfg_path.exists() and cfg_path.stat().st_size > 0:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(cfg, dict):
+                    token = str(cfg.get("finmind_token") or cfg.get("FINMIND_API_TOKEN") or "").strip()
+                    if token:
+                        log_info(f"[R5N10][FINMIND][TOKEN_LOADED] config={cfg_path} token={mask_secret(token)}")
+                        return token
+        except Exception as exc:
+            log_warning(f"[R5N10][FINMIND][CONFIG_READ_FAIL] {cfg_path}｜{exc}")
+
+    return ""
+
+
+def _r5n9_write_finmind_config_placeholder():
+    """R5N9：若 config/api_keys.json 不存在，建立空白設定檔，方便使用者填 token。"""
+    try:
+        FINMIND_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if not FINMIND_CONFIG_PATH.exists():
+            FINMIND_CONFIG_PATH.write_text(
+                json.dumps({"finmind_token": ""}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+
 def _r5n8c_market_label_to_type(value) -> str:
     """R5N8C：股票主檔 market 欄位轉 market_type，供所有外部資料 merge / gate 共用。"""
     return normalize_market_type(value)
@@ -6243,11 +6334,112 @@ REVENUE_OPENAPI_ENDPOINTS = {
 REVENUE_OPENAPI_OPTIONAL_ENDPOINTS = {
     "TPEX_REVENUE_R": "https://www.tpex.org.tw/openapi/v1/t187ap05_R",
 }
+
+# R5N10_CONFIGURATION_MANAGER_20260614：
+# MOPS t21sc03/t21sc04 已由實際 raw HTML 證明會回傳 Security Block Page，
+# 因此正式 OTC 月營收管線改為 FinMind Token API；MOPS 僅保留 debug，不再作正式補源。
+FINMIND_API_BASE_URL = "https://api.finmindtrade.com/api/v4/data"
+FINMIND_MONTH_REVENUE_DATASET = "TaiwanStockMonthRevenue"
+FINMIND_CONFIG_DIR = RUNTIME_DIR / "config"
+FINMIND_CONFIG_PATH = FINMIND_CONFIG_DIR / "api_keys.json"
+FINMIND_CONFIG_EXAMPLE_PATH = FINMIND_CONFIG_DIR / "api_keys.example.json"
+FINMIND_HTTP_TIMEOUT = int(os.getenv("GTC_FINMIND_TIMEOUT", "45") or "45")
+MOPS_REVENUE_FORMAL_ENABLED = os.getenv("GTC_ENABLE_MOPS_REVENUE_FORMAL", "0").strip() == "1"
 REVENUE_CACHE_APPEND_ONLY_POLICY = (
     "R4A：OpenAPI 月營收快取層僅在 R4 原流程失敗或缺指定月份時補資料；"
     "只補缺漏 stock_id+revenue_month，不覆蓋 external_revenue_history 既有有效資料；"
     "revenue<=0 或月份無法正規化者禁止寫入。"
 )
+
+# R5N10_CONFIGURATION_MANAGER_20260614：
+# Token 管理、資料來源管理、market_type 管理全部集中在 config/api_keys.json 與 UI「系統設定」。
+# 目的：第一次啟動自動建立設定檔，不再要求使用者手動建立 config 資料夾或 json 檔。
+DEFAULT_R5N10_CONFIG = {
+    "finmind_token": "",
+    "revenue_sources": {
+        "sii": "INDEX04_C04003",
+        "otc": "FINMIND_TOKEN",
+        "mops": "DEBUG_ONLY",
+    },
+    "market_type_policy": {
+        "mode": "AUTO_BY_STOCKS_MASTER",
+        "sii_label": "上市",
+        "otc_label": "上櫃",
+        "unknown_action": "WARN_AND_SKIP",
+    },
+    "ui": {
+        "config_manager_version": "R5N10",
+        "last_saved_at": "",
+    },
+}
+
+
+def _deep_merge_dict(base: dict, override: dict) -> dict:
+    out = dict(base or {})
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out.get(k, {}), v)
+        else:
+            out[k] = v
+    return out
+
+
+def mask_secret(value: str, show: int = 6) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return "未設定"
+    if len(s) <= show * 2:
+        return "*" * len(s)
+    return f"{s[:show]}...{s[-show:]}"
+
+
+def r5n10_ensure_config_file() -> Path:
+    """R5N10：自動建立 config/api_keys.json 與 api_keys.example.json。
+
+    不把 token 寫死在主程式；若檔案不存在，建立空白設定檔供 UI 儲存。
+    """
+    FINMIND_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_finmind_config_template()
+    if not FINMIND_CONFIG_PATH.exists():
+        cfg = dict(DEFAULT_R5N10_CONFIG)
+        cfg["ui"] = dict(cfg.get("ui", {}))
+        cfg["ui"]["last_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        FINMIND_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_info(f"[R5N10][CONFIG][CREATED] {FINMIND_CONFIG_PATH}")
+    return FINMIND_CONFIG_PATH
+
+
+def r5n10_load_config() -> dict:
+    path = r5n10_ensure_config_file()
+    cfg = {}
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg = raw
+    except Exception as exc:
+        log_warning(f"[R5N10][CONFIG][READ_FAIL] {path}｜{exc}")
+        cfg = {}
+    return _deep_merge_dict(DEFAULT_R5N10_CONFIG, cfg)
+
+
+def r5n10_save_config(cfg: dict) -> Path:
+    path = r5n10_ensure_config_file()
+    merged = _deep_merge_dict(DEFAULT_R5N10_CONFIG, cfg or {})
+    merged.setdefault("ui", {})
+    merged["ui"]["config_manager_version"] = "R5N10"
+    merged["ui"]["last_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_info(f"[R5N10][CONFIG][SAVED] {path} token={mask_secret(merged.get('finmind_token',''))} source={merged.get('revenue_sources',{})}")
+    return path
+
+
+def r5n10_get_revenue_source(market_type: str) -> str:
+    cfg = r5n10_load_config()
+    mt = normalize_market_type(market_type)
+    if not mt:
+        return ""
+    return str((cfg.get("revenue_sources") or {}).get(mt, "") or "").strip()
 
 
 # R5M_TWSE_INDEX04_C04003_HISTORY_20260608：TWSE index04 歷史月報 ZIP。
@@ -7133,7 +7325,7 @@ class R5N6FinalSafeIntegrator:
             INSERT INTO external_revenue_history(stock_id,revenue_month,market_type,revenue,mom,yoy,cumulative_revenue,cumulative_yoy,source_url,source_date,source_type,update_time)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(stock_id, revenue_month) DO UPDATE SET
-                market_type=CASE WHEN COALESCE(external_revenue_history.market_type,'')='' THEN excluded.market_type ELSE external_revenue_history.market_type END,
+                market_type=CASE WHEN COALESCE(excluded.market_type,'')<>'' AND COALESCE(external_revenue_history.market_type,'')<>COALESCE(excluded.market_type,'') THEN excluded.market_type ELSE external_revenue_history.market_type END,
                 revenue=CASE WHEN COALESCE(external_revenue_history.revenue,0)<=0 THEN excluded.revenue ELSE external_revenue_history.revenue END,
                 mom=CASE WHEN external_revenue_history.mom IS NULL THEN excluded.mom ELSE external_revenue_history.mom END,
                 yoy=CASE WHEN external_revenue_history.yoy IS NULL THEN excluded.yoy ELSE external_revenue_history.yoy END,
@@ -7545,6 +7737,158 @@ class RevenueOpenAPICacheDownloader:
             return out, f"{source_label} cache解析後有效 rows=0"
         return out, ""
 
+    def _market_stock_ids_from_db(self, db: DBManager | None, market_type: str = "otc") -> set[str]:
+        """R5N9：由 stocks_master 建立市場別股票清單，避免第三方全市場資料誤寫市場別。"""
+        mt = normalize_market_type(market_type)
+        if db is None or not mt:
+            return set()
+        try:
+            with db.lock:
+                master = pd.read_sql_query("SELECT stock_id, market FROM stocks_master WHERE is_active=1", db.conn)
+            if master is None or master.empty:
+                return set()
+            master["stock_id"] = master["stock_id"].map(normalize_stock_id)
+            master["market_type"] = master.get("market", "").map(normalize_market_type)
+            return set(master.loc[(master["stock_id"] != "") & (master["market_type"] == mt), "stock_id"].astype(str).tolist())
+        except Exception as exc:
+            log_warning(f"[R5N9][FINMIND][MARKET_MAP_FAIL] market={mt}｜{exc}")
+            return set()
+
+    def _parse_finmind_month_revenue(self, raw: pd.DataFrame, target_month: str, market_type: str = "otc", db: DBManager | None = None) -> tuple[pd.DataFrame, str]:
+        """R5N9：解析 FinMind TaiwanStockMonthRevenue。
+
+        支援欄位：stock_id / revenue / revenue_year / revenue_month / date。
+        FinMind 可能回傳全市場；正式寫入 OTC 時必須用 stocks_master 過濾上櫃股票。
+        """
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        mt = normalize_market_type(market_type) or "otc"
+        if raw is None or raw.empty or not m:
+            return pd.DataFrame(), "FinMind raw rows=0 or invalid month"
+        x = raw.copy().fillna("")
+        cols = {str(c).strip(): c for c in x.columns}
+        sid_col = cols.get("stock_id") or cols.get("StockID") or cols.get("證券代號") or cols.get("公司代號")
+        rev_col = cols.get("revenue") or cols.get("營收") or cols.get("當月營收")
+        if sid_col is None or rev_col is None:
+            return pd.DataFrame(), f"FinMind欄位不足：{list(x.columns)[:30]}"
+
+        def _row_month(row) -> str:
+            try:
+                if "date" in cols and str(row.get(cols["date"], "")).strip():
+                    return RevenueAccelerationEngine.normalize_month(row.get(cols["date"], ""))
+                y_col = cols.get("revenue_year") or cols.get("year") or cols.get("營收年度")
+                m_col = cols.get("revenue_month") or cols.get("month") or cols.get("營收月份")
+                y = str(row.get(y_col, "")).strip() if y_col is not None else ""
+                mm = str(row.get(m_col, "")).strip() if m_col is not None else ""
+                if y and mm:
+                    return f"{int(float(y)):04d}{int(float(mm)):02d}"
+                return ""
+            except Exception:
+                return ""
+
+        rows = []
+        for _, r in x.iterrows():
+            sid = normalize_stock_id(r.get(sid_col, ""))
+            rm = _row_month(r)
+            revenue = self._num(r.get(rev_col, np.nan), default=np.nan)
+            if not sid or rm != m or (not np.isfinite(revenue)) or float(revenue) <= 0:
+                continue
+            rows.append({
+                "stock_id": sid,
+                "revenue_month": m,
+                "market_type": mt,
+                "revenue": float(revenue),
+                "mom": np.nan,
+                "yoy": np.nan,
+                "cumulative_revenue": np.nan,
+                "cumulative_yoy": np.nan,
+                "source_date": datetime.now().strftime("%Y-%m-%d"),
+                "source_url": f"FINMIND:{FINMIND_MONTH_REVENUE_DATASET}:{m}:{mt}",
+                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out, f"FinMind解析後有效 rows=0 month={m}"
+        market_ids = self._market_stock_ids_from_db(db, mt)
+        if market_ids:
+            before = len(out)
+            out = out[out["stock_id"].astype(str).isin(market_ids)].copy()
+            log_info(f"[R5N9][FINMIND][MARKET_FILTER] month={m} market={mt} before={before} after={len(out)}")
+            if out.empty:
+                return out, f"FinMind rows filtered to 0 by stocks_master market={mt}"
+        else:
+            # 沒有 master 對照時，不做全市場寫入，避免上市/上櫃混入。
+            return pd.DataFrame(), f"FinMind缺 stocks_master 市場對照，禁止盲寫 market_type={mt}"
+        return out.drop_duplicates(["stock_id", "revenue_month"], keep="last"), ""
+
+    def download_finmind_month_revenue_cache(self, target_month: str, db: DBManager | None = None, market_type: str = "otc") -> pd.DataFrame:
+        """R5N9：使用 FinMind Token 下載指定月份上櫃月營收，寫入 raw/normalized/final cache。
+
+        正式用途：OTC 上櫃月營收補源。Token 不寫死在主程式，讀取順序：
+        1) FINMIND_API_TOKEN 環境變數
+        2) config/api_keys.json: {"finmind_token": "..."}
+        """
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        mt = normalize_market_type(market_type) or "otc"
+        if not m:
+            return pd.DataFrame()
+        token = load_finmind_api_token()
+        if not token:
+            _r5n9_write_finmind_config_placeholder()
+            msg = f"FinMind token missing；請將 api_keys.json 放在 {FINMIND_CONFIG_PATH}，或設定 FINMIND_CONFIG_PATH / FINMIND_API_TOKEN"
+            self._emit_cache_trace(m, "DOWNLOAD", "FAIL", 0, None, "FINMIND_TOKEN_MISSING", msg)
+            log_warning(f"[R5N9][FINMIND][TOKEN_MISSING] month={m} market={mt}｜{msg}")
+            return pd.DataFrame()
+        y, mm = int(m[:4]), int(m[4:6])
+        start_date = f"{y:04d}-{mm:02d}-01"
+        end_date = (pd.Timestamp(start_date) + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d")
+        params = {
+            "dataset": FINMIND_MONTH_REVENUE_DATASET,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        headers = {"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
+        raw_file = _r5n7d_revenue_pipeline_dir("raw", mt, "finmind_month_revenue") / f"finmind_{FINMIND_MONTH_REVENUE_DATASET}_{m}_{mt}.json"
+        try:
+            resp = requests.get(FINMIND_API_BASE_URL, headers=headers, params=params, timeout=FINMIND_HTTP_TIMEOUT)
+            status = str(resp.status_code)
+            content = resp.content or b""
+            raw_file.write_bytes(content)
+            _r5n7d_append_manifest({
+                "stage": "raw", "source_key": "finmind_month_revenue", "revenue_month": m,
+                "market_type": mt, "path": str(raw_file), "bytes": int(raw_file.stat().st_size),
+                "status": "PASS" if resp.status_code == 200 else "FAIL", "http_status": status,
+                "request_url": str(getattr(resp, "url", FINMIND_API_BASE_URL) or FINMIND_API_BASE_URL),
+            })
+            if resp.status_code != 200:
+                self._emit_cache_trace(m, "DOWNLOAD", "FAIL", 0, raw_file, "HTTP_FAIL", f"FinMind HTTP {status}")
+                return pd.DataFrame()
+            payload = resp.json()
+            if isinstance(payload, dict):
+                data = payload.get("data") or []
+                msg = str(payload.get("msg") or payload.get("message") or "")
+                if not isinstance(data, list):
+                    self._emit_cache_trace(m, "PARSE", "FAIL", 0, raw_file, "PARSE_FAILED", f"FinMind data not list msg={msg}")
+                    return pd.DataFrame()
+            elif isinstance(payload, list):
+                data = payload
+            else:
+                self._emit_cache_trace(m, "PARSE", "FAIL", 0, raw_file, "PARSE_FAILED", "FinMind JSON format invalid")
+                return pd.DataFrame()
+            raw = pd.DataFrame(data).astype(str).fillna("")
+            parsed, err = self._parse_finmind_month_revenue(raw, m, market_type=mt, db=db)
+            if parsed is None or parsed.empty:
+                self._emit_cache_trace(m, "PARSE", "FAIL", 0, raw_file, "PARSE_ROWS_ZERO", err or "FinMind parsed rows=0")
+                log_warning(f"[R5N9][FINMIND][PARSE_EMPTY] month={m} market={mt}｜{err}")
+                return pd.DataFrame()
+            self.write_month_cache(parsed, m, source_url=f"FINMIND:{FINMIND_MONTH_REVENUE_DATASET}:{m}:{mt}")
+            self._emit_cache_trace(m, "PARSE", "PASS", len(parsed), raw_file)
+            log_info(f"[R5N9][FINMIND][OTC_REVENUE_OK] month={m} market={mt} rows={len(parsed)} raw={raw_file}")
+            return parsed[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
+        except Exception as exc:
+            self._emit_cache_trace(m, "DOWNLOAD", "FAIL", 0, raw_file, "FINMIND_REQUEST_FAIL", str(exc))
+            log_warning(f"[R5N9][FINMIND][REQUEST_FAIL] month={m} market={mt}｜{exc}")
+            return pd.DataFrame()
+
     def save_cache_df(self, df: pd.DataFrame, source_tag: str = "official_openapi") -> Path | None:
         if df is None or df.empty:
             return None
@@ -7597,6 +7941,9 @@ class RevenueOpenAPICacheDownloader:
                     df["source_date"] = datetime.now().strftime("%Y-%m-%d")
                 if "update_time" not in df.columns:
                     df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if "market_type" not in df.columns:
+                    df["market_type"] = df["source_url"].map(normalize_market_type)
+                df["market_type"] = df["market_type"].map(normalize_market_type)
                 return df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
             except Exception as exc:
                 last_error = exc
@@ -7636,6 +7983,9 @@ class RevenueOpenAPICacheDownloader:
                     if "update_time" not in df.columns:
                         df["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     df["source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(p)
+                    if "market_type" not in df.columns:
+                        df["market_type"] = df["source_url"].map(normalize_market_type)
+                    df["market_type"] = df["market_type"].map(normalize_market_type)
                     parts.append(df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]])
                     break
                 except Exception:
@@ -8178,13 +8528,14 @@ class RevenueOpenAPICacheDownloader:
             return pd.DataFrame()
 
     def ensure_c04003_revenue_cache(self, months: list[str], force_download: bool = False, write_db: bool = False, db: DBManager | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """R5N：依 UI 選取月份逐月建立 TWSE index04/C04003 本機 Revenue Cache。
+        """R5N9：依 UI 選取月份建立上市/上櫃月營收本機 Cache。
 
-        - 不再寫死 202602/202603/202604。
-        - 先讀 data/revenue_cache/revenue_YYYYMM.csv。
-        - 缺檔或 force_download=True 時，自動下載 index04 C04003 ZIP、解析 XLS/XLSX、轉 CSV Cache。
-        - write_db=True 時，以 append-only 寫入 external_revenue_history。
-        - 回傳：summary_df, combined_df。
+        正式資料來源：
+        - SII 上市：TWSE Index04 C04003 ZIP → XLS/XLSX → CSV。
+        - OTC 上櫃：FinMind TaiwanStockMonthRevenue Token API → JSON → CSV。
+        - MOPS t21sc03/t21sc04：已證明會回 Security Block Page，退出正式流程，只保留 debug。
+
+        回傳：summary_df, combined_df。
         """
         norm_months = []
         for m in (months or []):
@@ -8194,53 +8545,89 @@ class RevenueOpenAPICacheDownloader:
         summary_rows = []
         data_parts = []
         for mm in norm_months:
-            cache_path = self.monthly_cache_path(mm, "sii")
+            # 1) SII 上市月營收：TWSE Index04 C04003
+            sii_cache_path = self.monthly_cache_path(mm, "sii")
             legacy_cache_path = self.cache_path_for_month(mm)
-            source = "CACHE_SII_FINAL"
-            df = pd.DataFrame()
+            sii_source = "CACHE_SII_FINAL"
+            sii_df = pd.DataFrame()
             if not force_download:
-                df = self.read_month_cache(mm, "sii")
-                if df is None or df.empty:
-                    source = "CACHE_LEGACY_ALL"
+                sii_df = self.read_month_cache(mm, "sii")
+                if sii_df is None or sii_df.empty:
+                    sii_source = "CACHE_LEGACY_ALL"
                     if legacy_cache_path.exists() and legacy_cache_path.stat().st_size > 0:
-                        df = self.load_month_cache(mm)
-            if df is None or df.empty:
-                source = "TWSE_INDEX04_C04003"
-                df = self.download_twse_index04_c04003_month_cache(mm)
-            rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
-            status = "PASS" if rows > 0 else ("NOT_DUE" if _r5n7d_is_revenue_not_due(mm) else "FAIL")
-            if rows > 0:
-                data_parts.append(df.copy())
+                        legacy_df = self.load_month_cache(mm)
+                        if legacy_df is not None and not legacy_df.empty:
+                            sii_df = legacy_df[legacy_df.get("market_type", "").astype(str).map(normalize_market_type).isin(["", "sii"])].copy()
+            if sii_df is None or sii_df.empty:
+                sii_source = "TWSE_INDEX04_C04003"
+                sii_df = self.download_twse_index04_c04003_month_cache(mm)
+            sii_rows = int(len(sii_df)) if isinstance(sii_df, pd.DataFrame) else 0
+            sii_status = "PASS" if sii_rows > 0 else ("NOT_DUE" if _r5n7d_is_revenue_not_due(mm) else "FAIL")
+            if sii_rows > 0:
+                data_parts.append(sii_df.copy())
             summary_rows.append({
                 "月份": mm,
-                "狀態": status,
-                "資料筆數": rows,
-                "來源": source,
-                "Cache檔案": str(cache_path),
+                "市場別": "sii",
+                "狀態": sii_status,
+                "資料筆數": sii_rows,
+                "來源": sii_source,
+                "Cache檔案": str(sii_cache_path),
                 "Legacy相容Cache": str(legacy_cache_path),
                 "NormalizedCache": str(self.normalized_cache_path(mm, "sii")),
-                "說明": "已建立逐月Cache" if rows > 0 else ("月報未到期，非缺資料" if status == "NOT_DUE" else "未取得有效 C04003 月營收資料"),
+                "說明": "上市月營收已建立" if sii_rows > 0 else ("月報未到期，非缺資料" if sii_status == "NOT_DUE" else "未取得有效 TWSE Index04 C04003 上市月營收"),
                 "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
+
+            # 2) OTC 上櫃月營收：FinMind Token
+            otc_cache_path = self.monthly_cache_path(mm, "otc")
+            otc_source = "CACHE_OTC_FINAL"
+            otc_df = pd.DataFrame()
+            if not force_download:
+                otc_df = self.read_month_cache(mm, "otc")
+            if otc_df is None or otc_df.empty:
+                otc_source = "FINMIND_TaiwanStockMonthRevenue"
+                otc_df = self.download_finmind_month_revenue_cache(mm, db=db, market_type="otc")
+            otc_rows = int(len(otc_df)) if isinstance(otc_df, pd.DataFrame) else 0
+            otc_status = "PASS" if otc_rows > 0 else ("TOKEN_MISSING" if not load_finmind_api_token() else ("NOT_DUE" if _r5n7d_is_revenue_not_due(mm) else "FAIL"))
+            if otc_rows > 0:
+                data_parts.append(otc_df.copy())
+            summary_rows.append({
+                "月份": mm,
+                "市場別": "otc",
+                "狀態": otc_status,
+                "資料筆數": otc_rows,
+                "來源": otc_source,
+                "Cache檔案": str(otc_cache_path),
+                "Legacy相容Cache": str(legacy_cache_path),
+                "NormalizedCache": str(self.normalized_cache_path(mm, "otc")),
+                "說明": "上櫃月營收已建立" if otc_rows > 0 else ("FinMind token未設定，請填 config/api_keys.json" if otc_status == "TOKEN_MISSING" else ("月報未到期，非缺資料" if otc_status == "NOT_DUE" else "未取得有效 FinMind 上櫃月營收")),
+                "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
         combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if data_parts else pd.DataFrame()
         if write_db and db is not None and combined is not None and not combined.empty:
             inserted = self.upsert_external_revenue_history(db, combined, append_only=False)
             for row in summary_rows:
-                row["DB寫入模式"] = "INSERT_OR_IGNORE"
+                row["DB寫入模式"] = "UPSERT_REPAIR"
                 row["DB寫入總筆數"] = inserted
         summary = pd.DataFrame(summary_rows)
         try:
             manifest = {
-                "version": "R5N2_TWSE_INDEX04_BACKEND_ZIP_DOWNLOAD_FIX_20260609",
+                "version": "R5N10_CONFIGURATION_MANAGER_20260614",
                 "months": norm_months,
                 "force_download": bool(force_download),
                 "write_db": bool(write_db),
+                "source_policy": {
+                    "sii": "TWSE Index04 C04003",
+                    "otc": "FinMind TaiwanStockMonthRevenue Token",
+                    "mops": "debug only; not formal revenue source",
+                },
                 "summary": summary_rows,
                 "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             (self.monthly_cache_dir / "revenue_cache_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
-            log_warning(f"[R5N][REVENUE_CACHE_MANIFEST][WRITE_FAIL] {exc}")
+            log_warning(f"[R5N9][REVENUE_CACHE_MANIFEST][WRITE_FAIL] {exc}")
         return summary, combined
 
     def upsert_external_revenue_history(self, db: DBManager, df: pd.DataFrame, append_only: bool = True) -> int:
@@ -8509,7 +8896,7 @@ class RevenueOpenAPICacheDownloader:
             return pd.DataFrame()
         return pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
-    def supplement_missing_only(self, existing_df: pd.DataFrame | None, required_months: list[str], force_download: bool = False) -> pd.DataFrame:
+    def supplement_missing_only(self, existing_df: pd.DataFrame | None, required_months: list[str], force_download: bool = False, db: DBManager | None = None) -> pd.DataFrame:
         required = [RevenueAccelerationEngine.normalize_month(m) for m in (required_months or [])]
         required = [m for m in required if m]
         if not required:
@@ -8546,17 +8933,31 @@ class RevenueOpenAPICacheDownloader:
                 index04_df = pd.concat(index04_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
                 cache_df = pd.concat([cache_df, index04_df], ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
                 log_warning(f"[REVENUE][HISTORY_BACKFILL][R5M_INDEX04] missing_after_cache={missing_after_cache} index04_rows={len(index04_df)} months={sorted(index04_df['revenue_month'].astype(str).unique().tolist())}")
-            # R5M：C04003 只涵蓋上市公司；仍嘗試 MOPS t21sc04 補上櫃/興櫃同月份，
-            # 但以上市 C04003 為優先，不讓 MOPS 解析異常覆蓋已成功的上市快取。
-            hist_df = self.download_required_history_caches(missing_after_cache)
-            if hist_df is not None and not hist_df.empty:
+            # R5N9：C04003 只涵蓋上市公司；OTC正式補源改為 FinMind Token。
+            # MOPS t21sc03/t21sc04 已由實測證明會回 Security Block Page，正式流程預設不再呼叫。
+            finmind_parts = []
+            for mm in missing_after_cache:
+                try:
+                    part = self.download_finmind_month_revenue_cache(mm, db=db, market_type="otc")
+                    if part is not None and not part.empty:
+                        finmind_parts.append(part)
+                except Exception as exc:
+                    log_warning(f"[R5N9][FINMIND_OTC][HISTORY_BACKFILL_FAIL] month={mm}｜{exc}")
+            if finmind_parts:
+                finmind_df = pd.concat(finmind_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
                 before_rows = len(cache_df)
-                cache_df = pd.concat([cache_df, hist_df], ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="first")
-                log_warning(f"[REVENUE][HISTORY_BACKFILL][R4F_MOPS_SUPPLEMENT] missing_after_cache={missing_after_cache} hist_rows={len(hist_df)} combined_rows_before={before_rows} combined_rows_after={len(cache_df)} months={sorted(hist_df['revenue_month'].astype(str).unique().tolist())}")
+                cache_df = pd.concat([cache_df, finmind_df], ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
+                log_warning(f"[R5N9][FINMIND_OTC][HISTORY_BACKFILL] missing_after_cache={missing_after_cache} finmind_rows={len(finmind_df)} combined_rows_before={before_rows} combined_rows_after={len(cache_df)} months={sorted(finmind_df['revenue_month'].astype(str).unique().tolist())}")
+            elif MOPS_REVENUE_FORMAL_ENABLED:
+                hist_df = self.download_required_history_caches(missing_after_cache)
+                if hist_df is not None and not hist_df.empty:
+                    before_rows = len(cache_df)
+                    cache_df = pd.concat([cache_df, hist_df], ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="first")
+                    log_warning(f"[REVENUE][HISTORY_BACKFILL][MOPS_DEBUG_ENABLED] missing_after_cache={missing_after_cache} hist_rows={len(hist_df)} combined_rows_before={before_rows} combined_rows_after={len(cache_df)} months={sorted(hist_df['revenue_month'].astype(str).unique().tolist())}")
             else:
                 still_missing = [m for m in missing_after_cache if m not in set(cache_df.get("revenue_month", pd.Series(dtype=str)).astype(str).tolist())]
                 if still_missing:
-                    log_warning(f"[REVENUE][HISTORY_BACKFILL][PARTIAL] C04003已補上市但仍可能缺上櫃/興櫃月份資料：{still_missing}")
+                    log_warning(f"[R5N9][REVENUE][PARTIAL] 已用 C04003 補SII；OTC需FinMind token。仍缺月份：{still_missing}")
         if cache_df.empty:
             return pd.DataFrame()
         if not existing.empty and {"stock_id", "revenue_month"}.issubset(existing.columns):
@@ -8569,7 +8970,7 @@ class RevenueOpenAPICacheDownloader:
         no_source_mask = cache_df["source_url"].astype(str).str.strip().eq("")
         cache_df.loc[no_source_mask, "source_url"] = "OFFICIAL_OPENAPI_CACHE:" + str(self.latest_cache_file() or "download_memory")
         log_info(f"[REVENUE][OPENAPI_CACHE][APPEND_ONLY] required_months={required} append_rows={len(cache_df)} months={sorted(cache_df['revenue_month'].astype(str).unique().tolist())} zero_rejected=1 policy=INSERT_OR_IGNORE_ONLY")
-        return cache_df[["stock_id", "revenue_month", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
+        return cache_df[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
 
 
@@ -14475,7 +14876,7 @@ class ExternalDataFetcher:
             available_months = set(df["revenue_month"].dropna().astype(str).unique().tolist())
             missing_months = [m for m in required_months if m and m not in available_months]
             if missing_months:
-                supplement = cache_downloader.supplement_missing_only(df, missing_months, force_download=False)
+                supplement = cache_downloader.supplement_missing_only(df, missing_months, force_download=False, db=self.db)
                 if supplement is not None and not supplement.empty:
                     df = pd.concat([df, supplement], ignore_index=True).drop_duplicates(subset=["stock_id", "revenue_month"], keep="first")
                     http_statuses.append(f"OFFICIAL_OPENAPI_CACHE_APPEND_ONLY:rows={len(supplement)}:months={','.join(missing_months)}")
@@ -19382,6 +19783,12 @@ class AppUI:
         self.theme_var = tk.StringVar(value="全部")
         self.search_var = tk.StringVar(value="")
 
+        # R5N10：啟動時自動建立設定檔，不再要求使用者手動建立 config/api_keys.json。
+        try:
+            r5n10_ensure_config_file()
+        except Exception as exc:
+            log_warning(f"[R5N10][CONFIG][BOOTSTRAP_FAIL] {exc}")
+
         self._build_ui()
         set_classification_log_callback(lambda message, level="INFO": self.root.after(0, lambda: self.append_log(message, level)))
         self.refresh_filters()
@@ -19583,6 +19990,7 @@ class AppUI:
             "主攻5",
             "V3.5操作說明",
             "策略設定",
+            "系統設定",
             "重新計算今日可下單",
             "v9策略回測",
             "初始化全市場",
@@ -19660,6 +20068,7 @@ class AppUI:
         self.tab_inst = ttk.Frame(self.left_notebook)
         self.tab_external = ttk.Frame(self.left_notebook)
         self.tab_strategy = ttk.Frame(self.left_notebook)
+        self.tab_config = ttk.Frame(self.left_notebook)
         self.tab_backtest = ttk.Frame(self.left_notebook)
         self.left_notebook.add(self.tab_dashboard, text="交易儀表板")
         self.left_notebook.add(self.tab_sop, text="V3.5操作SOP")
@@ -19752,6 +20161,7 @@ class AppUI:
         })
 
         self._build_strategy_config_tab()
+        self._build_system_config_tab()
 
         self.backtest_tree = self._make_tree(self.tab_backtest, ("rank", "id", "name", "win", "avg_ret", "cagr", "mdd", "sharpe", "samples"), {
             "rank": "排序", "id": "代號", "name": "名稱", "win": "勝率%", "avg_ret": "平均報酬%", "cagr": "CAGR%", "mdd": "MDD%", "sharpe": "Sharpe", "samples": "樣本數"
@@ -19808,6 +20218,178 @@ class AppUI:
         self.log_hsb.grid(row=1, column=0, sticky="ew")
         log_body.rowconfigure(0, weight=1)
         log_body.columnconfigure(0, weight=1)
+
+    def _build_system_config_tab(self):
+        """R5N10：系統設定頁。
+
+        集中處理 Token 管理、資料來源管理、market_type 管理，避免再由使用者手動建立資料夾或修改程式。
+        """
+        frame = self.tab_config
+        top = ttk.LabelFrame(frame, text="R5N10 Configuration Manager（Token / Revenue Source / market_type）", padding=8)
+        top.pack(fill="x", padx=8, pady=8)
+
+        try:
+            cfg = r5n10_load_config()
+        except Exception:
+            cfg = dict(DEFAULT_R5N10_CONFIG)
+
+        self.config_finmind_token_var = tk.StringVar(value=str(cfg.get("finmind_token", "") or ""))
+        self.config_sii_source_var = tk.StringVar(value=str((cfg.get("revenue_sources") or {}).get("sii", "INDEX04_C04003")))
+        self.config_otc_source_var = tk.StringVar(value=str((cfg.get("revenue_sources") or {}).get("otc", "FINMIND_TOKEN")))
+        self.config_mops_source_var = tk.StringVar(value=str((cfg.get("revenue_sources") or {}).get("mops", "DEBUG_ONLY")))
+        self.config_market_policy_var = tk.StringVar(value=str((cfg.get("market_type_policy") or {}).get("mode", "AUTO_BY_STOCKS_MASTER")))
+        self.config_status_var = tk.StringVar(value="")
+
+        row = ttk.Frame(top)
+        row.pack(fill="x", pady=3)
+        ttk.Label(row, text="FinMind Token", width=18).pack(side="left")
+        self.config_token_entry = ttk.Entry(row, textvariable=self.config_finmind_token_var, width=88, show="*")
+        self.config_token_entry.pack(side="left", padx=4, fill="x", expand=True)
+        ttk.Button(row, text="顯示/隱藏", command=self.toggle_finmind_token_visibility).pack(side="left", padx=4)
+
+        row2 = ttk.Frame(top)
+        row2.pack(fill="x", pady=3)
+        ttk.Label(row2, text="上市月營收來源", width=18).pack(side="left")
+        sii_cb = ttk.Combobox(row2, textvariable=self.config_sii_source_var, width=22, state="readonly")
+        sii_cb["values"] = ["INDEX04_C04003", "OPENAPI_BACKUP"]
+        sii_cb.pack(side="left", padx=4)
+        ttk.Label(row2, text="上櫃月營收來源", width=18).pack(side="left", padx=(16, 0))
+        otc_cb = ttk.Combobox(row2, textvariable=self.config_otc_source_var, width=22, state="readonly")
+        otc_cb["values"] = ["FINMIND_TOKEN", "OPENAPI_BACKUP", "DISABLED"]
+        otc_cb.pack(side="left", padx=4)
+
+        row3 = ttk.Frame(top)
+        row3.pack(fill="x", pady=3)
+        ttk.Label(row3, text="MOPS營收角色", width=18).pack(side="left")
+        mops_cb = ttk.Combobox(row3, textvariable=self.config_mops_source_var, width=22, state="readonly")
+        mops_cb["values"] = ["DEBUG_ONLY", "DISABLED"]
+        mops_cb.pack(side="left", padx=4)
+        ttk.Label(row3, text="market_type策略", width=18).pack(side="left", padx=(16, 0))
+        market_cb = ttk.Combobox(row3, textvariable=self.config_market_policy_var, width=28, state="readonly")
+        market_cb["values"] = ["AUTO_BY_STOCKS_MASTER", "AUTO_BY_SOURCE_PATH", "STRICT_STOCKS_MASTER"]
+        market_cb.pack(side="left", padx=4)
+
+        btns = ttk.Frame(top)
+        btns.pack(fill="x", pady=(8, 2))
+        ttk.Button(btns, text="載入目前設定", command=self.refresh_config_manager_ui).pack(side="left", padx=4)
+        ttk.Button(btns, text="儲存設定", command=self.save_config_manager_from_ui).pack(side="left", padx=4)
+        ttk.Button(btns, text="測試FinMind連線", command=self.test_finmind_token_from_ui).pack(side="left", padx=4)
+        ttk.Button(btns, text="開啟設定資料夾", command=lambda: open_path(FINMIND_CONFIG_DIR)).pack(side="left", padx=4)
+        ttk.Button(btns, text="切到高成長EPS", command=lambda: self.left_notebook.select(self.tab_highgrowth)).pack(side="left", padx=4)
+
+        self.config_status_label = ttk.Label(top, textvariable=self.config_status_var, foreground="#0F766E")
+        self.config_status_label.pack(fill="x", pady=(6, 2))
+
+        note = ttk.LabelFrame(frame, text="目前正式資料來源規則", padding=8)
+        note.pack(fill="both", expand=False, padx=8, pady=(0, 8))
+        self.config_note_text = tk.Text(note, height=12, wrap="word")
+        self.config_note_text.pack(fill="both", expand=True)
+        self.refresh_config_manager_ui()
+
+    def toggle_finmind_token_visibility(self):
+        try:
+            current = str(self.config_token_entry.cget("show") or "")
+            self.config_token_entry.config(show="" if current else "*")
+        except Exception:
+            pass
+
+    def refresh_config_manager_ui(self):
+        try:
+            cfg = r5n10_load_config()
+            if hasattr(self, "config_finmind_token_var"):
+                self.config_finmind_token_var.set(str(cfg.get("finmind_token", "") or ""))
+                self.config_sii_source_var.set(str((cfg.get("revenue_sources") or {}).get("sii", "INDEX04_C04003")))
+                self.config_otc_source_var.set(str((cfg.get("revenue_sources") or {}).get("otc", "FINMIND_TOKEN")))
+                self.config_mops_source_var.set(str((cfg.get("revenue_sources") or {}).get("mops", "DEBUG_ONLY")))
+                self.config_market_policy_var.set(str((cfg.get("market_type_policy") or {}).get("mode", "AUTO_BY_STOCKS_MASTER")))
+            token = str(cfg.get("finmind_token", "") or "")
+            status = (
+                f"設定檔：{FINMIND_CONFIG_PATH}｜Token：{mask_secret(token)}｜"
+                f"SII={r5n10_get_revenue_source('sii')}｜OTC={r5n10_get_revenue_source('otc')}｜MOPS={(cfg.get('revenue_sources') or {}).get('mops','')}"
+            )
+            if hasattr(self, "config_status_var"):
+                self.config_status_var.set(status)
+            if hasattr(self, "config_note_text"):
+                self.config_note_text.delete("1.0", tk.END)
+                self.config_note_text.insert("1.0", "\n".join([
+                    "R5N10 正式規則：",
+                    "1. 上市月營收：TWSE Index04 C04003。",
+                    "2. 上櫃月營收：FinMind TaiwanStockMonthRevenue Token API。",
+                    "3. MOPS t21sc03/t21sc04：不進正式 Revenue DB，只保留 debug 證據。",
+                    "4. R5N10A 試跑版：Token 已直接寫入主程式；設定頁可保留作後續管理。",
+                    "5. market_type 優先由 stocks_master 判斷，避免 revenue_202605.csv 全部被標成 otc 的錯誤重演。",
+                    "",
+                    f"目前設定：{json.dumps(cfg, ensure_ascii=False, indent=2)}",
+                ]))
+            self.append_log(f"[R5N10][CONFIG_UI] 載入設定完成：{status}")
+        except Exception as exc:
+            messagebox.showerror("系統設定", f"載入設定失敗：{exc}")
+
+    def save_config_manager_from_ui(self):
+        try:
+            cfg = r5n10_load_config()
+            cfg["finmind_token"] = str(self.config_finmind_token_var.get() or "").strip()
+            cfg["revenue_sources"] = {
+                "sii": str(self.config_sii_source_var.get() or "INDEX04_C04003").strip(),
+                "otc": str(self.config_otc_source_var.get() or "FINMIND_TOKEN").strip(),
+                "mops": str(self.config_mops_source_var.get() or "DEBUG_ONLY").strip(),
+            }
+            cfg["market_type_policy"] = {
+                "mode": str(self.config_market_policy_var.get() or "AUTO_BY_STOCKS_MASTER").strip(),
+                "sii_label": "上市",
+                "otc_label": "上櫃",
+                "unknown_action": "WARN_AND_SKIP",
+            }
+            path = r5n10_save_config(cfg)
+            self.refresh_config_manager_ui()
+            messagebox.showinfo("系統設定", f"設定已儲存：\n{path}")
+        except Exception as exc:
+            messagebox.showerror("系統設定", f"儲存設定失敗：{exc}")
+
+    def test_finmind_token_from_ui(self):
+        def worker():
+            label = "測試FinMind連線"
+            try:
+                self.ui_call(self.start_task, label, 2)
+                self.ui_call(self.update_task, label, 1, 2, item="讀取Token")
+                token = str(self.config_finmind_token_var.get() or "").strip()
+                if not token:
+                    token = load_finmind_api_token()
+                if not token:
+                    raise RuntimeError("FinMind token未設定，請在系統設定頁貼上 token 後按『儲存設定』。")
+                headers = {"Authorization": f"Bearer {token}"}
+                params = {
+                    "dataset": FINMIND_MONTH_REVENUE_DATASET,
+                    "data_id": "2330",
+                    "start_date": "2026-02-01",
+                    "end_date": "2026-02-28",
+                }
+                resp = requests.get(FINMIND_API_BASE_URL, headers=headers, params=params, timeout=FINMIND_HTTP_TIMEOUT)
+                status = int(getattr(resp, "status_code", 0) or 0)
+                if status != 200:
+                    raise RuntimeError(f"HTTP {status}: {str(resp.text)[:300]}")
+                try:
+                    payload = resp.json()
+                except Exception as json_exc:
+                    raise RuntimeError(f"JSON解析失敗：{json_exc}")
+                data = payload.get("data") if isinstance(payload, dict) else None
+                rows = len(data) if isinstance(data, list) else 0
+                self.ui_call(self.update_task, label, 2, 2, success=rows, item=f"rows={rows}")
+                self.ui_call(self.append_log, f"[R5N10][FINMIND_TEST] PASS rows={rows} token={mask_secret(token)}")
+                self.ui_call(self.finish_task, label, f"PASS rows={rows}")
+                self.ui_call(messagebox.showinfo, "FinMind測試", f"FinMind連線成功。\nHTTP={status}\nrows={rows}")
+            except Exception as exc:
+                self.ui_call(self.append_log, f"[R5N10][FINMIND_TEST] FAIL｜{exc}", "ERROR")
+                self.ui_call(self.finish_task, label, f"FAIL：{exc}")
+                self.ui_call(messagebox.showerror, "FinMind測試失敗", str(exc))
+        self._run_in_thread(worker, "r5n10_finmind_test")
+
+    def show_system_config(self):
+        try:
+            self.left_notebook.select(self.tab_config)
+            self.refresh_config_manager_ui()
+        except Exception as exc:
+            messagebox.showerror("系統設定", f"開啟系統設定失敗：{exc}")
 
     def _build_strategy_config_tab(self):
         frame = ttk.Frame(self.tab_strategy, padding=10)
@@ -20629,6 +21211,7 @@ class AppUI:
             "AI投資組合引擎": self.show_ai_portfolio_engine,
             "主攻5": self.show_top5,
             "V3.5操作說明": self.show_operation_guide,
+            "系統設定": self.show_system_config,
             "v9策略回測": self.show_strategy_backtest,
             "匯出分析Excel": self.export_analysis_excel,
             "開啟圖表": self.open_current_chart,
