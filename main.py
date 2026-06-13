@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.13-R5N10_CONFIGURATION_MANAGER"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.13-R5N10B_STARTUP_LOGTEXT_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -20717,6 +20717,12 @@ class AppUI:
         self.set_status(summary or f"{stage} 完成")
 
     def append_log(self, text, level: str = "INFO"):
+        """R5N10B STARTUP FIX：UI log_text 尚未建立時不得讓設定頁載入直接炸掉。
+
+        R5N10/R5N10A 在 _build_system_config_tab() 內會呼叫 refresh_config_manager_ui()，
+        但 log_text 是在右側 Log 區稍後才建立；因此 append_log 必須先寫檔案 log，
+        若 self.log_text 尚未存在就直接返回，避免啟動階段 AttributeError。
+        """
         ts = datetime.now().strftime("%H:%M:%S")
         level_upper = str(level or "INFO").upper()
         msg = f"[{ts}] [{level_upper}] {text}"
@@ -20729,12 +20735,21 @@ class AppUI:
                 log_info(text)
         except Exception:
             pass
-        self.log_text.insert(tk.END, msg + "\n")
-        self.log_text.see(tk.END)
-        self.root.update_idletasks()
+        try:
+            if not hasattr(self, "log_text") or self.log_text is None:
+                return
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+            self.root.update_idletasks()
+        except Exception as exc:
+            log_warning(f"[UI_LOG][SKIP] append_log failed before UI ready｜{exc}")
 
     def clear_log(self):
-        self.log_text.delete("1.0", tk.END)
+        try:
+            if hasattr(self, "log_text") and self.log_text is not None:
+                self.log_text.delete("1.0", tk.END)
+        except Exception as exc:
+            log_warning(f"[UI_LOG][SKIP] clear_log failed before UI ready｜{exc}")
 
     def save_history_state(self, state: dict):
         try:
