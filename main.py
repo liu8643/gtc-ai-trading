@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.14-R5N11_P0_GATE_REPAIR"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.15-R5N12_FINMIND_OTC_FORCE_GATE"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -7782,6 +7782,50 @@ class RevenueOpenAPICacheDownloader:
             return pd.DataFrame()
         return pd.concat(parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last")
 
+    def _validate_market_month_cache(self, df: pd.DataFrame, month: str, market_type: str, source_label: str = "CACHE") -> pd.DataFrame:
+        """R5N12：驗證分流 cache 是否真的符合指定市場與月份。
+
+        判斷無效條件：
+        - rows=0
+        - revenue_month 不是目標月
+        - market_type 不是指定市場（OTC 必須是 otc）
+        - stock_id 空白或 revenue <= 0
+        無效時回傳空 DataFrame，讓上層強制重打正式來源。
+        """
+        m = RevenueAccelerationEngine.normalize_month(month)
+        mt = normalize_market_type(market_type)
+        if df is None or df.empty or not m or not mt:
+            log_warning(f"[R5N12][CACHE_INVALID] source={source_label} month={m} market={mt} reason=ROWS_ZERO")
+            return pd.DataFrame()
+        try:
+            x = df.copy().fillna("")
+            if "stock_id" not in x.columns or "revenue" not in x.columns:
+                log_warning(f"[R5N12][CACHE_INVALID] source={source_label} month={m} market={mt} reason=REQUIRED_COLUMNS_MISSING columns={list(x.columns)[:30]}")
+                return pd.DataFrame()
+            x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+            if "revenue_month" not in x.columns:
+                x["revenue_month"] = m
+            x["revenue_month"] = x["revenue_month"].map(RevenueAccelerationEngine.normalize_month)
+            if "market_type" not in x.columns:
+                x["market_type"] = ""
+            x["market_type"] = x["market_type"].map(normalize_market_type)
+            x["revenue"] = pd.to_numeric(x["revenue"], errors="coerce")
+            before = len(x)
+            bad_months = sorted(set([v for v in x["revenue_month"].astype(str).tolist() if v != m]))
+            bad_markets = sorted(set([v for v in x["market_type"].astype(str).tolist() if v != mt]))
+            x = x[(x["stock_id"] != "") & x["revenue_month"].eq(m) & x["market_type"].eq(mt) & x["revenue"].gt(0)].copy()
+            if x.empty:
+                log_warning(
+                    f"[R5N12][CACHE_INVALID] source={source_label} month={m} market={mt} "
+                    f"reason=FILTERED_TO_ZERO before={before} bad_months={bad_months[:5]} bad_markets={bad_markets[:5]}"
+                )
+                return pd.DataFrame()
+            log_info(f"[R5N12][CACHE_VALID] source={source_label} month={m} market={mt} before={before} after={len(x)}")
+            return x.drop_duplicates(["stock_id", "revenue_month"], keep="last")
+        except Exception as exc:
+            log_warning(f"[R5N12][CACHE_INVALID] source={source_label} month={m} market={mt} reason=EXCEPTION｜{exc}")
+            return pd.DataFrame()
+
     def _emit_cache_trace(self, month: str, stage: str, status: str, rows: int = 0, cache_path: Path | None = None, reason_code: str = "", reason_detail: str = ""):
         try:
             if self.trace_engine is not None:
@@ -8007,14 +8051,17 @@ class RevenueOpenAPICacheDownloader:
 
         def _row_month(row) -> str:
             try:
-                if "date" in cols and str(row.get(cols["date"], "")).strip():
-                    return RevenueAccelerationEngine.normalize_month(row.get(cols["date"], ""))
+                # R5N12 FIX：FinMind 的 date 常是公告/資料列日期，實際營收年月應以
+                # revenue_year + revenue_month 為準。若先用 date，2026-02 營收會被誤判成
+                # 2026-03，造成 target_month 全部濾掉。
                 y_col = cols.get("revenue_year") or cols.get("year") or cols.get("營收年度")
                 m_col = cols.get("revenue_month") or cols.get("month") or cols.get("營收月份")
                 y = str(row.get(y_col, "")).strip() if y_col is not None else ""
                 mm = str(row.get(m_col, "")).strip() if m_col is not None else ""
                 if y and mm:
                     return f"{int(float(y)):04d}{int(float(mm)):02d}"
+                if "date" in cols and str(row.get(cols["date"], "")).strip():
+                    return RevenueAccelerationEngine.normalize_month(row.get(cols["date"], ""))
                 return ""
             except Exception:
                 return ""
@@ -8079,13 +8126,20 @@ class RevenueOpenAPICacheDownloader:
             "dataset": FINMIND_MONTH_REVENUE_DATASET,
             "start_date": start_date,
             "end_date": end_date,
+            # R5N12 FIX：FinMind 瀏覽器實測成功路徑使用 query param token。
+            # 保留 Authorization header，同時把 token 放入 params，避免 API 未計次/未授權。
+            "token": token,
         }
         headers = {"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
+        safe_params = dict(params)
+        safe_params["token"] = mask_secret(token)
+        log_info(f"[R5N12][FINMIND_REQUEST] month={m} market={mt} url={FINMIND_API_BASE_URL} params={safe_params}")
         raw_file = _r5n7d_revenue_pipeline_dir("raw", mt, "finmind_month_revenue") / f"finmind_{FINMIND_MONTH_REVENUE_DATASET}_{m}_{mt}.json"
         try:
             resp = requests.get(FINMIND_API_BASE_URL, headers=headers, params=params, timeout=FINMIND_HTTP_TIMEOUT)
             status = str(resp.status_code)
             content = resp.content or b""
+            log_info(f"[R5N12][FINMIND_HTTP_STATUS] month={m} market={mt} http_status={status} bytes={len(content)}")
             raw_file.write_bytes(content)
             _r5n7d_append_manifest({
                 "stage": "raw", "source_key": "finmind_month_revenue", "revenue_month": m,
@@ -8109,14 +8163,20 @@ class RevenueOpenAPICacheDownloader:
                 self._emit_cache_trace(m, "PARSE", "FAIL", 0, raw_file, "PARSE_FAILED", "FinMind JSON format invalid")
                 return pd.DataFrame()
             raw = pd.DataFrame(data).astype(str).fillna("")
+            rows_raw = int(len(raw))
+            log_info(f"[R5N12][FINMIND_ROWS_RAW] month={m} market={mt} rows_raw={rows_raw}")
             parsed, err = self._parse_finmind_month_revenue(raw, m, market_type=mt, db=db)
+            rows_parsed = int(len(parsed)) if isinstance(parsed, pd.DataFrame) else 0
+            log_info(f"[R5N12][FINMIND_ROWS_PARSED] month={m} market={mt} rows_parsed={rows_parsed} err={err or ''}")
             if parsed is None or parsed.empty:
                 self._emit_cache_trace(m, "PARSE", "FAIL", 0, raw_file, "PARSE_ROWS_ZERO", err or "FinMind parsed rows=0")
-                log_warning(f"[R5N9][FINMIND][PARSE_EMPTY] month={m} market={mt}｜{err}")
+                log_warning(f"[R5N12][FINMIND][PARSE_EMPTY] month={m} market={mt}｜{err}")
                 return pd.DataFrame()
-            self.write_month_cache(parsed, m, source_url=f"FINMIND:{FINMIND_MONTH_REVENUE_DATASET}:{m}:{mt}")
+            cache_written = self.write_month_cache(parsed, m, source_url=f"FINMIND:{FINMIND_MONTH_REVENUE_DATASET}:{m}:{mt}")
+            rows_written = rows_parsed if cache_written is not None else 0
+            log_info(f"[R5N12][FINMIND_ROWS_WRITTEN] month={m} market={mt} rows_written={rows_written} cache={cache_written}")
             self._emit_cache_trace(m, "PARSE", "PASS", len(parsed), raw_file)
-            log_info(f"[R5N9][FINMIND][OTC_REVENUE_OK] month={m} market={mt} rows={len(parsed)} raw={raw_file}")
+            log_info(f"[R5N12][FINMIND][OTC_REVENUE_OK] month={m} market={mt} rows={len(parsed)} raw={raw_file}")
             return parsed[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
         except Exception as exc:
             self._emit_cache_trace(m, "DOWNLOAD", "FAIL", 0, raw_file, "FINMIND_REQUEST_FAIL", str(exc))
@@ -8816,8 +8876,11 @@ class RevenueOpenAPICacheDownloader:
             otc_cache_path = self.monthly_cache_path(mm, "otc")
             otc_source = "CACHE_OTC_FINAL"
             otc_df = pd.DataFrame()
-            if not force_download:
+            if force_download:
+                log_info(f"[R5N12][OTC_FORCE_DOWNLOAD] month={mm} action=skip_cache_and_call_finmind")
+            else:
                 otc_df = self.read_month_cache(mm, "otc")
+                otc_df = self._validate_market_month_cache(otc_df, mm, "otc", source_label="CACHE_OTC_FINAL")
             if otc_df is None or otc_df.empty:
                 otc_source = "FINMIND_TaiwanStockMonthRevenue"
                 otc_df = self.download_finmind_month_revenue_cache(mm, db=db, market_type="otc")
@@ -8847,7 +8910,7 @@ class RevenueOpenAPICacheDownloader:
         summary = pd.DataFrame(summary_rows)
         try:
             manifest = {
-                "version": "R5N10_CONFIGURATION_MANAGER_20260614",
+                "version": "R5N12_FINMIND_OTC_FORCE_GATE_20260614",
                 "months": norm_months,
                 "force_download": bool(force_download),
                 "write_db": bool(write_db),
