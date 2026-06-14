@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.13-R5N10B_STARTUP_LOGTEXT_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.14-R5N11_P0_GATE_REPAIR"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -4309,12 +4309,35 @@ def get_r5j_registry_v2_rows() -> list[tuple]:
     def add(module, source_key, source_name, source_type, priority, official_url, request_template,
             target_table, expected_format, min_rows, min_bytes, mandatory_level,
             fallback_allowed=1, enabled=1, parser="", source_group="", note=""):
+        """R5N11-6：registry 型別防呆。
+
+        舊版 extra_sources 末端使用 (..., fallback_allowed, source_group, note) 的 17 欄格式，
+        但 add() 簽名是 (..., fallback_allowed, enabled, parser, source_group, note)。
+        因此 enabled 會收到 'classification'/'revenue' 等字串，int(enabled) 直接爆：
+        invalid literal for int() with base 10: 'classification'。
+        本修正相容兩種格式：若 enabled 是非數字字串，視為 source_group，parser 視為 note。
+        """
+        try:
+            enabled_raw = enabled
+            if isinstance(enabled_raw, str) and enabled_raw.strip() and not re.fullmatch(r"[-+]?\d+(\.0+)?", enabled_raw.strip()):
+                if not source_group and not note:
+                    source_group = enabled_raw
+                    note = parser
+                    parser = ""
+                enabled = 1
+            priority_i = _safe_int(priority, 0)
+            min_rows_i = _safe_int(min_rows, 0)
+            min_bytes_i = _safe_int(min_bytes, 0)
+            fallback_i = _safe_int(fallback_allowed, 1)
+            enabled_i = _safe_int(enabled, 1)
+        except Exception:
+            priority_i, min_rows_i, min_bytes_i, fallback_i, enabled_i = 0, 0, 0, 1, 1
         rows.append((
             str(module), _r5j_make_source_key(source_key), str(source_name), str(source_type),
-            int(priority or 0), str(official_url or ""), str(request_template or ""),
-            str(target_table or ""), str(expected_format or ""), int(min_rows or 0),
-            int(min_bytes or 0), str(mandatory_level or ""), int(fallback_allowed),
-            int(enabled), str(parser or ""), str(source_group or ""), str(note or ""), now
+            priority_i, str(official_url or ""), str(request_template or ""),
+            str(target_table or ""), str(expected_format or ""), min_rows_i,
+            min_bytes_i, str(mandatory_level or ""), fallback_i,
+            enabled_i, str(parser or ""), str(source_group or ""), str(note or ""), now
         ))
 
     # 1) ExternalSourceConfig.SOURCES（主程式本身的全系統外部資料配置）
@@ -5697,7 +5720,7 @@ HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
 HIGH_GROWTH_DEFAULT_QUARTERS = ["Q1"]
-HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N8D_INDEX04_REVENUE_CLOSED_LOOP_FIX_20260613"
+HIGH_GROWTH_RULE_VERSION = "HIGH_GROWTH_EPS_ENGINE_V4_15_R5N11_P0_GATE_REPAIR_20260614"
 # V4.11：避免 base_annual_eps 為負數或極小值時，q1_vs_annual_ratio 出現 72.8、48.0 等失真倍率。
 # 原始倍率仍保留在 q1_vs_annual_ratio_raw；策略排序/嚴格Gate只使用通過品質檢查的倍率。
 HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
@@ -6440,6 +6463,217 @@ def r5n10_get_revenue_source(market_type: str) -> str:
     if not mt:
         return ""
     return str((cfg.get("revenue_sources") or {}).get(mt, "") or "").strip()
+
+
+# ==========================================================
+# R5N11 P0 Gate Repair：只修會造成跑不出來/報表空白/資料錯讀的主因
+# 修正範圍：1 EPS market_type、3 OTC月營收正式來源、4 legacy營收正規化、
+#          6 Registry型別錯誤、8 啟動前自檢。
+# ==========================================================
+def r5n11_get_stock_market_map(db: DBManager | None = None) -> dict[str, str]:
+    """建立 stock_id -> market_type 對照，所有 EPS/營收資料寫入或修復都以 stocks_master 為準。"""
+    out: dict[str, str] = {}
+    try:
+        if db is not None:
+            with db.lock:
+                master = pd.read_sql_query("SELECT stock_id, market FROM stocks_master", db.conn)
+        else:
+            master = pd.read_csv(resolve_master_csv(), dtype=str).fillna("") if resolve_master_csv().exists() else pd.DataFrame()
+        if master is None or master.empty:
+            return out
+        master["stock_id"] = master.get("stock_id", "").map(normalize_stock_id)
+        master["market_type"] = master.get("market", "").map(normalize_market_type)
+        master = master[(master["stock_id"] != "") & master["market_type"].isin(["sii", "otc"])].copy()
+        out = dict(master.drop_duplicates("stock_id", keep="last").set_index("stock_id")["market_type"].to_dict())
+    except Exception as exc:
+        log_warning(f"[R5N11][MARKET_MAP][FAIL] {exc}")
+    return out
+
+
+def r5n11_repair_market_type_in_table(db: DBManager, table_name: str, only_blank: bool = True) -> int:
+    """用 stocks_master 修復 EPS/營收表 market_type。
+
+    目的：避免 quarterly_financial_history / annual_eps_history / external_revenue_history
+    market_type 空白或錯誤時，High Growth Gate 讀錯市場、錯配上櫃/上市，造成報表空白。
+    """
+    if db is None:
+        return 0
+    safe_table = re.sub(r"[^A-Za-z0-9_]", "", str(table_name or ""))
+    if not safe_table:
+        return 0
+    try:
+        with db.lock:
+            cur = db.conn.cursor()
+            exists = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (safe_table,)).fetchone()
+            if not exists:
+                return 0
+            cols = {str(r[1]) for r in cur.execute(f"PRAGMA table_info({safe_table})").fetchall()}
+            if "stock_id" not in cols:
+                return 0
+            if "market_type" not in cols:
+                cur.execute(f"ALTER TABLE {safe_table} ADD COLUMN market_type TEXT")
+            condition = "COALESCE(market_type,'')=''" if only_blank else "COALESCE(market_type,'') NOT IN ('sii','otc')"
+            cur.execute(f"""
+                UPDATE {safe_table}
+                SET market_type = (
+                    SELECT CASE
+                        WHEN sm.market IN ('上市','sii','SII','TWSE') THEN 'sii'
+                        WHEN sm.market IN ('上櫃','otc','OTC','TPEX') THEN 'otc'
+                        ELSE market_type
+                    END
+                    FROM stocks_master sm
+                    WHERE sm.stock_id = {safe_table}.stock_id
+                )
+                WHERE {condition}
+                  AND EXISTS (SELECT 1 FROM stocks_master sm WHERE sm.stock_id = {safe_table}.stock_id)
+            """)
+            changed = int(cur.rowcount or 0)
+            db.conn.commit()
+        log_info(f"[R5N11][MARKET_TYPE_REPAIR] table={safe_table} changed={changed} only_blank={only_blank}")
+        return changed
+    except Exception as exc:
+        log_warning(f"[R5N11][MARKET_TYPE_REPAIR_FAIL] table={safe_table}｜{exc}")
+        return 0
+
+
+def r5n11_repair_eps_market_type(db: DBManager) -> pd.DataFrame:
+    """R5N11-1：修 EPS market_type。"""
+    rows = []
+    for table in ["quarterly_financial_history", "annual_eps_history", "financial_feature_daily"]:
+        changed_blank = r5n11_repair_market_type_in_table(db, table, only_blank=True)
+        changed_invalid = r5n11_repair_market_type_in_table(db, table, only_blank=False)
+        rows.append({"修正項目": "EPS market_type", "資料表": table, "空白修正": changed_blank, "非法值修正": changed_invalid, "狀態": "PASS"})
+    return pd.DataFrame(rows)
+
+
+def r5n11_repair_revenue_market_type(db: DBManager) -> pd.DataFrame:
+    """R5N11-3/4：修營收 market_type，避免 legacy_all 與正式 market cache 混讀。"""
+    rows = []
+    for table in ["external_revenue_history", "external_revenue", "external_revenue_announce"]:
+        changed_blank = r5n11_repair_market_type_in_table(db, table, only_blank=True)
+        changed_invalid = r5n11_repair_market_type_in_table(db, table, only_blank=False)
+        rows.append({"修正項目": "Revenue market_type", "資料表": table, "空白修正": changed_blank, "非法值修正": changed_invalid, "狀態": "PASS"})
+    return pd.DataFrame(rows)
+
+
+def r5n11_migrate_legacy_revenue_cache(db: DBManager | None, months: list[str] | None = None, write_db: bool = True) -> pd.DataFrame:
+    """R5N11-4：將 legacy revenue_YYYYMM.csv 轉成 normalized/final sii/otc cache。
+
+    規則：
+    - legacy all cache 只能作備援，不可再當正式來源。
+    - 若 rows 沒有 market_type，就用 stocks_master.market 推回 sii/otc。
+    - 轉出的 final/normalized cache 才能進 DB 與 Gate。
+    """
+    rows = []
+    try:
+        mgr = RevenueOpenAPICacheDownloader()
+        if months:
+            norm_months = [RevenueAccelerationEngine.normalize_month(m) for m in months]
+            norm_months = [m for m in norm_months if m]
+        else:
+            norm_months = []
+            for p in Path(REVENUE_MONTHLY_CACHE_DIR).glob("revenue_*.csv"):
+                m = RevenueAccelerationEngine.normalize_month(p.stem.replace("revenue_", ""))
+                if m:
+                    norm_months.append(m)
+            norm_months = sorted(set(norm_months))
+        market_map = r5n11_get_stock_market_map(db)
+        for m in norm_months:
+            legacy_path = mgr.cache_path_for_month(m)
+            if not legacy_path.exists() or legacy_path.stat().st_size <= 0:
+                rows.append({"月份": m, "動作": "legacy轉正規化", "狀態": "SKIP", "原因": "無legacy檔", "輸出筆數": 0})
+                continue
+            raw = safe_read_csv_auto(legacy_path)
+            x = mgr._normalize_month_cache_df(raw, m, source_url="R5N11_LEGACY_NORMALIZE:" + str(legacy_path))
+            if x is None or x.empty:
+                rows.append({"月份": m, "動作": "legacy轉正規化", "狀態": "FAIL", "原因": "legacy解析後0筆", "輸出筆數": 0})
+                continue
+            if "market_type" not in x.columns:
+                x["market_type"] = ""
+            x["market_type"] = x["market_type"].map(normalize_market_type)
+            blank = x["market_type"].astype(str).eq("")
+            if blank.any() and market_map:
+                x.loc[blank, "market_type"] = x.loc[blank, "stock_id"].astype(str).map(market_map).fillna("")
+            x = x[x["market_type"].isin(["sii", "otc"])].copy()
+            if x.empty:
+                rows.append({"月份": m, "動作": "legacy轉正規化", "狀態": "FAIL", "原因": "無法依stocks_master分流", "輸出筆數": 0})
+                continue
+            # 寫出正式分流 cache 與 normalized cache
+            for mt in ["sii", "otc"]:
+                sub = x[x["market_type"].eq(mt)].copy()
+                if not sub.empty:
+                    _r5n7d_save_df_csv(sub, mgr.monthly_cache_path(m, mt), "final_from_legacy", m, mt, "r5n11_legacy_normalize")
+                    _r5n7d_save_df_csv(sub, mgr.normalized_cache_path(m, mt), "normalized_from_legacy", m, mt, "r5n11_legacy_normalize")
+            written = 0
+            if write_db and db is not None:
+                written = mgr.upsert_external_revenue_history(db, x, append_only=False)
+            rows.append({"月份": m, "動作": "legacy轉正規化", "狀態": "PASS", "原因": "已分流sii/otc並寫入DB" if write_db else "已分流sii/otc", "輸出筆數": int(len(x)), "DB新增筆數": written})
+    except Exception as exc:
+        rows.append({"月份": "", "動作": "legacy轉正規化", "狀態": "FAIL", "原因": str(exc), "輸出筆數": 0})
+        log_warning(f"[R5N11][LEGACY_REVENUE_MIGRATE_FAIL] {exc}")
+    return pd.DataFrame(rows)
+
+
+def r5n11_validate_gate_inputs(db: DBManager, months: list[str] | None = None) -> pd.DataFrame:
+    """R5N11-7/8：完整 Gate 輸入驗證表，用於改版驗收，不直接阻斷 UI。"""
+    months = [RevenueAccelerationEngine.normalize_month(m) for m in (months or ["202602", "202603", "202604"])]
+    months = [m for m in months if m]
+    rows = []
+    try:
+        with db.lock:
+            cur = db.conn.cursor()
+            for table in ["quarterly_financial_history", "annual_eps_history", "external_revenue_history", "stocks_master"]:
+                exists = bool(cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
+                cnt = int(cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0) if exists else 0
+                mt_blank = 0
+                if exists:
+                    cols = {str(r[1]) for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+                    if "market_type" in cols:
+                        mt_blank = int(cur.execute(f"SELECT COUNT(*) FROM {table} WHERE COALESCE(market_type,'')='' ").fetchone()[0] or 0)
+                rows.append({"Gate項目": table, "存在": "YES" if exists else "NO", "筆數": cnt, "market_type空白": mt_blank, "狀態": "PASS" if exists and cnt > 0 else "FAIL"})
+            for m in months:
+                for mt in ["sii", "otc"]:
+                    cnt = int(cur.execute("SELECT COUNT(*) FROM external_revenue_history WHERE revenue_month=? AND market_type=? AND COALESCE(revenue,0)>0", (m, mt)).fetchone()[0] or 0)
+                    rows.append({"Gate項目": f"external_revenue_history {m} {mt}", "存在": "YES", "筆數": cnt, "market_type空白": 0, "狀態": "PASS" if cnt > 0 or _r5n7d_is_revenue_not_due(m) else "FAIL"})
+    except Exception as exc:
+        rows.append({"Gate項目": "R5N11 Gate Validate", "存在": "ERROR", "筆數": 0, "market_type空白": 0, "狀態": "FAIL", "原因": str(exc)})
+    return pd.DataFrame(rows)
+
+
+def r5n11_preflight_repair(db: DBManager | None, months: list[str] | None = None, write_db: bool = True, log_cb=None) -> dict:
+    """R5N11-8：啟動/報表前自檢與修復。
+
+    不新增新功能，只做 P0 修復：registry、EPS market_type、營收 market_type、legacy cache 正規化。
+    """
+    result = {"status": "PASS", "details": {}}
+    if db is None:
+        return {"status": "SKIP", "details": {"reason": "db is None"}}
+    try:
+        try:
+            sync_count = sync_external_source_registry_from_code(db)
+            result["details"]["registry_sync_rows"] = sync_count
+        except Exception as exc:
+            result["status"] = "WARN"
+            result["details"]["registry_sync_error"] = str(exc)
+            log_warning(f"[R5N11][PREFLIGHT][REGISTRY_WARN] {exc}")
+        eps_df = r5n11_repair_eps_market_type(db)
+        rev_df = r5n11_repair_revenue_market_type(db)
+        legacy_df = r5n11_migrate_legacy_revenue_cache(db, months=months, write_db=write_db)
+        gate_df = r5n11_validate_gate_inputs(db, months=months)
+        result["details"]["eps_market_type_repair"] = int(eps_df.get("空白修正", pd.Series(dtype=int)).sum()) if not eps_df.empty else 0
+        result["details"]["revenue_market_type_repair"] = int(rev_df.get("空白修正", pd.Series(dtype=int)).sum()) if not rev_df.empty else 0
+        result["details"]["legacy_months_pass"] = int((legacy_df.get("狀態", pd.Series(dtype=str)).astype(str) == "PASS").sum()) if not legacy_df.empty else 0
+        result["details"]["gate_fail_count"] = int((gate_df.get("狀態", pd.Series(dtype=str)).astype(str) == "FAIL").sum()) if not gate_df.empty else 0
+        if result["details"]["gate_fail_count"] > 0:
+            result["status"] = "WARN"
+        if log_cb:
+            log_cb(f"[R5N11][PREFLIGHT] status={result['status']} details={result['details']}")
+        else:
+            log_info(f"[R5N11][PREFLIGHT] status={result['status']} details={result['details']}")
+    except Exception as exc:
+        result = {"status": "FAIL", "details": {"error": str(exc)}}
+        log_warning(f"[R5N11][PREFLIGHT][FAIL] {exc}")
+    return result
 
 
 # R5M_TWSE_INDEX04_C04003_HISTORY_20260608：TWSE index04 歷史月報 ZIP。
@@ -12980,6 +13214,12 @@ def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: 
     if db is None:
         db = DBManager(DB_PATH); db.init_db(); close_after = True
     try:
+        try:
+            qlist = normalize_high_growth_quarters(tracking_quarters)
+            required_months = resolve_high_growth_required_months(qlist)
+            r5n11_preflight_repair(db, months=required_months, write_db=True, log_cb=log_cb)
+        except Exception as preflight_exc:
+            log_warning(f"[R5N11][HIGH_GROWTH_PREFLIGHT][WARN] {preflight_exc}")
         return HighGrowthEPSEngine(db, tracking_quarters=tracking_quarters, min_yoy=min_yoy, mode=mode).export_report(output_dir=output_dir or HIGH_GROWTH_REPORT_DIR, log_cb=log_cb)
     finally:
         if close_after:
@@ -19820,6 +20060,10 @@ class AppUI:
                 self.ui_call(_refresh_and_mark)
                 done.wait()
                 self.ui_call(self.update_task, "啟動初始化", 3, 4, success=1, item="首輪畫面刷新完成")
+                try:
+                    r5n11_preflight_repair(self.db, months=["202602", "202603", "202604"], write_db=True, log_cb=lambda m: self.ui_call(self.append_log, m))
+                except Exception as preflight_exc:
+                    log_warning(f"[R5N11][STARTUP_PREFLIGHT][WARN] {preflight_exc}")
                 self.startup_initialized = True
                 self.ui_call(self.update_task, "啟動初始化", 4, 4, success=1, item="系統可操作")
                 self.ui_call(self.finish_task, "啟動初始化", "系統初始化完成，可開始操作。")
@@ -20863,6 +21107,10 @@ class AppUI:
                     trace = None
                 downloader = RevenueOpenAPICacheDownloader(trace_engine=trace)
                 summary, combined = downloader.ensure_c04003_revenue_cache(months, force_download=False, write_db=True, db=self.db)
+                try:
+                    r5n11_preflight_repair(self.db, months=months, write_db=True, log_cb=lambda m: self.ui_call(self.append_log, m))
+                except Exception as preflight_exc:
+                    log_warning(f"[R5N11][REVENUE_PREFLIGHT][WARN] {preflight_exc}")
                 validate_df = downloader.validate_selected_revenue_months(months, db=self.db)
                 pass_count = int((validate_df.get("驗收結果", pd.Series(dtype=str)).astype(str) == "PASS").sum()) if validate_df is not None and not validate_df.empty else 0
                 out_dir = HIGH_GROWTH_REPORT_DIR / "revenue_cache_reports"
