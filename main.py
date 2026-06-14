@@ -12275,19 +12275,91 @@ class EPSForecastEngine:
                 r["_priority"] = 3
                 parts.append(r[["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "_priority"]])
         parts = [p for p in parts if p is not None and not p.empty]
+        output_cols = [
+            "stock_id", "current_eps_ttm", "pe_ratio", "current_price",
+            "valuation_source", "eps_ttm_source", "eps_ttm_source_date",
+            "eps_ttm_fiscal_year_quarter", "eps_ttm_quality", "eps_ttm_gate"
+        ]
         if not parts:
-            return pd.DataFrame(columns=["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_gate"])
+            return pd.DataFrame(columns=output_cols)
+
         x = pd.concat(parts, ignore_index=True)
-        x["stock_id"] = x["stock_id"].map(normalize_stock_id)
-        x["current_eps_ttm"] = pd.to_numeric(x["current_eps_ttm"], errors="coerce")
-        x = x.dropna(subset=["stock_id", "current_eps_ttm"]).copy()
-        x = x[x["current_eps_ttm"].gt(0)].copy()
+        x["stock_id"] = x["stock_id"].map(normalize_stock_id).astype(str)
+        x["current_eps_ttm"] = pd.to_numeric(x.get("current_eps_ttm"), errors="coerce")
+        x["pe_ratio"] = pd.to_numeric(x.get("pe_ratio"), errors="coerce")
+        x["current_price"] = pd.to_numeric(x.get("current_price"), errors="coerce")
+        x["_priority"] = pd.to_numeric(x.get("_priority"), errors="coerce").fillna(99).astype(int)
+
+        # R5N17 FIX：PE/PEG 不可綁死在 EPS_TTM > 0。
+        # 原 R5N16 這裡直接 dropna(subset=["stock_id", "current_eps_ttm"]) 並要求 current_eps_ttm > 0，
+        # 會把「有官方 PE / PB / Yield，但沒有 eps_ttm 或 TPEx 沒收盤價」的估值列整批丟掉。
+        # 結果 external_valuation 明明有 PE，進到 High Growth EPS 報表時 pe_ratio / peg_ratio 仍空白。
+        # 正確資料血緣：
+        # - current_eps_ttm：可作 EPS_TTM proxy，但不是估值欄位存在的必要條件。
+        # - pe_ratio/current_price：只要有任一有效值，就必須保留到 High Growth EPS 報表。
+        x = x[
+            x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)
+            & ~x["stock_id"].isin(["0000", "9999"])
+            & (
+                x["current_eps_ttm"].gt(0)
+                | x["pe_ratio"].notna()
+                | x["current_price"].notna()
+            )
+        ].copy()
         if x.empty:
-            return pd.DataFrame(columns=["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_gate"])
-        x["eps_ttm_quality"] = "EPS_TTM_PROXY_ONLY"
-        x["eps_ttm_gate"] = x["current_eps_ttm"].gt(0)
-        x = x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first")
-        return x.drop(columns=["_priority"], errors="ignore")
+            return pd.DataFrame(columns=output_cols)
+
+        for col in ["valuation_source", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter"]:
+            if col not in x.columns:
+                x[col] = ""
+            x[col] = x[col].fillna("").astype(str)
+
+        x = x.sort_values(["stock_id", "_priority"]).reset_index(drop=True)
+
+        def _first_valid_num(g: pd.DataFrame, col: str, positive: bool = False):
+            s = pd.to_numeric(g.get(col), errors="coerce")
+            if positive:
+                s = s.where(s.gt(0))
+            s = s.dropna()
+            return float(s.iloc[0]) if not s.empty else np.nan
+
+        def _first_valid_text(g: pd.DataFrame, col: str):
+            if col not in g.columns:
+                return ""
+            s = g[col].fillna("").astype(str).str.strip()
+            s = s[s.ne("")]
+            return str(s.iloc[0]) if not s.empty else ""
+
+        rows = []
+        for sid, g in x.groupby("stock_id", sort=False):
+            eps_v = _first_valid_num(g, "current_eps_ttm", positive=True)
+            pe_v = _first_valid_num(g, "pe_ratio", positive=False)
+            price_v = _first_valid_num(g, "current_price", positive=False)
+
+            # EPS 來源優先指向真的有 EPS_TTM 的列；若沒有，仍保留 valuation-only 追溯。
+            eps_rows = g[pd.to_numeric(g["current_eps_ttm"], errors="coerce").gt(0)].copy()
+            source_base = eps_rows if not eps_rows.empty else g
+
+            valuation_source = _first_valid_text(g, "valuation_source")
+            eps_ttm_source = _first_valid_text(source_base, "eps_ttm_source")
+            eps_ttm_source_date = _first_valid_text(source_base, "eps_ttm_source_date")
+            eps_ttm_fyq = _first_valid_text(source_base, "eps_ttm_fiscal_year_quarter")
+
+            rows.append({
+                "stock_id": sid,
+                "current_eps_ttm": eps_v,
+                "pe_ratio": pe_v,
+                "current_price": price_v,
+                "valuation_source": valuation_source,
+                "eps_ttm_source": eps_ttm_source,
+                "eps_ttm_source_date": eps_ttm_source_date,
+                "eps_ttm_fiscal_year_quarter": eps_ttm_fyq,
+                "eps_ttm_quality": "EPS_TTM_PROXY_ONLY" if pd.notna(eps_v) and eps_v > 0 else "VALUATION_ONLY_NO_EPS_TTM",
+                "eps_ttm_gate": bool(pd.notna(eps_v) and eps_v > 0),
+            })
+
+        out = pd.DataFrame(rows)
+        return out[output_cols]
 
     def build_eps_features(self, master: pd.DataFrame, revenue_features: pd.DataFrame, quarters=None) -> pd.DataFrame:
         quarters = normalize_high_growth_quarters(quarters)
