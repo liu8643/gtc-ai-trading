@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.16-R5N13_DATAGOV_T187AP05_REVENUE_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.17-R5N15_EXTERNAL_VALUATION_WRITE_GATE"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -14264,6 +14264,69 @@ class ExternalDataWriter:
         elif table == "external_event" and "event_id" in df.columns:
             cur.executemany("DELETE FROM external_event WHERE event_id=?", [(str(v),) for v in df["event_id"].dropna().astype(str).unique().tolist()])
 
+    def _validate_external_valuation_before_write(self, df: pd.DataFrame) -> tuple[bool, pd.DataFrame, str]:
+        """
+        R5N15：external_valuation 寫入前健康檢查。
+
+        目的：
+        1. 阻擋 stock_id=0000 / 9999 / 空代號 / 非股票代號。
+        2. 阻擋 rows 或股票數過低的異常估值資料。
+        3. 阻擋 close_price / pe 有效率過低的資料。
+        4. Gate 失敗時回傳 False，讓 write_result() 直接 return，
+           不進 _delete_existing_rows()，避免舊的 external_valuation 好資料被壞資料覆蓋。
+        """
+        if df is None or df.empty:
+            return False, pd.DataFrame(), "valuation df empty"
+
+        x = df.copy()
+
+        if "stock_id" not in x.columns:
+            return False, x, "external_valuation 缺少 stock_id"
+
+        if "data_date" not in x.columns:
+            return False, x, "external_valuation 缺少 data_date"
+
+        x["stock_id"] = x["stock_id"].map(normalize_stock_id).astype(str)
+        x["data_date"] = x["data_date"].fillna("").astype(str).str.strip()
+
+        # R5N15：排除 0000/9999/空白/非股票代號，避免 1 筆 0000 被當成成功估值資料。
+        x = x[
+            x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)
+            & ~x["stock_id"].isin(["0000", "9999"])
+            & x["data_date"].ne("")
+        ].copy()
+
+        for col in ["close_price", "pe", "pb", "dividend_yield", "eps", "eps_ttm"]:
+            if col not in x.columns:
+                x[col] = np.nan
+            x[col] = pd.to_numeric(x[col], errors="coerce")
+
+        row_count = int(len(x))
+        stock_count = int(x["stock_id"].nunique()) if "stock_id" in x.columns else 0
+        price_nonnull = int(x["close_price"].notna().sum()) if "close_price" in x.columns else 0
+        pe_nonnull = int(x["pe"].notna().sum()) if "pe" in x.columns else 0
+
+        fail_reasons = []
+        if row_count < 1000:
+            fail_reasons.append(f"rows<{1000}: {row_count}")
+        if stock_count < 1000:
+            fail_reasons.append(f"stocks<{1000}: {stock_count}")
+        if price_nonnull < 1000:
+            fail_reasons.append(f"close_price_nonnull<{1000}: {price_nonnull}")
+        if pe_nonnull < 800:
+            fail_reasons.append(f"pe_nonnull<{800}: {pe_nonnull}")
+
+        detail = (
+            f"rows={row_count}, stocks={stock_count}, "
+            f"close_price_nonnull={price_nonnull}, pe_nonnull={pe_nonnull}"
+        )
+
+        if fail_reasons:
+            return False, x, detail + "｜" + "; ".join(fail_reasons)
+
+        return True, x, detail
+
+
     def write_result(self, result: ExternalPipelineResult, run_id: str | None = None) -> ExternalPipelineResult:
         if result is None:
             return ExternalPipelineResult("unknown", "fail", error_message="result is None")
@@ -14283,6 +14346,20 @@ class ExternalDataWriter:
                     result.data_ready = 0
                     result.error_message = "DB寫入前檢查失敗：revenue_month 無法正規化或 revenue<=0，禁止覆蓋既有資料"
                     return result
+
+            # R5N15：external_valuation 寫入前健康檢查。
+            # Gate 失敗時直接 return，不進 _delete_existing_rows()，避免壞資料覆蓋舊資料。
+            if result.target_table == "external_valuation":
+                ok, cleaned_df, reason = self._validate_external_valuation_before_write(df)
+                if not ok:
+                    result.status = "fail"
+                    result.data_ready = 0
+                    result.rows_count = 0
+                    result.error_message = "DB寫入前檢查失敗：external_valuation 資料異常，禁止覆蓋既有資料｜" + str(reason)
+                    log_error("[R5N15][VALUATION_WRITE_BLOCK] " + result.error_message)
+                    return result
+                df = cleaned_df
+                log_info("[R5N15][VALUATION_WRITE_PASS] " + str(reason))
             with self.db.lock:
                 if result.target_table == "market_snapshot":
                     self._delete_existing_rows("market_snapshot", df)
