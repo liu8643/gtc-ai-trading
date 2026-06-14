@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.15-R5N12_FINMIND_OTC_FORCE_GATE"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.16-R5N13_DATAGOV_T187AP05_REVENUE_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -4385,8 +4385,8 @@ def get_r5j_registry_v2_rows() -> list[tuple]:
         ("AnnualEPS", "Index05Selenium", "TWSE index05 C05001 Selenium", "BROWSER", 4, "https://www.twse.com.tw/en/trading/statistics/index05.html", "select year=2025; Query; download Q4 ZIP", "annual_eps_history", "zip/xls/xlsx", 1000, 5000, "P0", 1, "annual_eps", "browser fallback"),
         ("AnnualEPS", "MOPS_t163sb04", "MOPS年度EPS fallback", "HTML", 5, "https://mops.twse.com.tw/mops/web/ajax_t163sb04", "https://mops.twse.com.tw/mops/web/ajax_t163sb04", "annual_eps_history", "html", 1000, 5000, "P0", 1, "annual_eps", "requires lxml"),
         ("QuarterlyEPS", "OfficialEPSOpenAPI", "官方季度EPS OpenAPI", "API", 1, "https://openapi.twse.com.tw/", "TWSE/TPEx EPS OpenAPI", "quarterly_financial_history", "json", 1000, 5000, "P0", 1, "eps", "Q1/Q2/Q3/Q4"),
-        ("Revenue", "TWSE_t187ap05_L", "TWSE上市月營收", "API", 1, "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", "external_revenue_history", "json", 1000, 5000, "P0", 1, "revenue", "上市月營收"),
-        ("Revenue", "TPEX_t187ap05_O", "TPEx上櫃月營收", "API", 2, "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", "external_revenue_history", "json", 700, 5000, "P1", 1, "revenue", "上櫃月營收備援"),
+        ("Revenue", "DATAGOV_18420_T187AP05_L_CSV", "Data.gov上市月營收", "CSV", 1, "https://data.gov.tw/dataset/18420", "https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv", "external_revenue_history", "csv", 1000, 5000, "P0", 1, "revenue", "R5N13：上市月營收主來源，data.gov.tw dataset 18420 實際 CSV"),
+        ("Revenue", "DATAGOV_56510_T187AP05_O_CSV", "Data.gov上櫃月營收", "CSV", 2, "https://data.gov.tw/dataset/56510", "https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv", "external_revenue_history", "csv", 700, 5000, "P0", 1, "revenue", "R5N13：上櫃月營收主來源，data.gov.tw dataset 56510 實際 CSV"),
         ("Revenue", "FINMIND_TaiwanStockMonthRevenue_OTC", "FinMind上櫃月營收Token", "API", 2, "https://finmind.github.io/tutor/TaiwanMarket/Fundamental/", "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue", "external_revenue_history", "json", 700, 5000, "P0", 1, "revenue", "R5N9：OTC正式月營收主補源；token由config/api_keys.json或環境變數提供"),
         ("Revenue", "TPEX_t187ap05_R", "TPEx興櫃月營收", "API", 3, "https://www.tpex.org.tw/openapi/v1/t187ap05_R", "https://www.tpex.org.tw/openapi/v1/t187ap05_R", "external_revenue_history", "json", 1, 1000, "P2", 1, "revenue", "興櫃可WARN"),
         ("Valuation", "GoodinfoFallback", "Goodinfo估值fallback only", "WEB", 4, "https://goodinfo.tw/", "https://goodinfo.tw/", "external_valuation", "html", 1, 1000, "P2", 1, "valuation", "需GTC_ENABLE_GOODINFO_FALLBACK=1，不可作主來源"),
@@ -6350,12 +6350,33 @@ def _r5n8c_filter_strategy_universe(df: pd.DataFrame) -> pd.DataFrame:
     """R5N8C：爆發股/高成長候選用普通股母體；ETF/權證/特殊商品不進候選與缺漏統計。"""
     return _r5n7d_exclude_non_revenue_universe(df)
 
+# R5N13_DATAGOV_T187AP05_REVENUE_FIX_20260614：
+# data.gov.tw Dataset 18420/56510 實際資源下載 URL 已確認為 mopsfin.twse.com.tw/opendata/t187ap05_L/O.csv。
+# t187ap05 為上市/上櫃月營收正式 CSV 來源；若該來源只提供最新月，歷史月份仍保留 Index04/FinMind/Cache fallback。
 REVENUE_OPENAPI_ENDPOINTS = {
-    "TWSE_REVENUE_L": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
-    "TPEX_REVENUE_O": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+    "TWSE_REVENUE_L": "https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv",
+    "TPEX_REVENUE_O": "https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv",
 }
 REVENUE_OPENAPI_OPTIONAL_ENDPOINTS = {
+    "TWSE_OPENAPI_REVENUE_L_JSON": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+    "TPEX_OPENAPI_REVENUE_O_JSON": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
     "TPEX_REVENUE_R": "https://www.tpex.org.tw/openapi/v1/t187ap05_R",
+}
+DATA_GOV_REVENUE_DATASETS = {
+    "sii": {
+        "dataset_id": "18420",
+        "name": "上市公司每月營業收入彙總表",
+        "csv_url": "https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv",
+        "referer": "https://data.gov.tw/dataset/18420",
+        "source_key": "DATAGOV_18420_T187AP05_L_CSV",
+    },
+    "otc": {
+        "dataset_id": "56510",
+        "name": "上櫃公司每月營業收入彙總表",
+        "csv_url": "https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv",
+        "referer": "https://data.gov.tw/dataset/56510",
+        "source_key": "DATAGOV_56510_T187AP05_O_CSV",
+    },
 }
 
 # R5N10_CONFIGURATION_MANAGER_20260614：
@@ -6380,8 +6401,8 @@ REVENUE_CACHE_APPEND_ONLY_POLICY = (
 DEFAULT_R5N10_CONFIG = {
     "finmind_token": "",
     "revenue_sources": {
-        "sii": "INDEX04_C04003",
-        "otc": "FINMIND_TOKEN",
+        "sii": "DATAGOV_18420_T187AP05_L_CSV",
+        "otc": "DATAGOV_56510_T187AP05_O_CSV",
         "mops": "DEBUG_ONLY",
     },
     "market_type_policy": {
@@ -8821,15 +8842,145 @@ class RevenueOpenAPICacheDownloader:
             log_warning(f"[R5M][TWSE_INDEX04][C04003_FAIL] month={m} zip={zip_path}｜{exc}")
             return pd.DataFrame()
 
+    def _read_datagov_revenue_csv(self, market_type: str) -> tuple[pd.DataFrame, str, Path | None, str]:
+        """R5N13：讀取 data.gov.tw 18420/56510 對應的 mopsfin t187ap05 CSV。
+
+        回傳 raw_df, status_text, raw_file, error_text。
+        注意：t187ap05 可能只提供最新已公告月份；若目標歷史月不在 CSV，
+        上層會自動改用既有歷史來源 fallback。
+        """
+        mt = normalize_market_type(market_type)
+        cfg = DATA_GOV_REVENUE_DATASETS.get(mt, {})
+        if not cfg:
+            return pd.DataFrame(), "NO_CONFIG", None, f"unknown market_type={market_type}"
+        url = str(cfg.get("csv_url") or "")
+        referer = str(cfg.get("referer") or "https://data.gov.tw/")
+        source_key = str(cfg.get("source_key") or f"DATAGOV_{mt}")
+        raw_dir = _r5n7d_revenue_pipeline_dir("raw", mt, "datagov_t187ap05")
+        raw_file = raw_dir / f"{source_key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            "Accept": "text/csv,application/vnd.ms-excel,application/json,text/plain,*/*",
+            "Referer": referer,
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        try:
+            resp = requests.get(url, headers=headers, timeout=45)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            content = getattr(resp, "content", b"") or b""
+            raw_file.parent.mkdir(parents=True, exist_ok=True)
+            raw_file.write_bytes(content)
+            ctype = str(resp.headers.get("Content-Type", "") or "")
+            if status != 200:
+                return pd.DataFrame(), f"HTTP_{status}", raw_file, f"HTTP {status} url={url}"
+            if len(content) < 128:
+                return pd.DataFrame(), "BYTES_TOO_SMALL", raw_file, f"bytes={len(content)}"
+            head = content[:500].decode("utf-8", errors="ignore")
+            if "FOR SECURITY REASONS" in head.upper() or "CAN NOT BE ACCESSED" in head.upper():
+                return pd.DataFrame(), "SECURITY_BLOCK", raw_file, head[:200]
+            last_error = ""
+            for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+                try:
+                    df = pd.read_csv(io.BytesIO(content), encoding=enc, dtype=str).fillna("")
+                    if df is not None and not df.empty:
+                        log_info(f"[R5N13][DATAGOV_CSV][READ_OK] market={mt} rows={len(df)} encoding={enc} url={url} content_type={ctype}")
+                        return df, f"PASS:{enc}", raw_file, ""
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+            return pd.DataFrame(), "PARSE_FAILED", raw_file, last_error
+        except Exception as exc:
+            return pd.DataFrame(), "REQUEST_FAILED", raw_file, str(exc)
+
+    def _normalize_datagov_t187ap05_df(self, raw: pd.DataFrame, target_month: str, market_type: str) -> pd.DataFrame:
+        """R5N13：將 t187ap05_L/O CSV 欄位正規化為 external_revenue_history 欄位。"""
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        mt = normalize_market_type(market_type)
+        if raw is None or raw.empty or not m or mt not in ("sii", "otc"):
+            return pd.DataFrame()
+        x = raw.copy().fillna("")
+        x.columns = _coerce_unique_columns([str(c).strip().replace("\ufeff", "") for c in x.columns])
+        cmap = self._find_revenue_columns(x)
+        # t187ap05 常見欄位補強：出表日期不是 revenue_month，資料年月才是目標月份。
+        for c in x.columns:
+            cs = str(c).strip()
+            if cs in ("資料年月", "年月"):
+                cmap["revenue_month"] = c
+            elif cs in ("當月營收", "營業收入-當月營收"):
+                cmap["revenue"] = c
+            elif cs in ("上月比較增減(%)", "營業收入-上月比較增減(%)"):
+                cmap["mom"] = c
+            elif cs in ("去年同月增減(%)", "營業收入-去年同月增減(%)"):
+                cmap["yoy"] = c
+            elif cs in ("當月累計營收", "累計營業收入-當月累計營收"):
+                cmap["cumulative_revenue"] = c
+            elif cs in ("前期比較增減(%)", "累計營業收入-前期比較增減(%)", "去年累計增減(%)"):
+                cmap["cumulative_yoy"] = c
+        if "stock_id" not in cmap or "revenue" not in cmap:
+            log_warning(f"[R5N13][DATAGOV_CSV][SCHEMA_MISSING] market={mt} columns={list(x.columns)[:40]} cmap={cmap}")
+            return pd.DataFrame()
+        rows = []
+        for _, r in x.iterrows():
+            sid = normalize_stock_id(r.get(cmap.get("stock_id"), ""))
+            rm = RevenueAccelerationEngine.normalize_month(r.get(cmap.get("revenue_month"), m)) if cmap.get("revenue_month") else m
+            if not sid or rm != m:
+                continue
+            revenue = self._num(r.get(cmap.get("revenue"), np.nan), default=np.nan)
+            if not np.isfinite(revenue) or revenue <= 0:
+                continue
+            rows.append({
+                "stock_id": sid,
+                "revenue_month": m,
+                "market_type": mt,
+                "revenue": float(revenue),
+                "mom": self._num(r.get(cmap.get("mom"), np.nan), default=np.nan) if cmap.get("mom") else np.nan,
+                "yoy": self._num(r.get(cmap.get("yoy"), np.nan), default=np.nan) if cmap.get("yoy") else np.nan,
+                "cumulative_revenue": self._num(r.get(cmap.get("cumulative_revenue"), np.nan), default=np.nan) if cmap.get("cumulative_revenue") else np.nan,
+                "cumulative_yoy": self._num(r.get(cmap.get("cumulative_yoy"), np.nan), default=np.nan) if cmap.get("cumulative_yoy") else np.nan,
+                "source_date": f"{m[:4]}-{m[4:6]}",
+                "source_url": DATA_GOV_REVENUE_DATASETS.get(mt, {}).get("csv_url", ""),
+                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        out = pd.DataFrame(rows)
+        if out.empty:
+            log_warning(f"[R5N13][DATAGOV_CSV][MONTH_NO_ROWS] market={mt} target_month={m} raw_rows={len(x)}")
+            return out
+        return out[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]].drop_duplicates(["stock_id", "revenue_month"], keep="last")
+
+    def download_datagov_t187ap05_month_cache(self, target_month: str, market_type: str) -> pd.DataFrame:
+        """R5N13：主來源 data.gov.tw 18420/56510 實際 CSV 下載，並建立分市場月營收 cache。"""
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        mt = normalize_market_type(market_type)
+        if not m or mt not in ("sii", "otc"):
+            return pd.DataFrame()
+        raw, status, raw_file, err = self._read_datagov_revenue_csv(mt)
+        source_key = DATA_GOV_REVENUE_DATASETS.get(mt, {}).get("source_key", f"DATAGOV_{mt}")
+        if raw is None or raw.empty:
+            self._emit_cache_trace(m, "DATAGOV_CSV_DOWNLOAD", "FAIL", 0, raw_file, status or "DOWNLOAD_FAIL", err)
+            log_warning(f"[R5N13][DATAGOV_CSV][DOWNLOAD_FAIL] month={m} market={mt} status={status} err={err}")
+            return pd.DataFrame()
+        parsed = self._normalize_datagov_t187ap05_df(raw, m, mt)
+        if parsed is None or parsed.empty:
+            self._emit_cache_trace(m, "DATAGOV_CSV_PARSE", "FAIL", 0, raw_file, "PARSE_ROWS_ZERO", f"target_month={m} market={mt} status={status}")
+            return pd.DataFrame()
+        cache_path = self.write_month_cache(parsed, m, source_url=f"{source_key}:{DATA_GOV_REVENUE_DATASETS.get(mt, {}).get('csv_url','')}")
+        parsed["source_url"] = f"{source_key}:{DATA_GOV_REVENUE_DATASETS.get(mt, {}).get('csv_url','')}"
+        self._emit_cache_trace(m, "DATAGOV_CSV_PARSE", "PASS", len(parsed), raw_file)
+        log_info(f"[R5N13][DATAGOV_CSV][OK] month={m} market={mt} rows={len(parsed)} cache={cache_path}")
+        return parsed
+
     def ensure_c04003_revenue_cache(self, months: list[str], force_download: bool = False, write_db: bool = False, db: DBManager | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """R5N9：依 UI 選取月份建立上市/上櫃月營收本機 Cache。
+        """R5N13：依 UI 選取月份建立上市/上櫃月營收本機 Cache。
 
-        正式資料來源：
-        - SII 上市：TWSE Index04 C04003 ZIP → XLS/XLSX → CSV。
-        - OTC 上櫃：FinMind TaiwanStockMonthRevenue Token API → JSON → CSV。
-        - MOPS t21sc03/t21sc04：已證明會回 Security Block Page，退出正式流程，只保留 debug。
-
-        回傳：summary_df, combined_df。
+        正式資料來源優先順序：
+        1) data.gov.tw Dataset 18420 / 56510 實際 CSV：
+           https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv
+           https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv
+        2) 若 t187ap05 只提供最新月且目標歷史月無資料：
+           SII fallback：TWSE Index04 C04003 ZIP。
+           OTC fallback：既有 FinMind Token 管線。
+        3) MOPS HTML 仍維持 debug only，不作正式來源。
         """
         norm_months = []
         for m in (months or []):
@@ -8838,68 +8989,51 @@ class RevenueOpenAPICacheDownloader:
                 norm_months.append(mm)
         summary_rows = []
         data_parts = []
-        for mm in norm_months:
-            # 1) SII 上市月營收：TWSE Index04 C04003
-            sii_cache_path = self.monthly_cache_path(mm, "sii")
-            legacy_cache_path = self.cache_path_for_month(mm)
-            sii_source = "CACHE_SII_FINAL"
-            sii_df = pd.DataFrame()
-            if not force_download:
-                sii_df = self.read_month_cache(mm, "sii")
-                if sii_df is None or sii_df.empty:
-                    sii_source = "CACHE_LEGACY_ALL"
-                    if legacy_cache_path.exists() and legacy_cache_path.stat().st_size > 0:
-                        legacy_df = self.load_month_cache(mm)
-                        if legacy_df is not None and not legacy_df.empty:
-                            sii_df = legacy_df[legacy_df.get("market_type", "").astype(str).map(normalize_market_type).isin(["", "sii"])].copy()
-            if sii_df is None or sii_df.empty:
-                sii_source = "TWSE_INDEX04_C04003"
-                sii_df = self.download_twse_index04_c04003_month_cache(mm)
-            sii_rows = int(len(sii_df)) if isinstance(sii_df, pd.DataFrame) else 0
-            sii_status = "PASS" if sii_rows > 0 else ("NOT_DUE" if _r5n7d_is_revenue_not_due(mm) else "FAIL")
-            if sii_rows > 0:
-                data_parts.append(sii_df.copy())
-            summary_rows.append({
-                "月份": mm,
-                "市場別": "sii",
-                "狀態": sii_status,
-                "資料筆數": sii_rows,
-                "來源": sii_source,
-                "Cache檔案": str(sii_cache_path),
-                "Legacy相容Cache": str(legacy_cache_path),
-                "NormalizedCache": str(self.normalized_cache_path(mm, "sii")),
-                "說明": "上市月營收已建立" if sii_rows > 0 else ("月報未到期，非缺資料" if sii_status == "NOT_DUE" else "未取得有效 TWSE Index04 C04003 上市月營收"),
-                "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
 
-            # 2) OTC 上櫃月營收：FinMind Token
-            otc_cache_path = self.monthly_cache_path(mm, "otc")
-            otc_source = "CACHE_OTC_FINAL"
-            otc_df = pd.DataFrame()
-            if force_download:
-                log_info(f"[R5N12][OTC_FORCE_DOWNLOAD] month={mm} action=skip_cache_and_call_finmind")
-            else:
-                otc_df = self.read_month_cache(mm, "otc")
-                otc_df = self._validate_market_month_cache(otc_df, mm, "otc", source_label="CACHE_OTC_FINAL")
-            if otc_df is None or otc_df.empty:
-                otc_source = "FINMIND_TaiwanStockMonthRevenue"
-                otc_df = self.download_finmind_month_revenue_cache(mm, db=db, market_type="otc")
-            otc_rows = int(len(otc_df)) if isinstance(otc_df, pd.DataFrame) else 0
-            otc_status = "PASS" if otc_rows > 0 else ("TOKEN_MISSING" if not load_finmind_api_token() else ("NOT_DUE" if _r5n7d_is_revenue_not_due(mm) else "FAIL"))
-            if otc_rows > 0:
-                data_parts.append(otc_df.copy())
-            summary_rows.append({
-                "月份": mm,
-                "市場別": "otc",
-                "狀態": otc_status,
-                "資料筆數": otc_rows,
-                "來源": otc_source,
-                "Cache檔案": str(otc_cache_path),
-                "Legacy相容Cache": str(legacy_cache_path),
-                "NormalizedCache": str(self.normalized_cache_path(mm, "otc")),
-                "說明": "上櫃月營收已建立" if otc_rows > 0 else ("FinMind token未設定，請填 config/api_keys.json" if otc_status == "TOKEN_MISSING" else ("月報未到期，非缺資料" if otc_status == "NOT_DUE" else "未取得有效 FinMind 上櫃月營收")),
-                "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
+        for mm in norm_months:
+            legacy_cache_path = self.cache_path_for_month(mm)
+            for mt in ("sii", "otc"):
+                cache_path = self.monthly_cache_path(mm, mt)
+                source_used = "CACHE_FINAL"
+                df = pd.DataFrame()
+                if not force_download:
+                    df = self.read_month_cache(mm, mt)
+                    df = self._validate_market_month_cache(df, mm, mt, source_label=f"CACHE_{mt.upper()}_FINAL")
+
+                if df is None or df.empty:
+                    source_used = DATA_GOV_REVENUE_DATASETS.get(mt, {}).get("source_key", "DATAGOV_T187AP05")
+                    df = self.download_datagov_t187ap05_month_cache(mm, mt)
+                    df = self._validate_market_month_cache(df, mm, mt, source_label=source_used)
+
+                fallback_note = ""
+                if (df is None or df.empty) and mt == "sii":
+                    source_used = "TWSE_INDEX04_C04003_FALLBACK"
+                    fallback_note = "data.gov t187ap05 未涵蓋此歷史月份，改用 TWSE Index04 C04003"
+                    df = self.download_twse_index04_c04003_month_cache(mm)
+                    df = self._validate_market_month_cache(df, mm, mt, source_label=source_used)
+
+                if (df is None or df.empty) and mt == "otc":
+                    source_used = "FINMIND_TaiwanStockMonthRevenue_FALLBACK"
+                    fallback_note = "data.gov t187ap05 未涵蓋此歷史月份，改用既有 FinMind OTC 管線"
+                    df = self.download_finmind_month_revenue_cache(mm, db=db, market_type="otc")
+                    df = self._validate_market_month_cache(df, mm, mt, source_label=source_used)
+
+                rows_count = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+                status = "PASS" if rows_count > 0 else ("NOT_DUE" if _r5n7d_is_revenue_not_due(mm) else "FAIL")
+                if rows_count > 0:
+                    data_parts.append(df.copy())
+                summary_rows.append({
+                    "月份": mm,
+                    "市場別": mt,
+                    "狀態": status,
+                    "資料筆數": rows_count,
+                    "來源": source_used,
+                    "Cache檔案": str(cache_path),
+                    "Legacy相容Cache": str(legacy_cache_path),
+                    "NormalizedCache": str(self.normalized_cache_path(mm, mt)),
+                    "說明": ("月營收已建立" if rows_count > 0 else ("月報未到期，非缺資料" if status == "NOT_DUE" else "未取得有效月營收")) + (f"；{fallback_note}" if fallback_note else ""),
+                    "更新時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
 
         combined = pd.concat(data_parts, ignore_index=True).drop_duplicates(["stock_id", "revenue_month"], keep="last") if data_parts else pd.DataFrame()
         if write_db and db is not None and combined is not None and not combined.empty:
@@ -8910,13 +9044,15 @@ class RevenueOpenAPICacheDownloader:
         summary = pd.DataFrame(summary_rows)
         try:
             manifest = {
-                "version": "R5N12_FINMIND_OTC_FORCE_GATE_20260614",
+                "version": "R5N13_DATAGOV_T187AP05_REVENUE_FIX_20260614",
                 "months": norm_months,
                 "force_download": bool(force_download),
                 "write_db": bool(write_db),
                 "source_policy": {
-                    "sii": "TWSE Index04 C04003",
-                    "otc": "FinMind TaiwanStockMonthRevenue Token",
+                    "sii_primary": DATA_GOV_REVENUE_DATASETS.get("sii", {}).get("csv_url", ""),
+                    "otc_primary": DATA_GOV_REVENUE_DATASETS.get("otc", {}).get("csv_url", ""),
+                    "sii_fallback": "TWSE Index04 C04003",
+                    "otc_fallback": "FinMind TaiwanStockMonthRevenue Token",
                     "mops": "debug only; not formal revenue source",
                 },
                 "summary": summary_rows,
@@ -8924,7 +9060,7 @@ class RevenueOpenAPICacheDownloader:
             }
             (self.monthly_cache_dir / "revenue_cache_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
-            log_warning(f"[R5N9][REVENUE_CACHE_MANIFEST][WRITE_FAIL] {exc}")
+            log_warning(f"[R5N13][REVENUE_CACHE_MANIFEST][WRITE_FAIL] {exc}")
         return summary, combined
 
     def upsert_external_revenue_history(self, db: DBManager, df: pd.DataFrame, append_only: bool = True) -> int:
