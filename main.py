@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.18-R5N16_OFFICIAL_VALUATION_COLLECTOR"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.19-R5N19_OFFICIAL_PE_CACHE_TWSE_TPEX_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2652,6 +2652,7 @@ class DBManager:
         CREATE TABLE IF NOT EXISTS external_valuation (
             stock_id TEXT,
             data_date TEXT,
+            market_type TEXT,
             close_price REAL,
             pe REAL,
             pb REAL,
@@ -3417,6 +3418,7 @@ class DBManager:
             _add("quarterly_financial_history", col, ddl)
 
         for col, ddl in [
+            ("market_type", "market_type TEXT"),
             ("close_price", "close_price REAL"),
             ("dividend_yield", "dividend_yield REAL"),
             ("eps_ttm", "eps_ttm REAL"),
@@ -3602,7 +3604,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.18_r5n16_official_valuation_collector",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.19_r5n19_official_pe_cache_twse_tpex_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -12275,91 +12277,19 @@ class EPSForecastEngine:
                 r["_priority"] = 3
                 parts.append(r[["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "_priority"]])
         parts = [p for p in parts if p is not None and not p.empty]
-        output_cols = [
-            "stock_id", "current_eps_ttm", "pe_ratio", "current_price",
-            "valuation_source", "eps_ttm_source", "eps_ttm_source_date",
-            "eps_ttm_fiscal_year_quarter", "eps_ttm_quality", "eps_ttm_gate"
-        ]
         if not parts:
-            return pd.DataFrame(columns=output_cols)
-
+            return pd.DataFrame(columns=["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_gate"])
         x = pd.concat(parts, ignore_index=True)
-        x["stock_id"] = x["stock_id"].map(normalize_stock_id).astype(str)
-        x["current_eps_ttm"] = pd.to_numeric(x.get("current_eps_ttm"), errors="coerce")
-        x["pe_ratio"] = pd.to_numeric(x.get("pe_ratio"), errors="coerce")
-        x["current_price"] = pd.to_numeric(x.get("current_price"), errors="coerce")
-        x["_priority"] = pd.to_numeric(x.get("_priority"), errors="coerce").fillna(99).astype(int)
-
-        # R5N17 FIX：PE/PEG 不可綁死在 EPS_TTM > 0。
-        # 原 R5N16 這裡直接 dropna(subset=["stock_id", "current_eps_ttm"]) 並要求 current_eps_ttm > 0，
-        # 會把「有官方 PE / PB / Yield，但沒有 eps_ttm 或 TPEx 沒收盤價」的估值列整批丟掉。
-        # 結果 external_valuation 明明有 PE，進到 High Growth EPS 報表時 pe_ratio / peg_ratio 仍空白。
-        # 正確資料血緣：
-        # - current_eps_ttm：可作 EPS_TTM proxy，但不是估值欄位存在的必要條件。
-        # - pe_ratio/current_price：只要有任一有效值，就必須保留到 High Growth EPS 報表。
-        x = x[
-            x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)
-            & ~x["stock_id"].isin(["0000", "9999"])
-            & (
-                x["current_eps_ttm"].gt(0)
-                | x["pe_ratio"].notna()
-                | x["current_price"].notna()
-            )
-        ].copy()
+        x["stock_id"] = x["stock_id"].map(normalize_stock_id)
+        x["current_eps_ttm"] = pd.to_numeric(x["current_eps_ttm"], errors="coerce")
+        x = x.dropna(subset=["stock_id", "current_eps_ttm"]).copy()
+        x = x[x["current_eps_ttm"].gt(0)].copy()
         if x.empty:
-            return pd.DataFrame(columns=output_cols)
-
-        for col in ["valuation_source", "eps_ttm_source", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter"]:
-            if col not in x.columns:
-                x[col] = ""
-            x[col] = x[col].fillna("").astype(str)
-
-        x = x.sort_values(["stock_id", "_priority"]).reset_index(drop=True)
-
-        def _first_valid_num(g: pd.DataFrame, col: str, positive: bool = False):
-            s = pd.to_numeric(g.get(col), errors="coerce")
-            if positive:
-                s = s.where(s.gt(0))
-            s = s.dropna()
-            return float(s.iloc[0]) if not s.empty else np.nan
-
-        def _first_valid_text(g: pd.DataFrame, col: str):
-            if col not in g.columns:
-                return ""
-            s = g[col].fillna("").astype(str).str.strip()
-            s = s[s.ne("")]
-            return str(s.iloc[0]) if not s.empty else ""
-
-        rows = []
-        for sid, g in x.groupby("stock_id", sort=False):
-            eps_v = _first_valid_num(g, "current_eps_ttm", positive=True)
-            pe_v = _first_valid_num(g, "pe_ratio", positive=False)
-            price_v = _first_valid_num(g, "current_price", positive=False)
-
-            # EPS 來源優先指向真的有 EPS_TTM 的列；若沒有，仍保留 valuation-only 追溯。
-            eps_rows = g[pd.to_numeric(g["current_eps_ttm"], errors="coerce").gt(0)].copy()
-            source_base = eps_rows if not eps_rows.empty else g
-
-            valuation_source = _first_valid_text(g, "valuation_source")
-            eps_ttm_source = _first_valid_text(source_base, "eps_ttm_source")
-            eps_ttm_source_date = _first_valid_text(source_base, "eps_ttm_source_date")
-            eps_ttm_fyq = _first_valid_text(source_base, "eps_ttm_fiscal_year_quarter")
-
-            rows.append({
-                "stock_id": sid,
-                "current_eps_ttm": eps_v,
-                "pe_ratio": pe_v,
-                "current_price": price_v,
-                "valuation_source": valuation_source,
-                "eps_ttm_source": eps_ttm_source,
-                "eps_ttm_source_date": eps_ttm_source_date,
-                "eps_ttm_fiscal_year_quarter": eps_ttm_fyq,
-                "eps_ttm_quality": "EPS_TTM_PROXY_ONLY" if pd.notna(eps_v) and eps_v > 0 else "VALUATION_ONLY_NO_EPS_TTM",
-                "eps_ttm_gate": bool(pd.notna(eps_v) and eps_v > 0),
-            })
-
-        out = pd.DataFrame(rows)
-        return out[output_cols]
+            return pd.DataFrame(columns=["stock_id", "current_eps_ttm", "pe_ratio", "current_price", "valuation_source", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_gate"])
+        x["eps_ttm_quality"] = "EPS_TTM_PROXY_ONLY"
+        x["eps_ttm_gate"] = x["current_eps_ttm"].gt(0)
+        x = x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first")
+        return x.drop(columns=["_priority"], errors="ignore")
 
     def build_eps_features(self, master: pd.DataFrame, revenue_features: pd.DataFrame, quarters=None) -> pd.DataFrame:
         quarters = normalize_high_growth_quarters(quarters)
@@ -14203,24 +14133,23 @@ class ExternalSourceConfig:
             "source_priority": "1.TWSE OpenAPI t187ap05_L 上市月營收 JSON → 2.TPEx OpenAPI mopsfin_t187ap05_O 上櫃月營收 JSON；禁止 舊 mopsfin CSV",
         },
         "valuation": {
-            # R5N16_OFFICIAL_VALUATION_COLLECTOR：估值資料完全官方化。
-            # 來源改為 OfficialValuationCollectorEngine：TWSE BWIBBU_d + TPEx PE/PB/Yield + TPEx EPS補強。
-            "source_name": "OfficialValuationCollectorEngine（TWSE BWIBBU_d + TPEx P/E P/B Yield）",
-            "official_url": "https://www.twse.com.tw/zh/trading/historical/bwibbu-day.html | https://www.tpex.org.tw/zh-tw/mainboard/trading/info/daily-pe.html | https://www.tpex.org.tw/zh-tw/mainboard/listed/financial/rank-pe.html",
+            # R5N19_OFFICIAL_PE_CACHE_TWSE_TPEX_FIX：估值資料完全官方化且必須落地 cache。
+            # 來源改為 OfficialValuationCollectorEngine：TWSE BWIBBU_d + TPEx pera_result.php。
+            "source_name": "OfficialValuationCollectorEngine（TWSE BWIBBU_d + TPEx pera_result PE/PB/Yield）",
+            "official_url": "https://www.twse.com.tw/zh/trading/historical/bwibbu-day.html | https://www.tpex.org.tw/zh-tw/mainboard/trading/info/daily-pe.html",
             "request_template": "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date={date}&selectType=ALL&response=json",
             "request_templates": [
                 "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date={date}&selectType=ALL&response=json",
                 "https://www.twse.com.tw/exchangeReport/BWIBBU_d?date={date}&selectType=ALL&response=json",
                 "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date={date}&response=json",
                 "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=json",
-                "https://www.tpex.org.tw/web/regular_emerging/financereport/regular_capitals_rank/list.php?l=zh-tw&o=json",
             ],
             "target_table": "external_valuation",
             "required_columns": ["stock_id", "data_date", "pe", "pb", "dividend_yield", "eps_ttm"],
             "fallback_days": 10,
             "mandatory": False,
             "parser": "fetch_valuation",
-            "source_priority": "1.OfficialValuationCollectorEngine: TWSE BWIBBU_d上市官方估值 → 2.TPEx daily-pe上櫃PE/PB/殖利率 → 3.TPEx rank-pe官方EPS補強；不依賴第三方網站",
+            "source_priority": "1.OfficialValuationCollectorEngine: TWSE BWIBBU_d上市官方估值 → 2.TPEx pera_result.php上櫃PE/PB/殖利率；禁止 rank-pe/EPS排名寫入 external_valuation；不依賴第三方網站",
             "license_url": TWSE_OPENAPI_LICENSE_URL,
             "oas_swagger_url": TWSE_OPENAPI_SWAGGER_URL + " | " + TPEX_OPENAPI_SWAGGER_URL,
             "goodinfo_policy": "R5N16：external_valuation 不再使用第三方網站作主資料源；Goodinfo不接入OfficialValuationCollectorEngine。",
@@ -14542,17 +14471,17 @@ class ExternalDataWriter:
 
 class OfficialValuationCollectorEngine:
     """
-    R5N16_OFFICIAL_VALUATION_COLLECTOR：官方估值資料引擎。
+    R5N19_OFFICIAL_PE_CACHE_TWSE_TPEX_FIX：官方估值資料引擎。
 
     目的：
     1. 以 TWSE BWIBBU_d 取得上市公司收盤價、本益比、股價淨值比、殖利率與財報年/季。
-    2. 以 TPEx daily-pe 取得上櫃公司 P/E、P/B、殖利率。
-    3. 以 TPEx rank-pe 補強上櫃 EPS / EPS_TTM。
-    4. 輸出統一 external_valuation schema，交由 R5N15 寫入前健康檢查保護 DB。
+    2. 以 TPEx pera_result.php 取得上櫃公司 P/E、P/B、殖利率。
+    3. 嚴禁 rank-pe / regular_capitals_rank EPS排名資料寫入 external_valuation。
+    4. 下載後先落地 raw JSON 與 normalized CSV cache，再輸出統一 external_valuation schema。
     5. 不依賴第三方網站作為 external_valuation 主資料源。
     """
     OUTPUT_COLUMNS = [
-        "stock_id", "data_date", "close_price", "pe", "pb", "dividend_yield",
+        "stock_id", "data_date", "market_type", "close_price", "pe", "pb", "dividend_yield",
         "eps", "eps_ttm", "roe", "gross_margin", "operating_margin",
         "fiscal_year_quarter", "source_date", "source_url", "update_time",
     ]
@@ -14562,6 +14491,34 @@ class OfficialValuationCollectorEngine:
 
     def _empty(self) -> pd.DataFrame:
         return pd.DataFrame(columns=self.OUTPUT_COLUMNS)
+
+    def _valuation_cache_dir(self, kind: str, source: str) -> Path:
+        """R5N19：估值資料必須先落地，支援問題回溯與人工驗證。"""
+        path = RUNTIME_DIR / "data" / "valuation_cache" / str(kind) / str(source)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _write_raw_json_cache(self, source: str, date_ymd: str, filename: str, payload) -> str:
+        try:
+            raw_dir = self._valuation_cache_dir("raw", source)
+            raw_path = raw_dir / filename
+            raw_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return str(raw_path)
+        except Exception as exc:
+            log_warning(f"[R5N19][VALUATION_CACHE][RAW_WRITE_FAIL] source={source} date={date_ymd}｜{exc}")
+            return ""
+
+    def _write_normalized_cache(self, source: str, date_ymd: str, filename: str, df: pd.DataFrame) -> str:
+        try:
+            norm_dir = self._valuation_cache_dir("normalized", source)
+            norm_path = norm_dir / filename
+            if df is None:
+                df = pd.DataFrame()
+            df.to_csv(norm_path, index=False, encoding="utf-8-sig")
+            return str(norm_path)
+        except Exception as exc:
+            log_warning(f"[R5N19][VALUATION_CACHE][NORMALIZED_WRITE_FAIL] source={source} date={date_ymd}｜{exc}")
+            return ""
 
     def _normalize_output(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
@@ -14577,7 +14534,7 @@ class OfficialValuationCollectorEngine:
         ].copy()
         for col in ["close_price", "pe", "pb", "dividend_yield", "eps", "eps_ttm", "roe", "gross_margin", "operating_margin"]:
             x[col] = pd.to_numeric(x[col], errors="coerce")
-        for col in ["data_date", "fiscal_year_quarter", "source_date", "source_url", "update_time"]:
+        for col in ["data_date", "market_type", "fiscal_year_quarter", "source_date", "source_url", "update_time"]:
             x[col] = x[col].fillna("").astype(str)
         x = x[x["data_date"].ne("")].copy()
         return x[self.OUTPUT_COLUMNS].drop_duplicates(subset=["stock_id", "data_date"], keep="last")
@@ -14600,6 +14557,11 @@ class OfficialValuationCollectorEngine:
             url = str(tpl).format(date=date_ymd, roc_date="")
             try:
                 payload, http_status = self.fetcher._request_json(url)
+                raw_cache_path = self._write_raw_json_cache(
+                    "twse_bwibbu", date_ymd, f"BWIBBU_d_ALL_{date_ymd}.json", payload
+                )
+                if raw_cache_path:
+                    log_info(f"[R5N19][VALUATION_CACHE][RAW] TWSE_BWIBBU date={date_ymd} file={raw_cache_path}")
                 fields, data = self.fetcher._normalize_twse_dataset(payload)
                 if not fields or not data:
                     last_error = "TWSE BWIBBU_d 回傳無 fields/data"
@@ -14622,6 +14584,7 @@ class OfficialValuationCollectorEngine:
                     rows.append({
                         "stock_id": sid,
                         "data_date": date_iso,
+                        "market_type": "sii",
                         "close_price": None if pd.isna(close_price) else float(close_price),
                         "pe": None if pd.isna(pe) else float(pe),
                         "pb": None if pd.isna(pb) else float(pb),
@@ -14638,6 +14601,11 @@ class OfficialValuationCollectorEngine:
                     })
                 df = self._normalize_output(pd.DataFrame(rows))
                 if not df.empty:
+                    norm_cache_path = self._write_normalized_cache(
+                        "twse_bwibbu", date_ymd, f"BWIBBU_d_ALL_{date_ymd}.csv", df
+                    )
+                    if norm_cache_path:
+                        log_info(f"[R5N19][VALUATION_CACHE][NORMALIZED] TWSE_BWIBBU rows={len(df)} file={norm_cache_path}")
                     return df, url, http_status, ""
                 last_error = "TWSE BWIBBU_d 回傳無可解析個股資料"
             except Exception as exc:
@@ -14668,43 +14636,13 @@ class OfficialValuationCollectorEngine:
                 all_parts.append(self._normalize_output(tpex_daily))
                 request_urls.append(tpex_daily_url)
                 http_statuses.append(tpex_daily_status)
-                source_notes.append(f"TPEx daily-pe rows={len(tpex_daily)}")
+                source_notes.append(f"TPEx pera_result rows={len(tpex_daily)}")
             elif tpex_daily_err:
                 last_error = tpex_daily_err
-                source_notes.append(f"TPEx daily-pe fail={tpex_daily_err}")
+                source_notes.append(f"TPEx pera_result fail={tpex_daily_err}")
 
-            tpex_eps, tpex_eps_url, tpex_eps_status, tpex_eps_err = self.fetcher._fetch_tpex_rank_pe_eps(date_iso)
-            if tpex_eps is not None and not tpex_eps.empty:
-                tpex_eps_norm = self._normalize_output(tpex_eps)
-                if tpex_daily is not None and not tpex_daily.empty:
-                    key_cols = ["stock_id", "data_date"]
-                    daily_norm = self._normalize_output(tpex_daily)
-                    merged = daily_norm.merge(
-                        tpex_eps_norm[["stock_id", "data_date", "eps", "eps_ttm", "source_url"]],
-                        on=key_cols,
-                        how="left",
-                        suffixes=("", "_rank"),
-                    )
-                    for col in ["eps", "eps_ttm"]:
-                        rank_col = f"{col}_rank"
-                        if rank_col in merged.columns:
-                            merged[col] = pd.to_numeric(merged[col], errors="coerce")
-                            merged[rank_col] = pd.to_numeric(merged[rank_col], errors="coerce")
-                            merged[col] = merged[col].where(merged[col].notna(), merged[rank_col])
-                    if "source_url_rank" in merged.columns:
-                        merged["source_url"] = merged["source_url"].astype(str) + " | EPS:" + merged["source_url_rank"].fillna("").astype(str)
-                    drop_cols = [c for c in merged.columns if c.endswith("_rank") or c == "source_url_rank"]
-                    merged = merged.drop(columns=drop_cols, errors="ignore")
-                    # 用補完 EPS 的 TPEx daily-pe 取代未補前版本。
-                    all_parts = [p for p in all_parts if not (isinstance(p, pd.DataFrame) and set(key_cols).issubset(p.columns) and p["source_url"].astype(str).str.contains("peratio_analysis", na=False).any())]
-                    all_parts.append(self._normalize_output(merged))
-                else:
-                    all_parts.append(tpex_eps_norm)
-                request_urls.append(tpex_eps_url)
-                http_statuses.append(tpex_eps_status)
-                source_notes.append(f"TPEx rank-pe EPS rows={len(tpex_eps)}")
-            elif tpex_eps_err:
-                source_notes.append(f"TPEx rank-pe fail={tpex_eps_err}")
+            # R5N19：rank-pe / regular_capitals_rank 是 EPS 排名，不是本益比資料來源。
+            # 不得再補進 external_valuation，避免把 EPS 排名誤當估值資料污染 PE/PB/Yield。
 
             df = pd.concat([p for p in all_parts if p is not None and not p.empty], ignore_index=True) if all_parts else self._empty()
             df = self._normalize_output(df)
@@ -14721,7 +14659,7 @@ class OfficialValuationCollectorEngine:
                     fallback_count=offset,
                     target_table=cfg.get("target_table", "external_valuation"),
                     data_ready=1,
-                    source_level="official_only: TWSE_BWIBBU_d + TPEx_daily_pe + TPEx_rank_pe; no_third_party",
+                    source_level="official_only: TWSE_BWIBBU_d + TPEx_pera_result; no_third_party; cache_required",
                 )
             # 官網壓力保護：估值回溯日迴圈每次短暫停頓，避免連續打官方站台。
             time.sleep(1.0)
@@ -14752,7 +14690,7 @@ class ExternalDataFetcher:
             timeout=timeout,
             headers={
                 "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.twse.com.tw/",
+                "Referer": "https://www.tpex.org.tw/" if "tpex.org.tw" in str(url).lower() else "https://www.twse.com.tw/",
                 "Accept": "application/json,text/plain,*/*",
             },
         )
@@ -15796,9 +15734,18 @@ class ExternalDataFetcher:
                     return self._extract_tpex_rows_from_payload(json.loads(s), expected_keywords=expected_keywords)
                 except Exception:
                     pass
-            # Try CSV
+            # Try CSV. TPEx CSV 前面常有標題/資料日期/產業類別三行，需從欄位列開始讀。
             try:
-                df = pd.read_csv(io.StringIO(s), dtype=str).fillna("")
+                csv_text = s
+                csv_lines = [line for line in csv_text.splitlines() if str(line).strip()]
+                header_idx = None
+                for idx, line in enumerate(csv_lines):
+                    if ("股票代號" in line or "證券代號" in line) and any(k in line for k in expected_keywords):
+                        header_idx = idx
+                        break
+                if header_idx is not None:
+                    csv_text = "\n".join(csv_lines[header_idx:])
+                df = pd.read_csv(io.StringIO(csv_text), dtype=str).fillna("")
                 if not df.empty and any(any(k in str(c) for k in expected_keywords) for c in df.columns):
                     return list(df.columns), df.values.tolist()
             except Exception:
@@ -15835,6 +15782,14 @@ class ExternalDataFetcher:
             try:
                 if "o=json" in url:
                     payload, http_status = self._request_json(url)
+                    try:
+                        raw_dir = RUNTIME_DIR / "data" / "valuation_cache" / "raw" / "tpex_peratio"
+                        raw_dir.mkdir(parents=True, exist_ok=True)
+                        raw_path = raw_dir / f"tpex_peratio_{date_ymd}.json"
+                        raw_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                        log_info(f"[R5N19][VALUATION_CACHE][RAW] TPEX_PERATIO date={date_ymd} file={raw_path}")
+                    except Exception as cache_exc:
+                        log_warning(f"[R5N19][VALUATION_CACHE][RAW_WRITE_FAIL] TPEX_PERATIO date={date_ymd}｜{cache_exc}")
                     fields, data = self._extract_tpex_rows_from_payload(payload, expected_keywords=["本益比", "殖利率", "股價淨值比"])
                 else:
                     text, http_status = self._request_text(url, referer="https://www.tpex.org.tw/")
@@ -15848,14 +15803,15 @@ class ExternalDataFetcher:
                     sid = normalize_stock_id(row_map.get("股票代號", row_map.get("證券代號", vals[0] if vals else "")))
                     if not sid:
                         continue
-                    name = str(row_map.get("名稱", row_map.get("證券名稱", vals[1] if len(vals) > 1 else "")) or "").strip()
+                    name = str(row_map.get("公司名稱", row_map.get("名稱", row_map.get("證券名稱", vals[1] if len(vals) > 1 else ""))) or "").strip()
                     pe = self._num(row_map.get("本益比", vals[2] if len(vals) > 2 else np.nan), default=np.nan)
                     dividend_yield = self._num(row_map.get("殖利率(%)", row_map.get("殖利率", vals[5] if len(vals) > 5 else np.nan)), default=np.nan)
                     pb = self._num(row_map.get("股價淨值比", vals[6] if len(vals) > 6 else np.nan), default=np.nan)
-                    # TPEx daily-pe不一定提供收盤價；以PE直接使用，eps_ttm可由rank-pe補足。
+                    # TPEx pera_result 不提供收盤價；PE/PB/Yield 直接使用，eps_ttm 不以 EPS 排名補寫。
                     rows.append({
                         "stock_id": sid,
                         "data_date": date_iso,
+                        "market_type": "otc",
                         "close_price": None,
                         "pe": None if pd.isna(pe) else float(pe),
                         "pb": None if pd.isna(pb) else float(pb),
@@ -15865,13 +15821,21 @@ class ExternalDataFetcher:
                         "roe": None,
                         "gross_margin": None,
                         "operating_margin": None,
-                        "fiscal_year_quarter": "",
+                        "fiscal_year_quarter": str(row_map.get("財報年/季", "") or "").strip(),
                         "source_date": date_iso,
                         "source_url": url,
                         "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     })
                 df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "data_date"], keep="last") if rows else pd.DataFrame()
                 if df is not None and not df.empty:
+                    try:
+                        norm_dir = RUNTIME_DIR / "data" / "valuation_cache" / "normalized" / "tpex_peratio"
+                        norm_dir.mkdir(parents=True, exist_ok=True)
+                        norm_path = norm_dir / f"tpex_peratio_{date_ymd}.csv"
+                        df.to_csv(norm_path, index=False, encoding="utf-8-sig")
+                        log_info(f"[R5N19][VALUATION_CACHE][NORMALIZED] TPEX_PERATIO rows={len(df)} file={norm_path}")
+                    except Exception as cache_exc:
+                        log_warning(f"[R5N19][VALUATION_CACHE][NORMALIZED_WRITE_FAIL] TPEX_PERATIO date={date_ymd}｜{cache_exc}")
                     return df, url, http_status, ""
                 last_error = "TPEx daily-pe 回傳無可解析資料"
             except Exception as exc:
@@ -15880,52 +15844,12 @@ class ExternalDataFetcher:
         return pd.DataFrame(), urls[0], "", last_error
 
     def _fetch_tpex_rank_pe_eps(self, date_iso: str) -> tuple[pd.DataFrame, str, str, str]:
-        """TPEx rank-pe：上櫃 EPS 排名（官方，來源註明為MOPS最近期財報）。"""
-        urls = [
-            "https://www.tpex.org.tw/web/regular_emerging/financereport/regular_capitals_rank/list.php?l=zh-tw&o=json",
-            "https://www.tpex.org.tw/web/regular_emerging/financereport/regular_capitals_rank/list.php?l=zh-tw&o=csv",
-            "https://www.tpex.org.tw/web/regular_emerging/financereport/regular_capitals_rank/list.php?l=zh-tw&o=htm",
-            "https://www.tpex.org.tw/zh-tw/mainboard/listed/financial/rank-pe.html",
-        ]
-        last_error = ""
-        for url in urls:
-            try:
-                if "o=json" in url:
-                    payload, http_status = self._request_json(url)
-                    fields, data = self._extract_tpex_rows_from_payload(payload, expected_keywords=["EPS", "公司代號"])
-                else:
-                    text, http_status = self._request_text(url, referer="https://www.tpex.org.tw/")
-                    fields, data = self._extract_tpex_rows_from_payload(text, expected_keywords=["EPS", "公司代號"])
-                rows = []
-                for rec in data:
-                    vals = list(rec) if isinstance(rec, (list, tuple, np.ndarray)) else []
-                    if not vals:
-                        continue
-                    row_map = {str(fields[i]).strip(): vals[i] for i in range(min(len(fields), len(vals)))} if fields else {}
-                    sid = normalize_stock_id(row_map.get("公司代號", row_map.get("股票代號", row_map.get("證券代號", vals[1] if len(vals) > 1 else vals[0]))))
-                    if not sid:
-                        continue
-                    eps_val = row_map.get("EPS", row_map.get("每股盈餘", vals[-1] if vals else np.nan))
-                    eps = self._num(eps_val, default=np.nan)
-                    if pd.isna(eps):
-                        continue
-                    rows.append({
-                        "stock_id": sid,
-                        "data_date": date_iso,
-                        "eps": float(eps),
-                        "eps_ttm": float(eps),
-                        "source_url": url,
-                        "source_date": date_iso,
-                        "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-                df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "data_date"], keep="last") if rows else pd.DataFrame()
-                if df is not None and not df.empty:
-                    return df, url, http_status, ""
-                last_error = "TPEx rank-pe 回傳無可解析EPS資料"
-            except Exception as exc:
-                last_error = str(exc)
-                continue
-        return pd.DataFrame(), urls[0], "", last_error
+        """R5N19：停用。rank-pe / regular_capitals_rank 是 EPS 排名，不是 valuation 來源。
+
+        保留空函式只為避免舊呼叫點造成 AttributeError；OfficialValuationCollectorEngine.collect()
+        已不再呼叫此函式，且不得寫入 external_valuation。
+        """
+        return pd.DataFrame(), "DISABLED_R5N19_RANK_PE_IS_EPS_RANK_NOT_VALUATION", "", "rank-pe disabled: EPS排名不得作為本益比/PB/殖利率來源"
 
     def _fetch_goodinfo_eps_fallback(self, date_iso: str) -> tuple[pd.DataFrame, str, str, str]:
         """Goodinfo 僅作 fallback；預設停用，不作主資料源。"""
@@ -15962,14 +15886,14 @@ class ExternalDataFetcher:
 
     def fetch_valuation(self, module: str, cfg: dict, run_id: str) -> ExternalPipelineResult:
         """
-        R5N16_OFFICIAL_VALUATION_COLLECTOR：估值資料改由 OfficialValuationCollectorEngine 統一處理。
+        R5N19_OFFICIAL_PE_CACHE_TWSE_TPEX_FIX：估值資料改由 OfficialValuationCollectorEngine 統一處理。
 
         直接來源：
         1. TWSE BWIBBU_d：上市 P/E、P/B、殖利率、收盤價、財報年/季。
-        2. TPEx daily-pe：上櫃 P/E、P/B、殖利率。
-        3. TPEx rank-pe：上櫃 EPS / EPS_TTM 補強。
+        2. TPEx pera_result.php：上櫃 P/E、P/B、殖利率。
 
         注意：external_valuation 不再使用第三方網站作主資料源；
+        rank-pe / regular_capitals_rank 是 EPS 排名，禁止寫入 external_valuation。
         寫入 DB 前仍由 R5N15 Gate 檢查 rows / stock_id / close_price / pe 覆蓋率。
         """
         engine = OfficialValuationCollectorEngine(self)
