@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.19-R5N19_OFFICIAL_PE_CACHE_TWSE_TPEX_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.20-R5N20_VALUATION_DATE_FALLBACK_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -1487,6 +1487,69 @@ def calculate_eps_ttm(price, pe, max_abs_eps: float = 100.0):
         return round(float(eps), 4)
     except Exception:
         return None
+
+
+
+
+def validate_official_valuation_df(
+    df: pd.DataFrame,
+    source_name: str,
+    min_rows: int = 500,
+    min_pe_nonnull: int = 300,
+    min_close_nonnull: int = 0,
+) -> tuple[bool, pd.DataFrame, str]:
+    """R5N20：官方估值資料有效性檢查。
+
+    目的：
+    1. 避免 TWSE/TPEx 非交易日回傳 total=0 / data=[] 仍被當成成功。
+    2. 避免 TPEx 查詢頁或空表被解析成 stock_id=0000 的假資料。
+    3. normalized cache 與 external_valuation 只允許有效交易日資料寫入。
+    """
+    if df is None or df.empty:
+        return False, pd.DataFrame(), f"{source_name}: df empty"
+
+    x = df.copy()
+    if "stock_id" not in x.columns:
+        return False, x, f"{source_name}: missing stock_id"
+
+    x["stock_id"] = x["stock_id"].map(normalize_stock_id).astype(str)
+    x = x[
+        x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)
+        & ~x["stock_id"].isin(["0000", "9999"])
+    ].copy()
+
+    for col in ["pe", "pb", "dividend_yield", "close_price"]:
+        if col not in x.columns:
+            x[col] = np.nan
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+
+    row_count = int(len(x))
+    stock_count = int(x["stock_id"].nunique()) if "stock_id" in x.columns else 0
+    pe_nonnull = int(x["pe"].notna().sum())
+    pb_nonnull = int(x["pb"].notna().sum())
+    dy_nonnull = int(x["dividend_yield"].notna().sum())
+    close_nonnull = int(x["close_price"].notna().sum())
+
+    reasons = []
+    if row_count < int(min_rows):
+        reasons.append(f"rows<{int(min_rows)}:{row_count}")
+    if stock_count < int(min_rows):
+        reasons.append(f"stocks<{int(min_rows)}:{stock_count}")
+    if pe_nonnull < int(min_pe_nonnull):
+        reasons.append(f"pe_nonnull<{int(min_pe_nonnull)}:{pe_nonnull}")
+    if int(min_close_nonnull or 0) > 0 and close_nonnull < int(min_close_nonnull):
+        reasons.append(f"close_price_nonnull<{int(min_close_nonnull)}:{close_nonnull}")
+    if (pe_nonnull + pb_nonnull + dy_nonnull) == 0:
+        reasons.append("pe/pb/dividend_yield all empty")
+
+    detail = (
+        f"{source_name}: rows={row_count}, stocks={stock_count}, "
+        f"pe_nonnull={pe_nonnull}, pb_nonnull={pb_nonnull}, "
+        f"dividend_yield_nonnull={dy_nonnull}, close_price_nonnull={close_nonnull}"
+    )
+    if reasons:
+        return False, x, detail + "｜" + "; ".join(reasons)
+    return True, x, detail
 
 def _safe_text_fill_series(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
     if isinstance(df, pd.DataFrame) and col in df.columns:
@@ -3604,7 +3667,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.19_r5n19_official_pe_cache_twse_tpex_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.20_r5n20_valuation_date_fallback_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -14147,6 +14210,12 @@ class ExternalSourceConfig:
             "target_table": "external_valuation",
             "required_columns": ["stock_id", "data_date", "pe", "pb", "dividend_yield", "eps_ttm"],
             "fallback_days": 10,
+            # R5N20_VALUATION_DATE_FALLBACK_FIX：非交易日或官方尚未產製時，自動往前找最近有效交易日。
+            "twse_min_rows": 500,
+            "twse_min_pe_nonnull": 300,
+            "twse_min_close_nonnull": 300,
+            "tpex_min_rows": 500,
+            "tpex_min_pe_nonnull": 300,
             "mandatory": False,
             "parser": "fetch_valuation",
             "source_priority": "1.OfficialValuationCollectorEngine: TWSE BWIBBU_d上市官方估值 → 2.TPEx pera_result.php上櫃PE/PB/殖利率；禁止 rank-pe/EPS排名寫入 external_valuation；不依賴第三方網站",
@@ -14601,11 +14670,23 @@ class OfficialValuationCollectorEngine:
                     })
                 df = self._normalize_output(pd.DataFrame(rows))
                 if not df.empty:
+                    ok, clean_df, reason = validate_official_valuation_df(
+                        df,
+                        "TWSE_BWIBBU",
+                        min_rows=int(cfg.get("twse_min_rows", 500) or 500),
+                        min_pe_nonnull=int(cfg.get("twse_min_pe_nonnull", 300) or 300),
+                        min_close_nonnull=int(cfg.get("twse_min_close_nonnull", 300) or 300),
+                    )
+                    if not ok:
+                        last_error = reason
+                        log_warning(f"[R5N20][VALUATION_DATE_REJECT] date={date_ymd} source=TWSE_BWIBBU reason={reason}")
+                        continue
+                    df = self._normalize_output(clean_df)
                     norm_cache_path = self._write_normalized_cache(
                         "twse_bwibbu", date_ymd, f"BWIBBU_d_ALL_{date_ymd}.csv", df
                     )
                     if norm_cache_path:
-                        log_info(f"[R5N19][VALUATION_CACHE][NORMALIZED] TWSE_BWIBBU rows={len(df)} file={norm_cache_path}")
+                        log_info(f"[R5N20][VALUATION_CACHE][NORMALIZED] TWSE_BWIBBU rows={len(df)} file={norm_cache_path}")
                     return df, url, http_status, ""
                 last_error = "TWSE BWIBBU_d 回傳無可解析個股資料"
             except Exception as exc:
@@ -14633,10 +14714,23 @@ class OfficialValuationCollectorEngine:
 
             tpex_daily, tpex_daily_url, tpex_daily_status, tpex_daily_err = self.fetcher._fetch_tpex_daily_pe(date_ymd, date_iso)
             if tpex_daily is not None and not tpex_daily.empty:
-                all_parts.append(self._normalize_output(tpex_daily))
-                request_urls.append(tpex_daily_url)
-                http_statuses.append(tpex_daily_status)
-                source_notes.append(f"TPEx pera_result rows={len(tpex_daily)}")
+                tpex_norm = self._normalize_output(tpex_daily)
+                ok, tpex_clean, tpex_reason = validate_official_valuation_df(
+                    tpex_norm,
+                    "TPEX_PERATIO",
+                    min_rows=int(cfg.get("tpex_min_rows", 500) or 500),
+                    min_pe_nonnull=int(cfg.get("tpex_min_pe_nonnull", 300) or 300),
+                    min_close_nonnull=0,
+                )
+                if ok:
+                    all_parts.append(self._normalize_output(tpex_clean))
+                    request_urls.append(tpex_daily_url)
+                    http_statuses.append(tpex_daily_status)
+                    source_notes.append(f"TPEx pera_result rows={len(tpex_clean)}")
+                else:
+                    last_error = tpex_reason
+                    source_notes.append(f"TPEx pera_result reject={tpex_reason}")
+                    log_warning(f"[R5N20][VALUATION_DATE_REJECT] date={date_ymd} source=TPEX_PERATIO reason={tpex_reason}")
             elif tpex_daily_err:
                 last_error = tpex_daily_err
                 source_notes.append(f"TPEx pera_result fail={tpex_daily_err}")
@@ -14647,6 +14741,11 @@ class OfficialValuationCollectorEngine:
             df = pd.concat([p for p in all_parts if p is not None and not p.empty], ignore_index=True) if all_parts else self._empty()
             df = self._normalize_output(df)
             if not df.empty:
+                if offset > 0:
+                    start_ymd = datetime.now().strftime("%Y%m%d")
+                    msg = f"FALLBACK_DATE_USED {start_ymd}->{date_ymd} offset={offset} rows={len(df)}"
+                    source_notes.append(msg)
+                    log_warning(f"[R5N20][VALUATION_DATE_FALLBACK_USED] {msg}")
                 return ExternalPipelineResult(
                     module,
                     "success" if offset == 0 else "fallback",
@@ -15828,14 +15927,26 @@ class ExternalDataFetcher:
                     })
                 df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id", "data_date"], keep="last") if rows else pd.DataFrame()
                 if df is not None and not df.empty:
+                    ok, clean_df, reason = validate_official_valuation_df(
+                        df,
+                        "TPEX_PERATIO",
+                        min_rows=500,
+                        min_pe_nonnull=300,
+                        min_close_nonnull=0,
+                    )
+                    if not ok:
+                        last_error = reason
+                        log_warning(f"[R5N20][VALUATION_DATE_REJECT] date={date_ymd} source=TPEX_PERATIO url={url} reason={reason}")
+                        continue
+                    df = clean_df.drop_duplicates(subset=["stock_id", "data_date"], keep="last")
                     try:
                         norm_dir = RUNTIME_DIR / "data" / "valuation_cache" / "normalized" / "tpex_peratio"
                         norm_dir.mkdir(parents=True, exist_ok=True)
                         norm_path = norm_dir / f"tpex_peratio_{date_ymd}.csv"
                         df.to_csv(norm_path, index=False, encoding="utf-8-sig")
-                        log_info(f"[R5N19][VALUATION_CACHE][NORMALIZED] TPEX_PERATIO rows={len(df)} file={norm_path}")
+                        log_info(f"[R5N20][VALUATION_CACHE][NORMALIZED] TPEX_PERATIO rows={len(df)} file={norm_path}")
                     except Exception as cache_exc:
-                        log_warning(f"[R5N19][VALUATION_CACHE][NORMALIZED_WRITE_FAIL] TPEX_PERATIO date={date_ymd}｜{cache_exc}")
+                        log_warning(f"[R5N20][VALUATION_CACHE][NORMALIZED_WRITE_FAIL] TPEX_PERATIO date={date_ymd}｜{cache_exc}")
                     return df, url, http_status, ""
                 last_error = "TPEx daily-pe 回傳無可解析資料"
             except Exception as exc:
