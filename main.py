@@ -14198,7 +14198,7 @@ class ExternalSourceConfig:
         "valuation": {
             # R5N19_OFFICIAL_PE_CACHE_TWSE_TPEX_FIX：估值資料完全官方化且必須落地 cache。
             # 來源改為 OfficialValuationCollectorEngine：TWSE BWIBBU_d + TPEx pera_result.php。
-            "source_name": "OfficialValuationCollectorEngine（TWSE BWIBBU_d + TPEx pera_result PE/PB/Yield）",
+            "source_name": "OfficialValuationCollectorEngine（TWSE BWIBBU_d + TPEx JSON/CSV/HTML PE/PB/Yield）",
             "official_url": "https://www.twse.com.tw/zh/trading/historical/bwibbu-day.html | https://www.tpex.org.tw/zh-tw/mainboard/trading/info/daily-pe.html",
             "request_template": "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date={date}&selectType=ALL&response=json",
             "request_templates": [
@@ -14206,6 +14206,9 @@ class ExternalSourceConfig:
                 "https://www.twse.com.tw/exchangeReport/BWIBBU_d?date={date}&selectType=ALL&response=json",
                 "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date={date}&response=json",
                 "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=json",
+                "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=csv",
+                "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=htm",
+                "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/daily-pe.html",
             ],
             "target_table": "external_valuation",
             "required_columns": ["stock_id", "data_date", "pe", "pb", "dividend_yield", "eps_ttm"],
@@ -15870,28 +15873,65 @@ class ExternalDataFetcher:
             roc_date = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
         except Exception:
             roc_date = ""
-        urls = [
-            f"https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=json",
-            f"https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=csv",
-            f"https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=htm",
-            f"https://www.tpex.org.tw/zh-tw/mainboard/trading/info/daily-pe.html",
+        # R5N21_OFFICIAL_VALUATION_SOURCE_PRIORITY_FIX：
+        # 上櫃估值來源採「官方多層備援」：L1 JSON → L2 CSV(UTF-8) → L3 HTML table。
+        # 每一層都先落地 raw cache，只有通過 validate_official_valuation_df 才寫 normalized cache / external_valuation。
+        sources = [
+            {
+                "level": "L1",
+                "name": "TPEX_PERATIO_JSON",
+                "url": f"https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=json",
+                "kind": "json",
+                "raw_ext": "json",
+            },
+            {
+                "level": "L2",
+                "name": "TPEX_PERATIO_CSV_UTF8",
+                "url": f"https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=csv",
+                "kind": "text",
+                "raw_ext": "csv",
+            },
+            {
+                "level": "L3",
+                "name": "TPEX_PERATIO_HTML",
+                "url": f"https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?d={roc_date}&l=zh-tw&o=htm",
+                "kind": "text",
+                "raw_ext": "html",
+            },
+            {
+                "level": "L3",
+                "name": "TPEX_DAILY_PE_HTML_PAGE",
+                "url": f"https://www.tpex.org.tw/zh-tw/mainboard/trading/info/daily-pe.html",
+                "kind": "text",
+                "raw_ext": "html",
+            },
         ]
         last_error = ""
-        for url in urls:
+        for source in sources:
+            url = source["url"]
+            source_name = source["name"]
+            source_level = source["level"]
             try:
-                if "o=json" in url:
+                raw_dir = RUNTIME_DIR / "data" / "valuation_cache" / "raw" / "tpex_peratio"
+                raw_dir.mkdir(parents=True, exist_ok=True)
+                safe_source = re.sub(r"[^A-Za-z0-9_\-]", "_", source_name.lower())
+                if source["kind"] == "json":
                     payload, http_status = self._request_json(url)
+                    raw_path = raw_dir / f"{safe_source}_{date_ymd}.{source['raw_ext']}"
                     try:
-                        raw_dir = RUNTIME_DIR / "data" / "valuation_cache" / "raw" / "tpex_peratio"
-                        raw_dir.mkdir(parents=True, exist_ok=True)
-                        raw_path = raw_dir / f"tpex_peratio_{date_ymd}.json"
                         raw_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                        log_info(f"[R5N19][VALUATION_CACHE][RAW] TPEX_PERATIO date={date_ymd} file={raw_path}")
+                        log_info(f"[R5N21][VALUATION_CACHE][RAW] {source_name} level={source_level} date={date_ymd} file={raw_path}")
                     except Exception as cache_exc:
-                        log_warning(f"[R5N19][VALUATION_CACHE][RAW_WRITE_FAIL] TPEX_PERATIO date={date_ymd}｜{cache_exc}")
+                        log_warning(f"[R5N21][VALUATION_CACHE][RAW_WRITE_FAIL] {source_name} date={date_ymd}｜{cache_exc}")
                     fields, data = self._extract_tpex_rows_from_payload(payload, expected_keywords=["本益比", "殖利率", "股價淨值比"])
                 else:
-                    text, http_status = self._request_text(url, referer="https://www.tpex.org.tw/")
+                    text, http_status = self._request_text(url, referer="https://www.tpex.org.tw/zh-tw/mainboard/trading/info/daily-pe.html")
+                    raw_path = raw_dir / f"{safe_source}_{date_ymd}.{source['raw_ext']}"
+                    try:
+                        raw_path.write_text(str(text or ""), encoding="utf-8")
+                        log_info(f"[R5N21][VALUATION_CACHE][RAW] {source_name} level={source_level} date={date_ymd} file={raw_path}")
+                    except Exception as cache_exc:
+                        log_warning(f"[R5N21][VALUATION_CACHE][RAW_WRITE_FAIL] {source_name} date={date_ymd}｜{cache_exc}")
                     fields, data = self._extract_tpex_rows_from_payload(text, expected_keywords=["本益比", "殖利率", "股價淨值比"])
                 rows = []
                 for rec in data:
@@ -15929,14 +15969,14 @@ class ExternalDataFetcher:
                 if df is not None and not df.empty:
                     ok, clean_df, reason = validate_official_valuation_df(
                         df,
-                        "TPEX_PERATIO",
+                        source_name,
                         min_rows=500,
                         min_pe_nonnull=300,
                         min_close_nonnull=0,
                     )
                     if not ok:
                         last_error = reason
-                        log_warning(f"[R5N20][VALUATION_DATE_REJECT] date={date_ymd} source=TPEX_PERATIO url={url} reason={reason}")
+                        log_warning(f"[R5N21][VALUATION_DATE_REJECT] date={date_ymd} source={source_name} level={source_level} url={url} reason={reason}")
                         continue
                     df = clean_df.drop_duplicates(subset=["stock_id", "data_date"], keep="last")
                     try:
@@ -15944,15 +15984,15 @@ class ExternalDataFetcher:
                         norm_dir.mkdir(parents=True, exist_ok=True)
                         norm_path = norm_dir / f"tpex_peratio_{date_ymd}.csv"
                         df.to_csv(norm_path, index=False, encoding="utf-8-sig")
-                        log_info(f"[R5N20][VALUATION_CACHE][NORMALIZED] TPEX_PERATIO rows={len(df)} file={norm_path}")
+                        log_info(f"[R5N21][VALUATION_CACHE][NORMALIZED] {source_name} level={source_level} rows={len(df)} file={norm_path}")
                     except Exception as cache_exc:
-                        log_warning(f"[R5N20][VALUATION_CACHE][NORMALIZED_WRITE_FAIL] TPEX_PERATIO date={date_ymd}｜{cache_exc}")
+                        log_warning(f"[R5N21][VALUATION_CACHE][NORMALIZED_WRITE_FAIL] {source_name} date={date_ymd}｜{cache_exc}")
                     return df, url, http_status, ""
                 last_error = "TPEx daily-pe 回傳無可解析資料"
             except Exception as exc:
                 last_error = str(exc)
                 continue
-        return pd.DataFrame(), urls[0], "", last_error
+        return pd.DataFrame(), sources[0]["url"] if sources else "", "", last_error
 
     def _fetch_tpex_rank_pe_eps(self, date_iso: str) -> tuple[pd.DataFrame, str, str, str]:
         """R5N19：停用。rank-pe / regular_capitals_rank 是 EPS 排名，不是 valuation 來源。
