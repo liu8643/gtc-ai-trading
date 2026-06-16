@@ -5795,14 +5795,6 @@ HIGH_GROWTH_MIN_BASE_EPS_FOR_RATIO = 1.0
 HIGH_GROWTH_MIN_ANNUAL_EPS_ROWS_FOR_FORMAL_REPORT = int(os.getenv("GTC_HIGH_GROWTH_MIN_ANNUAL_EPS_ROWS", "1") or "1")
 HIGH_GROWTH_BLOCK_FORMAL_WHEN_ANNUAL_EPS_MISSING = os.getenv("GTC_HIGH_GROWTH_BLOCK_FORMAL_ON_MISSING_ANNUAL_EPS", "1").strip() != "0"
 
-# R5N23 EPS_PARTIAL_IMPORT_GUARD_20260616：防止「下載歷史營收」後誤觸高成長報表時，
-# TWSE 上市 EPS 連線失敗但 TPEx 上櫃 889 筆先寫入，導致 actual_q1_eps/PE/PEG 整頁空白。
-# 追蹤年度 Q1 EPS 必須同時具備 SII/OTC 足量資料，否則禁止寫入 actual_q1_eps cache、禁止產生高成長EPS報表。
-HIGH_GROWTH_TRACK_Q1_EPS_MIN_TOTAL_ROWS = int(os.getenv("GTC_HIGH_GROWTH_TRACK_Q1_EPS_MIN_TOTAL_ROWS", "1800") or "1800")
-HIGH_GROWTH_TRACK_Q1_EPS_MIN_SII_ROWS = int(os.getenv("GTC_HIGH_GROWTH_TRACK_Q1_EPS_MIN_SII_ROWS", "1000") or "1000")
-HIGH_GROWTH_TRACK_Q1_EPS_MIN_OTC_ROWS = int(os.getenv("GTC_HIGH_GROWTH_TRACK_Q1_EPS_MIN_OTC_ROWS", "800") or "800")
-HIGH_GROWTH_BLOCK_REPORT_ON_PARTIAL_TRACK_Q1_EPS = os.getenv("GTC_HIGH_GROWTH_BLOCK_REPORT_ON_PARTIAL_TRACK_Q1_EPS", "1").strip() != "0"
-
 # V4.12 LEADING_EPS_FORECAST_SELECTION_FIX：選股策略改為「領先預測」而非等待正式 EPS。
 # 核心排序：40% predicted_q2_eps + 25% eps_acceleration + 20% revenue_acceleration + 15% valuation(PE/PEG)。
 # actual_q1_eps 只作驗證/模型誤差，不再作為主排序。
@@ -6232,24 +6224,20 @@ def normalize_market_type(value) -> str:
     low = s.lower().replace("\\", "/")
 
     # 明確資料夾/欄位/中文市場別。
-    # R5N23 FIX：source_type 會出現「上市_一般業_T187AP06_OPENAPI」。舊邏輯因含 t187ap06_o
-    # 被誤判為 OTC；中文市場字樣必須優先於 endpoint 片段判斷。
-    if "上櫃" in s:
+    if low in ("otc", "上櫃") or "/otc/" in low or low.endswith("_otc.csv") or low.endswith("_otc"):
         return "otc"
-    if "上市" in s:
-        return "sii"
-    if low in ("otc",) or "/otc/" in low or low.endswith("_otc.csv") or low.endswith("_otc"):
-        return "otc"
-    if low in ("sii",) or "/sii/" in low or low.endswith("_sii.csv") or low.endswith("_sii"):
+    if low in ("sii", "上市") or "/sii/" in low or low.endswith("_sii.csv") or low.endswith("_sii"):
         return "sii"
 
     # 官方 OpenAPI / 模組標籤，必須精準到 endpoint 或 label。
-    if "tpex" in low or "mopsfin_t187ap05_o" in low or "mopsfin_t187ap06_o" in low or "tpex_revenue_o" in low or "tpex_revenue_r" in low:
-        return "otc"
-    if "twse" in low or "mopsfin_t187ap05_l" in low or "mopsfin_t187ap06_l" in low or "t187ap05_l" in low or "t187ap06_l" in low or "twse_revenue_l" in low or "index04_c04003" in low or "c04003" in low:
+    # R5N24 EPS_ATOMIC_GUARD：修正 ``T187AP06_OPENAPI`` 內含 ``t187ap06_o`` 被誤判為 OTC 的舊缺陷。
+    # 只有 TPEx 明確網址/endpoint/中文前綴才可判定 OTC；TWSE/上市前綴必須判定 SII。
+    if low.startswith("上市") or "twse" in low or "t187ap05_l" in low or "t187ap06_l" in low or "twse_revenue_l" in low or "index04_c04003" in low or "c04003" in low:
         return "sii"
+    if low.startswith("上櫃") or "tpex" in low or "mopsfin_t187ap05_o" in low or "mopsfin_t187ap06_o" in low or "tpex_revenue_o" in low or "tpex_revenue_r" in low:
+        return "otc"
 
-    # 禁止再用 generic '_o' / '_l'，避免 revenue_openapi 被誤判。
+    # 禁止再用 generic '_o' / '_l' 或 t187ap06_o，避免 *_OPENAPI 被誤判。
     return ""
 
 def market_type_to_label(value) -> str:
@@ -7733,6 +7721,14 @@ class R5N6FinalSafeIntegrator:
                 """, self.db.conn, params=[int(fiscal_year)])
                 if src is None or src.empty:
                     return pd.DataFrame([{"項目": "actual_q1_eps_cache", "狀態": "FAIL", "筆數": 0, "說明": f"quarterly_financial_history 無 {fiscal_year}Q1 eps_quarter"}])
+                # R5N24 EPS_ATOMIC_GUARD：R5N6 safe patch 不可用 889 筆 partial EPS 覆蓋舊 actual_q1_eps cache。
+                try:
+                    _mt = src.get("source_type", pd.Series("", index=src.index)).astype(str).map(normalize_market_type)
+                    _sii = int((_mt == "sii").sum()); _otc = int((_mt == "otc").sum()); _total = int(len(src))
+                    if _total < 1800 or _sii < 1000 or _otc < 800:
+                        return pd.DataFrame([{"項目": "actual_q1_eps_cache", "狀態": "FAIL", "筆數": _total, "說明": f"R5N24 guard: Q1 EPS source incomplete, keep old cache untouched. counts={{'sii': {_sii}, 'otc': {_otc}, 'total': {_total}}}"}])
+                except Exception as _guard_exc:
+                    return pd.DataFrame([{"項目": "actual_q1_eps_cache", "狀態": "FAIL", "筆數": len(src), "說明": f"R5N24 guard exception: {_guard_exc}"}])
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 tuples = []
                 for _, r in src.iterrows():
@@ -10227,6 +10223,7 @@ class EPSForecastEngine:
         out["eps_prev_cumulative"] = 0.0 if q == 1 else np.nan
         out["eps_calc_method"] = "OPENAPI_Q1_BASIC_EPS_AS_ACTUAL_QUARTER" if q == 1 else "OPENAPI_BASIC_EPS_AS_OFFICIAL_QUARTER"
         out["market"] = str(market or "")
+        out["market_type"] = normalize_market_type(market)
         out["source_url"] = str(source_url or "")
         out["source_date"] = f"{fiscal_year}Q{q}"
         out["source_type"] = f"{market}_{source_key}_T187AP06_OPENAPI"
@@ -10278,8 +10275,75 @@ class EPSForecastEngine:
         if "market_type" not in out.columns and "source_type" in out.columns:
             out["market_type"] = out["source_type"].map(normalize_market_type)
         out["market_type"] = out.get("market_type", pd.Series("", index=out.index)).map(normalize_market_type)
-        self._save_eps_split_normalized_cache(out, fiscal_year, q, label="openapi")
+        # R5N24 EPS_ATOMIC_GUARD：這裡只是 staging DataFrame，禁止先覆寫 normalized EPS cache；
+        # 必須等 ensure_quarterly_eps_from_openapi 完整性驗證 PASS 並成功 commit 後才落正式 cache。
         return out
+
+    # R5N24 EPS_ATOMIC_GUARD：EPS 匯入完整性門檻。避免 TWSE 失敗時只拿 TPEx 889 筆覆蓋 actual_q1_eps cache。
+    EPS_Q1_MIN_SII_ROWS = 1000
+    EPS_Q1_MIN_OTC_ROWS = 800
+    EPS_Q1_MIN_TOTAL_ROWS = 1800
+
+    def _eps_market_counts(self, df: pd.DataFrame | None) -> dict:
+        counts = {"sii": 0, "otc": 0, "unknown": 0, "total": 0}
+        try:
+            if df is None or df.empty:
+                return counts
+            x = df.copy()
+            if "market_type" not in x.columns:
+                if "market" in x.columns:
+                    x["market_type"] = x["market"].map(normalize_market_type)
+                elif "source_type" in x.columns:
+                    x["market_type"] = x["source_type"].map(normalize_market_type)
+                else:
+                    x["market_type"] = ""
+            mt = x["market_type"].map(normalize_market_type).replace("", "unknown")
+            vc = mt.value_counts().to_dict()
+            counts["sii"] = int(vc.get("sii", 0))
+            counts["otc"] = int(vc.get("otc", 0))
+            counts["unknown"] = int(vc.get("unknown", 0))
+            counts["total"] = int(len(x))
+        except Exception:
+            pass
+        return counts
+
+    def _validate_q1_eps_staging_complete(self, df: pd.DataFrame | None, fiscal_year: int, quarter: int, include_tpex: bool = True) -> tuple[bool, dict, str]:
+        """Validate staging EPS before any DB/cache overwrite.
+
+        R5N24 design:
+        - Q1 EPS is the actual_q1_eps source. It must be complete enough before commit.
+        - If a network failure returns only OTC rows, this function returns False and caller discards staging.
+        - Existing good DB/cache is kept untouched.
+        """
+        q = int(quarter)
+        counts = self._eps_market_counts(df)
+        if q != 1:
+            ok = counts["total"] > 0 and (counts["sii"] > 0 or counts["otc"] > 0)
+            return ok, counts, f"Q{q} staging rows={counts}"
+        min_sii = int(self.EPS_Q1_MIN_SII_ROWS)
+        min_otc = int(self.EPS_Q1_MIN_OTC_ROWS) if include_tpex else 0
+        min_total = int(self.EPS_Q1_MIN_TOTAL_ROWS if include_tpex else self.EPS_Q1_MIN_SII_ROWS)
+        ok = counts["total"] >= min_total and counts["sii"] >= min_sii and (not include_tpex or counts["otc"] >= min_otc)
+        detail = f"Q1 EPS staging completeness counts={counts}, required sii>={min_sii}, otc>={min_otc}, total>={min_total}"
+        return ok, counts, detail
+
+    def _existing_q1_eps_complete(self, fiscal_year: int, quarter: int = 1, include_tpex: bool = True) -> tuple[bool, dict, pd.DataFrame]:
+        try:
+            with self.db.lock:
+                existing = pd.read_sql_query("""
+                    SELECT stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter,
+                           COALESCE(market_type,'') AS market_type, eps, eps_cumulative, eps_quarter,
+                           eps_prev_cumulative, eps_calc_method, source_type, source_url, source_date, update_time
+                    FROM quarterly_financial_history
+                    WHERE fiscal_year=? AND quarter=? AND COALESCE(eps_quarter, eps) IS NOT NULL
+                """, self.db.conn, params=[int(fiscal_year), int(quarter)])
+        except Exception:
+            existing = pd.DataFrame()
+        ok, counts, _ = self._validate_q1_eps_staging_complete(existing, fiscal_year, quarter, include_tpex=include_tpex)
+        return ok, counts, existing
+
+    def _validate_actual_q1_cache_source_complete(self, df: pd.DataFrame | None, fiscal_year: int) -> tuple[bool, dict, str]:
+        return self._validate_q1_eps_staging_complete(df, fiscal_year, 1, include_tpex=True)
 
     def ensure_quarterly_eps_from_openapi(self, fiscal_year: int, season, force: bool = False, include_tpex: bool = True, local_json_map: dict | None = None) -> dict:
         fiscal_year = int(fiscal_year)
@@ -10295,12 +10359,10 @@ class EPSForecastEngine:
                     GROUP BY COALESCE(market_type,'')
                 """, self.db.conn, params=[fiscal_year, q])
             existing_total = int(existing_df["cnt"].sum()) if existing_df is not None and not existing_df.empty else 0
-            existing_markets = set(existing_df["market_type"].map(normalize_market_type).dropna().astype(str).tolist()) if existing_df is not None and not existing_df.empty else set()
-            # R5N7B：不能只要有上市資料就跳過，否則上櫃永遠不補。
-            # include_tpex=True 時，必須 sii/otc 都有資料才可視為 exists。
-            required_markets = {"sii", "otc"} if include_tpex else {"sii"}
-            if existing_total > 0 and required_markets.issubset(existing_markets) and not force:
-                result.update({"status": "exists", "rows": existing_total, "message": f"quarterly_financial_history 已有 {fiscal_year}Q{q} sii/otc"})
+            existing_ok, existing_counts, _existing_cache_df = self._existing_q1_eps_complete(fiscal_year, q, include_tpex=include_tpex)
+            # R5N24 EPS_ATOMIC_GUARD：已有完整 Q1 EPS 時才可跳過；只有 otc 889 筆不可視為 exists。
+            if existing_ok and not force:
+                result.update({"status": "exists", "rows": existing_total, "message": f"quarterly_financial_history 已有完整 {fiscal_year}Q{q} EPS counts={existing_counts}"})
                 try:
                     existing_cache = pd.read_sql_query("""
                         SELECT * FROM quarterly_financial_history
@@ -10321,26 +10383,25 @@ class EPSForecastEngine:
             if "market_type" not in current.columns:
                 current["market_type"] = current["source_type"].map(normalize_market_type)
             current["market_type"] = current["market_type"].map(normalize_market_type)
-            # R5N23：OpenAPI 部分成功不可寫入追蹤年度 Q1。
-            # 若 TWSE 上市 ConnectionReset，只剩 TPEx 889 筆，舊版會先寫 quarterly_financial_history，
-            # 之後 update_actual_q1_eps_cache 也跟著覆寫成 889 筆，造成 EPS/PE/PEG 空白。
-            if fiscal_year == int(self.track_year) and q == 1 and include_tpex and HIGH_GROWTH_BLOCK_REPORT_ON_PARTIAL_TRACK_Q1_EPS:
-                _tmp = current.dropna(subset=["eps_quarter"]).copy()
-                _tmp["_mt_guard"] = _tmp.get("market_type", "").astype(str).map(normalize_market_type)
-                _total = int(len(_tmp.drop_duplicates("stock_id", keep="last")))
-                _sii = int(_tmp.drop_duplicates("stock_id", keep="last")["_mt_guard"].eq("sii").sum()) if _total else 0
-                _otc = int(_tmp.drop_duplicates("stock_id", keep="last")["_mt_guard"].eq("otc").sum()) if _total else 0
-                if _total < HIGH_GROWTH_TRACK_Q1_EPS_MIN_TOTAL_ROWS or _sii < HIGH_GROWTH_TRACK_Q1_EPS_MIN_SII_ROWS or _otc < HIGH_GROWTH_TRACK_Q1_EPS_MIN_OTC_ROWS:
-                    msg = (f"OpenAPI partial Q1 EPS blocked before DB write: total={_total}/{HIGH_GROWTH_TRACK_Q1_EPS_MIN_TOTAL_ROWS} "
-                           f"sii={_sii}/{HIGH_GROWTH_TRACK_Q1_EPS_MIN_SII_ROWS} otc={_otc}/{HIGH_GROWTH_TRACK_Q1_EPS_MIN_OTC_ROWS}")
-                    result.update({"status": "partial_blocked", "rows": _total, "message": msg})
-                    log_warning(f"[HIGH_GROWTH][R5N23][OPENAPI_EPS_PARTIAL_BLOCKED] {msg}")
-                    return result
             write = current.dropna(subset=["eps_quarter"])[[
                 "stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "market_type", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"
             ]].copy()
             if write.empty:
                 result.update({"status": "parse_failed", "message": f"OpenAPI資料無可寫入EPS {fiscal_year}Q{q}"})
+                return result
+            staging_ok, staging_counts, staging_detail = self._validate_q1_eps_staging_complete(write, fiscal_year, q, include_tpex=include_tpex)
+            if not staging_ok:
+                # Atomic guard：丟棄本次 partial staging，不寫 DB、不覆寫 EPS normalized cache、不更新 actual_q1_eps。
+                # 若 DB 內已有舊完整資料，報表仍可沿用舊資料；若沒有，則明確阻斷，不產生假成功。
+                existing_ok2, existing_counts2, _ = self._existing_q1_eps_complete(fiscal_year, q, include_tpex=include_tpex)
+                result.update({
+                    "status": "partial_rejected",
+                    "rows": int(len(write)),
+                    "message": f"EPS staging incomplete; discard partial import. {staging_detail}; existing_ok={existing_ok2}; existing_counts={existing_counts2}",
+                    "staging_counts": staging_counts,
+                    "existing_counts": existing_counts2,
+                })
+                log_warning(f"[HIGH_GROWTH][R5N24][EPS_ATOMIC_GUARD] reject OpenAPI partial year={fiscal_year} q={q} {result['message']}")
                 return result
             with self.db.lock:
                 cur = self.db.conn.cursor()
@@ -10759,70 +10820,6 @@ class EPSForecastEngine:
         x["eps_calc_method"] = "CUMULATIVE_DIFF_FROM_PREV_QUARTER"
         return x
 
-    def _validate_track_q1_eps_completeness_guard(self, fiscal_year: int | None = None, quarter: int = 1) -> dict:
-        """R5N23：追蹤年度 Q1 EPS 完整性 Gate。
-
-        若 TWSE 上市 EPS 連線失敗，只剩 TPEx 上櫃約 889 筆，絕對不可更新
-        actual_q1_eps cache，也不可繼續輸出 High Growth EPS 報表。
-        """
-        fiscal_year = int(fiscal_year or self.track_year)
-        q = int(quarter or 1)
-        result = {
-            "status": "skip", "fiscal_year": fiscal_year, "quarter": q,
-            "total_rows": 0, "sii_rows": 0, "otc_rows": 0,
-            "min_total_rows": int(HIGH_GROWTH_TRACK_Q1_EPS_MIN_TOTAL_ROWS),
-            "min_sii_rows": int(HIGH_GROWTH_TRACK_Q1_EPS_MIN_SII_ROWS),
-            "min_otc_rows": int(HIGH_GROWTH_TRACK_Q1_EPS_MIN_OTC_ROWS),
-            "message": ""
-        }
-        try:
-            if not HIGH_GROWTH_BLOCK_REPORT_ON_PARTIAL_TRACK_Q1_EPS:
-                result.update({"status": "disabled", "message": "partial EPS guard disabled by env"})
-                return result
-            if fiscal_year != int(self.track_year) or q != 1:
-                result.update({"status": "not_required", "message": "guard only applies to tracking fiscal year Q1"})
-                return result
-            with self.db.lock:
-                df = pd.read_sql_query("""
-                    SELECT q.stock_id, COALESCE(q.eps_quarter, q.eps) AS eps_value,
-                           COALESCE(q.market_type,'') AS q_market_type,
-                           COALESCE(q.source_type,'') AS source_type,
-                           COALESCE(sm.market,'') AS master_market
-                    FROM quarterly_financial_history q
-                    LEFT JOIN stocks_master sm ON q.stock_id=sm.stock_id
-                    WHERE q.fiscal_year=? AND q.quarter=? AND COALESCE(q.eps_quarter, q.eps) IS NOT NULL
-                """, self.db.conn, params=[fiscal_year, q])
-            if df is None or df.empty:
-                result.update({"status": "blocked", "message": f"Q1 EPS table empty fiscal_year={fiscal_year}"})
-                return result
-            df = df.copy()
-            df["stock_id"] = df["stock_id"].map(normalize_stock_id)
-            df = df[df["stock_id"].astype(str).str.fullmatch(r"\d{4,5}", na=False)].drop_duplicates("stock_id", keep="last")
-            mt = df["q_market_type"].astype(str).map(normalize_market_type)
-            mt = mt.mask(mt.eq(""), df["source_type"].astype(str).map(normalize_market_type))
-            mt = mt.mask(mt.eq(""), df["master_market"].astype(str).map(normalize_market_type))
-            df["_market_type_guard"] = mt
-            total = int(len(df))
-            sii = int(df["_market_type_guard"].eq("sii").sum())
-            otc = int(df["_market_type_guard"].eq("otc").sum())
-            result.update({"total_rows": total, "sii_rows": sii, "otc_rows": otc})
-            ok = (total >= result["min_total_rows"] and sii >= result["min_sii_rows"] and otc >= result["min_otc_rows"])
-            if not ok:
-                result.update({
-                    "status": "blocked",
-                    "message": (
-                        f"TRACK_Q1_EPS_PARTIAL_BLOCKED fiscal_year={fiscal_year} total={total}/{result['min_total_rows']} "
-                        f"sii={sii}/{result['min_sii_rows']} otc={otc}/{result['min_otc_rows']}；"
-                        "禁止更新 actual_q1_eps cache / 禁止輸出 High Growth EPS 報表"
-                    )
-                })
-                return result
-            result.update({"status": "pass", "message": f"TRACK_Q1_EPS_COMPLETE total={total} sii={sii} otc={otc}"})
-            return result
-        except Exception as exc:
-            result.update({"status": "error", "message": str(exc)})
-            return result
-
     def update_actual_q1_eps_cache(self, fiscal_year: int | None = None, feature_date: str | None = None) -> dict:
         """R5N6_FIX_4：將 quarterly_financial_history 的 Q1 實際 EPS 同步回 feature cache。
 
@@ -10856,11 +10853,16 @@ class EPSForecastEngine:
             if df is None or df.empty:
                 result.update({"status": "no_data", "message": f"quarterly_financial_history no Q1 actual EPS fiscal_year={fiscal_year}"})
                 return result
-            guard = self._validate_track_q1_eps_completeness_guard(fiscal_year=fiscal_year, quarter=1)
-            result["completeness_guard"] = guard
-            if str(guard.get("status", "")).lower() in ("blocked", "error"):
-                result.update({"status": "blocked", "rows": 0, "message": guard.get("message", "TRACK_Q1_EPS_PARTIAL_BLOCKED")})
-                log_warning(f"[HIGH_GROWTH][R5N23][ACTUAL_Q1_CACHE_BLOCKED] {result['message']}")
+            src_for_validation = df.rename(columns={"actual_q1_eps_market_type": "market_type"}).copy()
+            cache_ok, cache_counts, cache_detail = self._validate_actual_q1_cache_source_complete(src_for_validation, fiscal_year)
+            if not cache_ok:
+                result.update({
+                    "status": "partial_rejected",
+                    "rows": int(len(df)),
+                    "message": f"actual_q1_eps cache source incomplete; keep old-good financial_feature_daily untouched. {cache_detail}",
+                    "source_counts": cache_counts,
+                })
+                log_warning(f"[HIGH_GROWTH][R5N24][ACTUAL_Q1_CACHE_GUARD] reject update fiscal_year={fiscal_year} {result['message']}")
                 return result
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rows = []
@@ -11004,6 +11006,18 @@ class EPSForecastEngine:
             write = current.dropna(subset=["eps_quarter"])[["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "market_type", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"]].copy()
             if write.empty:
                 result.update({"status": "parse_failed", "message": f"MOPS資料無可寫入EPS {fiscal_year}Q{q}"})
+                return result
+            staging_ok, staging_counts, staging_detail = self._validate_q1_eps_staging_complete(write, fiscal_year, q, include_tpex=True)
+            if not staging_ok:
+                existing_ok2, existing_counts2, _ = self._existing_q1_eps_complete(fiscal_year, q, include_tpex=True)
+                result.update({
+                    "status": "partial_rejected",
+                    "rows": int(len(write)),
+                    "message": f"MOPS EPS staging incomplete; discard partial import. {staging_detail}; existing_ok={existing_ok2}; existing_counts={existing_counts2}",
+                    "staging_counts": staging_counts,
+                    "existing_counts": existing_counts2,
+                })
+                log_warning(f"[HIGH_GROWTH][R5N24][EPS_ATOMIC_GUARD] reject MOPS partial year={fiscal_year} q={q} {result['message']}")
                 return result
             with self.db.lock:
                 cur = self.db.conn.cursor()
@@ -11195,14 +11209,9 @@ class EPSForecastEngine:
                 results[f"track_Q{q}"] = results[f"track_Q{q}_mops"]
         try:
             results["r5n6_actual_q1_eps_cache"] = self.update_actual_q1_eps_cache(self.track_year)
-            _cache_status = str(results["r5n6_actual_q1_eps_cache"].get("status", "")).lower()
-            if _cache_status == "blocked" and HIGH_GROWTH_BLOCK_REPORT_ON_PARTIAL_TRACK_Q1_EPS:
-                raise RuntimeError(results["r5n6_actual_q1_eps_cache"].get("message", "TRACK_Q1_EPS_PARTIAL_BLOCKED"))
             results["r5n6_otc_coverage_rows"] = {"status": "computed", "rows": int(len(self.validate_otc_coverage(self.track_year, 1)))}
         except Exception as _r5n6_sync_exc:
-            log_warning(f"[HIGH_GROWTH][R5N23] actual_q1 cache/coverage sync blocked｜{_r5n6_sync_exc}")
-            if HIGH_GROWTH_BLOCK_REPORT_ON_PARTIAL_TRACK_Q1_EPS:
-                raise
+            log_warning(f"[HIGH_GROWTH][R5N6] actual_q1 cache/coverage sync skipped｜{_r5n6_sync_exc}")
         try:
             debug_dir = RUNTIME_DIR / "data" / "official_eps_openapi"
             debug_dir.mkdir(parents=True, exist_ok=True)
@@ -21830,8 +21839,6 @@ class AppUI:
                 if hasattr(self, "highgrowth_status_var"):
                     self.ui_call(self.highgrowth_status_var.set, f"歷史營收下載完成：{months[0]}~{months[-1]}｜PASS {pass_count}/{len(months)}｜{out_path}")
                 self.ui_call(self.append_log, f"[R5N] 歷史營收下載完成：months={months} pass={pass_count}/{len(months)} report={out_path}")
-                self.ui_call(self.append_log, "[R5N23][REVENUE_ONLY_GUARD] 下載歷史營收作業到此結束：不自動觸發 high_growth_eps_v4_report / EPS Import / actual_q1_eps cache / Excel報表")
-                log_info("[R5N23][REVENUE_ONLY_GUARD] historical revenue download completed; no auto High Growth EPS report triggered by this callback")
                 self.ui_call(self.update_task, label, max(len(months), 1) + 2, max(len(months), 1) + 2, success=pass_count, item="完成")
                 self.ui_call(self.finish_task, label, f"完成：PASS {pass_count}/{len(months)}｜{out_path}")
                 self.ui_call(messagebox.showinfo, "完成", f"歷史營收下載完成：\n月份：{months[0]} ~ {months[-1]}\nPASS：{pass_count}/{len(months)}\n\n驗收報告：\n{out_path}")
