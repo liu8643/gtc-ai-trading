@@ -15011,375 +15011,6 @@ class OfficialValuationCollectorEngine:
         )
 
 
-# === R5N20B 財報回填與估值合併修正層 START ===
-def _r5n20b_get_conn_and_lock(db_path_or_db):
-    """R5N20B：允許傳入 DBManager 或 sqlite db_path，方便 UI 流程與離線修復共用。"""
-    import sqlite3
-    if hasattr(db_path_or_db, "conn"):
-        return db_path_or_db.conn, getattr(db_path_or_db, "lock", None), False
-    conn = sqlite3.connect(str(db_path_or_db))
-    return conn, None, True
-
-
-def _r5n20b_table_exists(conn, table_name: str) -> bool:
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (str(table_name),))
-        return cur.fetchone() is not None
-    except Exception:
-        return False
-
-
-def _r5n20b_column_exists(conn, table_name: str, column_name: str) -> bool:
-    try:
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({table_name})")
-        return str(column_name) in [str(r[1]) for r in cur.fetchall()]
-    except Exception:
-        return False
-
-
-def _r5n20b_add_column(conn, table_name: str, column_name: str, ddl: str):
-    try:
-        if _r5n20b_table_exists(conn, table_name) and not _r5n20b_column_exists(conn, table_name, column_name):
-            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
-    except Exception as exc:
-        try:
-            log_warning(f"[R5N20B][SCHEMA][WARN] {table_name}.{column_name} add failed｜{exc}")
-        except Exception:
-            pass
-
-
-def ensure_r5n20b_repair_schema(conn):
-    """R5N20B：補齊修復層需要的欄位，不重建既有表，不破壞 R5N24 Atomic Guard。"""
-    if _r5n20b_table_exists(conn, "financial_feature_daily"):
-        for col, ddl in [
-            ("actual_q1_eps", "actual_q1_eps REAL"),
-            ("actual_q1_eps_source_type", "actual_q1_eps_source_type TEXT"),
-            ("actual_q1_eps_market_type", "actual_q1_eps_market_type TEXT"),
-            ("actual_q1_eps_update_time", "actual_q1_eps_update_time TEXT"),
-        ]:
-            _r5n20b_add_column(conn, "financial_feature_daily", col, ddl)
-    if _r5n20b_table_exists(conn, "external_valuation"):
-        for col, ddl in [
-            ("market_type", "market_type TEXT"),
-            ("eps", "eps REAL"),
-            ("eps_ttm", "eps_ttm REAL"),
-            ("roe", "roe REAL"),
-            ("gross_margin", "gross_margin REAL"),
-            ("operating_margin", "operating_margin REAL"),
-            ("fiscal_year_quarter", "fiscal_year_quarter TEXT"),
-            ("source_url", "source_url TEXT"),
-            ("update_time", "update_time TEXT"),
-        ]:
-            _r5n20b_add_column(conn, "external_valuation", col, ddl)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS annual_eps_history (
-            stock_id TEXT,
-            fiscal_year INTEGER,
-            market_type TEXT,
-            fiscal_year_roc INTEGER,
-            quarter INTEGER,
-            eps_full_year REAL,
-            eps_cumulative REAL,
-            eps_quarter REAL,
-            eps_prev_cumulative REAL,
-            eps_calc_method TEXT,
-            source_type TEXT,
-            source_url TEXT,
-            source_file TEXT,
-            source_date TEXT,
-            update_time TEXT,
-            PRIMARY KEY(stock_id, fiscal_year)
-        )
-    """)
-    for col, ddl in [
-        ("market_type", "market_type TEXT"),
-        ("fiscal_year_roc", "fiscal_year_roc INTEGER"),
-        ("quarter", "quarter INTEGER"),
-        ("eps_cumulative", "eps_cumulative REAL"),
-        ("eps_quarter", "eps_quarter REAL"),
-        ("eps_prev_cumulative", "eps_prev_cumulative REAL"),
-        ("eps_calc_method", "eps_calc_method TEXT"),
-        ("source_type", "source_type TEXT"),
-        ("source_url", "source_url TEXT"),
-        ("source_file", "source_file TEXT"),
-        ("source_date", "source_date TEXT"),
-        ("update_time", "update_time TEXT"),
-    ]:
-        _r5n20b_add_column(conn, "annual_eps_history", col, ddl)
-    try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_annual_eps_history_stock_year ON annual_eps_history(stock_id, fiscal_year)")
-    except Exception:
-        pass
-
-
-def normalize_stock_id_and_market_type(conn):
-    """R5N20B：統一 stock_id 與 market_type，避免 3163 / otc 因型態或大小寫錯過 merge。"""
-    ensure_r5n20b_repair_schema(conn)
-    for table in ["quarterly_financial_history", "financial_feature_daily", "external_valuation", "annual_eps_history"]:
-        if not _r5n20b_table_exists(conn, table):
-            continue
-        if _r5n20b_column_exists(conn, table, "stock_id"):
-            try:
-                conn.execute(f"""
-                    UPDATE {table}
-                    SET stock_id = printf('%04d', CAST(stock_id AS INTEGER))
-                    WHERE stock_id IS NOT NULL AND TRIM(CAST(stock_id AS TEXT)) <> ''
-                """)
-            except Exception as exc:
-                log_warning(f"[R5N20B][NORMALIZE][WARN] {table}.stock_id｜{exc}")
-        if _r5n20b_column_exists(conn, table, "market_type"):
-            try:
-                conn.execute(f"""
-                    UPDATE {table}
-                    SET market_type = lower(TRIM(CAST(market_type AS TEXT)))
-                    WHERE market_type IS NOT NULL AND TRIM(CAST(market_type AS TEXT)) <> ''
-                """)
-            except Exception as exc:
-                log_warning(f"[R5N20B][NORMALIZE][WARN] {table}.market_type｜{exc}")
-
-
-def _r5n20b_q1_where(fiscal_year: int) -> tuple[str, tuple]:
-    roc_year = int(fiscal_year) - 1911 if int(fiscal_year) > 1911 else int(fiscal_year)
-    return """
-        (
-            q.fiscal_year = ? AND q.quarter = 1
-        ) OR q.fiscal_year_quarter IN (?, ?, ?)
-    """, (int(fiscal_year), f"{roc_year}/1", f"{roc_year}Q1", f"{int(fiscal_year)}Q1")
-
-
-def backfill_actual_q1_eps_from_quarterly(conn, fiscal_year: int | None = None, feature_date: str | None = None) -> int:
-    """R5N20B：由 quarterly_financial_history 回填 financial_feature_daily.actual_q1_eps。"""
-    fiscal_year = int(fiscal_year or datetime.now().year)
-    feature_date = feature_date or datetime.now().strftime("%Y-%m-%d")
-    ensure_r5n20b_repair_schema(conn)
-    q_where, params = _r5n20b_q1_where(fiscal_year)
-    cur = conn.cursor()
-    cur.execute(f"""
-        SELECT
-            q.stock_id,
-            COALESCE(NULLIF(lower(q.market_type), ''), lower(CASE WHEN sm.market='上櫃' THEN 'otc' WHEN sm.market='上市' THEN 'sii' ELSE '' END)) AS market_type,
-            COALESCE(q.eps_quarter, q.eps) AS actual_q1_eps,
-            COALESCE(q.source_type, 'QUARTERLY_FINANCIAL_HISTORY') AS source_type
-        FROM quarterly_financial_history q
-        LEFT JOIN stocks_master sm ON q.stock_id = sm.stock_id
-        WHERE ({q_where})
-          AND COALESCE(q.eps_quarter, q.eps) IS NOT NULL
-    """, params)
-    rows = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for sid, market_type, eps, source_type in cur.fetchall():
-        try:
-            eps_val = float(eps)
-        except Exception:
-            continue
-        rows.append((normalize_stock_id(sid), feature_date, eps_val, "BACKFILL_FROM_QUARTERLY_115Q1_R5N20B", normalize_market_type(market_type), now, now))
-    if not rows:
-        return 0
-    cur.executemany("""
-        INSERT INTO financial_feature_daily(stock_id, feature_date, actual_q1_eps, actual_q1_eps_source_type, actual_q1_eps_market_type, actual_q1_eps_update_time, update_time)
-        VALUES(?,?,?,?,?,?,?)
-        ON CONFLICT(stock_id, feature_date) DO UPDATE SET
-            actual_q1_eps = COALESCE(financial_feature_daily.actual_q1_eps, excluded.actual_q1_eps),
-            actual_q1_eps_source_type = CASE
-                WHEN financial_feature_daily.actual_q1_eps IS NULL THEN excluded.actual_q1_eps_source_type
-                ELSE COALESCE(financial_feature_daily.actual_q1_eps_source_type, excluded.actual_q1_eps_source_type)
-            END,
-            actual_q1_eps_market_type = COALESCE(NULLIF(financial_feature_daily.actual_q1_eps_market_type,''), excluded.actual_q1_eps_market_type),
-            actual_q1_eps_update_time = CASE
-                WHEN financial_feature_daily.actual_q1_eps IS NULL THEN excluded.actual_q1_eps_update_time
-                ELSE COALESCE(financial_feature_daily.actual_q1_eps_update_time, excluded.actual_q1_eps_update_time)
-            END,
-            update_time = excluded.update_time
-    """, rows)
-    return int(cur.rowcount if cur.rowcount is not None else len(rows))
-
-
-def rebuild_annual_eps_history_from_q4(conn, fiscal_year: int | None = None) -> int:
-    """R5N20B：用 114Q4/2025Q4 累計 EPS 回補 annual_eps_history。"""
-    fiscal_year = int(fiscal_year or datetime.now().year)
-    annual_year = int(fiscal_year) - 1
-    annual_roc = annual_year - 1911 if annual_year > 1911 else annual_year
-    ensure_r5n20b_repair_schema(conn)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO annual_eps_history
-        (stock_id, fiscal_year, market_type, fiscal_year_roc, quarter, eps_full_year, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_date, update_time)
-        SELECT
-            q.stock_id,
-            ? AS fiscal_year,
-            lower(COALESCE(NULLIF(q.market_type,''), CASE WHEN sm.market='上櫃' THEN 'otc' WHEN sm.market='上市' THEN 'sii' ELSE '' END)) AS market_type,
-            ? AS fiscal_year_roc,
-            4 AS quarter,
-            COALESCE(q.eps_cumulative, q.eps) AS eps_full_year,
-            COALESCE(q.eps_cumulative, q.eps) AS eps_cumulative,
-            q.eps_quarter,
-            q.eps_prev_cumulative,
-            'Q4_CUMULATIVE_AS_FULL_YEAR_R5N20B' AS eps_calc_method,
-            'BACKFILL_FROM_114Q4_R5N20B' AS source_type,
-            q.source_url,
-            COALESCE(q.source_date, ''),
-            datetime('now', 'localtime') AS update_time
-        FROM quarterly_financial_history q
-        LEFT JOIN stocks_master sm ON q.stock_id = sm.stock_id
-        WHERE (
-                (q.fiscal_year = ? AND q.quarter = 4)
-             OR q.fiscal_year_quarter IN (?, ?, ?)
-        )
-          AND COALESCE(q.eps_cumulative, q.eps) IS NOT NULL
-    """, (annual_year, annual_roc, annual_roc, f"{annual_roc}/4", f"{annual_roc}Q4", f"{annual_year}Q4"))
-    return int(cur.rowcount if cur.rowcount is not None else 0)
-
-
-def merge_financial_metrics_into_external_valuation(conn, fiscal_year: int | None = None) -> int:
-    """R5N20B：把 Q1 EPS / EPS_TTM / ROE / 毛利率 / 營益率合併回 external_valuation。"""
-    fiscal_year = int(fiscal_year or datetime.now().year)
-    ensure_r5n20b_repair_schema(conn)
-    q_where, params = _r5n20b_q1_where(fiscal_year)
-    cur = conn.cursor()
-    cur.execute(f"""
-        UPDATE external_valuation
-        SET
-            eps = COALESCE((
-                SELECT COALESCE(q.eps_quarter, q.eps)
-                FROM quarterly_financial_history q
-                WHERE q.stock_id = external_valuation.stock_id
-                  AND (lower(COALESCE(q.market_type,'')) = lower(COALESCE(external_valuation.market_type,'')) OR COALESCE(external_valuation.market_type,'') = '' OR COALESCE(q.market_type,'') = '')
-                  AND ({q_where})
-                  AND COALESCE(q.eps_quarter, q.eps) IS NOT NULL
-                LIMIT 1
-            ), eps),
-            eps_ttm = COALESCE((
-                SELECT f.eps_ttm
-                FROM financial_feature_daily f
-                WHERE f.stock_id = external_valuation.stock_id
-                  AND (lower(COALESCE(f.actual_q1_eps_market_type, f.market_type, '')) = lower(COALESCE(external_valuation.market_type,'')) OR COALESCE(external_valuation.market_type,'') = '')
-                  AND f.eps_ttm IS NOT NULL
-                ORDER BY f.feature_date DESC
-                LIMIT 1
-            ), eps_ttm),
-            roe = COALESCE((
-                SELECT f.roe
-                FROM financial_feature_daily f
-                WHERE f.stock_id = external_valuation.stock_id
-                  AND f.roe IS NOT NULL
-                ORDER BY f.feature_date DESC
-                LIMIT 1
-            ), roe),
-            gross_margin = COALESCE((
-                SELECT q.gross_margin
-                FROM quarterly_financial_history q
-                WHERE q.stock_id = external_valuation.stock_id
-                  AND (lower(COALESCE(q.market_type,'')) = lower(COALESCE(external_valuation.market_type,'')) OR COALESCE(external_valuation.market_type,'') = '' OR COALESCE(q.market_type,'') = '')
-                  AND ({q_where})
-                  AND q.gross_margin IS NOT NULL
-                LIMIT 1
-            ), gross_margin),
-            operating_margin = COALESCE((
-                SELECT q.operating_margin
-                FROM quarterly_financial_history q
-                WHERE q.stock_id = external_valuation.stock_id
-                  AND (lower(COALESCE(q.market_type,'')) = lower(COALESCE(external_valuation.market_type,'')) OR COALESCE(external_valuation.market_type,'') = '' OR COALESCE(q.market_type,'') = '')
-                  AND ({q_where})
-                  AND q.operating_margin IS NOT NULL
-                LIMIT 1
-            ), operating_margin),
-            fiscal_year_quarter = COALESCE(NULLIF(fiscal_year_quarter,''), (
-                SELECT q.fiscal_year_quarter
-                FROM quarterly_financial_history q
-                WHERE q.stock_id = external_valuation.stock_id
-                  AND ({q_where})
-                LIMIT 1
-            )),
-            update_time = datetime('now', 'localtime')
-        WHERE EXISTS (
-            SELECT 1 FROM quarterly_financial_history q
-            WHERE q.stock_id = external_valuation.stock_id
-              AND ({q_where})
-        ) OR EXISTS (
-            SELECT 1 FROM financial_feature_daily f
-            WHERE f.stock_id = external_valuation.stock_id AND f.eps_ttm IS NOT NULL
-        )
-    """, params * 5)
-    return int(cur.rowcount if cur.rowcount is not None else 0)
-
-
-def validate_r5n20b_fix(conn, sample_stock_id: str = "3163") -> dict:
-    """R5N20B：固定驗證 3163 波若威與全表覆蓋率。"""
-    sid = normalize_stock_id(sample_stock_id)
-    out = {"sample_stock_id": sid}
-    cur = conn.cursor()
-    for name, sql in {
-        "qfh": "SELECT COUNT(*) FROM quarterly_financial_history WHERE stock_id=? AND COALESCE(eps_quarter, eps) IS NOT NULL",
-        "ffd_actual_q1": "SELECT COUNT(*) FROM financial_feature_daily WHERE stock_id=? AND actual_q1_eps IS NOT NULL",
-        "ev_eps": "SELECT COUNT(*) FROM external_valuation WHERE stock_id=? AND eps IS NOT NULL",
-        "ev_eps_ttm": "SELECT COUNT(*) FROM external_valuation WHERE stock_id=? AND eps_ttm IS NOT NULL",
-        "annual": "SELECT COUNT(*) FROM annual_eps_history WHERE stock_id=? AND eps_full_year IS NOT NULL",
-    }.items():
-        try:
-            cur.execute(sql, (sid,))
-            out[name] = int(cur.fetchone()[0] or 0)
-        except Exception as exc:
-            out[name] = f"ERROR:{exc}"
-    try:
-        cur.execute("SELECT COUNT(*), SUM(CASE WHEN eps IS NOT NULL THEN 1 ELSE 0 END), SUM(CASE WHEN eps_ttm IS NOT NULL THEN 1 ELSE 0 END) FROM external_valuation")
-        total, eps_cnt, ttm_cnt = cur.fetchone()
-        out["external_valuation_total"] = int(total or 0)
-        out["external_valuation_eps_nonnull"] = int(eps_cnt or 0)
-        out["external_valuation_eps_ttm_nonnull"] = int(ttm_cnt or 0)
-    except Exception as exc:
-        out["external_valuation_summary_error"] = str(exc)
-    return out
-
-
-def repair_financial_merge_and_valuation_r5n20b(db_path, fiscal_year: int | None = None, feature_date: str | None = None) -> dict:
-    """
-    R5N20B 統一修復流程：
-    quarterly_financial_history → actual_q1_eps → annual_eps_history → external_valuation → validate。
-    可傳入 sqlite db_path 或 DBManager；不下載任何外部資料，不覆蓋 EPS 原始來源。
-    """
-    conn, lock, should_close = _r5n20b_get_conn_and_lock(db_path)
-    fiscal_year = int(fiscal_year or datetime.now().year)
-    result = {"status": "start", "fiscal_year": fiscal_year}
-    def _run():
-        normalize_stock_id_and_market_type(conn)
-        result["actual_q1_backfill_rows"] = backfill_actual_q1_eps_from_quarterly(conn, fiscal_year=fiscal_year, feature_date=feature_date)
-        result["annual_eps_backfill_rows"] = rebuild_annual_eps_history_from_q4(conn, fiscal_year=fiscal_year)
-        result["external_valuation_merge_rows"] = merge_financial_metrics_into_external_valuation(conn, fiscal_year=fiscal_year)
-        result["validation"] = validate_r5n20b_fix(conn)
-        conn.commit()
-    try:
-        if lock is not None:
-            with lock:
-                _run()
-        else:
-            _run()
-        result["status"] = "success"
-        try:
-            log_info(f"[R5N20B][REPAIR][PASS] {result}")
-        except Exception:
-            pass
-    except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        result.update({"status": "fail", "error": str(exc)})
-        try:
-            log_warning(f"[R5N20B][REPAIR][FAIL] {exc}")
-        except Exception:
-            pass
-    finally:
-        if should_close:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    return result
-# === R5N20B 財報回填與估值合併修正層 END ===
-
-
 class ExternalDataFetcher:
     def __init__(self, db: DBManager):
         self.db = db
@@ -16753,17 +16384,6 @@ class ExternalDataFetcher:
             if log_cb:
                 log_cb(f"[FUNDAMENTAL CACHE][{module}] status={result.status}｜ready={result.data_ready}｜rows={result.rows_count}｜source_date={result.source_date}")
 
-        # R5N20B：估值/營收同步後、financial_feature_daily 重建前，統一修復財報回填與 external_valuation 合併。
-        r5n20b_repair_result = {}
-        try:
-            if "valuation" in wanted or "revenue" in wanted:
-                r5n20b_repair_result = repair_financial_merge_and_valuation_r5n20b(self.db, fiscal_year=datetime.now().year)
-                if log_cb:
-                    log_cb(f"[R5N20B][REPAIR] status={r5n20b_repair_result.get('status')}｜actual_q1={r5n20b_repair_result.get('actual_q1_backfill_rows')}｜annual={r5n20b_repair_result.get('annual_eps_backfill_rows')}｜valuation_merge={r5n20b_repair_result.get('external_valuation_merge_rows')}")
-        except Exception as exc:
-            r5n20b_repair_result = {"status": "fail", "error": str(exc)}
-            log_warning(f"[R5N20B][REPAIR][SKIP] {exc}")
-
         feature_rows = 0
         ne_ratio = 1.0
         feature_status = "fail"
@@ -16838,7 +16458,6 @@ class ExternalDataFetcher:
             "feature_rows": feature_rows,
             "ne_ratio": ne_ratio,
             "status": quality_status,
-            "r5n20b_repair": r5n20b_repair_result,
         }
 
     def refresh_external_data_pipeline(self, run_id: str | None = None) -> dict:
@@ -16847,11 +16466,6 @@ class ExternalDataFetcher:
         for module, cfg in ExternalSourceConfig.SOURCES.items():
             results.append(self._execute_module(module, cfg, run_id))
         ready_map = {r.module: int(r.data_ready) for r in results}
-        try:
-            r5n20b_repair_result = repair_financial_merge_and_valuation_r5n20b(self.db, fiscal_year=datetime.now().year)
-            log_info(f"[R5N20B][REPAIR][REFRESH_ALL] {r5n20b_repair_result}")
-        except Exception as exc:
-            log_warning(f"[R5N20B][REPAIR][REFRESH_ALL][SKIP] {exc}")
         try:
             ff = FinancialFeatureEngine(self.db).build_feature_batch(run_id=run_id, write_db=True)
             self.db.log_external_data(
@@ -17210,6 +16824,394 @@ class MarginDecisionEngine:
 
 
 
+class R5N20BFinancialValuationRepair:
+    """R5N20B：財報回填與估值合併修復層。
+
+    目的：修正 OTC 資料已進 quarterly_financial_history / external_valuation，
+    但 actual_q1_eps、annual_eps_history、external_valuation 財報欄位與 EPS_YOY
+    未串接，導致正式通過頁 / EPS Matrix / Analysis_Report 未完整顯示。
+
+    設計原則：
+    1. 不覆蓋既有有效資料，只補缺值或缺表欄位。
+    2. 不破壞 R5N24 EPS Atomic Guard；EPS 下載失敗時不覆蓋舊快取。
+    3. 統一 stock_id / market_type，再執行回填與驗證。
+    """
+    VERSION = "R5N20B_FINANCIAL_MERGE_REPAIR_20260617"
+
+    def __init__(self, db: DBManager):
+        self.db = db
+
+    @staticmethod
+    def _safe_num(v, default=np.nan):
+        try:
+            if v is None:
+                return default
+            out = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+            if pd.isna(out):
+                return default
+            return float(out)
+        except Exception:
+            return default
+
+    def _table_exists(self, table: str) -> bool:
+        try:
+            cur = self.db.conn.cursor()
+            row = cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
+    def _columns(self, table: str) -> set[str]:
+        try:
+            cur = self.db.conn.cursor()
+            return {str(r[1]) for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+        except Exception:
+            return set()
+
+    def ensure_repair_schema(self):
+        cur = self.db.conn.cursor()
+        def _add(table, col, ddl):
+            try:
+                cols = self._columns(table)
+                if table and col not in cols:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+            except Exception:
+                pass
+        for table in ["quarterly_financial_history", "annual_eps_history", "external_valuation", "financial_feature_daily"]:
+            if self._table_exists(table):
+                _add(table, "market_type", "market_type TEXT")
+                _add(table, "update_time", "update_time TEXT")
+        for col, ddl in [
+            ("actual_q1_eps", "actual_q1_eps REAL"),
+            ("actual_q1_eps_source_type", "actual_q1_eps_source_type TEXT"),
+            ("actual_q1_eps_market_type", "actual_q1_eps_market_type TEXT"),
+            ("actual_q1_eps_update_time", "actual_q1_eps_update_time TEXT"),
+            ("eps_yoy", "eps_yoy REAL"),
+        ]:
+            _add("financial_feature_daily", col, ddl)
+        for col, ddl in [
+            ("eps", "eps REAL"), ("eps_ttm", "eps_ttm REAL"), ("eps_yoy", "eps_yoy REAL"),
+            ("roe", "roe REAL"), ("gross_margin", "gross_margin REAL"), ("operating_margin", "operating_margin REAL"),
+            ("data_quality_flag", "data_quality_flag TEXT"), ("repair_source_type", "repair_source_type TEXT"),
+        ]:
+            _add("external_valuation", col, ddl)
+        for col, ddl in [
+            ("market_type", "market_type TEXT"), ("eps_full_year", "eps_full_year REAL"),
+            ("eps_cumulative", "eps_cumulative REAL"), ("source_type", "source_type TEXT"),
+            ("source_date", "source_date TEXT"), ("update_time", "update_time TEXT"),
+        ]:
+            _add("annual_eps_history", col, ddl)
+
+    def normalize_stock_id_and_market_type(self) -> dict:
+        """統一 stock_id / market_type，並由 stocks_master 補空白市場別。"""
+        cur = self.db.conn.cursor()
+        stats = {}
+        market_map = {}
+        try:
+            sm = pd.read_sql_query("SELECT stock_id, market FROM stocks_master WHERE is_active=1", self.db.conn)
+            sm["stock_id"] = sm["stock_id"].map(normalize_stock_id)
+            sm["market_type"] = sm["market"].map(normalize_market_type)
+            market_map = dict(zip(sm["stock_id"], sm["market_type"]))
+        except Exception:
+            market_map = {}
+        for table in ["quarterly_financial_history", "financial_feature_daily", "external_valuation", "annual_eps_history"]:
+            if not self._table_exists(table):
+                continue
+            try:
+                df = pd.read_sql_query(f"SELECT rowid, stock_id, market_type FROM {table}", self.db.conn)
+                if df.empty:
+                    stats[table] = 0
+                    continue
+                rows = []
+                for _, r in df.iterrows():
+                    sid = normalize_stock_id(r.get("stock_id", ""))
+                    mt = normalize_market_type(r.get("market_type", "")) or market_map.get(sid, "")
+                    rows.append((sid, mt, int(r["rowid"])))
+                cur.executemany(f"UPDATE {table} SET stock_id=?, market_type=? WHERE rowid=?", rows)
+                stats[table] = len(rows)
+            except Exception as exc:
+                stats[table] = f"ERROR:{exc}"
+        return stats
+
+    def backfill_actual_q1_eps_from_quarterly(self, fiscal_year_roc: int = 115, quarter: int = 1) -> int:
+        """quarterly_financial_history 115/1 -> financial_feature_daily.actual_q1_eps。"""
+        if not (self._table_exists("quarterly_financial_history") and self._table_exists("financial_feature_daily")):
+            return 0
+        qcols = self._columns("quarterly_financial_history")
+        eps_col = "eps_quarter" if "eps_quarter" in qcols else "eps"
+        if eps_col not in qcols:
+            return 0
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        cur.execute(f"""
+            UPDATE financial_feature_daily
+            SET actual_q1_eps = COALESCE(actual_q1_eps, (
+                    SELECT q.{eps_col}
+                    FROM quarterly_financial_history q
+                    WHERE q.stock_id = financial_feature_daily.stock_id
+                      AND (COALESCE(q.market_type,'') = COALESCE(financial_feature_daily.market_type,'') OR COALESCE(financial_feature_daily.market_type,'')='')
+                      AND q.fiscal_year = ? AND q.quarter = ?
+                      AND q.{eps_col} IS NOT NULL
+                    LIMIT 1
+                )),
+                actual_q1_eps_source_type = CASE
+                    WHEN actual_q1_eps_source_type IS NULL OR actual_q1_eps_source_type='' THEN 'BACKFILL_FROM_QUARTERLY_115Q1_R5N20B'
+                    ELSE actual_q1_eps_source_type END,
+                actual_q1_eps_market_type = COALESCE(NULLIF(actual_q1_eps_market_type,''), market_type),
+                actual_q1_eps_update_time = datetime('now','localtime'),
+                update_time = datetime('now','localtime')
+            WHERE EXISTS (
+                SELECT 1 FROM quarterly_financial_history q
+                WHERE q.stock_id = financial_feature_daily.stock_id
+                  AND (COALESCE(q.market_type,'') = COALESCE(financial_feature_daily.market_type,'') OR COALESCE(financial_feature_daily.market_type,'')='')
+                  AND q.fiscal_year = ? AND q.quarter = ?
+                  AND q.{eps_col} IS NOT NULL
+            )
+        """, (fiscal_year_roc, quarter, fiscal_year_roc, quarter))
+        return max(0, self.db.conn.total_changes - before)
+
+    def rebuild_annual_eps_history_from_q4(self, fiscal_year: int = 2025) -> int:
+        """由 114Q4 / 2025Q4 累計 EPS 補 annual_eps_history。
+
+        注意：只使用 quarterly_financial_history 的 Q4 累計 EPS 欄位；若沒有 eps_cumulative，
+        才退回 eps 欄位。這裡不把 Q1/Q2/Q3 相加，避免把單季 EPS 誤當全年。
+        """
+        if not (self._table_exists("quarterly_financial_history") and self._table_exists("annual_eps_history")):
+            return 0
+        qcols = self._columns("quarterly_financial_history")
+        eps_expr = "eps_cumulative" if "eps_cumulative" in qcols else ("eps" if "eps" in qcols else None)
+        if eps_expr is None:
+            return 0
+        roc_year = int(fiscal_year) - 1911
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        cur.execute(f"""
+            INSERT INTO annual_eps_history
+            (stock_id, fiscal_year, market_type, fiscal_year_roc, quarter, eps_full_year, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_file, source_date, update_time)
+            SELECT
+                q.stock_id,
+                ? AS fiscal_year,
+                COALESCE(NULLIF(q.market_type,''), '') AS market_type,
+                ? AS fiscal_year_roc,
+                4 AS quarter,
+                q.{eps_expr} AS eps_full_year,
+                q.{eps_expr} AS eps_cumulative,
+                CASE WHEN 'eps_quarter' IN ('eps_quarter') THEN COALESCE(q.eps_quarter, NULL) ELSE NULL END AS eps_quarter,
+                NULL AS eps_prev_cumulative,
+                'Q4_CUMULATIVE_AS_ANNUAL_EPS' AS eps_calc_method,
+                'BACKFILL_FROM_114Q4_R5N20B' AS source_type,
+                COALESCE(q.source_url, '') AS source_url,
+                '' AS source_file,
+                '2025Q4' AS source_date,
+                datetime('now','localtime') AS update_time
+            FROM quarterly_financial_history q
+            WHERE q.fiscal_year = ? AND q.quarter = 4
+              AND q.{eps_expr} IS NOT NULL
+              AND q.stock_id IS NOT NULL AND q.stock_id <> ''
+            ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                market_type = CASE WHEN COALESCE(excluded.market_type,'')<>'' THEN excluded.market_type ELSE annual_eps_history.market_type END,
+                fiscal_year_roc = excluded.fiscal_year_roc,
+                quarter = excluded.quarter,
+                eps_full_year = COALESCE(annual_eps_history.eps_full_year, excluded.eps_full_year),
+                eps_cumulative = COALESCE(annual_eps_history.eps_cumulative, excluded.eps_cumulative),
+                eps_calc_method = COALESCE(NULLIF(annual_eps_history.eps_calc_method,''), excluded.eps_calc_method),
+                source_type = COALESCE(NULLIF(annual_eps_history.source_type,''), excluded.source_type),
+                source_date = COALESCE(NULLIF(annual_eps_history.source_date,''), excluded.source_date),
+                update_time = datetime('now','localtime')
+        """, (int(fiscal_year), roc_year, roc_year))
+        return max(0, self.db.conn.total_changes - before)
+
+    def merge_financial_metrics_into_external_valuation(self, fiscal_year_roc: int = 115, quarter: int = 1, annual_year: int = 2025) -> int:
+        """把 Q1 EPS、financial_feature_daily、annual EPS 合併補到 external_valuation。"""
+        if not self._table_exists("external_valuation"):
+            return 0
+        qcols = self._columns("quarterly_financial_history")
+        q_eps = "eps_quarter" if "eps_quarter" in qcols else ("eps" if "eps" in qcols else None)
+        q_gm = "gross_margin" if "gross_margin" in qcols else None
+        q_om = "operating_margin" if "operating_margin" in qcols else None
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        if q_eps:
+            cur.execute(f"""
+                UPDATE external_valuation
+                SET eps = COALESCE(eps, (
+                        SELECT q.{q_eps} FROM quarterly_financial_history q
+                        WHERE q.stock_id=external_valuation.stock_id
+                          AND (COALESCE(q.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                          AND q.fiscal_year=? AND q.quarter=? AND q.{q_eps} IS NOT NULL
+                        LIMIT 1
+                    )),
+                    fiscal_year_quarter = COALESCE(NULLIF(fiscal_year_quarter,''), '115Q1'),
+                    repair_source_type = COALESCE(NULLIF(repair_source_type,''), ?),
+                    update_time = datetime('now','localtime')
+                WHERE eps IS NULL
+            """, (fiscal_year_roc, quarter, self.VERSION))
+        if q_gm:
+            cur.execute(f"""
+                UPDATE external_valuation
+                SET gross_margin = COALESCE(gross_margin, (
+                    SELECT q.{q_gm} FROM quarterly_financial_history q
+                    WHERE q.stock_id=external_valuation.stock_id
+                      AND (COALESCE(q.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                      AND q.fiscal_year=? AND q.quarter=? AND q.{q_gm} IS NOT NULL LIMIT 1
+                )), update_time=datetime('now','localtime')
+                WHERE gross_margin IS NULL
+            """, (fiscal_year_roc, quarter))
+        if q_om:
+            cur.execute(f"""
+                UPDATE external_valuation
+                SET operating_margin = COALESCE(operating_margin, (
+                    SELECT q.{q_om} FROM quarterly_financial_history q
+                    WHERE q.stock_id=external_valuation.stock_id
+                      AND (COALESCE(q.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                      AND q.fiscal_year=? AND q.quarter=? AND q.{q_om} IS NOT NULL LIMIT 1
+                )), update_time=datetime('now','localtime')
+                WHERE operating_margin IS NULL
+            """, (fiscal_year_roc, quarter))
+        if self._table_exists("financial_feature_daily"):
+            cur.execute("""
+                UPDATE external_valuation
+                SET eps_ttm = COALESCE(eps_ttm, (
+                        SELECT f.eps_ttm FROM financial_feature_daily f
+                        WHERE f.stock_id=external_valuation.stock_id
+                          AND (COALESCE(f.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                          AND f.eps_ttm IS NOT NULL
+                        ORDER BY f.feature_date DESC LIMIT 1
+                    )),
+                    eps_yoy = COALESCE(eps_yoy, (
+                        SELECT f.eps_yoy FROM financial_feature_daily f
+                        WHERE f.stock_id=external_valuation.stock_id
+                          AND (COALESCE(f.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                          AND f.eps_yoy IS NOT NULL
+                        ORDER BY f.feature_date DESC LIMIT 1
+                    )),
+                    roe = COALESCE(roe, (
+                        SELECT f.roe FROM financial_feature_daily f
+                        WHERE f.stock_id=external_valuation.stock_id
+                          AND (COALESCE(f.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                          AND f.roe IS NOT NULL
+                        ORDER BY f.feature_date DESC LIMIT 1
+                    )),
+                    update_time = datetime('now','localtime')
+            """)
+        if self._table_exists("annual_eps_history"):
+            cur.execute("""
+                UPDATE external_valuation
+                SET eps_ttm = COALESCE(eps_ttm, (
+                        SELECT a.eps_full_year FROM annual_eps_history a
+                        WHERE a.stock_id=external_valuation.stock_id
+                          AND (COALESCE(a.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                          AND a.fiscal_year=? AND a.eps_full_year IS NOT NULL
+                        LIMIT 1
+                    )),
+                    eps_yoy = COALESCE(eps_yoy, CASE
+                        WHEN eps_ttm IS NOT NULL AND (
+                            SELECT ABS(a.eps_full_year) FROM annual_eps_history a
+                            WHERE a.stock_id=external_valuation.stock_id
+                              AND (COALESCE(a.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                              AND a.fiscal_year=? AND a.eps_full_year IS NOT NULL LIMIT 1
+                        ) > 0 THEN (eps_ttm - (
+                            SELECT a.eps_full_year FROM annual_eps_history a
+                            WHERE a.stock_id=external_valuation.stock_id
+                              AND (COALESCE(a.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                              AND a.fiscal_year=? AND a.eps_full_year IS NOT NULL LIMIT 1
+                        )) / ABS((
+                            SELECT a.eps_full_year FROM annual_eps_history a
+                            WHERE a.stock_id=external_valuation.stock_id
+                              AND (COALESCE(a.market_type,'')=COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='')
+                              AND a.fiscal_year=? AND a.eps_full_year IS NOT NULL LIMIT 1
+                        )) * 100.0 ELSE eps_yoy END),
+                    update_time = datetime('now','localtime')
+            """, (annual_year, annual_year, annual_year, annual_year))
+        cur.execute("""
+            UPDATE external_valuation
+            SET data_quality_flag = TRIM(
+                COALESCE(CASE WHEN eps IS NULL THEN 'EPS_MISSING|' ELSE '' END, '') ||
+                COALESCE(CASE WHEN eps_ttm IS NULL THEN 'EPS_TTM_MISSING|' ELSE '' END, '') ||
+                COALESCE(CASE WHEN eps_yoy IS NULL THEN 'EPS_YOY_MISSING|' ELSE '' END, ''), '|'
+            )
+        """)
+        cur.execute("UPDATE external_valuation SET data_quality_flag='OK' WHERE data_quality_flag IS NULL OR data_quality_flag='' ")
+        return max(0, self.db.conn.total_changes - before)
+
+    def backfill_financial_feature_eps_yoy(self, annual_year: int = 2025) -> int:
+        """補 financial_feature_daily.eps_yoy，避免 Ranking/EPS_Matrix 長期 EPS_YOY_MISSING。"""
+        if not (self._table_exists("financial_feature_daily") and self._table_exists("annual_eps_history")):
+            return 0
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        cur.execute("""
+            UPDATE financial_feature_daily
+            SET eps_yoy = COALESCE(eps_yoy, CASE
+                WHEN eps_ttm IS NOT NULL AND (
+                    SELECT ABS(a.eps_full_year) FROM annual_eps_history a
+                    WHERE a.stock_id=financial_feature_daily.stock_id
+                      AND (COALESCE(a.market_type,'')=COALESCE(financial_feature_daily.market_type,'') OR COALESCE(financial_feature_daily.market_type,'')='')
+                      AND a.fiscal_year=? AND a.eps_full_year IS NOT NULL LIMIT 1
+                ) > 0 THEN (eps_ttm - (
+                    SELECT a.eps_full_year FROM annual_eps_history a
+                    WHERE a.stock_id=financial_feature_daily.stock_id
+                      AND (COALESCE(a.market_type,'')=COALESCE(financial_feature_daily.market_type,'') OR COALESCE(financial_feature_daily.market_type,'')='')
+                      AND a.fiscal_year=? AND a.eps_full_year IS NOT NULL LIMIT 1
+                )) / ABS((
+                    SELECT a.eps_full_year FROM annual_eps_history a
+                    WHERE a.stock_id=financial_feature_daily.stock_id
+                      AND (COALESCE(a.market_type,'')=COALESCE(financial_feature_daily.market_type,'') OR COALESCE(financial_feature_daily.market_type,'')='')
+                      AND a.fiscal_year=? AND a.eps_full_year IS NOT NULL LIMIT 1
+                )) * 100.0 ELSE eps_yoy END),
+                update_time = datetime('now','localtime')
+            WHERE eps_yoy IS NULL AND eps_ttm IS NOT NULL
+        """, (annual_year, annual_year, annual_year))
+        return max(0, self.db.conn.total_changes - before)
+
+    def validate_r5n20b_fix(self) -> pd.DataFrame:
+        rows = []
+        cur = self.db.conn.cursor()
+        def _scalar(sql, params=()):
+            try:
+                r = cur.execute(sql, params).fetchone()
+                return r[0] if r else None
+            except Exception as exc:
+                return f"ERROR:{exc}"
+        for sid in ["3163", "3406"]:
+            rows.append({
+                "stock_id": sid,
+                "q1_eps": _scalar("SELECT COALESCE(eps_quarter, eps) FROM quarterly_financial_history WHERE stock_id=? AND fiscal_year=115 AND quarter=1 LIMIT 1", (sid,)),
+                "actual_q1_eps": _scalar("SELECT actual_q1_eps FROM financial_feature_daily WHERE stock_id=? ORDER BY feature_date DESC LIMIT 1", (sid,)),
+                "annual_2025": _scalar("SELECT eps_full_year FROM annual_eps_history WHERE stock_id=? AND fiscal_year=2025 LIMIT 1", (sid,)),
+                "valuation_eps": _scalar("SELECT eps FROM external_valuation WHERE stock_id=? ORDER BY data_date DESC LIMIT 1", (sid,)),
+                "valuation_eps_ttm": _scalar("SELECT eps_ttm FROM external_valuation WHERE stock_id=? ORDER BY data_date DESC LIMIT 1", (sid,)),
+                "valuation_eps_yoy": _scalar("SELECT eps_yoy FROM external_valuation WHERE stock_id=? ORDER BY data_date DESC LIMIT 1", (sid,)),
+                "feature_eps_yoy": _scalar("SELECT eps_yoy FROM financial_feature_daily WHERE stock_id=? ORDER BY feature_date DESC LIMIT 1", (sid,)),
+            })
+        return pd.DataFrame(rows)
+
+    def repair_financial_merge_and_valuation_r5n20b(self, annual_year: int = 2025, q1_roc_year: int = 115) -> dict:
+        """統一流程入口：normalize -> actual_q1 -> annual_eps -> external_valuation -> eps_yoy -> validate。"""
+        result = {"version": self.VERSION, "status": "start"}
+        try:
+            with self.db.lock:
+                self.ensure_repair_schema()
+                result["normalize"] = self.normalize_stock_id_and_market_type()
+                result["actual_q1_eps_updated"] = self.backfill_actual_q1_eps_from_quarterly(q1_roc_year, 1)
+                result["annual_eps_updated"] = self.rebuild_annual_eps_history_from_q4(annual_year)
+                result["external_valuation_updated"] = self.merge_financial_metrics_into_external_valuation(q1_roc_year, 1, annual_year)
+                result["feature_eps_yoy_updated"] = self.backfill_financial_feature_eps_yoy(annual_year)
+                self.db.conn.commit()
+            result["validation"] = self.validate_r5n20b_fix().to_dict("records")
+            result["status"] = "done"
+            log_info(f"[R5N20B][REPAIR_DONE] {result}")
+        except Exception as exc:
+            try:
+                self.db.conn.rollback()
+            except Exception:
+                pass
+            result["status"] = "fail"
+            result["error"] = str(exc)
+            log_error(f"[R5N20B][REPAIR_FAIL] {exc}")
+        return result
+
+
 class FinancialFeatureEngine:
     """V9.6.2-R7：把 external_valuation / external_revenue 正確合併成 financial_feature_daily。
 
@@ -17543,6 +17545,12 @@ class FinancialFeatureEngine:
     def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 10) -> pd.DataFrame:
         run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         feature_date = datetime.now().strftime("%Y-%m-%d")
+        # R5N20B：在 EPS Matrix 建立前先補齊 OTC 財報/估值最後一哩路。
+        # 這不下載新資料，也不覆蓋舊好資料，只補 DB 既有資料間的 merge 缺口。
+        try:
+            R5N20BFinancialValuationRepair(self.db).repair_financial_merge_and_valuation_r5n20b()
+        except Exception as _r5n20b_exc:
+            log_warning(f"[R5N20B][REPAIR_SKIP_IN_FEATURE_BUILD] {_r5n20b_exc}")
         master = self.db.get_master()
         valuation = self._latest_by_stock("external_valuation", "data_date")
         # P0：FinancialFeature 不只讀當次快照 external_revenue；若同步失敗，改用 history 最後成功月份。
@@ -17550,6 +17558,15 @@ class FinancialFeatureEngine:
         latest_close_map = self._latest_close_map()
         if master is None or master.empty:
             return pd.DataFrame()
+
+        # R5N20B-P0：EPS Matrix 只允許一般股票母體，排除 ETF/ETN/權證/00xxx 特殊商品。
+        # 修正 Analysis_Report 中 00400/00401/00402/00403 被列入 EPS_Matrix_Check 的問題。
+        try:
+            before_universe = len(master)
+            master = _r5n8c_filter_strategy_universe(master).copy()
+            log_info(f"[R5N20B][EPS_MATRIX_UNIVERSE_FILTER] before={before_universe} after={len(master)} removed={before_universe-len(master)}")
+        except Exception as _r5n20b_universe_exc:
+            log_warning(f"[R5N20B][EPS_MATRIX_UNIVERSE_FILTER_FAIL] {_r5n20b_universe_exc}")
 
         base = master[["stock_id"]].copy()
         base["stock_id"] = self._normalize_stock_id_series(base["stock_id"])
@@ -24449,11 +24466,32 @@ class AppUI:
                                 })
                     else:
                         _blocking_rows.append({"severity": "INFO", "module": "ALL", "status": "missing", "rows_count": 0, "blocking_reason": "尚未執行外部資料同步或external_source_status空白；V9.5.9僅作提示，不停止分析/交易邏輯", "go_no_go": "INFO-SOFT-BLOCK"})
+
+                    # R5N20B-P0：Go/NoGo 必須揭露 EPS Matrix 資料品質缺口，避免報表 GO 但 EPS_NE/REV_NE/EPS_YOY_MISSING 已大量存在。
+                    try:
+                        _dq_df = tables.get("Financial_Feature", pd.DataFrame())
+                        if _dq_df is not None and not _dq_df.empty and "data_quality_flag" in _dq_df.columns:
+                            _dq_flag = _dq_df["data_quality_flag"].fillna("").astype(str)
+                            _abnormal_id_cnt = int(_dq_df.get("stock_id", pd.Series(dtype=str)).astype(str).str.startswith(("00", "01", "02", "91")).sum()) if "stock_id" in _dq_df.columns else 0
+                            _eps_ne_cnt = int(_dq_flag.str.contains("EPS_NE", na=False).sum())
+                            _rev_ne_cnt = int(_dq_flag.str.contains("REV_NE", na=False).sum())
+                            _eps_yoy_missing_cnt = int(_dq_flag.str.contains("EPS_YOY_MISSING", na=False).sum())
+                            _total_ff_cnt = int(len(_dq_df))
+                            if _abnormal_id_cnt > 0:
+                                _blocking_rows.append({"severity": "P0", "module": "EPS_Matrix", "status": "DATA_QUALITY_FAIL", "rows_count": _abnormal_id_cnt, "blocking_reason": "EPS Matrix 含 ETF/特殊商品/異常代號，需先排除 00/01/02/91 開頭標的", "go_no_go": "GO-WITH-DATA-QUALITY-WARNING"})
+                            if _eps_ne_cnt > max(20, int(_total_ff_cnt * 0.02)) or _rev_ne_cnt > max(20, int(_total_ff_cnt * 0.02)):
+                                _blocking_rows.append({"severity": "P0", "module": "EPS_Matrix", "status": "DATA_QUALITY_FAIL", "rows_count": f"EPS_NE={_eps_ne_cnt}; REV_NE={_rev_ne_cnt}; total={_total_ff_cnt}", "blocking_reason": "EPS/Revenue 核心缺失比例過高，需檢查 external_valuation / external_revenue merge", "go_no_go": "GO-WITH-DATA-QUALITY-WARNING"})
+                            if _eps_yoy_missing_cnt > max(50, int(_total_ff_cnt * 0.05)):
+                                _blocking_rows.append({"severity": "WARN", "module": "EPS_YOY", "status": "DATA_QUALITY_WARNING", "rows_count": f"EPS_YOY_MISSING={_eps_yoy_missing_cnt}; total={_total_ff_cnt}", "blocking_reason": "EPS_TTM 有值但 EPS_YOY 大量缺失，需檢查 annual_eps_history / eps_yoy 回填", "go_no_go": "GO-WITH-DATA-QUALITY-WARNING"})
+                    except Exception as _dq_exc:
+                        _blocking_rows.append({"severity": "WARN", "module": "EPS_Matrix", "status": "DQ_CHECK_FAIL", "rows_count": 0, "blocking_reason": str(_dq_exc), "go_no_go": "GO-WITH-DATA-QUALITY-WARNING"})
+
                     tables["Blocking_Issues"] = pd.DataFrame(_blocking_rows) if _blocking_rows else pd.DataFrame([{"severity": "OK", "module": "ALL", "status": "ok", "rows_count": "", "blocking_reason": "", "go_no_go": "GO"}])
+                    _go_label = "GO_WITH_DATA_QUALITY_WARNING" if _blocking_rows else "GO"
                     tables["Go_NoGo_Summary"] = pd.DataFrame([{
-                        "go_no_go": "GO_WITH_EXTERNAL_INFO_WARNING" if _blocking_rows else "GO",
+                        "go_no_go": _go_label,
                         "blocking_count": len(_blocking_rows),
-                        "rule": "V9.5.9：外部資料不得直接控制trade_allowed；execution_ready/soft_block僅為資訊提示欄位",
+                        "rule": "R5N20B：外部資料不直接控制trade_allowed，但報表必須揭露 EPS_NE/REV_NE/EPS_YOY_MISSING 與異常代號資料品質警示",
                         "db_path": str(self.db.db_path),
                         "db_hash": self.db._safe_sha256(self.db.db_path),
                         "program_name": APP_NAME,
