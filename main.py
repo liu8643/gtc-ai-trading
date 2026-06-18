@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.20-R5N20_VALUATION_DATE_FALLBACK_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.20-R5N26B_OTC_ANNUAL_CACHE_MARKET_GATE_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3667,7 +3667,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.20_r5n20_valuation_date_fallback_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.20_r5n26b_otc_annual_cache_market_gate_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -9631,6 +9631,72 @@ class AnnualEPSCacheEngine:
             log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CACHE] count_db_rows failed fiscal_year={fiscal_year}｜{exc}")
             return 0
 
+    def _count_db_rows_by_market(self, fiscal_year: int) -> dict:
+        """R5N26B：年度 EPS Cache 成功判斷必須分市場。
+
+        舊版只要 annual_eps_history 有 1069 筆上市資料就視為 CACHE PASS 並 return，
+        導致 R5N26A TPEx OTC O_2025Q4.xls 永遠不會被呼叫。
+        本函式回傳 sii/otc/unknown 分市場筆數，供 annual chain 判斷是否可以停止。
+        """
+        try:
+            if not self.owner._table_exists("annual_eps_history"):
+                return {}
+            with self.owner.db.lock:
+                df = pd.read_sql_query("""
+                    SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                    FROM annual_eps_history
+                    WHERE fiscal_year=? AND eps_full_year IS NOT NULL
+                    GROUP BY COALESCE(market_type,'')
+                """, self.owner.db.conn, params=[int(fiscal_year)])
+            if df is None or df.empty:
+                return {}
+            out = {}
+            for _, r in df.iterrows():
+                mt = normalize_market_type(r.get("market_type")) or "unknown"
+                out[mt] = out.get(mt, 0) + int(r.get("cnt") or 0)
+            return out
+        except Exception as exc:
+            log_warning(f"[HIGH_GROWTH][R5N26B][ANNUAL_EPS_MARKET_COUNT_FAIL] fiscal_year={fiscal_year}｜{exc}")
+            return {}
+
+    def _min_otc_rows(self) -> int:
+        try:
+            return int(getattr(self.owner, "TPEX_OTC_FINANCIAL_XLS_MIN_ROWS", 700) or 700)
+        except Exception:
+            return 700
+
+    def _has_required_market_coverage(self, fiscal_year: int) -> tuple[bool, dict, str]:
+        counts = self._count_db_rows_by_market(fiscal_year)
+        sii_rows = int(counts.get("sii", 0) or 0)
+        otc_rows = int(counts.get("otc", 0) or 0)
+        min_otc = self._min_otc_rows()
+        ok = sii_rows > 0 and otc_rows >= min_otc
+        reason = "PASS" if ok else f"MARKET_GAP sii={sii_rows} otc={otc_rows} min_otc={min_otc} counts={counts}"
+        return ok, counts, reason
+
+    def _ensure_tpex_otc_financial_xls_prefill(self, fiscal_year: int, force: bool = False) -> dict:
+        """R5N26B：AnnualEPS Chain 顯式呼叫 TPEx OTC Financial XLS。
+
+        目的：不再把 R5N26A 隱藏在 OfficialOpenAPI_Q4 內，避免 Cache/LocalFile 總筆數 PASS 後短路。
+        若 OTC 已達門檻則跳過；否則下載 O_YYYYQ1~Q4.xls、寫 quarterly_financial_history，
+        並在 Q4 寫 annual_eps_history。
+        """
+        fiscal_year = int(fiscal_year)
+        ok_before, counts_before, reason_before = self._has_required_market_coverage(fiscal_year)
+        min_otc = self._min_otc_rows()
+        if not force and int(counts_before.get("otc", 0) or 0) >= min_otc:
+            return {"status": "exists", "rows": int(sum(counts_before.values())), "source": "TPEX_OTC_FINANCIAL_XLS", "market_counts": counts_before, "message": f"OTC annual EPS 已達門檻，略過下載｜{reason_before}"}
+        if not hasattr(self.owner, "ensure_tpex_otc_financial_xls_quarters"):
+            return {"status": "missing_func", "rows": 0, "source": "TPEX_OTC_FINANCIAL_XLS", "market_counts": counts_before, "message": "owner 缺少 ensure_tpex_otc_financial_xls_quarters()"}
+        log_info(f"[R5N26B][TPEX_OTC_FINANCIAL_XLS][CHAIN_PREFILL] start fiscal_year={fiscal_year} before={counts_before}")
+        res = self.owner.ensure_tpex_otc_financial_xls_quarters(fiscal_year, quarters=(1, 2, 3, 4), force=force)
+        ok_after, counts_after, reason_after = self._has_required_market_coverage(fiscal_year)
+        rows = int(sum(counts_after.values()))
+        status = "imported" if int(counts_after.get("otc", 0) or 0) >= min_otc else "market_gap"
+        out = {"status": status, "rows": rows, "source": "TPEX_OTC_FINANCIAL_XLS", "market_counts": counts_after, "message": f"TPEx OTC XLS prefill done｜{reason_after}", "tpex_result": res}
+        log_info(f"[R5N26B][TPEX_OTC_FINANCIAL_XLS][CHAIN_PREFILL] done fiscal_year={fiscal_year} result={out}")
+        return out
+
     def _cache_paths(self, fiscal_year: int) -> list[Path]:
         fiscal_year = int(fiscal_year)
         roc_year = fiscal_year - 1911
@@ -9702,6 +9768,7 @@ class AnnualEPSCacheEngine:
         stock_col = self._pick_column(raw, ["stock_id", "公司代號", "證券代號", "代號", "Code"])
         name_col = self._pick_column(raw, ["stock_name", "公司名稱", "公司簡稱", "證券名稱", "Name"])
         eps_col = self._pick_column(raw, ["eps_full_year", "annual_eps", "eps_cumulative", "基本每股盈餘", "EPS", "basic_eps"])
+        market_col = self._pick_column(raw, ["market_type", "market", "市場", "上市櫃", "source_market"])
         year_col = self._pick_column(raw, ["fiscal_year", "年度", "year"])
         q_col = self._pick_column(raw, ["quarter", "季別", "season"])
 
@@ -9711,6 +9778,7 @@ class AnnualEPSCacheEngine:
         out = pd.DataFrame()
         out["stock_id"] = raw[stock_col].map(normalize_stock_id)
         out["stock_name"] = raw[name_col].astype(str).str.strip() if name_col in raw.columns else ""
+        out["market_type"] = raw[market_col].map(normalize_market_type) if market_col in raw.columns else ""
         out["eps_full_year"] = pd.to_numeric(raw[eps_col], errors="coerce")
 
         if year_col in raw.columns:
@@ -9779,7 +9847,7 @@ class AnnualEPSCacheEngine:
                 result.update({"status": "missing_table", "message": "annual_eps_history 不存在"})
                 return result
             df = self.owner._read_sql(
-                "SELECT stock_id, fiscal_year, fiscal_year_roc, quarter, eps_full_year, eps_cumulative, eps_quarter, "
+                "SELECT stock_id, fiscal_year, market_type, fiscal_year_roc, quarter, eps_full_year, eps_cumulative, eps_quarter, "
                 "eps_prev_cumulative, eps_calc_method, source_type, source_url, source_file, source_date, update_time "
                 "FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
                 [int(fiscal_year)]
@@ -9821,14 +9889,15 @@ class AnnualEPSCacheEngine:
             "AnnualEPS", "R5H_CHAIN", "START", "PASS",
             target_table="annual_eps_history",
             source_date=f"{fiscal_year}Q4",
-            fail_reason_detail="Cache>LocalFile>OfficialOpenAPI_Q4>Index05Selenium>MOPS"
+            fail_reason_detail="Cache>LocalFile>TPEX_OTC_FINANCIAL_XLS_PREFILL>OfficialOpenAPI_Q4>Index05Selenium>MOPS"
         )
-        log_info(f"[HIGH_GROWTH][R5H_ANNUAL_EPS_CHAIN] start fiscal_year={fiscal_year} order=Cache>LocalFile>OfficialOpenAPI_Q4>Index05Selenium>MOPS")
+        log_info(f"[HIGH_GROWTH][R5H_ANNUAL_EPS_CHAIN] start fiscal_year={fiscal_year} order=Cache>LocalFile>TPEX_OTC_FINANCIAL_XLS_PREFILL>OfficialOpenAPI_Q4>Index05Selenium>MOPS market_gate=enabled")
 
         # R5I：每層來源都寫入 external_data_trace_event，並在最後做 annual_eps_history verify。
         chain = [
             ("CACHE", self.try_import_cache),
             ("LOCAL_FILE_114Q4_2025Q4", self.owner.ensure_annual_eps_from_local_114q4_file),
+            ("TPEX_OTC_FINANCIAL_XLS_PREFILL", self._ensure_tpex_otc_financial_xls_prefill),
             ("OFFICIAL_EPS_OPENAPI_2025Q4", self.owner.ensure_annual_eps_from_official_openapi_q4),
             ("INDEX05_SELENIUM_C05001", self.owner.ensure_annual_eps_from_twse_c05001),
             ("MOPS_T163SB04", self.owner.ensure_annual_eps_from_mops),
@@ -9843,14 +9912,16 @@ class AnnualEPSCacheEngine:
             status_raw = str(result.get("status", "")).lower()
             rows = int(result.get("rows", 0) or 0)
             verify_count = self._count_db_rows(fiscal_year)
-            event_status = "PASS" if (status_raw in self.SUCCESS_STATUS or rows > 0 or verify_count > 0) else ("WARN" if status_raw in ("skip", "missing_file", "no_data") else "FAIL")
-            reason = "" if event_status == "PASS" else ExternalDataTraceEngine.infer_fail_reason(
+            market_ok, market_counts, market_reason = self._has_required_market_coverage(fiscal_year)
+            source_has_data = (status_raw in self.SUCCESS_STATUS or rows > 0 or verify_count > 0)
+            event_status = "PASS" if (source_has_data and market_ok) else ("WARN" if source_has_data or status_raw in ("skip", "missing_file", "no_data", "market_gap") else "FAIL")
+            reason = "" if event_status == "PASS" else ("ANNUAL_EPS_MARKET_GAP" if source_has_data and not market_ok else ExternalDataTraceEngine.infer_fail_reason(
                 stage="SOURCE",
                 status=event_status,
                 rows_written=rows,
                 verify_count=verify_count,
                 detail=str(result.get("message", ""))
-            )
+            ))
             trace_engine.event(
                 "AnnualEPS", source_name, "SOURCE", event_status,
                 target_table="annual_eps_history",
@@ -9858,18 +9929,19 @@ class AnnualEPSCacheEngine:
                 rows_written=rows,
                 verify_count=verify_count,
                 fail_reason_code=reason,
-                fail_reason_detail=str(result.get("message", "")),
+                fail_reason_detail=(str(result.get("message", "")) + f" | market_counts={market_counts} | market_gate={market_reason}"),
                 source_file=str(result.get("source_file", "")),
                 source_date=f"{fiscal_year}Q4",
                 elapsed_ms=elapsed_ms,
             )
-            if status_raw in self.SUCCESS_STATUS or rows > 0 or verify_count > 0:
+            if source_has_data and market_ok:
                 final = {
                     "status": "success",
                     "rows": rows or verify_count,
                     "winning_source": source_name,
+                    "market_counts": market_counts,
                     "trace": trace,
-                    "message": f"R5I年度EPS備援成功：{source_name}",
+                    "message": f"R5N26B年度EPS備援成功：{source_name}，分市場覆蓋通過 {market_counts}",
                     "trace_run_id": trace_engine.run_id,
                 }
                 trace_engine.verify_core_table(
@@ -9877,8 +9949,10 @@ class AnnualEPSCacheEngine:
                     "fiscal_year=? AND eps_full_year IS NOT NULL",
                     (fiscal_year,), min_rows=1
                 )
-                log_info(f"[HIGH_GROWTH][R5I_ANNUAL_EPS_CHAIN] success winning_source={source_name} rows={rows} verify={verify_count}")
+                log_info(f"[HIGH_GROWTH][R5I_ANNUAL_EPS_CHAIN] success winning_source={source_name} rows={rows} verify={verify_count} market_counts={market_counts}")
                 return final
+            if source_has_data and not market_ok:
+                log_warning(f"[R5N26B][ANNUAL_EPS_CHAIN][CONTINUE_MARKET_GAP] source={source_name} fiscal_year={fiscal_year} rows={rows} verify={verify_count} {market_reason}")
 
         verify_count = self._count_db_rows(fiscal_year)
         trace_engine.fail(
