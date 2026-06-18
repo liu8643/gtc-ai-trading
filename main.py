@@ -10044,6 +10044,250 @@ class EPSForecastEngine:
     }
 
 
+    # R5N26_TPEX_OTC_FINANCIAL_XLS_EPS_IMPORT_20260618：
+    # TPEx 上櫃公司季報 XLS 官方來源。URL 規則已由官網頁面驗證：
+    # https://www.tpex.org.tw/storage/statistic/financial/O_YYYYQn.xls
+    # 注意：TPEx 季報 XLS 的「每股稅後純益」為累計 EPS；quarterly_financial_history.eps/eps_quarter 必須寫單季 EPS，
+    # annual_eps_history 只能在 Q4 使用累計 EPS 寫入全年 EPS，不得年化。
+    TPEX_OTC_FINANCIAL_XLS_BASE_URL = "https://www.tpex.org.tw/storage/statistic/financial"
+    TPEX_OTC_FINANCIAL_XLS_REFERER = "https://www.tpex.org.tw/zh-tw/mainboard/listed/financial/summary.html"
+    TPEX_OTC_FINANCIAL_XLS_MIN_ROWS = int(os.getenv("GTC_TPEX_OTC_FINANCIAL_XLS_MIN_ROWS", "700") or "700")
+
+    def _tpex_otc_financial_xls_cache_dir(self) -> Path:
+        cache_dir = EPS_CACHE_OTC_DIR / "tpex_financial"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _tpex_otc_financial_xls_url(self, fiscal_year: int, quarter: int) -> str:
+        return f"{self.TPEX_OTC_FINANCIAL_XLS_BASE_URL}/O_{int(fiscal_year)}Q{int(quarter)}.xls"
+
+    def download_tpex_otc_financial_xls(self, fiscal_year: int, quarter: int, force: bool = False) -> Path:
+        """下載 TPEx 上櫃公司季報 XLS 到 data/eps_cache/otc/tpex_financial。
+
+        只接受合理大小且看起來像 Excel/HTML table 的內容；避免 404/錯誤頁被寫入 cache。
+        """
+        fiscal_year = int(fiscal_year); quarter = int(quarter)
+        filename = f"O_{fiscal_year}Q{quarter}.xls"
+        out_path = self._tpex_otc_financial_xls_cache_dir() / filename
+        if out_path.exists() and out_path.stat().st_size > 5000 and not force:
+            return out_path
+        url = self._tpex_otc_financial_xls_url(fiscal_year, quarter)
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/vnd.ms-excel,application/octet-stream,text/html,*/*",
+            "Referer": self.TPEX_OTC_FINANCIAL_XLS_REFERER,
+        }
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        content = resp.content or b""
+        if len(content) < 5000:
+            raise RuntimeError(f"TPEx OTC financial XLS too small: year={fiscal_year} quarter={quarter} bytes={len(content)} url={url}")
+        head = content[:300].lower()
+        if (b"<html" in head or b"<!doctype" in head) and (b"company" not in head and "公司".encode("utf-8") not in content[:5000]):
+            raise RuntimeError(f"TPEx OTC financial XLS looks like error html: {url}")
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        tmp_path.write_bytes(content)
+        tmp_path.replace(out_path)
+        return out_path
+
+    @staticmethod
+    def _find_tpex_otc_financial_col(columns, keyword_groups: list[list[str]]) -> str | None:
+        normalized = [(str(c).strip().replace("\n", "").replace(" ", ""), c) for c in columns]
+        for keywords in keyword_groups:
+            keys = [str(k).replace(" ", "") for k in keywords]
+            for compact, original in normalized:
+                if all(k in compact for k in keys):
+                    return original
+        return None
+
+    def parse_tpex_otc_financial_xls(self, xls_path: str | Path, fiscal_year: int, quarter: int) -> pd.DataFrame:
+        """解析 TPEx O_YYYYQn.xls，回傳 cumulative EPS staging。
+
+        回傳欄位 eps_cumulative 代表官方累計 EPS；尚未在此步驟換算單季 EPS。
+        """
+        fiscal_year = int(fiscal_year); quarter = int(quarter)
+        xls_path = Path(xls_path)
+        engines = []
+        try:
+            if importlib.util.find_spec("xlrd") is not None:
+                engines.append("xlrd")
+        except Exception:
+            pass
+        engines.append(None)
+        raw = None; last_error = None
+        for engine in engines:
+            try:
+                raw = pd.read_excel(xls_path, header=None, dtype=str, engine=engine) if engine else pd.read_excel(xls_path, header=None, dtype=str)
+                break
+            except Exception as exc:
+                last_error = exc
+        if raw is None:
+            raise RuntimeError(f"TPEx OTC financial XLS read failed: {xls_path}｜{last_error}")
+
+        header_row = None
+        max_scan = min(len(raw), 50)
+        for i in range(max_scan):
+            row_text = " ".join(raw.iloc[i].fillna("").astype(str).tolist()).replace("\n", " ")
+            compact = row_text.replace(" ", "")
+            if ("公司代號" in compact or "代號" in compact) and ("每股稅後純益" in compact or "基本每股盈餘" in compact or "NetIncomePerShare" in compact):
+                header_row = i
+                break
+        if header_row is None:
+            raise RuntimeError(f"Cannot find TPEx OTC EPS header row: {xls_path}")
+
+        df = None; last_error = None
+        for engine in engines:
+            try:
+                df = pd.read_excel(xls_path, header=header_row, dtype=str, engine=engine) if engine else pd.read_excel(xls_path, header=header_row, dtype=str)
+                break
+            except Exception as exc:
+                last_error = exc
+        if df is None:
+            raise RuntimeError(f"TPEx OTC financial XLS parse failed: {xls_path}｜{last_error}")
+        df.columns = [str(c).strip().replace("\n", "") for c in df.columns]
+
+        stock_col = self._find_tpex_otc_financial_col(df.columns, [["公司代號"], ["股票代號"], ["代號"]])
+        name_col = self._find_tpex_otc_financial_col(df.columns, [["公司名稱"], ["公司簡稱"], ["名稱"]])
+        eps_col = self._find_tpex_otc_financial_col(df.columns, [["每股稅後純益"], ["基本每股盈餘"], ["Net", "Income", "Per", "Share"]])
+        if not stock_col or not eps_col:
+            raise RuntimeError(f"Missing TPEx OTC financial XLS columns file={xls_path} stock_col={stock_col} eps_col={eps_col} columns={df.columns.tolist()[:40]}")
+
+        out = pd.DataFrame()
+        out["stock_id"] = df[stock_col].astype(str).str.extract(r"(\d{4})")[0]
+        out["stock_name"] = df[name_col].astype(str).str.strip() if name_col else ""
+        eps_raw = (df[eps_col].astype(str)
+                   .str.replace(",", "", regex=False)
+                   .str.replace("—", "", regex=False)
+                   .str.replace("－", "", regex=False)
+                   .str.replace("--", "", regex=False)
+                   .str.strip())
+        out["eps_cumulative"] = pd.to_numeric(eps_raw, errors="coerce")
+        out = out.dropna(subset=["stock_id", "eps_cumulative"])
+        out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
+        out["fiscal_year"] = fiscal_year
+        out["quarter"] = quarter
+        out["fiscal_year_quarter"] = f"{fiscal_year}Q{quarter}"
+        out["western_quarter"] = f"{fiscal_year}Q{quarter}"
+        out["market_type"] = "otc"
+        out["source_type"] = f"TPEX_OTC_FINANCIAL_XLS_O_{fiscal_year}Q{quarter}"
+        out["source_url"] = self._tpex_otc_financial_xls_url(fiscal_year, quarter)
+        out["source_file"] = str(xls_path)
+        out["source_date"] = f"{fiscal_year}Q{quarter}"
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return out.drop_duplicates(["stock_id", "fiscal_year", "quarter"], keep="last")
+
+    def _load_tpex_otc_prev_cumulative_eps(self, fiscal_year: int, quarter: int, force: bool = False) -> pd.DataFrame:
+        """取得前一季累計 EPS，用於把 TPEx 累計 EPS 換算為單季 EPS。"""
+        fiscal_year = int(fiscal_year); quarter = int(quarter)
+        if quarter <= 1:
+            return pd.DataFrame(columns=["stock_id", "eps_prev_cumulative"])
+        prev_q = quarter - 1
+        try:
+            with self.db.lock:
+                prev = pd.read_sql_query("""
+                    SELECT stock_id, eps_cumulative AS eps_prev_cumulative
+                    FROM quarterly_financial_history
+                    WHERE fiscal_year=? AND quarter=? AND COALESCE(market_type,'')='otc' AND eps_cumulative IS NOT NULL
+                """, self.db.conn, params=[fiscal_year, prev_q])
+            if prev is not None and len(prev) >= self.TPEX_OTC_FINANCIAL_XLS_MIN_ROWS:
+                return prev
+        except Exception:
+            pass
+        prev_path = self.download_tpex_otc_financial_xls(fiscal_year, prev_q, force=force)
+        prev_df = self.parse_tpex_otc_financial_xls(prev_path, fiscal_year, prev_q)
+        if prev_df is None or prev_df.empty:
+            return pd.DataFrame(columns=["stock_id", "eps_prev_cumulative"])
+        return prev_df[["stock_id", "eps_cumulative"]].rename(columns={"eps_cumulative": "eps_prev_cumulative"})
+
+    def import_tpex_otc_financial_xls_to_db(self, fiscal_year: int, quarter: int, force: bool = False) -> dict:
+        """TPEx OTC 季報 XLS EPS Import Engine。
+
+        1. 下載 O_YYYYQn.xls。
+        2. 解析「每股稅後純益」為累計 EPS。
+        3. 寫入 quarterly_financial_history：eps/eps_quarter 使用單季 EPS；eps_cumulative 保留官方累計 EPS。
+        4. Q4 額外寫入 annual_eps_history：eps_full_year 使用 Q4 累計 EPS，不年化。
+        """
+        fiscal_year = int(fiscal_year); quarter = int(quarter)
+        result = {"status": "skip", "rows": 0, "annual_rows": 0, "source": "TPEX_OTC_FINANCIAL_XLS", "message": "", "year": fiscal_year, "quarter": quarter}
+        try:
+            xls_path = self.download_tpex_otc_financial_xls(fiscal_year, quarter, force=force)
+            cur_df = self.parse_tpex_otc_financial_xls(xls_path, fiscal_year, quarter)
+            if cur_df is None or cur_df.empty:
+                result.update({"status": "parse_zero", "message": f"TPEx OTC financial XLS parse zero rows {fiscal_year}Q{quarter}", "xls_path": str(xls_path)})
+                return result
+            if len(cur_df) < self.TPEX_OTC_FINANCIAL_XLS_MIN_ROWS:
+                raise RuntimeError(f"TPEx OTC financial XLS rows too few: {fiscal_year}Q{quarter}, rows={len(cur_df)}, min={self.TPEX_OTC_FINANCIAL_XLS_MIN_ROWS}")
+            prev_df = self._load_tpex_otc_prev_cumulative_eps(fiscal_year, quarter, force=force)
+            write = cur_df.merge(prev_df, on="stock_id", how="left") if prev_df is not None and not prev_df.empty else cur_df.copy()
+            if "eps_prev_cumulative" not in write.columns:
+                write["eps_prev_cumulative"] = np.nan
+            write["eps_prev_cumulative"] = pd.to_numeric(write["eps_prev_cumulative"], errors="coerce")
+            write["eps_cumulative"] = pd.to_numeric(write["eps_cumulative"], errors="coerce")
+            if quarter == 1:
+                write["eps_quarter"] = write["eps_cumulative"]
+                write["eps_calc_method"] = "TPEX_XLS_Q1_CUMULATIVE_EQUALS_QUARTER"
+            else:
+                write["eps_quarter"] = write["eps_cumulative"] - write["eps_prev_cumulative"]
+                write["eps_calc_method"] = "TPEX_XLS_CUMULATIVE_DIFF_TO_QUARTER"
+            # 若少數公司前一季不存在，保留官方累計值但不把累計 EPS 誤寫成單季 EPS。
+            missing_prev = int(write["eps_quarter"].isna().sum()) if quarter > 1 else 0
+            write["eps"] = write["eps_quarter"]
+            write = write.dropna(subset=["stock_id", "eps_cumulative"])
+            db_cols = ["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "market_type", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"]
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.executemany("""
+                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, market_type, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(stock_id, fiscal_year, quarter) DO UPDATE SET
+                        fiscal_year_quarter=excluded.fiscal_year_quarter,
+                        western_quarter=excluded.western_quarter,
+                        market_type=excluded.market_type,
+                        eps=excluded.eps,
+                        eps_cumulative=excluded.eps_cumulative,
+                        eps_quarter=excluded.eps_quarter,
+                        eps_prev_cumulative=excluded.eps_prev_cumulative,
+                        eps_calc_method=excluded.eps_calc_method,
+                        source_type=excluded.source_type,
+                        source_url=excluded.source_url,
+                        source_date=excluded.source_date,
+                        update_time=excluded.update_time
+                """, list(write[db_cols].itertuples(index=False, name=None)))
+                self.db.conn.commit()
+            annual_rows = 0
+            if quarter == 4:
+                annual_df = write.copy()
+                annual_df["eps_full_year"] = annual_df["eps_cumulative"]
+                annual_df["source_file"] = str(xls_path)
+                annual_rows = self._write_annual_eps_history(annual_df, fiscal_year, source_label=f"TPEX_OTC_{fiscal_year}Q4_XLS_CUMULATIVE_AS_ANNUAL_EPS")
+            result.update({
+                "status": "imported",
+                "rows": int(len(write)),
+                "annual_rows": int(annual_rows),
+                "xls_path": str(xls_path),
+                "message": f"TPEx OTC XLS imported {fiscal_year}Q{quarter}; missing_prev_cumulative={missing_prev}; Q4 annual_rows={annual_rows}",
+            })
+            log_info(f"[R5N26][TPEX_OTC_FINANCIAL_XLS][OK] year={fiscal_year} q={quarter} rows={len(write)} annual_rows={annual_rows} missing_prev={missing_prev} file={xls_path}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[R5N26][TPEX_OTC_FINANCIAL_XLS][FAIL] year={fiscal_year} q={quarter}｜{exc}")
+            return result
+
+    def ensure_tpex_otc_financial_xls_quarters(self, fiscal_year: int, quarters=(1, 2, 3, 4), force: bool = False) -> dict:
+        """批次補入 TPEx OTC 官方季報 XLS。Q4 會同步補 annual_eps_history。"""
+        fiscal_year = int(fiscal_year)
+        results = []
+        total_rows = 0
+        annual_rows = 0
+        for q in quarters:
+            res = self.import_tpex_otc_financial_xls_to_db(fiscal_year, int(q), force=force)
+            results.append(res)
+            total_rows += int((res or {}).get("rows", 0) or 0)
+            annual_rows += int((res or {}).get("annual_rows", 0) or 0)
+        return {"status": "done", "rows": total_rows, "annual_rows": annual_rows, "results": results, "source": "TPEX_OTC_FINANCIAL_XLS_BATCH"}
+
+
 
     @staticmethod
     def _pick_first_existing_key(row: dict, candidates: list[str]) -> str | None:
@@ -11964,6 +12208,30 @@ class EPSForecastEngine:
                 return result
             if existing > 0 and not force:
                 log_warning(f"[R5N8C][ANNUAL_EPS_MARKET_GAP] fiscal_year={fiscal_year} existing_by_market={existing_by_market}，仍繼續補缺市場")
+
+            # R5N26：先用 TPEx 官網季報 XLS 補 OTC 年度 EPS 缺口。
+            # OTC O_YYYYQn.xls 的 EPS 是累計值；import_tpex_otc_financial_xls_to_db 會換算單季 EPS 寫入 quarterly_financial_history，
+            # 並只在 Q4 將累計值寫入 annual_eps_history，避免 Q2/Q3/Q4 累計 EPS 污染 TTM。
+            otc_xls_result = {}
+            try:
+                if force or existing_by_market.get("otc", 0) < self.TPEX_OTC_FINANCIAL_XLS_MIN_ROWS:
+                    otc_xls_result = self.ensure_tpex_otc_financial_xls_quarters(fiscal_year, quarters=(1, 2, 3, 4), force=force)
+                    log_info(f"[R5N26][TPEX_OTC_FINANCIAL_XLS][ANNUAL_PREFILL] fiscal_year={fiscal_year} result={otc_xls_result}")
+                    with self.db.lock:
+                        refreshed_df = pd.read_sql_query("""
+                            SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                            FROM annual_eps_history
+                            WHERE fiscal_year=? AND eps_full_year IS NOT NULL
+                            GROUP BY COALESCE(market_type,'')
+                        """, self.db.conn, params=[fiscal_year])
+                    existing_by_market = {normalize_market_type(r.get("market_type")) or "unknown": int(r.get("cnt") or 0) for _, r in refreshed_df.iterrows()} if refreshed_df is not None and not refreshed_df.empty else existing_by_market
+                    existing = int(refreshed_df["cnt"].sum()) if refreshed_df is not None and not refreshed_df.empty else existing
+                    if existing > 0 and not force and existing_by_market.get("sii", 0) > 0 and existing_by_market.get("otc", 0) >= self.TPEX_OTC_FINANCIAL_XLS_MIN_ROWS:
+                        result.update({"status": "exists_after_tpex_otc_xls", "rows": existing, "message": f"annual_eps_history 已由 TPEx OTC XLS 補齊分市場資料 {existing_by_market}"})
+                        trace.success("AnnualEPS", "TPEX_OTC_FINANCIAL_XLS_Q4", "VERIFY", target_table="annual_eps_history", verify_count=existing, source_date=f"{fiscal_year}Q4")
+                        return result
+            except Exception as otc_xls_exc:
+                log_warning(f"[R5N26][TPEX_OTC_FINANCIAL_XLS][ANNUAL_PREFILL_FAIL] fiscal_year={fiscal_year}｜{otc_xls_exc}")
 
             # 先嘗試建立 Q1~Q4 的 official_eps_openapi cache 與 quarterly_financial_history。
             q_results = self.ensure_official_eps_openapi_quarters(fiscal_year, quarters=(1, 2, 3, 4), force=force)
