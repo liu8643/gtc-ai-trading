@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.20-R5N26C_UI_MONTH_QUARTER_DOWNLOAD_PLAN_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.21-R5N26D_UI_DATE_SELECTOR_DOWNLOAD_PLAN_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3667,7 +3667,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.20_r5n26c_ui_month_quarter_download_plan_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.21_r5n26d_ui_date_selector_download_plan_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -6914,7 +6914,11 @@ def resolve_ui_download_plan(start_month: str, end_month: str, q1: bool = False,
     }
 
 def revenue_month_options(back_years: int = 2, forward_months: int = 0) -> list[str]:
-    """R5N：產生 UI 下拉月份選項。預設提供近兩年到本月。"""
+    """R5N：舊版 YYYYMM 下拉月份候選。
+
+    R5N26D 起高成長 EPS UI 不再使用固定 YYYYMM 下拉；
+    此函式保留給舊流程/相容用途。
+    """
     today = datetime.now()
     start_y = today.year - int(back_years or 0)
     start_m = 1
@@ -6923,6 +6927,46 @@ def revenue_month_options(back_years: int = 2, forward_months: int = 0) -> list[
         end_y += 1
         end_m -= 12
     return build_month_range(f"{start_y:04d}{start_m:02d}", f"{end_y:04d}{end_m:02d}")
+
+
+# R5N26D_UI_DATE_SELECTOR_DOWNLOAD_PLAN_FIX_20260618：
+# 高成長 EPS UI 改為「起始年/月、結束年/月」日期選單，避免 2027/2028 受固定 YYYYMM Combobox 限制。
+def normalize_ui_year_month(year_value, month_value) -> str:
+    """將 UI 年/月欄位轉成 YYYYMM。
+
+    支援：2026 + 01、2026 + 1、2026 + 202601、或舊版直接傳入 202601。
+    """
+    y = str(year_value or "").strip()
+    m = str(month_value or "").strip()
+
+    if re.fullmatch(r"\d{6}", y) and not m:
+        return y
+    if re.fullmatch(r"\d{6}", m):
+        return m
+
+    y_match = re.search(r"(\d{4})", y)
+    m_match = re.search(r"(\d{1,2})", m)
+    if not y_match or not m_match:
+        raise ValueError(f"年月格式錯誤：year={year_value}, month={month_value}")
+
+    yy = int(y_match.group(1))
+    mm = int(m_match.group(1))
+    if yy < 2000 or yy > 2099:
+        raise ValueError(f"年份超出支援範圍：{yy}，請使用 2000~2099")
+    if mm < 1 or mm > 12:
+        raise ValueError(f"月份超出支援範圍：{mm}，請使用 1~12")
+    return f"{yy:04d}{mm:02d}"
+
+
+def month_number_options() -> list[str]:
+    """UI 月份選單：固定 01~12，不限制年度。"""
+    return [f"{m:02d}" for m in range(1, 13)]
+
+
+def default_year_selector_bounds(back_years: int = 5, forward_years: int = 10) -> tuple[int, int]:
+    """UI 年份 Spinbox 邊界；不是資料年份限制，只是避免誤輸入。"""
+    today = datetime.now()
+    return today.year - int(back_years or 0), today.year + int(forward_years or 0)
 
 
 def safe_read_html_tables(html_text, source_label: str = "") -> tuple[list[pd.DataFrame], str, str]:
@@ -22885,15 +22929,39 @@ class AppUI:
         return f"{today.year:04d}01", f"{today.year:04d}{today.month:02d}"
 
     def _selected_revenue_months_from_ui(self) -> list[str]:
-        """R5N：讀取第二排最右側 UI 的起始/結束月份。"""
-        start = getattr(self, "revenue_start_month_var", tk.StringVar(value="")).get()
-        end = getattr(self, "revenue_end_month_var", tk.StringVar(value="")).get()
+        """R5N26D：讀取 UI 日期/年月選單，轉成 YYYYMM 月份序列。
+
+        優先使用新版 year/month selector；若使用舊版變數仍可 fallback。
+        """
+        start, end = self._selected_revenue_month_bounds_from_ui()
         return build_month_range(start, end)
 
-    def _resolve_highgrowth_ui_download_plan(self) -> dict:
-        """R5N26C：統一解析高成長 EPS UI 的年月與季度。"""
+    def _selected_revenue_month_bounds_from_ui(self) -> tuple[str, str]:
+        """R5N26D：回傳 (start_yyyymm, end_yyyymm)，不再依賴固定 YYYYMM Combobox 清單。"""
+        if hasattr(self, "revenue_start_year_var") and hasattr(self, "revenue_start_month_no_var"):
+            start = normalize_ui_year_month(
+                self.revenue_start_year_var.get(),
+                self.revenue_start_month_no_var.get(),
+            )
+            end = normalize_ui_year_month(
+                self.revenue_end_year_var.get(),
+                self.revenue_end_month_no_var.get(),
+            )
+            # 同步舊變數，讓仍讀 revenue_start_month_var/revenue_end_month_var 的舊流程不斷線。
+            try:
+                self.revenue_start_month_var.set(start)
+                self.revenue_end_month_var.set(end)
+            except Exception:
+                pass
+            return start, end
+
         start = getattr(self, "revenue_start_month_var", tk.StringVar(value="")).get()
         end = getattr(self, "revenue_end_month_var", tk.StringVar(value="")).get()
+        return str(start), str(end)
+
+    def _resolve_highgrowth_ui_download_plan(self) -> dict:
+        """R5N26D：統一解析高成長 EPS UI 的日期選單與季度。"""
+        start, end = self._selected_revenue_month_bounds_from_ui()
         return resolve_ui_download_plan(
             start,
             end,
@@ -22980,7 +23048,9 @@ class AppUI:
         self.highgrowth_q4_var = tk.BooleanVar(value=False)
         for q, var in [("Q1", self.highgrowth_q1_var), ("Q2", self.highgrowth_q2_var), ("Q3", self.highgrowth_q3_var), ("Q4", self.highgrowth_q4_var)]:
             ttk.Checkbutton(control, text=q, variable=var).pack(side="left", padx=2)
-        # R5N：模式與營收月份選擇器移到第二排最右側，避免第一排按鈕過擠。
+        # R5N26D：模式與營收年月選擇器移到第二排最右側。
+        # 關鍵修正：不再使用固定 YYYYMM Combobox（例如 202509~202606），改用年/月日期選單；
+        # 2027、2028 會由使用者選定年月直接推導 analysis_year/base_year。
         # V4.15：UI固定中文，不提供語言切換；中文/英文只在匯出Excel各產生一份。
         self.highgrowth_status_var = tk.StringVar(value=f"V4.15報表輸出：{HIGH_GROWTH_REPORT_DIR}｜Excel中文/英文各一份")
         ttk.Label(control, textvariable=self.highgrowth_status_var).pack(side="left", padx=12)
@@ -22988,22 +23058,37 @@ class AppUI:
         control2 = ttk.Frame(self.tab_highgrowth, padding=(6, 0, 6, 4))
         control2.pack(fill="x")
         self.highgrowth_mode_var = tk.StringVar(value="HYBRID")
-        self.revenue_start_month_var = tk.StringVar()
+        self.revenue_start_month_var = tk.StringVar()  # 兼容舊流程：實際值由日期選單同步成 YYYYMM
         self.revenue_end_month_var = tk.StringVar()
+        self.revenue_start_year_var = tk.StringVar()
+        self.revenue_start_month_no_var = tk.StringVar()
+        self.revenue_end_year_var = tk.StringVar()
+        self.revenue_end_month_no_var = tk.StringVar()
         start_m, end_m = self._default_revenue_month_bounds()
         self.revenue_start_month_var.set(start_m)
         self.revenue_end_month_var.set(end_m)
-        month_values = revenue_month_options(back_years=2, forward_months=0)
+        self.revenue_start_year_var.set(start_m[:4])
+        self.revenue_start_month_no_var.set(start_m[4:6])
+        self.revenue_end_year_var.set(end_m[:4])
+        self.revenue_end_month_no_var.set(end_m[4:6])
+        year_from, year_to = default_year_selector_bounds(back_years=5, forward_years=10)
+        month_values = month_number_options()
         ttk.Button(control2, text="下載歷史營收", command=self.on_download_historical_revenue_clicked).pack(side="right", padx=(6, 2))
-        end_cb = ttk.Combobox(control2, textvariable=self.revenue_end_month_var, width=8, state="readonly")
-        end_cb["values"] = month_values
-        end_cb.pack(side="right", padx=(2, 6))
-        ttk.Label(control2, text="結束").pack(side="right", padx=(6, 2))
-        start_cb = ttk.Combobox(control2, textvariable=self.revenue_start_month_var, width=8, state="readonly")
-        start_cb["values"] = month_values
-        start_cb.pack(side="right", padx=(2, 6))
-        ttk.Label(control2, text="起始").pack(side="right", padx=(6, 2))
-        ttk.Label(control2, text="營收月份").pack(side="right", padx=(10, 4))
+
+        end_month_cb = ttk.Combobox(control2, textvariable=self.revenue_end_month_no_var, width=3, state="readonly")
+        end_month_cb["values"] = month_values
+        end_month_cb.pack(side="right", padx=(2, 6))
+        end_year_sp = tk.Spinbox(control2, from_=year_from, to=year_to, textvariable=self.revenue_end_year_var, width=6)
+        end_year_sp.pack(side="right", padx=(2, 2))
+        ttk.Label(control2, text="結束年月").pack(side="right", padx=(6, 2))
+
+        start_month_cb = ttk.Combobox(control2, textvariable=self.revenue_start_month_no_var, width=3, state="readonly")
+        start_month_cb["values"] = month_values
+        start_month_cb.pack(side="right", padx=(2, 6))
+        start_year_sp = tk.Spinbox(control2, from_=year_from, to=year_to, textvariable=self.revenue_start_year_var, width=6)
+        start_year_sp.pack(side="right", padx=(2, 2))
+        ttk.Label(control2, text="起始年月").pack(side="right", padx=(6, 2))
+        ttk.Label(control2, text="營收日期").pack(side="right", padx=(10, 4))
         mode_cb = ttk.Combobox(control2, textvariable=self.highgrowth_mode_var, width=16, state="readonly")
         mode_cb["values"] = ["HYBRID", "STRICT_ACTUAL_ONLY", "FORECAST_PROXY"]
         mode_cb.pack(side="right", padx=(2, 10))
@@ -23139,8 +23224,9 @@ class AppUI:
     def on_highgrowth_report(self):
         """UI按鈕：產生高成長EPS加速度V4報表。
 
-        R5N26C：由營收月份起訖與 Q1/Q2/Q3/Q4 勾選產生 DownloadPlan。
-        end_month=202606 + Q1 時，會在報表前補 data/eps_cache/otc/tpex_financial/O_2026Q1.xls。
+        R5N26D：由營收日期選單與 Q1/Q2/Q3/Q4 勾選產生 DownloadPlan。
+        不寫死 2025/2026；end_month=202606 + Q1 時會補 O_2026Q1.xls，
+        end_month=202706 + Q2 時會補 O_2026Q1~Q4 + O_2027Q1~Q2。
         """
         quarters = self._selected_highgrowth_quarters()
         mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
