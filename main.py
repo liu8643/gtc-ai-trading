@@ -16835,8 +16835,12 @@ class R5N20BFinancialValuationRepair:
     1. 不覆蓋既有有效資料，只補缺值或缺表欄位。
     2. 不破壞 R5N24 EPS Atomic Guard；EPS 下載失敗時不覆蓋舊快取。
     3. 統一 stock_id / market_type，再執行回填與驗證。
+    4. R5N25：EPS_TTM 以 financial_feature_daily 為唯一主來源同步至 external_valuation；
+       external_valuation 不可自行斷鏈。
+    5. R5N25：OTC 2025 年度 EPS 缺口以 114Q4 / 2025Q4 累計 EPS 回補，
+       114Q4 已是全年累計 EPS，不得年化。
     """
-    VERSION = "R5N20B_FINANCIAL_MERGE_REPAIR_20260617"
+    VERSION = "R5N25_EPS_TTM_SYNC_OTC_ANNUAL_FALLBACK_20260617"
 
     def __init__(self, db: DBManager):
         self.db = db
@@ -16891,6 +16895,7 @@ class R5N20BFinancialValuationRepair:
             _add("financial_feature_daily", col, ddl)
         for col, ddl in [
             ("eps", "eps REAL"), ("eps_ttm", "eps_ttm REAL"), ("eps_yoy", "eps_yoy REAL"),
+            ("pe_ratio", "pe_ratio REAL"), ("peg_ratio", "peg_ratio REAL"),
             ("roe", "roe REAL"), ("gross_margin", "gross_margin REAL"), ("operating_margin", "operating_margin REAL"),
             ("data_quality_flag", "data_quality_flag TEXT"), ("repair_source_type", "repair_source_type TEXT"),
         ]:
@@ -16996,7 +17001,7 @@ class R5N20BFinancialValuationRepair:
                 4 AS quarter,
                 q.{eps_expr} AS eps_full_year,
                 q.{eps_expr} AS eps_cumulative,
-                CASE WHEN 'eps_quarter' IN ('eps_quarter') THEN COALESCE(q.eps_quarter, NULL) ELSE NULL END AS eps_quarter,
+                {('q.eps_quarter' if 'eps_quarter' in qcols else 'NULL')} AS eps_quarter,
                 NULL AS eps_prev_cumulative,
                 'Q4_CUMULATIVE_AS_ANNUAL_EPS' AS eps_calc_method,
                 'BACKFILL_FROM_114Q4_R5N20B' AS source_type,
@@ -17134,6 +17139,219 @@ class R5N20BFinancialValuationRepair:
         cur.execute("UPDATE external_valuation SET data_quality_flag='OK' WHERE data_quality_flag IS NULL OR data_quality_flag='' ")
         return max(0, self.db.conn.total_changes - before)
 
+    def ensure_otc_annual_eps_2025(self, annual_year: int = 2025) -> int:
+        """R5N25：補 OTC 2025 全年 EPS 缺口。
+
+        來源只允許 quarterly_financial_history 的 114Q4 / 2025Q4 累計 EPS。
+        注意：114Q4 / 2025Q4 是全年累計 EPS，不可年化、不可用 Q1~Q3 加總。
+        僅在 annual_eps_history 缺值或為 0 時補值，不覆蓋既有有效年度 EPS。
+        """
+        if not (self._table_exists("quarterly_financial_history") and self._table_exists("annual_eps_history")):
+            return 0
+        qcols = self._columns("quarterly_financial_history")
+        if "eps_cumulative" in qcols:
+            eps_expr = "q.eps_cumulative"
+        elif "eps" in qcols:
+            eps_expr = "q.eps"
+        else:
+            return 0
+        has_fyq = "fiscal_year_quarter" in qcols
+        has_wq = "western_quarter" in qcols
+        has_market = "market_type" in qcols
+        fyq_filter = ""
+        if has_fyq:
+            fyq_filter += " OR COALESCE(q.fiscal_year_quarter,'') IN ('114Q4','114/4','2025Q4','2025/Q4')"
+        if has_wq:
+            fyq_filter += " OR COALESCE(q.western_quarter,'') IN ('2025Q4','2025/Q4')"
+        market_filter = "1=1"
+        if has_market:
+            market_filter = """
+            (
+                normalize_market_type_sql(COALESCE(q.market_type,''))='otc'
+                OR COALESCE(q.market_type,'') IN ('otc','上櫃','TPEx','TPEX')
+                OR EXISTS (
+                    SELECT 1 FROM stocks_master sm
+                    WHERE sm.stock_id=q.stock_id AND sm.market='上櫃'
+                )
+            )
+            """
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        # SQLite 無 Python normalize_market_type，改以 CASE 在 SQL 內完成，避免 user-defined function 依賴。
+        market_filter = market_filter.replace("normalize_market_type_sql(COALESCE(q.market_type,''))='otc' OR ", "")
+        cur.execute(f"""
+            INSERT INTO annual_eps_history
+            (stock_id, fiscal_year, market_type, fiscal_year_roc, quarter, eps_full_year, eps_cumulative,
+             eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_file, source_date, update_time)
+            SELECT
+                q.stock_id,
+                ? AS fiscal_year,
+                'otc' AS market_type,
+                ? AS fiscal_year_roc,
+                4 AS quarter,
+                {eps_expr} AS eps_full_year,
+                {eps_expr} AS eps_cumulative,
+                NULL AS eps_quarter,
+                NULL AS eps_prev_cumulative,
+                'OTC_Q4_CUMULATIVE_AS_ANNUAL_EPS_NO_ANNUALIZE' AS eps_calc_method,
+                'R5N25_OTC_2025Q4_AS_ANNUAL_EPS' AS source_type,
+                COALESCE(q.source_url, '') AS source_url,
+                '' AS source_file,
+                '2025Q4' AS source_date,
+                datetime('now','localtime') AS update_time
+            FROM quarterly_financial_history q
+            WHERE q.stock_id IS NOT NULL AND q.stock_id <> ''
+              AND ({eps_expr}) IS NOT NULL AND ({eps_expr}) <> 0
+              AND {market_filter}
+              AND ((q.fiscal_year=? AND q.quarter=4) {fyq_filter})
+            ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                market_type = CASE WHEN COALESCE(annual_eps_history.market_type,'')='' THEN 'otc' ELSE annual_eps_history.market_type END,
+                fiscal_year_roc = COALESCE(annual_eps_history.fiscal_year_roc, excluded.fiscal_year_roc),
+                quarter = COALESCE(annual_eps_history.quarter, excluded.quarter),
+                eps_full_year = CASE
+                    WHEN annual_eps_history.eps_full_year IS NULL OR annual_eps_history.eps_full_year=0 THEN excluded.eps_full_year
+                    ELSE annual_eps_history.eps_full_year END,
+                eps_cumulative = CASE
+                    WHEN annual_eps_history.eps_cumulative IS NULL OR annual_eps_history.eps_cumulative=0 THEN excluded.eps_cumulative
+                    ELSE annual_eps_history.eps_cumulative END,
+                eps_calc_method = CASE
+                    WHEN annual_eps_history.eps_calc_method IS NULL OR annual_eps_history.eps_calc_method='' THEN excluded.eps_calc_method
+                    ELSE annual_eps_history.eps_calc_method END,
+                source_type = CASE
+                    WHEN annual_eps_history.source_type IS NULL OR annual_eps_history.source_type='' THEN excluded.source_type
+                    ELSE annual_eps_history.source_type END,
+                source_date = CASE
+                    WHEN annual_eps_history.source_date IS NULL OR annual_eps_history.source_date='' THEN excluded.source_date
+                    ELSE annual_eps_history.source_date END,
+                update_time = datetime('now','localtime')
+        """, (int(annual_year), int(annual_year) - 1911, int(annual_year) - 1911))
+        return max(0, self.db.conn.total_changes - before)
+
+    def sync_eps_ttm_to_external_valuation(self) -> int:
+        """R5N25：將 financial_feature_daily.eps_ttm 同步至 external_valuation.eps_ttm。
+
+        external_valuation 只在 eps_ttm 空白或 0 時補值，不覆蓋既有有效官方值。
+        financial_feature_daily 是 EPS_TTM 的主來源；同步點固定在 external_valuation 建立後、PE/PEG 重算前。
+        """
+        if not (self._table_exists("external_valuation") and self._table_exists("financial_feature_daily")):
+            return 0
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        cur.execute("""
+            UPDATE external_valuation
+            SET eps_ttm = (
+                    SELECT f.eps_ttm
+                    FROM financial_feature_daily f
+                    WHERE f.stock_id = external_valuation.stock_id
+                      AND (COALESCE(f.market_type,'') = COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='' OR COALESCE(f.market_type,'')='')
+                      AND f.eps_ttm IS NOT NULL
+                      AND f.eps_ttm <> 0
+                    ORDER BY f.feature_date DESC
+                    LIMIT 1
+                ),
+                repair_source_type = CASE
+                    WHEN repair_source_type IS NULL OR repair_source_type='' THEN 'R5N25_SYNC_EPS_TTM_FROM_FINANCIAL_FEATURE_DAILY'
+                    ELSE repair_source_type || '|R5N25_SYNC_EPS_TTM' END,
+                update_time = datetime('now','localtime')
+            WHERE (eps_ttm IS NULL OR eps_ttm = 0)
+              AND EXISTS (
+                    SELECT 1
+                    FROM financial_feature_daily f
+                    WHERE f.stock_id = external_valuation.stock_id
+                      AND (COALESCE(f.market_type,'') = COALESCE(external_valuation.market_type,'') OR COALESCE(external_valuation.market_type,'')='' OR COALESCE(f.market_type,'')='')
+                      AND f.eps_ttm IS NOT NULL
+                      AND f.eps_ttm <> 0
+                )
+        """)
+        return max(0, self.db.conn.total_changes - before)
+
+    def recalculate_pe_from_eps_ttm(self) -> int:
+        """R5N25：EPS_TTM 同步完成後重算 PE。
+
+        使用 close_price / eps_ttm，只在 PE 空白或 0 時補值；eps_ttm <= 0 不計算 PE。
+        同步維護 pe 與 pe_ratio 欄位，避免報表欄位名稱不一致造成空白。
+        """
+        if not self._table_exists("external_valuation"):
+            return 0
+        cols = self._columns("external_valuation")
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        if "pe" in cols:
+            cur.execute("""
+                UPDATE external_valuation
+                SET pe = close_price / eps_ttm,
+                    update_time = datetime('now','localtime')
+                WHERE close_price IS NOT NULL AND close_price > 0
+                  AND eps_ttm IS NOT NULL AND eps_ttm > 0
+                  AND (pe IS NULL OR pe = 0)
+            """)
+        if "pe_ratio" in cols:
+            cur.execute("""
+                UPDATE external_valuation
+                SET pe_ratio = COALESCE(NULLIF(pe_ratio, 0), pe, close_price / eps_ttm),
+                    update_time = datetime('now','localtime')
+                WHERE close_price IS NOT NULL AND close_price > 0
+                  AND eps_ttm IS NOT NULL AND eps_ttm > 0
+                  AND (pe_ratio IS NULL OR pe_ratio = 0)
+            """)
+        if {"pe", "pe_ratio"}.issubset(cols):
+            cur.execute("""
+                UPDATE external_valuation
+                SET pe_ratio = COALESCE(NULLIF(pe_ratio, 0), pe),
+                    pe = COALESCE(NULLIF(pe, 0), pe_ratio),
+                    update_time = datetime('now','localtime')
+                WHERE (pe_ratio IS NULL OR pe_ratio=0 OR pe IS NULL OR pe=0)
+                  AND (COALESCE(pe_ratio, pe) IS NOT NULL OR COALESCE(pe, pe_ratio) IS NOT NULL)
+            """)
+        return max(0, self.db.conn.total_changes - before)
+
+    def recalculate_peg_from_pe_and_eps_yoy(self) -> int:
+        """R5N25：PE 與 EPS 成長率皆有效時才計算 PEG。"""
+        if not self._table_exists("external_valuation"):
+            return 0
+        cols = self._columns("external_valuation")
+        if "peg_ratio" not in cols or "eps_yoy" not in cols:
+            return 0
+        pe_expr = "COALESCE(NULLIF(pe_ratio,0), NULLIF(pe,0))" if "pe" in cols and "pe_ratio" in cols else ("pe" if "pe" in cols else "pe_ratio")
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        cur.execute(f"""
+            UPDATE external_valuation
+            SET peg_ratio = ({pe_expr}) / eps_yoy,
+                update_time = datetime('now','localtime')
+            WHERE ({pe_expr}) IS NOT NULL AND ({pe_expr}) > 0
+              AND eps_yoy IS NOT NULL AND eps_yoy > 0
+              AND (peg_ratio IS NULL OR peg_ratio = 0)
+        """)
+        return max(0, self.db.conn.total_changes - before)
+
+    def update_external_valuation_quality_flags(self) -> int:
+        """R5N25：重算 EPS_TTM/PE/PEG 後更新 external_valuation 品質旗標。"""
+        if not self._table_exists("external_valuation"):
+            return 0
+        cols = self._columns("external_valuation")
+        pe_missing_expr = ""
+        if "pe" in cols:
+            pe_missing_expr = "COALESCE(CASE WHEN pe IS NULL OR pe=0 THEN 'PE_MISSING|' ELSE '' END, '') ||"
+        peg_missing_expr = ""
+        if "peg_ratio" in cols:
+            peg_missing_expr = "COALESCE(CASE WHEN peg_ratio IS NULL OR peg_ratio=0 THEN 'PEG_MISSING|' ELSE '' END, '') ||"
+        before = self.db.conn.total_changes
+        cur = self.db.conn.cursor()
+        cur.execute(f"""
+            UPDATE external_valuation
+            SET data_quality_flag = TRIM(
+                COALESCE(CASE WHEN eps IS NULL THEN 'EPS_MISSING|' ELSE '' END, '') ||
+                COALESCE(CASE WHEN eps_ttm IS NULL OR eps_ttm=0 THEN 'EPS_TTM_MISSING|' ELSE '' END, '') ||
+                COALESCE(CASE WHEN eps_yoy IS NULL THEN 'EPS_YOY_MISSING|' ELSE '' END, '') ||
+                {pe_missing_expr}
+                {peg_missing_expr}
+                ''
+            , '|')
+        """)
+        cur.execute("UPDATE external_valuation SET data_quality_flag='OK' WHERE data_quality_flag IS NULL OR data_quality_flag='' ")
+        return max(0, self.db.conn.total_changes - before)
+
     def backfill_financial_feature_eps_yoy(self, annual_year: int = 2025) -> int:
         """補 financial_feature_daily.eps_yoy，避免 Ranking/EPS_Matrix 長期 EPS_YOY_MISSING。"""
         if not (self._table_exists("financial_feature_daily") and self._table_exists("annual_eps_history")):
@@ -17195,8 +17413,13 @@ class R5N20BFinancialValuationRepair:
                 result["normalize"] = self.normalize_stock_id_and_market_type()
                 result["actual_q1_eps_updated"] = self.backfill_actual_q1_eps_from_quarterly(q1_roc_year, 1)
                 result["annual_eps_updated"] = self.rebuild_annual_eps_history_from_q4(annual_year)
+                result["otc_annual_eps_2025_fallback_updated"] = self.ensure_otc_annual_eps_2025(annual_year)
                 result["external_valuation_updated"] = self.merge_financial_metrics_into_external_valuation(q1_roc_year, 1, annual_year)
+                result["eps_ttm_synced_to_external_valuation"] = self.sync_eps_ttm_to_external_valuation()
+                result["pe_recalculated_from_eps_ttm"] = self.recalculate_pe_from_eps_ttm()
                 result["feature_eps_yoy_updated"] = self.backfill_financial_feature_eps_yoy(annual_year)
+                result["peg_recalculated"] = self.recalculate_peg_from_pe_and_eps_yoy()
+                result["quality_flags_updated"] = self.update_external_valuation_quality_flags()
                 self.db.conn.commit()
             result["validation"] = self.validate_r5n20b_fix().to_dict("records")
             result["status"] = "done"
@@ -17545,8 +17768,8 @@ class FinancialFeatureEngine:
     def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 10) -> pd.DataFrame:
         run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         feature_date = datetime.now().strftime("%Y-%m-%d")
-        # R5N20B：在 EPS Matrix 建立前先補齊 OTC 財報/估值最後一哩路。
-        # 這不下載新資料，也不覆蓋舊好資料，只補 DB 既有資料間的 merge 缺口。
+        # R5N25：在 EPS Matrix 建立前先補齊 OTC 年度 EPS 與 EPS_TTM/PE/PEG 最後一哩路。
+        # 這不下載新資料，也不覆蓋舊好資料，只補 DB 既有資料間的 merge / sync 缺口。
         try:
             R5N20BFinancialValuationRepair(self.db).repair_financial_merge_and_valuation_r5n20b()
         except Exception as _r5n20b_exc:
