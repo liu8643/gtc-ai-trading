@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.20-R5N26B_OTC_ANNUAL_CACHE_MARKET_GATE_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.20-R5N26C_UI_MONTH_QUARTER_DOWNLOAD_PLAN_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3667,7 +3667,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.20_r5n26b_otc_annual_cache_market_gate_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.20_r5n26c_ui_month_quarter_download_plan_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -6856,6 +6856,63 @@ def build_month_range(start_month: str, end_month: str) -> list[str]:
     return months
 
 
+
+# R5N26C_UI_MONTH_QUARTER_DOWNLOAD_PLAN_FIX_20260618：
+# 統一解析 UI 年月與 Q1/Q2/Q3/Q4，避免 EPS 年度/季度寫死 2025/2026。
+def resolve_eps_quarters_from_ui(q1: bool = False, q2: bool = False, q3: bool = False, q4: bool = False) -> list[int]:
+    """Q 勾選轉成本年度應下載季度。
+
+    多選時取最大季度：Q1+Q2 -> [1,2]；Q3 -> [1,2,3]。
+    未勾選時預設 Q1，避免本年度 EPS 完全不下載。
+    """
+    max_q = 0
+    for flag, q in [(q1, 1), (q2, 2), (q3, 3), (q4, 4)]:
+        try:
+            if bool(flag):
+                max_q = max(max_q, q)
+        except Exception:
+            pass
+    if max_q <= 0:
+        max_q = 1
+    return list(range(1, max_q + 1))
+
+
+def resolve_ui_download_plan(start_month: str, end_month: str, q1: bool = False, q2: bool = False, q3: bool = False, q4: bool = False) -> dict:
+    """由 UI 起訖月份與 Q 勾選產生 DownloadPlan。
+
+    Revenue：只由 start_month~end_month 決定，分上市/上櫃下載。
+    EPS：analysis_year 由 end_month 前四碼推導；base_year=analysis_year-1 永遠補 Q1~Q4；
+         analysis_year 依 Q 勾選補 O_{analysis_year}Qn.xls。
+    """
+    months = build_month_range(start_month, end_month)
+    if not months:
+        raise ValueError(f"無法解析 Revenue 月份區間：start={start_month}, end={end_month}")
+    analysis_year = int(str(months[-1])[:4])
+    base_year = analysis_year - 1
+    analysis_quarters = resolve_eps_quarters_from_ui(q1, q2, q3, q4)
+    return {
+        "revenue": {
+            "months": months,
+            "markets": ["sii", "otc"],
+            "start_month": months[0],
+            "end_month": months[-1],
+        },
+        "eps": {
+            "base_year": base_year,
+            "base_quarters": [1, 2, 3, 4],
+            "analysis_year": analysis_year,
+            "analysis_quarters": analysis_quarters,
+            "markets": ["otc"],
+        },
+        "analysis_year": analysis_year,
+        "base_year": base_year,
+        "selected_quarters": analysis_quarters,
+        "required_eps_files": [
+            *[f"O_{base_year}Q{q}.xls" for q in [1, 2, 3, 4]],
+            *[f"O_{analysis_year}Q{q}.xls" for q in analysis_quarters],
+        ],
+    }
+
 def revenue_month_options(back_years: int = 2, forward_months: int = 0) -> list[str]:
     """R5N：產生 UI 下拉月份選項。預設提供近兩年到本月。"""
     today = datetime.now()
@@ -7018,8 +7075,8 @@ class RevenueAccelerationEngine:
                     months.append(m)
         return months
 
-    def load_monthly_revenue(self, quarters=None) -> pd.DataFrame:
-        months = self.required_months(quarters)
+    def load_monthly_revenue(self, quarters=None, required_months: list[str] | None = None) -> pd.DataFrame:
+        months = [self.normalize_month(m) for m in (required_months or self.required_months(quarters))]
         parts = []
         for table, priority in [("external_revenue_history", 1), ("external_revenue", 2)]:
             if not self._table_exists(table):
@@ -7044,10 +7101,10 @@ class RevenueAccelerationEngine:
         x = x.drop_duplicates(["stock_id", "revenue_month_norm"], keep="first")
         return x.drop(columns=["_priority"], errors="ignore")
 
-    def build_revenue_features(self, master: pd.DataFrame, quarters=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def build_revenue_features(self, master: pd.DataFrame, quarters=None, required_months: list[str] | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
         quarters = normalize_high_growth_quarters(quarters)
-        months = self.required_months(quarters)
-        rev = self.load_monthly_revenue(quarters)
+        months = [self.normalize_month(m) for m in (required_months or self.required_months(quarters))]
+        rev = self.load_monthly_revenue(quarters, required_months=months)
         base = master[["stock_id"]].drop_duplicates().copy() if master is not None and not master.empty else pd.DataFrame(columns=["stock_id"])
         if base.empty:
             return base, rev
@@ -10400,6 +10457,38 @@ class EPSForecastEngine:
         return {"status": "done", "rows": total_rows, "annual_rows": annual_rows, "results": results, "source": "TPEX_OTC_FINANCIAL_XLS_BATCH"}
 
 
+    def ensure_tpex_otc_eps_by_plan(self, eps_plan: dict | None, force: bool = False) -> dict:
+        """R5N26C：依 DownloadPlan 補 TPEx OTC XLS EPS。
+
+        必補：base_year Q1~Q4，用 Q4 建 annual_eps_history。
+        連動：analysis_year 依 UI Q1/Q2/Q3/Q4 勾選補本年度季度 EPS，例如 end_month=202606 + Q1 必須補 O_2026Q1.xls。
+        """
+        plan = dict(eps_plan or {})
+        base_year = int(plan.get("base_year") or self.base_year)
+        analysis_year = int(plan.get("analysis_year") or self.track_year)
+        base_quarters = sorted({int(q) for q in plan.get("base_quarters", [1, 2, 3, 4]) if 1 <= int(q) <= 4}) or [1, 2, 3, 4]
+        analysis_quarters = sorted({int(q) for q in plan.get("analysis_quarters", [1]) if 1 <= int(q) <= 4}) or [1]
+        all_results = []
+        log_info(f"[R5N26C][EPS_PLAN] start base_year={base_year} base_q={base_quarters} analysis_year={analysis_year} analysis_q={analysis_quarters}")
+        base_res = self.ensure_tpex_otc_financial_xls_quarters(base_year, quarters=base_quarters, force=force)
+        all_results.append({"scope": "base_year", "year": base_year, "quarters": base_quarters, "result": base_res})
+        analysis_res = self.ensure_tpex_otc_financial_xls_quarters(analysis_year, quarters=analysis_quarters, force=force)
+        all_results.append({"scope": "analysis_year", "year": analysis_year, "quarters": analysis_quarters, "result": analysis_res})
+        rows = int((base_res or {}).get("rows", 0) or 0) + int((analysis_res or {}).get("rows", 0) or 0)
+        annual_rows = int((base_res or {}).get("annual_rows", 0) or 0) + int((analysis_res or {}).get("annual_rows", 0) or 0)
+        # 驗證應存在的檔案，讓 log 直接可追 O_2026Q1.xls 是否落地。
+        cache_dir = self._tpex_otc_financial_xls_cache_dir()
+        expected_files = [f"O_{base_year}Q{q}.xls" for q in base_quarters] + [f"O_{analysis_year}Q{q}.xls" for q in analysis_quarters]
+        missing_files = [fn for fn in expected_files if not (cache_dir / fn).exists()]
+        status = "done" if not missing_files else "missing_file"
+        out = {"status": status, "rows": rows, "annual_rows": annual_rows, "source": "R5N26C_TPEX_OTC_EPS_PLAN", "base_year": base_year, "analysis_year": analysis_year, "analysis_quarters": analysis_quarters, "expected_files": expected_files, "missing_files": missing_files, "results": all_results}
+        if missing_files:
+            log_warning(f"[R5N26C][EPS_PLAN][MISSING] {missing_files} cache_dir={cache_dir}")
+        else:
+            log_info(f"[R5N26C][EPS_PLAN][OK] expected_files={expected_files} cache_dir={cache_dir}")
+        return out
+
+
 
     @staticmethod
     def _pick_first_existing_key(row: dict, candidates: list[str]) -> str | None:
@@ -13292,15 +13381,16 @@ class EPSForecastEngine:
 class HighGrowthEPSEngine:
     """高成長EPS主引擎：整合營收加速度、EPS預測/實績與技術風險分層。"""
 
-    def __init__(self, db: DBManager, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID"):
+    def __init__(self, db: DBManager, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID", revenue_months: list[str] | None = None, base_year: int | None = None, track_year: int | None = None):
         self.db = db
         # R5N7B FIX：HighGrowthEPSEngine 本體也必須持有 base_year/track_year。
         # R5N6FinalSafeIntegrator / validate_otc_coverage 會從 owner.track_year 讀值；
         # R5N7A 漏補此屬性，導致報表 01I/03A 出現
         # 'HighGrowthEPSEngine' object has no attribute 'track_year'。
-        self.base_year = int(HIGH_GROWTH_BASE_YEAR)
-        self.track_year = int(HIGH_GROWTH_TRACK_YEAR)
+        self.base_year = int(base_year if base_year is not None else HIGH_GROWTH_BASE_YEAR)
+        self.track_year = int(track_year if track_year is not None else HIGH_GROWTH_TRACK_YEAR)
         self.tracking_quarters = normalize_high_growth_quarters(tracking_quarters)
+        self.selected_revenue_months = [RevenueAccelerationEngine.normalize_month(m) for m in (revenue_months or []) if RevenueAccelerationEngine.normalize_month(m)]
         self.min_yoy = float(min_yoy)
         self.mode = str(mode or "HYBRID").upper()
         self.revenue_engine = RevenueAccelerationEngine(db, min_yoy=self.min_yoy)
@@ -13577,7 +13667,7 @@ class HighGrowthEPSEngine:
         if master.empty:
             return pd.DataFrame(), self.inspect_db_assets(), pd.DataFrame(), pd.DataFrame()
         master = master[master["is_etf"].ne(1)].copy()
-        rev_features, rev_raw = self.revenue_engine.build_revenue_features(master, self.tracking_quarters)
+        rev_features, rev_raw = self.revenue_engine.build_revenue_features(master, self.tracking_quarters, required_months=(self.selected_revenue_months or None))
         eps_features = self.eps_engine.build_eps_features(master, rev_features, self.tracking_quarters)
         tech = self._load_technical_layer()
         x = master.merge(rev_features, on="stock_id", how="left").merge(eps_features, on="stock_id", how="left", suffixes=("", "_eps"))
@@ -13684,7 +13774,7 @@ class HighGrowthEPSEngine:
         x = self._apply_formal_block_if_needed(x)
         x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
-        months = self.revenue_engine.required_months(self.tracking_quarters)
+        months = self.selected_revenue_months or self.revenue_engine.required_months(self.tracking_quarters)
         order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "eps_basis_type", "ui_source_type", "formal_eps_ready", "annual_eps_ready", "report_status", "formal_block_reason", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "legacy_strict_pass", "selection_gate", "selection_score", "valuation_data_missing", "effective_valuation_score", "effective_valuation_weight", "outlier_risk_flag", "outlier_penalty", "selection_eps", "selection_eps_source", "selection_eps_confidence", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "eps_surprise_pct", "prediction_basis", "v412_model_definition", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
         for m in months:
             order_cols += [f"rev_{m}", f"yoy_{m}"]
@@ -13809,7 +13899,7 @@ class HighGrowthEPSEngine:
             {"run_evidence_item": "log_path", "run_evidence_value": str(LOG_PATH)},
             {"run_evidence_item": "master_active_rows_same_run", "run_evidence_value": master_rows},
             {"run_evidence_item": "screening_rows_same_run", "run_evidence_value": int(len(df) if isinstance(df, pd.DataFrame) else 0)},
-            {"run_evidence_item": "required_revenue_months", "run_evidence_value": ",".join(self.revenue_engine.required_months(self.tracking_quarters))},
+            {"run_evidence_item": "required_revenue_months", "run_evidence_value": ",".join(self.selected_revenue_months or self.revenue_engine.required_months(self.tracking_quarters))},
             {"run_evidence_item": "missing_required_revenue_months", "run_evidence_value": coverage_missing or "NONE"},
             {"run_evidence_item": "available_revenue_months_last12", "run_evidence_value": ",".join(sorted(set(revenue_month_coverage.get("available_months_in_db_last12", pd.Series(dtype=str)).dropna().astype(str).tolist()))) if isinstance(revenue_month_coverage, pd.DataFrame) and "available_months_in_db_last12" in revenue_month_coverage.columns else ""},
             {"run_evidence_item": "no_touch_guard", "run_evidence_value": "分類/Universe/Bootstrap/主UI架構未修改"},
@@ -13858,7 +13948,7 @@ class HighGrowthEPSEngine:
         pe_nonnull_count = int(pd.to_numeric(df.get("pe_ratio"), errors="coerce").notna().sum()) if df is not None and not df.empty and "pe_ratio" in df.columns else 0
         peg_nonnull_count = int(pd.to_numeric(df.get("peg_ratio"), errors="coerce").notna().sum()) if df is not None and not df.empty and "peg_ratio" in df.columns else 0
         effective_valuation_count = int(pd.to_numeric(df.get("effective_valuation_weight"), errors="coerce").fillna(0).gt(0).sum()) if df is not None and not df.empty and "effective_valuation_weight" in df.columns else 0
-        required_months = self.revenue_engine.required_months(self.tracking_quarters)
+        required_months = self.selected_revenue_months or self.revenue_engine.required_months(self.tracking_quarters)
         # R5N6_FINAL_SAFE_PATCH_20260611：在產生 01F/03A 前先補齊可驗證的上櫃營收缺月與 actual_q1_eps cache。
         try:
             r5n6_safe_patch_result = R5N6FinalSafeIntegrator(self.db).run(required_months=["202602", "202603", "202604"], fiscal_year=self.track_year)
@@ -14084,18 +14174,26 @@ class HighGrowthEPSEngine:
 HighGrowthEpsRevenueEngine = HighGrowthEPSEngine
 
 
-def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: Path | None = None, log_cb=None, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID") -> Path:
+def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: Path | None = None, log_cb=None, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID", revenue_months: list[str] | None = None, download_plan: dict | None = None, base_year: int | None = None, track_year: int | None = None) -> Path:
     close_after = False
     if db is None:
         db = DBManager(DB_PATH); db.init_db(); close_after = True
     try:
         try:
             qlist = normalize_high_growth_quarters(tracking_quarters)
-            required_months = resolve_high_growth_required_months(qlist)
+            required_months = [RevenueAccelerationEngine.normalize_month(m) for m in (revenue_months or []) if RevenueAccelerationEngine.normalize_month(m)]
+            if not required_months:
+                required_months = resolve_high_growth_required_months(qlist)
             r5n11_preflight_repair(db, months=required_months, write_db=True, log_cb=log_cb)
         except Exception as preflight_exc:
             log_warning(f"[R5N11][HIGH_GROWTH_PREFLIGHT][WARN] {preflight_exc}")
-        return HighGrowthEPSEngine(db, tracking_quarters=tracking_quarters, min_yoy=min_yoy, mode=mode).export_report(output_dir=output_dir or HIGH_GROWTH_REPORT_DIR, log_cb=log_cb)
+        try:
+            eps_plan = (download_plan or {}).get("eps", {}) if isinstance(download_plan, dict) else {}
+            if eps_plan:
+                EPSForecastEngine(db, base_year=int(base_year or eps_plan.get("base_year") or HIGH_GROWTH_BASE_YEAR), track_year=int(track_year or eps_plan.get("analysis_year") or HIGH_GROWTH_TRACK_YEAR)).ensure_tpex_otc_eps_by_plan(eps_plan, force=False)
+        except Exception as eps_plan_exc:
+            log_warning(f"[R5N26C][HIGH_GROWTH_EPS_PLAN][WARN] {eps_plan_exc}")
+        return HighGrowthEPSEngine(db, tracking_quarters=tracking_quarters, min_yoy=min_yoy, mode=mode, revenue_months=revenue_months, base_year=base_year, track_year=track_year).export_report(output_dir=output_dir or HIGH_GROWTH_REPORT_DIR, log_cb=log_cb)
     finally:
         if close_after:
             db.close()
@@ -22792,6 +22890,19 @@ class AppUI:
         end = getattr(self, "revenue_end_month_var", tk.StringVar(value="")).get()
         return build_month_range(start, end)
 
+    def _resolve_highgrowth_ui_download_plan(self) -> dict:
+        """R5N26C：統一解析高成長 EPS UI 的年月與季度。"""
+        start = getattr(self, "revenue_start_month_var", tk.StringVar(value="")).get()
+        end = getattr(self, "revenue_end_month_var", tk.StringVar(value="")).get()
+        return resolve_ui_download_plan(
+            start,
+            end,
+            bool(getattr(self, "highgrowth_q1_var", tk.BooleanVar(value=True)).get()),
+            bool(getattr(self, "highgrowth_q2_var", tk.BooleanVar(value=False)).get()),
+            bool(getattr(self, "highgrowth_q3_var", tk.BooleanVar(value=False)).get()),
+            bool(getattr(self, "highgrowth_q4_var", tk.BooleanVar(value=False)).get()),
+        )
+
     def on_download_historical_revenue_clicked(self):
         """R5N UI按鈕：下載指定月份區間的 TWSE index04/C04003 歷史營收。"""
         try:
@@ -22926,7 +23037,7 @@ class AppUI:
         try:
             quarters = self._selected_highgrowth_quarters()
             if df is None:
-                df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()).get_latest_view()
+                df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get(), revenue_months=(self._selected_revenue_months_from_ui() if hasattr(self, "revenue_start_month_var") else None)).get_latest_view()
             self.last_highgrowth_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
             if not hasattr(self, "highgrowth_tree"):
                 return
@@ -23026,16 +23137,27 @@ class AppUI:
             return messagebox.showerror("輸出失敗", f"高成長EPS畫面內容報告輸出失敗：\n{exc}")
 
     def on_highgrowth_report(self):
-        """UI按鈕：產生高成長EPS加速度V4報表。"""
+        """UI按鈕：產生高成長EPS加速度V4報表。
+
+        R5N26C：由營收月份起訖與 Q1/Q2/Q3/Q4 勾選產生 DownloadPlan。
+        end_month=202606 + Q1 時，會在報表前補 data/eps_cache/otc/tpex_financial/O_2026Q1.xls。
+        """
         quarters = self._selected_highgrowth_quarters()
         mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
+        try:
+            plan = self._resolve_highgrowth_ui_download_plan()
+            revenue_months = list(plan.get("revenue", {}).get("months", []))
+            base_year = int(plan.get("base_year"))
+            track_year = int(plan.get("analysis_year"))
+        except Exception as exc:
+            return messagebox.showerror("年月/季度設定錯誤", f"請確認營收月份起訖與 Q1/Q2/Q3/Q4 勾選。\n\n{exc}")
         def worker():
             self.ui_call(self.start_task, "高成長EPS V4報表", 3)
-            self.ui_call(self.update_task, "高成長EPS V4報表", 1, 3, item=f"讀取EPS與營收資料｜季度={'+'.join(quarters)}")
-            path = run_high_growth_eps_revenue_report(db=self.db, output_dir=HIGH_GROWTH_REPORT_DIR, log_cb=lambda m: self.ui_call(self.append_log, m), tracking_quarters=quarters, mode=mode)
+            self.ui_call(self.update_task, "高成長EPS V4報表", 1, 3, item=f"DownloadPlan｜Revenue={revenue_months[0]}~{revenue_months[-1]}｜base={base_year}｜analysis={track_year}｜Q={plan.get('selected_quarters')}")
+            path = run_high_growth_eps_revenue_report(db=self.db, output_dir=HIGH_GROWTH_REPORT_DIR, log_cb=lambda m: self.ui_call(self.append_log, m), tracking_quarters=quarters, mode=mode, revenue_months=revenue_months, download_plan=plan, base_year=base_year, track_year=track_year)
             self.last_highgrowth_report_path = Path(path)
             self.ui_call(self.update_task, "高成長EPS V4報表", 2, 3, item="刷新UI表格")
-            df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=mode).get_latest_view()
+            df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=mode, revenue_months=revenue_months, base_year=base_year, track_year=track_year).get_latest_view()
             self.ui_call(self._refresh_highgrowth_tree, df)
             self.ui_call(self.update_task, "高成長EPS V4報表", 3, 3, success=len(df) if isinstance(df, pd.DataFrame) else 0, item="Excel完成")
             self.ui_call(self.append_log, f"高成長EPS V4報表已產生：{path}")
