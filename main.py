@@ -10101,67 +10101,102 @@ class EPSForecastEngine:
         return None
 
     def parse_tpex_otc_financial_xls(self, xls_path: str | Path, fiscal_year: int, quarter: int) -> pd.DataFrame:
-        """解析 TPEx O_YYYYQn.xls，回傳 cumulative EPS staging。
+        """R5N26A：解析 TPEx O_YYYYQn.xls 實檔格式，回傳 cumulative EPS staging。
 
-        回傳欄位 eps_cumulative 代表官方累計 EPS；尚未在此步驟換算單季 EPS。
+        已依 O_2025Q4.xls 實檔確認格式：
+        - A欄 = 股票代號或產業代碼；正式公司列為 4 碼股票代號。
+        - B欄 = 公司名稱。
+        - N欄 = 當年度/當季累計「每股稅後純益 Net Income Per Share」。
+        - O欄 = 前一年度同期 EPS，僅做追溯，不寫入當期 eps。
+
+        注意：TPEx 季報 XLS 的 EPS 為累計 EPS。此函式只輸出 eps_cumulative，
+        單季 eps_quarter 必須由 import_tpex_otc_financial_xls_to_db() 用前一季累計差額換算。
         """
         fiscal_year = int(fiscal_year); quarter = int(quarter)
         xls_path = Path(xls_path)
-        engines = []
-        try:
-            if importlib.util.find_spec("xlrd") is not None:
-                engines.append("xlrd")
-        except Exception:
-            pass
-        engines.append(None)
-        raw = None; last_error = None
-        for engine in engines:
+
+        def _read_raw_excel(path: Path) -> pd.DataFrame:
+            engines = []
             try:
-                raw = pd.read_excel(xls_path, header=None, dtype=str, engine=engine) if engine else pd.read_excel(xls_path, header=None, dtype=str)
-                break
-            except Exception as exc:
-                last_error = exc
-        if raw is None:
-            raise RuntimeError(f"TPEx OTC financial XLS read failed: {xls_path}｜{last_error}")
-
-        header_row = None
-        max_scan = min(len(raw), 50)
-        for i in range(max_scan):
-            row_text = " ".join(raw.iloc[i].fillna("").astype(str).tolist()).replace("\n", " ")
-            compact = row_text.replace(" ", "")
-            if ("公司代號" in compact or "代號" in compact) and ("每股稅後純益" in compact or "基本每股盈餘" in compact or "NetIncomePerShare" in compact):
-                header_row = i
-                break
-        if header_row is None:
-            raise RuntimeError(f"Cannot find TPEx OTC EPS header row: {xls_path}")
-
-        df = None; last_error = None
-        for engine in engines:
+                if importlib.util.find_spec("xlrd") is not None:
+                    engines.append("xlrd")
+            except Exception:
+                pass
+            engines.append(None)
+            last_error = None
+            for engine in engines:
+                try:
+                    return pd.read_excel(path, header=None, dtype=str, engine=engine) if engine else pd.read_excel(path, header=None, dtype=str)
+                except Exception as exc:
+                    last_error = exc
+            # EXE/CI 常漏 xlrd：用既有 LibreOffice 強制轉 xlsx 後再讀。
             try:
-                df = pd.read_excel(xls_path, header=header_row, dtype=str, engine=engine) if engine else pd.read_excel(xls_path, header=header_row, dtype=str)
-                break
-            except Exception as exc:
-                last_error = exc
-        if df is None:
-            raise RuntimeError(f"TPEx OTC financial XLS parse failed: {xls_path}｜{last_error}")
-        df.columns = [str(c).strip().replace("\n", "") for c in df.columns]
+                converted_dir = self._tpex_otc_financial_xls_cache_dir() / "converted"
+                converted_dir.mkdir(parents=True, exist_ok=True)
+                converted = converted_dir / f"{path.stem}.xlsx"
+                conv = convert_xls_to_xlsx_force(path, converted, log_cb=lambda m: log_info(f"[R5N26A][TPEX_OTC_XLS_CONVERT] {m}"))
+                if conv is not None and Path(conv).exists() and Path(conv).stat().st_size > 0:
+                    return pd.read_excel(Path(conv), header=None, dtype=str, engine="openpyxl")
+            except Exception as conv_exc:
+                last_error = f"{last_error}；convert_failed={conv_exc}"
+            raise RuntimeError(f"TPEx OTC financial XLS read failed: {path}｜{last_error}｜請安裝 xlrd 或確認 LibreOffice 可轉檔")
 
-        stock_col = self._find_tpex_otc_financial_col(df.columns, [["公司代號"], ["股票代號"], ["代號"]])
-        name_col = self._find_tpex_otc_financial_col(df.columns, [["公司名稱"], ["公司簡稱"], ["名稱"]])
-        eps_col = self._find_tpex_otc_financial_col(df.columns, [["每股稅後純益"], ["基本每股盈餘"], ["Net", "Income", "Per", "Share"]])
-        if not stock_col or not eps_col:
-            raise RuntimeError(f"Missing TPEx OTC financial XLS columns file={xls_path} stock_col={stock_col} eps_col={eps_col} columns={df.columns.tolist()[:40]}")
+        raw = _read_raw_excel(xls_path)
+        if raw is None or raw.empty or raw.shape[1] < 14:
+            raise RuntimeError(f"TPEx OTC financial XLS content too small: {xls_path} shape={getattr(raw, 'shape', None)}")
 
-        out = pd.DataFrame()
-        out["stock_id"] = df[stock_col].astype(str).str.extract(r"(\d{4})")[0]
-        out["stock_name"] = df[name_col].astype(str).str.strip() if name_col else ""
-        eps_raw = (df[eps_col].astype(str)
+        # 實檔固定格式優先：A=code, B=name, N=current EPS, O=prev EPS。
+        code_col_idx, name_col_idx, eps_col_idx, prev_eps_col_idx = 0, 1, 13, 14
+        code = raw.iloc[:, code_col_idx].astype(str).str.extract(r"(\d{4})", expand=False).fillna("")
+        mask = code.str.fullmatch(r"\d{4}")
+        if int(mask.sum()) == 0:
+            # 若未來格式改版，再用表頭關鍵字定位；但不能把「公司名稱」誤當股票代號欄。
+            header_row = None
+            for i in range(min(len(raw), 50)):
+                row_text = " ".join(raw.iloc[i].fillna("").astype(str).tolist()).replace("\n", " ")
+                compact = row_text.replace(" ", "")
+                if ("每股稅後純益" in compact or "基本每股盈餘" in compact or "NetIncomePerShare" in compact):
+                    header_row = i
+                    break
+            raise RuntimeError(f"TPEx OTC financial XLS cannot find 4-digit stock rows: file={xls_path} header_row={header_row} shape={raw.shape}")
+
+        eps_raw = (raw.loc[mask, raw.columns[eps_col_idx]].astype(str)
                    .str.replace(",", "", regex=False)
                    .str.replace("—", "", regex=False)
                    .str.replace("－", "", regex=False)
                    .str.replace("--", "", regex=False)
+                   .str.replace("<<<<<", "0", regex=False)
                    .str.strip())
-        out["eps_cumulative"] = pd.to_numeric(eps_raw, errors="coerce")
+        prev_eps_raw = (raw.loc[mask, raw.columns[prev_eps_col_idx]].astype(str)
+                        .str.replace(",", "", regex=False)
+                        .str.replace("—", "", regex=False)
+                        .str.replace("－", "", regex=False)
+                        .str.replace("--", "", regex=False)
+                        .str.replace("<<<<<", "0", regex=False)
+                        .str.strip()) if raw.shape[1] > prev_eps_col_idx else pd.Series(index=raw.loc[mask].index, dtype="object")
+
+        out = pd.DataFrame({
+            "stock_id": code[mask].map(normalize_stock_id),
+            "stock_name": raw.loc[mask, raw.columns[name_col_idx]].astype(str).str.strip(),
+            "eps_cumulative": pd.to_numeric(eps_raw, errors="coerce"),
+            "eps_prev_year_same_period": pd.to_numeric(prev_eps_raw, errors="coerce"),
+        })
+        # 可追溯欄位：若主表未使用也不影響寫入。
+        optional_map = {
+            "operating_revenue_cumulative": 2,
+            "operating_income_cumulative": 5,
+            "non_operating_income_cumulative": 7,
+            "net_income_after_tax_cumulative": 9,
+            "capital_stock_end_period": 12,
+            "book_value_per_share": 15,
+            "equity_assets_ratio": 16,
+            "current_ratio": 17,
+            "quick_ratio": 18,
+        }
+        for col, idx in optional_map.items():
+            if raw.shape[1] > idx:
+                out[col] = pd.to_numeric(raw.loc[mask, raw.columns[idx]].astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+
         out = out.dropna(subset=["stock_id", "eps_cumulative"])
         out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
         out["fiscal_year"] = fiscal_year
@@ -10174,7 +10209,10 @@ class EPSForecastEngine:
         out["source_file"] = str(xls_path)
         out["source_date"] = f"{fiscal_year}Q{quarter}"
         out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return out.drop_duplicates(["stock_id", "fiscal_year", "quarter"], keep="last")
+        out = out.drop_duplicates(["stock_id", "fiscal_year", "quarter"], keep="last")
+        if len(out) < self.TPEX_OTC_FINANCIAL_XLS_MIN_ROWS:
+            raise RuntimeError(f"TPEx OTC financial XLS parsed rows too few: {xls_path} rows={len(out)} min={self.TPEX_OTC_FINANCIAL_XLS_MIN_ROWS}")
+        return out
 
     def _load_tpex_otc_prev_cumulative_eps(self, fiscal_year: int, quarter: int, force: bool = False) -> pd.DataFrame:
         """取得前一季累計 EPS，用於把 TPEx 累計 EPS 換算為單季 EPS。"""
