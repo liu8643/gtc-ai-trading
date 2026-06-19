@@ -9794,13 +9794,25 @@ class AnnualEPSCacheEngine:
         except Exception:
             return 700
 
+    def _min_sii_rows(self) -> int:
+        """R5N26G：上市年度 EPS 覆蓋率門檻。
+
+        修正 R5N26F1 只要 annual_eps_history 有 OTC 851 筆就讓年度 EPS cache 成功，
+        造成 SII 2025 全年 EPS 缺失而上市正式 EPS Gate 全掛。
+        """
+        try:
+            return int(getattr(self.owner, "EPS_Q1_MIN_SII_ROWS", 1000) or 1000)
+        except Exception:
+            return 1000
+
     def _has_required_market_coverage(self, fiscal_year: int) -> tuple[bool, dict, str]:
         counts = self._count_db_rows_by_market(fiscal_year)
         sii_rows = int(counts.get("sii", 0) or 0)
         otc_rows = int(counts.get("otc", 0) or 0)
+        min_sii = self._min_sii_rows()
         min_otc = self._min_otc_rows()
-        ok = sii_rows > 0 and otc_rows >= min_otc
-        reason = "PASS" if ok else f"MARKET_GAP sii={sii_rows} otc={otc_rows} min_otc={min_otc} counts={counts}"
+        ok = sii_rows >= min_sii and otc_rows >= min_otc
+        reason = "PASS" if ok else f"MARKET_GAP sii={sii_rows}/{min_sii} otc={otc_rows}/{min_otc} counts={counts}"
         return ok, counts, reason
 
     def _ensure_tpex_otc_financial_xls_prefill(self, fiscal_year: int, force: bool = False) -> dict:
@@ -9941,10 +9953,13 @@ class AnnualEPSCacheEngine:
         result = {"status": "skip", "rows": 0, "source": "ANNUAL_EPS_CACHE", "source_file": "", "message": ""}
         try:
             existing = self._count_db_rows(fiscal_year)
-            if existing > 0 and not force:
+            market_ok, market_counts, market_reason = self._has_required_market_coverage(fiscal_year)
+            if existing > 0 and not force and market_ok:
                 self.save_cache_from_db(fiscal_year)
-                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料，已同步確認 cache"})
+                result.update({"status": "exists", "rows": existing, "market_counts": market_counts, "message": f"annual_eps_history 分市場覆蓋完整，已同步確認 cache｜{market_reason}"})
                 return result
+            if existing > 0 and not force and not market_ok:
+                log_warning(f"[R5N26G][ANNUAL_EPS_CACHE_MARKET_GAP] fiscal_year={fiscal_year} existing={existing}｜{market_reason}，不可用 partial cache 短路，繼續補 SII/OTC 缺口")
 
             errors = []
             for path in self._cache_paths(fiscal_year):
@@ -9984,6 +9999,11 @@ class AnnualEPSCacheEngine:
             if df is None or df.empty:
                 result.update({"status": "no_data", "message": "annual_eps_history 無可寫入 cache 資料"})
                 return result
+            market_ok, market_counts, market_reason = self._has_required_market_coverage(fiscal_year)
+            if not market_ok:
+                result.update({"status": "skip_market_gap", "rows": int(len(df)), "market_counts": market_counts, "message": f"分市場覆蓋不足，不覆寫正式年度 EPS cache｜{market_reason}"})
+                log_warning(f"[R5N26G][ANNUAL_EPS_CACHE_SAVE_BLOCKED] fiscal_year={fiscal_year} rows={len(df)}｜{market_reason}")
+                return result
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_file = self.cache_dir / f"annual_eps_{int(fiscal_year)}.csv"
             df.to_csv(cache_file, index=False, encoding="utf-8-sig")
@@ -10002,9 +10022,15 @@ class AnnualEPSCacheEngine:
             if not isinstance(result, dict):
                 result = {"status": "unknown", "rows": 0, "message": str(result)}
             log_info(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] done source={source_name} result={result}")
-            if str(result.get("status", "")).lower() in self.SUCCESS_STATUS or int(result.get("rows", 0) or 0) > 0:
+            # R5N26G：只有上市+上櫃年度 EPS 分市場覆蓋都達標，才允許覆寫年度 EPS cache。
+            # 避免 TPEx OTC-only 851 筆覆蓋 annual_eps_2025.csv，讓下一輪誤判年度 EPS 已完成。
+            market_ok, market_counts, market_reason = self._has_required_market_coverage(fiscal_year)
+            if (str(result.get("status", "")).lower() in self.SUCCESS_STATUS or int(result.get("rows", 0) or 0) > 0) and market_ok:
                 cache_result = self.save_cache_from_db(fiscal_year)
                 result["cache_result"] = cache_result
+            elif int(result.get("rows", 0) or 0) > 0 and not market_ok:
+                result["cache_result"] = {"status": "skip_market_gap", "rows": 0, "market_counts": market_counts, "message": market_reason}
+                log_warning(f"[R5N26G][ANNUAL_EPS_CACHE_SAVE_SKIP] source={source_name} fiscal_year={fiscal_year}｜{market_reason}")
             return result
         except Exception as exc:
             log_warning(f"[HIGH_GROWTH][R5G_ANNUAL_EPS_CHAIN] source={source_name} failed｜{exc}")
@@ -11619,16 +11645,27 @@ class EPSForecastEngine:
         try:
             with self.db.lock:
                 cur = self.db.conn.cursor()
-                row = cur.execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,)).fetchone()
-                existing = int(row[0] or 0) if row else 0
-            if existing > 0 and not force:
-                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                existing_df = pd.read_sql_query("""
+                    SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                    FROM annual_eps_history
+                    WHERE fiscal_year=? AND eps_full_year IS NOT NULL
+                    GROUP BY COALESCE(market_type,'')
+                """, self.db.conn, params=[fiscal_year])
+                existing = int(existing_df["cnt"].sum()) if existing_df is not None and not existing_df.empty else 0
+                existing_by_market = {normalize_market_type(r.get("market_type")) or "unknown": int(r.get("cnt") or 0) for _, r in existing_df.iterrows()} if existing_df is not None and not existing_df.empty else {}
+            min_sii = int(getattr(self, "EPS_Q1_MIN_SII_ROWS", 1000) or 1000)
+            min_otc = int(getattr(self, "TPEX_OTC_FINANCIAL_XLS_MIN_ROWS", 700) or 700)
+            market_ok = existing_by_market.get("sii", 0) >= min_sii and existing_by_market.get("otc", 0) >= min_otc
+            if existing > 0 and not force and market_ok:
+                result.update({"status": "exists", "rows": existing, "market_counts": existing_by_market, "message": "annual_eps_history 分市場資料已完整"})
                 return result
+            if existing > 0 and not force and not market_ok:
+                log_warning(f"[R5N26G][ANNUAL_EPS_QFH_BACKFILL_MARKET_GAP] fiscal_year={fiscal_year} existing_by_market={existing_by_market}，繼續由 Q4 季報補缺市場")
             if not self._table_exists("quarterly_financial_history"):
                 result.update({"status": "missing_table", "message": "quarterly_financial_history 不存在"})
                 return result
             q = self._read_sql(
-                "SELECT stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_calc_method, source_url, source_date "
+                "SELECT stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, COALESCE(market_type,'') AS market_type, eps, eps_cumulative, eps_quarter, eps_calc_method, source_url, source_date "
                 "FROM quarterly_financial_history WHERE quarter=4",
             )
             if q is None or q.empty:
@@ -11653,15 +11690,32 @@ class EPSForecastEngine:
             q["source_type"] = "quarterly_financial_history_q4_eps_cumulative"
             q["source_date"] = q.get("source_date", "").fillna("").astype(str).replace("", f"{fiscal_year}Q4")
             q["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            write = q[["stock_id", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].copy()
+            if "market_type" not in q.columns:
+                q["market_type"] = ""
+            q["market_type"] = q["market_type"].map(normalize_market_type)
+            if q["market_type"].eq("").any():
+                try:
+                    with self.db.lock:
+                        market_map_df = pd.read_sql_query("SELECT stock_id, market FROM stocks_master WHERE is_active=1", self.db.conn)
+                    market_map = _r5n8c_build_market_map(market_map_df)
+                    miss = q["market_type"].eq("")
+                    q.loc[miss, "market_type"] = q.loc[miss, "stock_id"].map(market_map).fillna("")
+                except Exception:
+                    pass
+            write = q[["stock_id", "fiscal_year", "market_type", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].copy()
             write["fiscal_year"] = fiscal_year
-            write = write[["stock_id", "fiscal_year", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].drop_duplicates(["stock_id", "fiscal_year"], keep="last")
+            write = write[["stock_id", "fiscal_year", "market_type", "eps_full_year", "source_type", "source_url", "source_date", "update_time"]].drop_duplicates(["stock_id", "fiscal_year"], keep="last")
             with self.db.lock:
                 cur = self.db.conn.cursor()
+                try:
+                    cur.execute("ALTER TABLE annual_eps_history ADD COLUMN market_type TEXT")
+                except Exception:
+                    pass
                 cur.executemany("""
-                    INSERT INTO annual_eps_history(stock_id, fiscal_year, eps_full_year, source_type, source_url, source_date, update_time)
-                    VALUES(?,?,?,?,?,?,?)
+                    INSERT INTO annual_eps_history(stock_id, fiscal_year, market_type, eps_full_year, source_type, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?,?)
                     ON CONFLICT(stock_id, fiscal_year) DO UPDATE SET
+                        market_type=CASE WHEN COALESCE(excluded.market_type,'')<>'' THEN excluded.market_type ELSE annual_eps_history.market_type END,
                         eps_full_year=excluded.eps_full_year,
                         source_type=excluded.source_type,
                         source_url=excluded.source_url,
@@ -12908,11 +12962,22 @@ class EPSForecastEngine:
         try:
             with self.db.lock:
                 cur = self.db.conn.cursor()
-                row = cur.execute("SELECT COUNT(*) FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL", (fiscal_year,)).fetchone()
-                existing = int(row[0] or 0) if row else 0
-            if existing > 0 and not force:
-                result.update({"status": "exists", "rows": existing, "message": "annual_eps_history 已有資料"})
+                existing_df = pd.read_sql_query("""
+                    SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                    FROM annual_eps_history
+                    WHERE fiscal_year=? AND eps_full_year IS NOT NULL
+                    GROUP BY COALESCE(market_type,'')
+                """, self.db.conn, params=[fiscal_year])
+                existing = int(existing_df["cnt"].sum()) if existing_df is not None and not existing_df.empty else 0
+                existing_by_market = {normalize_market_type(r.get("market_type")) or "unknown": int(r.get("cnt") or 0) for _, r in existing_df.iterrows()} if existing_df is not None and not existing_df.empty else {}
+            min_sii = int(getattr(self, "EPS_Q1_MIN_SII_ROWS", 1000) or 1000)
+            min_otc = int(getattr(self, "TPEX_OTC_FINANCIAL_XLS_MIN_ROWS", 700) or 700)
+            market_ok = existing_by_market.get("sii", 0) >= min_sii and existing_by_market.get("otc", 0) >= min_otc
+            if existing > 0 and not force and market_ok:
+                result.update({"status": "exists", "rows": existing, "market_counts": existing_by_market, "message": "annual_eps_history 分市場資料已完整"})
                 return result
+            if existing > 0 and not force and not market_ok:
+                log_warning(f"[R5N26G][ANNUAL_EPS_QFH_BACKFILL_MARKET_GAP] fiscal_year={fiscal_year} existing_by_market={existing_by_market}，繼續由 Q4 季報補缺市場")
 
             candidates = self._twse_c05001_candidate_paths(fiscal_year, "Q4")
             if not candidates:
@@ -14254,6 +14319,34 @@ class HighGrowthEPSEngine:
 HighGrowthEpsRevenueEngine = HighGrowthEPSEngine
 
 
+def r5n26g_validate_annual_eps_market_coverage(db: DBManager, fiscal_year: int, min_sii: int = 1000, min_otc: int = 700) -> dict:
+    """R5N26G：年度 EPS 分市場覆蓋驗證。
+
+    這個驗證專門防止 annual_eps_history 只剩 OTC 851 筆，卻被誤判為年度 EPS 完成。
+    回傳格式可直接寫入 Log / 報表修正記錄。
+    """
+    out = {"fiscal_year": int(fiscal_year), "sii": 0, "otc": 0, "unknown": 0, "pass": False, "status": "FAIL"}
+    try:
+        with db.lock:
+            df = pd.read_sql_query("""
+                SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                FROM annual_eps_history
+                WHERE fiscal_year=? AND eps_full_year IS NOT NULL
+                GROUP BY COALESCE(market_type,'')
+            """, db.conn, params=[int(fiscal_year)])
+        if df is not None and not df.empty:
+            for _, r in df.iterrows():
+                mt = normalize_market_type(r.get("market_type")) or "unknown"
+                out[mt] = out.get(mt, 0) + int(r.get("cnt") or 0)
+        out["pass"] = int(out.get("sii", 0) or 0) >= int(min_sii) and int(out.get("otc", 0) or 0) >= int(min_otc)
+        out["status"] = "PASS" if out["pass"] else "MARKET_GAP"
+        out["detail"] = f"sii={out.get('sii',0)}/{min_sii}, otc={out.get('otc',0)}/{min_otc}, unknown={out.get('unknown',0)}"
+    except Exception as exc:
+        out["status"] = "ERROR"
+        out["detail"] = str(exc)
+    return out
+
+
 def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: Path | None = None, log_cb=None, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID", revenue_months: list[str] | None = None, download_plan: dict | None = None, base_year: int | None = None, track_year: int | None = None, gate_revenue_months: list[str] | None = None) -> Path:
     close_after = False
     if db is None:
@@ -14273,6 +14366,18 @@ def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: 
                 EPSForecastEngine(db, base_year=int(base_year or eps_plan.get("base_year") or HIGH_GROWTH_BASE_YEAR), track_year=int(track_year or eps_plan.get("analysis_year") or HIGH_GROWTH_TRACK_YEAR)).ensure_tpex_otc_eps_by_plan(eps_plan, force=False)
         except Exception as eps_plan_exc:
             log_warning(f"[R5N26C][HIGH_GROWTH_EPS_PLAN][WARN] {eps_plan_exc}")
+        # R5N26G：報表前強制檢查 base_year 年度 EPS 分市場覆蓋；若 SII 缺失，不可讓 OTC-only 851 筆短路。
+        try:
+            _base_year_for_repair = int(base_year or ((download_plan or {}).get("base_year") if isinstance(download_plan, dict) else 0) or HIGH_GROWTH_BASE_YEAR)
+            _track_year_for_repair = int(track_year or ((download_plan or {}).get("analysis_year") if isinstance(download_plan, dict) else 0) or HIGH_GROWTH_TRACK_YEAR)
+            _eps_engine_for_annual = EPSForecastEngine(db, base_year=_base_year_for_repair, track_year=_track_year_for_repair)
+            _annual_chain_result = _eps_engine_for_annual.ensure_annual_eps_history(fiscal_year=_base_year_for_repair, force=False) if hasattr(_eps_engine_for_annual, "ensure_annual_eps_history") else AnnualEPSCacheEngine(_eps_engine_for_annual).ensure(_base_year_for_repair, force=False)
+            _annual_market = r5n26g_validate_annual_eps_market_coverage(db, _base_year_for_repair, min_sii=getattr(_eps_engine_for_annual, "EPS_Q1_MIN_SII_ROWS", 1000), min_otc=getattr(_eps_engine_for_annual, "TPEX_OTC_FINANCIAL_XLS_MIN_ROWS", 700))
+            log_info(f"[R5N26G][PRE_REPORT_ANNUAL_EPS_MARKET] chain={_annual_chain_result} market={_annual_market}")
+            if log_cb:
+                log_cb(f"[R5N26G][PRE_REPORT_ANNUAL_EPS_MARKET] { _annual_market.get('status') }｜{ _annual_market.get('detail') }")
+        except Exception as annual_market_exc:
+            log_warning(f"[R5N26G][PRE_REPORT_ANNUAL_EPS_MARKET][WARN] {annual_market_exc}")
         # R5N26E-VAL-003/004：報表前用 UI DownloadPlan 年度執行 valuation repair + health gate。
         try:
             _base_year_for_repair = int(base_year or ((download_plan or {}).get("base_year") if isinstance(download_plan, dict) else 0) or HIGH_GROWTH_BASE_YEAR)
