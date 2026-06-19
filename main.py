@@ -6913,6 +6913,34 @@ def resolve_ui_download_plan(start_month: str, end_month: str, q1: bool = False,
         ],
     }
 
+def resolve_revenue_gate_required_months(track_year: int, quarters=None) -> list[str]:
+    """R5N26F：依分析年度與追蹤季度推導 Revenue Gate 必要月份。
+
+    注意：UI 的起訖年月只代表「下載/快取範圍」，不可直接當成 Revenue Gate 月份。
+    Gate 月份必須由分析年度 track_year 與 Q1/Q2/Q3/Q4 決定：
+    Q1 -> track_year 02/03/04
+    Q2 -> track_year 05/06/07
+    Q3 -> track_year 08/09/10
+    Q4 -> track_year 11/12 + next_year 01
+    """
+    try:
+        year = int(track_year)
+    except Exception:
+        year = int(HIGH_GROWTH_TRACK_YEAR)
+    out: list[str] = []
+    mapping = {
+        "Q1": [(year, 2), (year, 3), (year, 4)],
+        "Q2": [(year, 5), (year, 6), (year, 7)],
+        "Q3": [(year, 8), (year, 9), (year, 10)],
+        "Q4": [(year, 11), (year, 12), (year + 1, 1)],
+    }
+    for q in normalize_high_growth_quarters(quarters):
+        for y, m in mapping.get(q, []):
+            ym = f"{int(y):04d}{int(m):02d}"
+            if ym not in out:
+                out.append(ym)
+    return out
+
 def revenue_month_options(back_years: int = 2, forward_months: int = 0) -> list[str]:
     """R5N：舊版 YYYYMM 下拉月份候選。
 
@@ -13425,7 +13453,7 @@ class EPSForecastEngine:
 class HighGrowthEPSEngine:
     """高成長EPS主引擎：整合營收加速度、EPS預測/實績與技術風險分層。"""
 
-    def __init__(self, db: DBManager, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID", revenue_months: list[str] | None = None, base_year: int | None = None, track_year: int | None = None):
+    def __init__(self, db: DBManager, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID", revenue_months: list[str] | None = None, base_year: int | None = None, track_year: int | None = None, gate_revenue_months: list[str] | None = None):
         self.db = db
         # R5N7B FIX：HighGrowthEPSEngine 本體也必須持有 base_year/track_year。
         # R5N6FinalSafeIntegrator / validate_otc_coverage 會從 owner.track_year 讀值；
@@ -13434,7 +13462,14 @@ class HighGrowthEPSEngine:
         self.base_year = int(base_year if base_year is not None else HIGH_GROWTH_BASE_YEAR)
         self.track_year = int(track_year if track_year is not None else HIGH_GROWTH_TRACK_YEAR)
         self.tracking_quarters = normalize_high_growth_quarters(tracking_quarters)
-        self.selected_revenue_months = [RevenueAccelerationEngine.normalize_month(m) for m in (revenue_months or []) if RevenueAccelerationEngine.normalize_month(m)]
+        # R5N26F：拆開 UI 下載月份與 Revenue Gate 月份。
+        # revenue_months 僅保留為下載/快取範圍，不再直接拿來做 Gate。
+        self.download_revenue_months = [RevenueAccelerationEngine.normalize_month(m) for m in (revenue_months or []) if RevenueAccelerationEngine.normalize_month(m)]
+        self.gate_required_months = [RevenueAccelerationEngine.normalize_month(m) for m in (gate_revenue_months or []) if RevenueAccelerationEngine.normalize_month(m)]
+        if not self.gate_required_months:
+            self.gate_required_months = resolve_revenue_gate_required_months(self.track_year, self.tracking_quarters)
+        # 保留舊屬性名稱，避免 export_report / evidence 既有流程斷線；語意改為 Gate required months。
+        self.selected_revenue_months = list(self.gate_required_months)
         self.min_yoy = float(min_yoy)
         self.mode = str(mode or "HYBRID").upper()
         self.revenue_engine = RevenueAccelerationEngine(db, min_yoy=self.min_yoy)
@@ -13711,7 +13746,8 @@ class HighGrowthEPSEngine:
         if master.empty:
             return pd.DataFrame(), self.inspect_db_assets(), pd.DataFrame(), pd.DataFrame()
         master = master[master["is_etf"].ne(1)].copy()
-        rev_features, rev_raw = self.revenue_engine.build_revenue_features(master, self.tracking_quarters, required_months=(self.selected_revenue_months or None))
+        # R5N26F：Revenue Gate 只使用 gate_required_months，不使用 UI 下載範圍。
+        rev_features, rev_raw = self.revenue_engine.build_revenue_features(master, self.tracking_quarters, required_months=(self.gate_required_months or None))
         eps_features = self.eps_engine.build_eps_features(master, rev_features, self.tracking_quarters)
         tech = self._load_technical_layer()
         x = master.merge(rev_features, on="stock_id", how="left").merge(eps_features, on="stock_id", how="left", suffixes=("", "_eps"))
@@ -13819,14 +13855,14 @@ class HighGrowthEPSEngine:
         x["追蹤季度"] = "+".join(self.tracking_quarters)
         x["規則版本"] = HIGH_GROWTH_RULE_VERSION
         months = self.selected_revenue_months or self.revenue_engine.required_months(self.tracking_quarters)
-        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "eps_basis_type", "ui_source_type", "formal_eps_ready", "annual_eps_ready", "report_status", "formal_block_reason", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "legacy_strict_pass", "selection_gate", "selection_score", "valuation_data_missing", "effective_valuation_score", "effective_valuation_weight", "outlier_risk_flag", "outlier_penalty", "selection_eps", "selection_eps_source", "selection_eps_confidence", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "eps_surprise_pct", "prediction_basis", "v412_model_definition", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
+        order_cols = ["stock_id", "stock_name", "market", "industry", "theme", "追蹤季度", "基本面狀態", "投資分層", "eps_basis_type", "ui_source_type", "formal_eps_ready", "annual_eps_ready", "report_status", "formal_block_reason", "base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "q1_ratio_quality", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "eps_ratio_definition", "forecast_yoy_cap_flag", "forecast_risk_flag", "official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "legacy_strict_pass", "selection_gate", "selection_score", "valuation_data_missing", "effective_valuation_score", "effective_valuation_weight", "outlier_risk_flag", "outlier_penalty", "selection_eps", "selection_eps_source", "selection_eps_confidence", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "revenue_month_count_hit", "revenue_month_count_required", "pe_ratio", "peg_ratio", "valuation_score_v412", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "v412_total_score", "v412_prediction_quality", "prediction_error", "eps_surprise", "eps_surprise_pct", "prediction_basis", "v412_model_definition", "avg_revenue_yoy_used", "eps_source_used", "eps_ttm_source", "eps_ttm_quality", "eps_ttm_source_date", "eps_ttm_fiscal_year_quarter", "base_eps_source", "eps_data_quality", "base_eps_quality"]
         for m in months:
             order_cols += [f"rev_{m}", f"yoy_{m}"]
-        order_cols += ["avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_partial_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "legacy_strict_pass", "strict_pass", "v412_pass", "leading_pass", "legacy_forecast_eps_gate", "forecast_eps_gate", "forecast_candidate", "ttm_proxy_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
+        order_cols += ["selected_revenue_months", "revenue_month_count_hit", "revenue_month_count_required", "avg_revenue_yoy", "min_revenue_yoy", "revenue_complete_gate", "revenue_yoy_gate", "revenue_partial_yoy_gate", "revenue_stair_gate", "revenue_strict_gate", "close", "rsi14", "macd_hist", "trend_score", "volume_ratio", "legacy_strict_pass", "strict_pass", "v412_pass", "leading_pass", "legacy_forecast_eps_gate", "forecast_eps_gate", "forecast_candidate", "ttm_proxy_candidate", "proxy_pass", "風險旗標", "建議動作", "資料缺口/未通過原因", "規則版本"]
         order_cols = list(dict.fromkeys(order_cols))
         for c in order_cols:
             if c not in x.columns:
-                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "selection_score", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "v412_total_score", "prediction_error", "eps_surprise", "eps_surprise_pct", "avg_revenue_yoy_used") else (False if c in ("official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "legacy_strict_pass", "selection_gate", "valuation_data_missing") else "")
+                x[c] = np.nan if c.startswith(("rev_", "yoy_")) or c in ("base_annual_eps", "actual_q1_eps", "actual_eps_cumulative", "selected_actual_eps_cumulative", "current_eps_ttm", "eps_cumulative_used", "forecast_eps_cumulative", "forecast_eps_cumulative_raw", "q1_vs_annual_ratio", "q1_vs_annual_ratio_raw", "selected_actual_vs_annual_ratio", "selected_actual_vs_annual_ratio_raw", "forecast_vs_annual_ratio", "forecast_vs_annual_ratio_raw", "ttm_vs_annual_ratio", "eps_ratio", "eps_ratio_legacy", "selection_score", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "eps_acceleration_pct", "revenue_acceleration", "pe_ratio", "peg_ratio", "valuation_score_v412", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "predicted_q2_eps_score", "eps_acceleration_score_v412", "revenue_acceleration_score_v412", "pe_score", "peg_score", "effective_valuation_score", "effective_valuation_weight", "outlier_penalty", "v412_total_score", "prediction_error", "eps_surprise", "eps_surprise_pct", "avg_revenue_yoy_used", "revenue_month_count_hit", "revenue_month_count_required") else (False if c in ("official_eps_verified_pass", "official_eps_only_pass", "official_eps_revenue_pass", "legacy_strict_pass", "selection_gate", "valuation_data_missing") else "")
         x = x[order_cols].copy()
         # V4.12 主排序：先看領先預測總分，再看 Q2/Q3 EPS、EPS 加速度、營收加速度與估值。
         x = x.sort_values(["selection_gate", "selection_score", "forecast_candidate", "official_eps_verified_pass", "selection_eps", "predicted_q2_eps", "predicted_q3_eps", "eps_acceleration", "revenue_acceleration", "valuation_score_v412", "trend_score"], ascending=[False, False, False, False, False, False, False, False, False, False, False], na_position="last")
@@ -14218,7 +14254,7 @@ class HighGrowthEPSEngine:
 HighGrowthEpsRevenueEngine = HighGrowthEPSEngine
 
 
-def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: Path | None = None, log_cb=None, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID", revenue_months: list[str] | None = None, download_plan: dict | None = None, base_year: int | None = None, track_year: int | None = None) -> Path:
+def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: Path | None = None, log_cb=None, tracking_quarters=None, min_yoy: float = HIGH_GROWTH_MIN_YOY, mode: str = "HYBRID", revenue_months: list[str] | None = None, download_plan: dict | None = None, base_year: int | None = None, track_year: int | None = None, gate_revenue_months: list[str] | None = None) -> Path:
     close_after = False
     if db is None:
         db = DBManager(DB_PATH); db.init_db(); close_after = True
@@ -14255,7 +14291,7 @@ def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: 
                     log_cb(f"[R5N26E][PRE_REPORT_VAL_HEALTH_RETRY] OTC rows={_health2.get('otc_rows')} eps_ttm_ok={_health2.get('otc_eps_ttm_ok')} status={_health2.get('status')}")
         except Exception as val_sync_exc:
             log_warning(f"[R5N26E][HIGH_GROWTH_VAL_SYNC][WARN] {val_sync_exc}")
-        return HighGrowthEPSEngine(db, tracking_quarters=tracking_quarters, min_yoy=min_yoy, mode=mode, revenue_months=revenue_months, base_year=base_year, track_year=track_year).export_report(output_dir=output_dir or HIGH_GROWTH_REPORT_DIR, log_cb=log_cb)
+        return HighGrowthEPSEngine(db, tracking_quarters=tracking_quarters, min_yoy=min_yoy, mode=mode, revenue_months=revenue_months, base_year=base_year, track_year=track_year, gate_revenue_months=gate_months).export_report(output_dir=output_dir or HIGH_GROWTH_REPORT_DIR, log_cb=log_cb)
     finally:
         if close_after:
             db.close()
@@ -23302,7 +23338,19 @@ class AppUI:
         try:
             quarters = self._selected_highgrowth_quarters()
             if df is None:
-                df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get(), revenue_months=(self._selected_revenue_months_from_ui() if hasattr(self, "revenue_start_month_var") else None)).get_latest_view()
+                mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
+                try:
+                    plan = self._resolve_highgrowth_ui_download_plan()
+                    revenue_months = list(plan.get("revenue", {}).get("months", []))
+                    base_year = int(plan.get("base_year"))
+                    track_year = int(plan.get("analysis_year"))
+                    gate_months = resolve_revenue_gate_required_months(track_year, quarters)
+                except Exception:
+                    revenue_months = self._selected_revenue_months_from_ui() if hasattr(self, "revenue_start_month_var") else None
+                    base_year = None
+                    track_year = None
+                    gate_months = None
+                df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=mode, revenue_months=revenue_months, base_year=base_year, track_year=track_year, gate_revenue_months=gate_months).get_latest_view()
             self.last_highgrowth_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
             if not hasattr(self, "highgrowth_tree"):
                 return
@@ -23415,15 +23463,16 @@ class AppUI:
             revenue_months = list(plan.get("revenue", {}).get("months", []))
             base_year = int(plan.get("base_year"))
             track_year = int(plan.get("analysis_year"))
+            gate_revenue_months = resolve_revenue_gate_required_months(track_year, quarters)
         except Exception as exc:
             return messagebox.showerror("年月/季度設定錯誤", f"請確認營收月份起訖與 Q1/Q2/Q3/Q4 勾選。\n\n{exc}")
         def worker():
             self.ui_call(self.start_task, "高成長EPS V4報表", 3)
-            self.ui_call(self.update_task, "高成長EPS V4報表", 1, 3, item=f"DownloadPlan｜Revenue={revenue_months[0]}~{revenue_months[-1]}｜base={base_year}｜analysis={track_year}｜Q={plan.get('selected_quarters')}")
-            path = run_high_growth_eps_revenue_report(db=self.db, output_dir=HIGH_GROWTH_REPORT_DIR, log_cb=lambda m: self.ui_call(self.append_log, m), tracking_quarters=quarters, mode=mode, revenue_months=revenue_months, download_plan=plan, base_year=base_year, track_year=track_year)
+            self.ui_call(self.update_task, "高成長EPS V4報表", 1, 3, item=f"DownloadPlan｜Revenue={revenue_months[0]}~{revenue_months[-1]}｜Gate={','.join(gate_revenue_months)}｜base={base_year}｜analysis={track_year}｜Q={plan.get('selected_quarters')}")
+            path = run_high_growth_eps_revenue_report(db=self.db, output_dir=HIGH_GROWTH_REPORT_DIR, log_cb=lambda m: self.ui_call(self.append_log, m), tracking_quarters=quarters, mode=mode, revenue_months=revenue_months, download_plan=plan, base_year=base_year, track_year=track_year, gate_revenue_months=gate_revenue_months)
             self.last_highgrowth_report_path = Path(path)
             self.ui_call(self.update_task, "高成長EPS V4報表", 2, 3, item="刷新UI表格")
-            df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=mode, revenue_months=revenue_months, base_year=base_year, track_year=track_year).get_latest_view()
+            df = HighGrowthEPSEngine(self.db, tracking_quarters=quarters, mode=mode, revenue_months=revenue_months, base_year=base_year, track_year=track_year, gate_revenue_months=gate_revenue_months).get_latest_view()
             self.ui_call(self._refresh_highgrowth_tree, df)
             self.ui_call(self.update_task, "高成長EPS V4報表", 3, 3, success=len(df) if isinstance(df, pd.DataFrame) else 0, item="Excel完成")
             self.ui_call(self.append_log, f"高成長EPS V4報表已產生：{path}")
