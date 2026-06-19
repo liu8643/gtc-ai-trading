@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.22-R5N26E_VAL_SYNC_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.23-R5N26F1_REVENUE_GATE_UI_SYNC_SCOPE_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3667,7 +3667,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.22_r5n26e_val_sync_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.23_r5n26f1_revenue_gate_ui_sync_scope_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -14291,6 +14291,22 @@ def run_high_growth_eps_revenue_report(db: DBManager | None = None, output_dir: 
                     log_cb(f"[R5N26E][PRE_REPORT_VAL_HEALTH_RETRY] OTC rows={_health2.get('otc_rows')} eps_ttm_ok={_health2.get('otc_eps_ttm_ok')} status={_health2.get('status')}")
         except Exception as val_sync_exc:
             log_warning(f"[R5N26E][HIGH_GROWTH_VAL_SYNC][WARN] {val_sync_exc}")
+        # R5N26F1 FIX：R5N26F 將 Gate 月份與下載月份拆開，但 run_high_growth_eps_revenue_report()
+        # 漏建立 gate_months，造成 name 'gate_months' is not defined。
+        # 這裡依 track_year + tracking_quarters 重新推導 Gate 專用月份；
+        # revenue_months 仍保留 UI 下載範圍，兩者不可混用。
+        try:
+            _qlist_for_gate = normalize_high_growth_quarters(tracking_quarters)
+            _track_year_for_gate = int(track_year or ((download_plan or {}).get("analysis_year") if isinstance(download_plan, dict) else 0) or HIGH_GROWTH_TRACK_YEAR)
+            if gate_revenue_months:
+                gate_months = [RevenueAccelerationEngine.normalize_month(m) for m in gate_revenue_months if RevenueAccelerationEngine.normalize_month(m)]
+            else:
+                gate_months = resolve_revenue_gate_required_months(_track_year_for_gate, _qlist_for_gate)
+            if log_cb:
+                log_cb(f"[R5N26F1][GATE_MONTHS] download_months={revenue_months or []}｜gate_months={gate_months}")
+        except Exception as gate_month_exc:
+            log_warning(f"[R5N26F1][GATE_MONTHS][WARN] {gate_month_exc}")
+            gate_months = gate_revenue_months
         return HighGrowthEPSEngine(db, tracking_quarters=tracking_quarters, min_yoy=min_yoy, mode=mode, revenue_months=revenue_months, base_year=base_year, track_year=track_year, gate_revenue_months=gate_months).export_report(output_dir=output_dir or HIGH_GROWTH_REPORT_DIR, log_cb=log_cb)
     finally:
         if close_after:
