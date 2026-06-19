@@ -10044,17 +10044,19 @@ class AnnualEPSCacheEngine:
             "AnnualEPS", "R5H_CHAIN", "START", "PASS",
             target_table="annual_eps_history",
             source_date=f"{fiscal_year}Q4",
-            fail_reason_detail="Cache>LocalFile>TPEX_OTC_FINANCIAL_XLS_PREFILL>OfficialOpenAPI_Q4>Index05Selenium>MOPS"
+            fail_reason_detail="Cache>LocalFile>TPEX_OTC_FINANCIAL_XLS_PREFILL>TWSE_C05001_STATIC_ZIP>OfficialOpenAPI_Q4>MOPS"
         )
-        log_info(f"[HIGH_GROWTH][R5H_ANNUAL_EPS_CHAIN] start fiscal_year={fiscal_year} order=Cache>LocalFile>TPEX_OTC_FINANCIAL_XLS_PREFILL>OfficialOpenAPI_Q4>Index05Selenium>MOPS market_gate=enabled")
+        log_info(f"[HIGH_GROWTH][R5H_ANNUAL_EPS_CHAIN] start fiscal_year={fiscal_year} order=Cache>LocalFile>TPEX_OTC_FINANCIAL_XLS_PREFILL>TWSE_C05001_STATIC_ZIP>OfficialOpenAPI_Q4>MOPS market_gate=enabled")
 
         # R5I：每層來源都寫入 external_data_trace_event，並在最後做 annual_eps_history verify。
         chain = [
             ("CACHE", self.try_import_cache),
             ("LOCAL_FILE_114Q4_2025Q4", self.owner.ensure_annual_eps_from_local_114q4_file),
             ("TPEX_OTC_FINANCIAL_XLS_PREFILL", self._ensure_tpex_otc_financial_xls_prefill),
+            # R5N26H：上市 SII 年度 EPS 必須先走 TWSE C05001 官方固定 ZIP，
+            # 避免 OfficialOpenAPI_Q4 無歷史 Q4 導致 eps_2025_Q4_sii.csv = 0 rows。
+            ("TWSE_C05001_STATIC_ZIP", self.owner.ensure_annual_eps_from_twse_c05001),
             ("OFFICIAL_EPS_OPENAPI_2025Q4", self.owner.ensure_annual_eps_from_official_openapi_q4),
-            ("INDEX05_SELENIUM_C05001", self.owner.ensure_annual_eps_from_twse_c05001),
             ("MOPS_T163SB04", self.owner.ensure_annual_eps_from_mops),
         ]
 
@@ -12934,6 +12936,9 @@ class EPSForecastEngine:
             f"C05001_{fiscal_year}{q}.zip", f"C05001_{fiscal_year}{q}.xls", f"C05001_{fiscal_year}{q}.xlsx",
         ]
         static_bases = [
+            # R5N26H：TWSE index05 實際財報 ZIP 官方固定路徑。
+            # 使用者實測：2025Q1~Q4、2026Q1 均為 /staticFiles/inspection/inspection/05/001/{year}Q{quarter}_C05001.zip
+            "https://www.twse.com.tw/staticFiles/inspection/inspection/05/001/",
             "https://www.twse.com.tw/staticFiles/en/trading/statistics/financialInfo/",
             "https://www.twse.com.tw/staticFiles/zh/trading/statistics/financialInfo/",
             "https://www.twse.com.tw/staticFiles/trading/statistics/financialInfo/",
@@ -12953,6 +12958,224 @@ class EPSForecastEngine:
             if downloaded is not None and Path(downloaded).exists():
                 return Path(downloaded)
         return None
+
+
+    # === R5N26H SII C05001 Financial ZIP EPS Import Engine =====================
+    def _twse_c05001_static_url(self, fiscal_year: int, quarter: int | str) -> str:
+        """R5N26H：TWSE 上市公司財報簡表 C05001 官方 ZIP 固定網址。
+
+        已由使用者實測確認：
+        https://www.twse.com.tw/staticFiles/inspection/inspection/05/001/{year}Q{quarter}_C05001.zip
+        例：2025Q4_C05001.zip、2026Q1_C05001.zip。
+        """
+        q = str(quarter).upper().replace("Q", "").strip()
+        return f"https://www.twse.com.tw/staticFiles/inspection/inspection/05/001/{int(fiscal_year)}Q{int(q)}_C05001.zip"
+
+    def download_twse_sii_c05001_zip(self, fiscal_year: int, quarter: int | str, force: bool = False) -> Path:
+        """下載 TWSE SII C05001 ZIP 到 data/eps_cache/sii/twse_c05001/YYYYQn。
+
+        舊版只靠 index05 HTML/selenium 猜連結，R5N26H 改用官方固定 URL，避免
+        eps_2025_Q4_sii.csv rows=0 導致上市年度 EPS 全缺。
+        """
+        fiscal_year = int(fiscal_year)
+        q = int(str(quarter).upper().replace("Q", "").strip())
+        out_dir = RUNTIME_DIR / "data" / "eps_cache" / "sii" / "twse_c05001" / f"{fiscal_year}Q{q}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{fiscal_year}Q{q}_C05001.zip"
+        if out_path.exists() and out_path.stat().st_size > 5000 and not force:
+            return out_path
+        url = self._twse_c05001_static_url(fiscal_year, q)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome Safari",
+            "Referer": "https://www.twse.com.tw/zh/trading/statistics/index05.html",
+            "Accept": "application/zip,application/vnd.ms-excel,*/*",
+        }
+        resp = requests.get(url, timeout=(10, 60), headers=headers)
+        content = resp.content or b""
+        if resp.status_code != 200:
+            raise RuntimeError(f"TWSE C05001 download failed status={resp.status_code} url={url}")
+        ok, reason = self._validate_twse_c05001_download_content(content, url=url, ctype=resp.headers.get("content-type", ""))
+        if not ok:
+            raise RuntimeError(f"TWSE C05001 invalid content reason={reason} url={url} bytes={len(content)}")
+        out_path.write_bytes(content)
+        log_info(f"[R5N26H][TWSE_C05001][DOWNLOAD] saved={out_path} bytes={len(content)} url={url} reason={reason}")
+        return out_path
+
+    def parse_twse_sii_c05001_financial_zip(self, zip_or_excel_path: str | Path, fiscal_year: int, quarter: int | str) -> pd.DataFrame:
+        """解析 TWSE C05001 上市公司財報簡表 EPS。
+
+        C05001 實檔固定欄位：A=公司代號、B=公司名稱、N=本期累計 EPS、O=去年同期累計 EPS。
+        對 Q1~Q4 均先保留官方累計 EPS；單季 EPS 由 import 階段用前一季累計值換算。
+        Q4 的累計 EPS 即為全年 EPS，會再寫 annual_eps_history。
+        """
+        fiscal_year = int(fiscal_year)
+        q = int(str(quarter).upper().replace("Q", "").strip())
+        materialized = self._materialize_twse_c05001_file(Path(zip_or_excel_path), fiscal_year, f"Q{q}")
+        if materialized is None:
+            raise RuntimeError(f"TWSE C05001 materialize failed: {zip_or_excel_path}")
+        raw, sheet_name = self._read_twse_c05001_workbook_raw(Path(materialized))
+        if raw is None or raw.empty or raw.shape[1] < 15:
+            raise RuntimeError(f"TWSE C05001 content too small: {materialized} shape={getattr(raw, 'shape', None)}")
+        code = raw.iloc[:, 0].astype(str).str.extract(r"(\d{4})", expand=False).fillna("")
+        mask = code.str.fullmatch(r"\d{4}")
+        if int(mask.sum()) == 0:
+            raise RuntimeError(f"TWSE C05001 cannot find 4-digit stock rows: {materialized} sheet={sheet_name}")
+        eps_raw = (raw.loc[mask, raw.columns[13]].astype(str)
+                   .str.replace(",", "", regex=False)
+                   .str.replace("—", "", regex=False)
+                   .str.replace("－", "", regex=False)
+                   .str.replace("--", "", regex=False)
+                   .str.replace("<<<<<", "0", regex=False)
+                   .str.strip())
+        prev_eps_raw = (raw.loc[mask, raw.columns[14]].astype(str)
+                        .str.replace(",", "", regex=False)
+                        .str.replace("—", "", regex=False)
+                        .str.replace("－", "", regex=False)
+                        .str.replace("--", "", regex=False)
+                        .str.replace("<<<<<", "0", regex=False)
+                        .str.strip()) if raw.shape[1] > 14 else pd.Series(index=raw.loc[mask].index, dtype="object")
+        out = pd.DataFrame({
+            "stock_id": code[mask].map(normalize_stock_id),
+            "stock_name": raw.loc[mask, raw.columns[1]].astype(str).str.strip(),
+            "eps_cumulative": pd.to_numeric(eps_raw, errors="coerce"),
+            "eps_prev_year_same_period": pd.to_numeric(prev_eps_raw, errors="coerce"),
+        })
+        # 附帶保留常用財報欄位，供後續 trace / QA 使用。
+        optional_map = {
+            "operating_revenue_cumulative": 2,
+            "operating_income_cumulative": 5,
+            "non_operating_income_cumulative": 7,
+            "net_income_after_tax_cumulative": 9,
+            "capital_stock_end_period": 12,
+            "book_value_per_share": 15,
+            "equity_assets_ratio": 16,
+            "current_ratio": 17,
+            "quick_ratio": 18,
+        }
+        for col, idx in optional_map.items():
+            if raw.shape[1] > idx:
+                out[col] = pd.to_numeric(raw.loc[mask, raw.columns[idx]].astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+        out = out.dropna(subset=["stock_id", "eps_cumulative"])
+        out = out[out["stock_id"].astype(str).str.fullmatch(r"\d{4}", na=False)].copy()
+        out["fiscal_year"] = fiscal_year
+        out["quarter"] = q
+        out["fiscal_year_quarter"] = f"{fiscal_year}Q{q}"
+        out["western_quarter"] = f"{fiscal_year}Q{q}"
+        out["market_type"] = "sii"
+        out["source_type"] = f"TWSE_C05001_SII_{fiscal_year}Q{q}"
+        out["source_url"] = self._twse_c05001_static_url(fiscal_year, q)
+        out["source_file"] = str(materialized)
+        out["source_date"] = f"{fiscal_year}Q{q}"
+        out["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        out = out.drop_duplicates(["stock_id", "fiscal_year", "quarter"], keep="last")
+        min_rows = int(getattr(self, "EPS_Q1_MIN_SII_ROWS", 1000) or 1000)
+        if len(out) < min_rows:
+            raise RuntimeError(f"TWSE C05001 parsed rows too few: {materialized} rows={len(out)} min={min_rows}")
+        log_info(f"[R5N26H][TWSE_C05001][PARSE] file={materialized} fiscal_year={fiscal_year} q={q} rows={len(out)}")
+        return out
+
+    def _load_twse_sii_prev_cumulative_eps(self, fiscal_year: int, quarter: int, force: bool = False) -> pd.DataFrame:
+        fiscal_year = int(fiscal_year); quarter = int(quarter)
+        if quarter <= 1:
+            return pd.DataFrame(columns=["stock_id", "eps_prev_cumulative"])
+        prev_q = quarter - 1
+        try:
+            with self.db.lock:
+                prev = pd.read_sql_query("""
+                    SELECT stock_id, eps_cumulative AS eps_prev_cumulative
+                    FROM quarterly_financial_history
+                    WHERE fiscal_year=? AND quarter=? AND COALESCE(market_type,'')='sii' AND eps_cumulative IS NOT NULL
+                """, self.db.conn, params=[fiscal_year, prev_q])
+            if prev is not None and len(prev) >= int(getattr(self, "EPS_Q1_MIN_SII_ROWS", 1000) or 1000):
+                return prev
+        except Exception:
+            pass
+        prev_zip = self.download_twse_sii_c05001_zip(fiscal_year, prev_q, force=force)
+        prev_df = self.parse_twse_sii_c05001_financial_zip(prev_zip, fiscal_year, prev_q)
+        if prev_df is None or prev_df.empty:
+            return pd.DataFrame(columns=["stock_id", "eps_prev_cumulative"])
+        return prev_df[["stock_id", "eps_cumulative"]].rename(columns={"eps_cumulative": "eps_prev_cumulative"})
+
+    def import_twse_sii_c05001_financial_zip_to_db(self, fiscal_year: int, quarter: int | str, force: bool = False) -> dict:
+        """TWSE SII C05001 財報 ZIP EPS Import Engine。
+
+        1. 下載 {year}Q{quarter}_C05001.zip。
+        2. 解析 N 欄「本期累計 EPS」。
+        3. 寫入 quarterly_financial_history：eps/eps_quarter 使用單季 EPS；eps_cumulative 保留官方累計 EPS。
+        4. Q4 額外寫入 annual_eps_history：eps_full_year 使用 Q4 累計 EPS，market_type='sii'。
+        """
+        fiscal_year = int(fiscal_year)
+        q = int(str(quarter).upper().replace("Q", "").strip())
+        result = {"status": "skip", "rows": 0, "annual_rows": 0, "source": "TWSE_C05001_SII", "message": "", "year": fiscal_year, "quarter": q}
+        try:
+            zpath = self.download_twse_sii_c05001_zip(fiscal_year, q, force=force)
+            cur_df = self.parse_twse_sii_c05001_financial_zip(zpath, fiscal_year, q)
+            if cur_df is None or cur_df.empty:
+                result.update({"status": "parse_zero", "message": f"TWSE C05001 parse zero rows {fiscal_year}Q{q}", "zip_path": str(zpath)})
+                return result
+            prev_df = self._load_twse_sii_prev_cumulative_eps(fiscal_year, q, force=force)
+            write = cur_df.merge(prev_df, on="stock_id", how="left") if prev_df is not None and not prev_df.empty else cur_df.copy()
+            if "eps_prev_cumulative" not in write.columns:
+                write["eps_prev_cumulative"] = np.nan
+            write["eps_prev_cumulative"] = pd.to_numeric(write["eps_prev_cumulative"], errors="coerce")
+            write["eps_cumulative"] = pd.to_numeric(write["eps_cumulative"], errors="coerce")
+            if q == 1:
+                write["eps_quarter"] = write["eps_cumulative"]
+                write["eps_calc_method"] = "TWSE_C05001_Q1_CUMULATIVE_EQUALS_QUARTER"
+            else:
+                write["eps_quarter"] = write["eps_cumulative"] - write["eps_prev_cumulative"]
+                write["eps_calc_method"] = "TWSE_C05001_CUMULATIVE_DIFF_TO_QUARTER"
+            write["eps"] = write["eps_quarter"]
+            write = write.dropna(subset=["stock_id", "eps_cumulative"])
+            db_cols = ["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "western_quarter", "market_type", "eps", "eps_cumulative", "eps_quarter", "eps_prev_cumulative", "eps_calc_method", "source_type", "source_url", "source_date", "update_time"]
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.executemany("""
+                    INSERT INTO quarterly_financial_history(stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, market_type, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_type, source_url, source_date, update_time)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(stock_id, fiscal_year, quarter) DO UPDATE SET
+                        fiscal_year_quarter=excluded.fiscal_year_quarter,
+                        western_quarter=excluded.western_quarter,
+                        market_type=excluded.market_type,
+                        eps=excluded.eps,
+                        eps_cumulative=excluded.eps_cumulative,
+                        eps_quarter=excluded.eps_quarter,
+                        eps_prev_cumulative=excluded.eps_prev_cumulative,
+                        eps_calc_method=excluded.eps_calc_method,
+                        source_type=excluded.source_type,
+                        source_url=excluded.source_url,
+                        source_date=excluded.source_date,
+                        update_time=excluded.update_time
+                """, list(write[db_cols].itertuples(index=False, name=None)))
+                self.db.conn.commit()
+            annual_rows = 0
+            if q == 4:
+                annual_df = write.copy()
+                annual_df["eps_full_year"] = annual_df["eps_cumulative"]
+                annual_df["source_file"] = str(zpath)
+                annual_rows = self._write_annual_eps_history(annual_df, fiscal_year, source_label=f"TWSE_C05001_SII_{fiscal_year}Q4_CUMULATIVE_AS_ANNUAL_EPS")
+            result.update({"status": "imported", "rows": int(len(write)), "annual_rows": int(annual_rows), "zip_path": str(zpath), "message": f"TWSE C05001 SII {fiscal_year}Q{q} imported rows={len(write)} annual_rows={annual_rows}"})
+            log_info(f"[R5N26H][TWSE_C05001][IMPORT] {result}")
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "rows": 0, "message": str(exc)})
+            log_warning(f"[R5N26H][TWSE_C05001][IMPORT_FAIL] fiscal_year={fiscal_year} q={q}｜{exc}")
+            return result
+
+    def ensure_twse_sii_c05001_quarters(self, fiscal_year: int, quarters=(1, 2, 3, 4), force: bool = False) -> dict:
+        """批次補入 TWSE SII C05001 財報 ZIP。Q4 會同步補 annual_eps_history。"""
+        results = []
+        rows = 0
+        annual_rows = 0
+        for q in quarters:
+            res = self.import_twse_sii_c05001_financial_zip_to_db(fiscal_year, int(q), force=force)
+            results.append(res)
+            rows += int((res or {}).get("rows", 0) or 0)
+            annual_rows += int((res or {}).get("annual_rows", 0) or 0)
+        status = "imported" if rows > 0 else "no_data"
+        out = {"status": status, "rows": rows, "annual_rows": annual_rows, "source": "TWSE_C05001_SII_Q1_Q4", "results": results, "message": f"TWSE SII C05001 quarters done rows={rows} annual_rows={annual_rows}"}
+        log_info(f"[R5N26H][TWSE_C05001][BATCH] fiscal_year={fiscal_year} result={out}")
+        return out
 
     def ensure_annual_eps_from_twse_c05001(self, fiscal_year: int | None = None, force: bool = False) -> dict:
         """主流程：由本地 TWSE C05001 Q4 Excel/ZIP 補入年度EPS。"""
@@ -12978,6 +13201,23 @@ class EPSForecastEngine:
                 return result
             if existing > 0 and not force and not market_ok:
                 log_warning(f"[R5N26G][ANNUAL_EPS_QFH_BACKFILL_MARKET_GAP] fiscal_year={fiscal_year} existing_by_market={existing_by_market}，繼續由 Q4 季報補缺市場")
+
+            # R5N26H：先用 TWSE 官方固定 ZIP URL 直接下載/解析 Q1~Q4；Q4 寫 annual_eps_history。
+            # 目的：修正 eps_2025_Q4_sii.csv rows=0 造成上市年度 EPS 全缺。
+            if force or existing_by_market.get("sii", 0) < min_sii:
+                batch_res = self.ensure_twse_sii_c05001_quarters(fiscal_year, quarters=(1, 2, 3, 4), force=force)
+                log_info(f"[R5N26H][TWSE_C05001][ANNUAL_PREFILL] fiscal_year={fiscal_year} result={batch_res}")
+                with self.db.lock:
+                    refreshed_df = pd.read_sql_query("""
+                        SELECT COALESCE(market_type,'') AS market_type, COUNT(*) AS cnt
+                        FROM annual_eps_history
+                        WHERE fiscal_year=? AND eps_full_year IS NOT NULL
+                        GROUP BY COALESCE(market_type,'')
+                    """, self.db.conn, params=[fiscal_year])
+                refreshed_counts = {normalize_market_type(r.get("market_type")) or "unknown": int(r.get("cnt") or 0) for _, r in refreshed_df.iterrows()} if refreshed_df is not None and not refreshed_df.empty else {}
+                if int(refreshed_counts.get("sii", 0) or 0) >= min_sii:
+                    result.update({"status": "imported", "rows": int(sum(refreshed_counts.values())), "market_counts": refreshed_counts, "source_file": str((batch_res.get("results") or [{}])[-1].get("zip_path", "")), "message": f"已由 TWSE C05001 官方 ZIP 補入 SII 年度EPS {refreshed_counts}"})
+                    return result
 
             candidates = self._twse_c05001_candidate_paths(fiscal_year, "Q4")
             if not candidates:
