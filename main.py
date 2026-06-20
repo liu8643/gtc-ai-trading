@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.23-R5N26F1_REVENUE_GATE_UI_SYNC_SCOPE_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.24-R5N26I_ROOTCAUSE_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2446,6 +2446,11 @@ def _normalize_master_df(df: pd.DataFrame, market_label: str, persist_classifica
         return pd.DataFrame(columns=["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"])
 
     x["market"] = market_label
+    # R5N26I-3：建立主檔時即套用已確認個股市場別修正，避免後續 EPS/valuation merge 以錯誤 market 判定 mismatch。
+    try:
+        x["market"] = [r5n26i_authoritative_market_label(sid, market_label) for sid in x["stock_id"]]
+    except Exception:
+        pass
     x["industry"] = ""
     x["theme"] = ""
     x["sub_theme"] = ""
@@ -3667,7 +3672,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.23_r5n26f1_revenue_gate_ui_sync_scope_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.24_r5n26i_rootcause_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3886,6 +3891,11 @@ class DBManager:
         x = x[x["stock_id"].str.fullmatch(r"\d{4,5}", na=False)].copy()
         x["is_etf"] = pd.to_numeric(x["is_etf"], errors="coerce").fillna(0).astype(int)
         x["is_active"] = pd.to_numeric(x["is_active"], errors="coerce").fillna(1).astype(int)
+        # R5N26I-3：匯入主檔時修正已確認 market_type mismatch 個股。
+        try:
+            x["market"] = [r5n26i_authoritative_market_label(sid, mv) for sid, mv in zip(x["stock_id"], x["market"])]
+        except Exception:
+            pass
         x = x[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]]
         with self.lock:
             x.to_sql("stocks_master", self.conn, if_exists="replace", index=False)
@@ -6053,6 +6063,25 @@ REVENUE_NORMALIZED_CACHE_DIR = REVENUE_CACHE_DIR / "normalized"
 REVENUE_ARCHIVE_CACHE_DIR = REVENUE_CACHE_DIR / "archive"
 # R5N7_MARKET_SPLIT_EPS_REVENUE_20260612：上市/上櫃資料必須分流保存，避免 C04003 上市月報覆蓋或混入上櫃資料。
 MARKET_TYPE_MAP = {"上市": "sii", "上櫃": "otc", "sii": "sii", "otc": "otc", "SII": "sii", "OTC": "otc"}
+# R5N26I-3 ROOTCAUSE FIX：個股市場別權威修正表。
+# 目的：修正 stocks_master 與官方財報來源不一致時的 merge / Gate 污染。
+# 來源：R5N26I_RootCause_Check_20260620.xlsx「03_market_type_mismatch」。
+# 注意：此表只處理已確認的個股市場別衝突；其他個股仍以 stocks_master/官方分類為準。
+R5N26I_AUTHORITATIVE_STOCK_MARKET_TYPE = {
+    "3324": "otc",
+    "4979": "otc",
+}
+
+def r5n26i_authoritative_market_type(stock_id=None, market_value=None) -> str:
+    sid = normalize_stock_id(stock_id) if stock_id is not None else ""
+    if sid in R5N26I_AUTHORITATIVE_STOCK_MARKET_TYPE:
+        return R5N26I_AUTHORITATIVE_STOCK_MARKET_TYPE[sid]
+    return normalize_market_type(market_value)
+
+def r5n26i_authoritative_market_label(stock_id=None, market_value=None) -> str:
+    mt = r5n26i_authoritative_market_type(stock_id, market_value)
+    return market_type_to_label(mt) or str(market_value or "")
+
 REVENUE_CACHE_SII_DIR = REVENUE_CACHE_DIR / "sii"
 REVENUE_CACHE_OTC_DIR = REVENUE_CACHE_DIR / "otc"
 REVENUE_INDEX04_C04003_SII_DIR = REVENUE_CACHE_SII_DIR / "index04_c04003"
@@ -6348,10 +6377,11 @@ def _r5n8c_build_market_map(master_df: pd.DataFrame) -> dict:
         return {}
     x["stock_id"] = x["stock_id"].map(normalize_stock_id)
     if "market_type" in x.columns:
-        mt = x["market_type"].map(normalize_market_type)
+        base_mt = x["market_type"]
     else:
-        mt = x.get("market", pd.Series("", index=x.index)).map(normalize_market_type)
-    x["_market_type"] = mt
+        base_mt = x.get("market", pd.Series("", index=x.index))
+    # R5N26I-3：stock_id 層級權威市場別優先於 stocks_master 舊值。
+    x["_market_type"] = [r5n26i_authoritative_market_type(sid, mv) for sid, mv in zip(x["stock_id"], base_mt)]
     x = x[(x["stock_id"] != "") & (x["_market_type"] != "")].drop_duplicates("stock_id", keep="last")
     return dict(zip(x["stock_id"], x["_market_type"]))
 
@@ -11416,7 +11446,7 @@ class EPSForecastEngine:
                     normalize_stock_id(r.get("stock_id")), feature_date,
                     float(r.get("actual_q1_eps")),
                     str(r.get("actual_q1_eps_source_type") or ""),
-                    normalize_market_type(r.get("actual_q1_eps_market_type")),
+                    r5n26i_authoritative_market_type(r.get("stock_id"), r.get("actual_q1_eps_market_type")),
                     now, now
                 ))
             with self.db.lock:
@@ -11470,7 +11500,7 @@ class EPSForecastEngine:
         x["source_type"] = x.get("source_type", "").fillna("").astype(str)
         x.loc[x["actual_q1_eps"].notna() & x["source_type"].eq(""), "source_type"] = "DB_QUARTERLY_HISTORY"
         x["eps_market_type"] = x.get("market_type_y", x.get("market_type", "")).fillna("").astype(str).map(normalize_market_type) if "market_type_y" in x.columns or "market_type" in x.columns else ""
-        x["expected_market_type"] = x["market"].astype(str).map(normalize_market_type)
+        x["expected_market_type"] = [r5n26i_authoritative_market_type(sid, mv) for sid, mv in zip(x["stock_id"], x["market"])]
         x["market_type_match"] = np.where((x["eps_market_type"].eq("")) | (x["expected_market_type"].eq("")), "UNKNOWN", np.where(x["eps_market_type"].eq(x["expected_market_type"]), "MATCH", "MISMATCH"))
         x["coverage_status"] = np.where(x["actual_q1_eps"].notna() & x["source_type"].ne("") & x["market_type_match"].isin(["MATCH", "UNKNOWN"]), "PASS", "MISSING")
         x["fiscal_year"] = fiscal_year
@@ -13253,7 +13283,7 @@ class EPSForecastEngine:
             log_warning(f"[HIGH_GROWTH][C05001] 補入annual_eps_history失敗：{exc}")
             return result
 
-    def load_base_annual_eps(self) -> pd.DataFrame:
+    def load_base_annual_eps(self, master: pd.DataFrame | None = None) -> pd.DataFrame:
         """讀取真正可作為 2025 全年度 EPS 的資料。
 
         注意：EPS_TTM 不在此函式使用，避免把 TTM 誤當年度 EPS。
@@ -13278,14 +13308,15 @@ class EPSForecastEngine:
                 annual_cols = set()
             source_expr = "COALESCE(source_type,'annual_eps_history')" if "source_type" in annual_cols else "'annual_eps_history'"
             source_date_expr = "source_date" if "source_date" in annual_cols else "''"
+            market_expr = "COALESCE(market_type,'')" if "market_type" in annual_cols else "''"
             df = self._read_sql(
-                f"SELECT stock_id, eps_full_year AS base_annual_eps, {source_expr} AS base_eps_source, {source_date_expr} AS source_date "
+                f"SELECT stock_id, {market_expr} AS base_eps_market_type, eps_full_year AS base_annual_eps, {source_expr} AS base_eps_source, {source_date_expr} AS source_date "
                 "FROM annual_eps_history WHERE fiscal_year=? AND eps_full_year IS NOT NULL",
                 [self.base_year],
             )
             parts.append(df)
         if self._table_exists("quarterly_financial_history"):
-            qdf = self._read_sql("SELECT stock_id, fiscal_year, quarter, eps, eps_quarter, eps_cumulative, source_date FROM quarterly_financial_history WHERE COALESCE(eps_quarter, eps) IS NOT NULL")
+            qdf = self._read_sql("SELECT stock_id, COALESCE(market_type,'') AS base_eps_market_type, fiscal_year, quarter, eps, eps_quarter, eps_cumulative, source_date FROM quarterly_financial_history WHERE COALESCE(eps_quarter, eps) IS NOT NULL")
             if qdf is not None and not qdf.empty:
                 fy = pd.to_numeric(qdf.get("fiscal_year"), errors="coerce")
                 q = pd.to_numeric(qdf.get("quarter"), errors="coerce")
@@ -13293,13 +13324,15 @@ class EPSForecastEngine:
                 qdf = qdf.loc[mask].copy()
                 if not qdf.empty:
                     qdf["eps_quarter_used"] = pd.to_numeric(qdf.get("eps_quarter"), errors="coerce").fillna(pd.to_numeric(qdf.get("eps"), errors="coerce"))
-                    cnt = qdf.groupby("stock_id")["eps_quarter_used"].count().reset_index(name="quarter_count")
-                    s = qdf.groupby("stock_id", as_index=False)["eps_quarter_used"].sum().rename(columns={"eps_quarter_used": "base_annual_eps"})
-                    s = s.merge(cnt, on="stock_id", how="left")
+                    qdf["base_eps_market_type"] = qdf.get("base_eps_market_type", "").map(normalize_market_type)
+                    group_cols = ["stock_id", "base_eps_market_type"]
+                    cnt = qdf.groupby(group_cols)["eps_quarter_used"].count().reset_index(name="quarter_count")
+                    s = qdf.groupby(group_cols, as_index=False)["eps_quarter_used"].sum().rename(columns={"eps_quarter_used": "base_annual_eps"})
+                    s = s.merge(cnt, on=group_cols, how="left")
                     s = s[s["quarter_count"].ge(4)].copy()
                     s["base_eps_source"] = "quarterly_financial_history_sum4_eps_quarter"
                     s["source_date"] = ""
-                    parts.append(s[["stock_id", "base_annual_eps", "base_eps_source", "source_date"]])
+                    parts.append(s[["stock_id", "base_eps_market_type", "base_annual_eps", "base_eps_source", "source_date"]])
         parts = [p for p in parts if p is not None and not p.empty]
         if not parts:
             return pd.DataFrame(columns=["stock_id", "base_annual_eps", "base_eps_source", "source_date", "base_eps_quality"])
@@ -13309,20 +13342,34 @@ class EPSForecastEngine:
         x = x.dropna(subset=["stock_id", "base_annual_eps"])
         if "source_date" not in x.columns:
             x["source_date"] = ""
-        x["base_eps_quality"] = "STRICT"
+        if "base_eps_market_type" not in x.columns:
+            x["base_eps_market_type"] = ""
+        x["base_eps_market_type"] = [r5n26i_authoritative_market_type(sid, mt) for sid, mt in zip(x["stock_id"], x["base_eps_market_type"])]
+        market_map = _r5n8c_build_market_map(master) if master is not None else {}
+        x["_expected_market_type"] = x["stock_id"].map(market_map).fillna("")
+        x["_market_priority"] = np.select([
+            x["_expected_market_type"].ne("") & x["base_eps_market_type"].eq(x["_expected_market_type"]),
+            x["base_eps_market_type"].eq(""),
+        ], [3, 2], default=0)
+        x["base_eps_quality"] = np.where(x["_market_priority"].eq(0) & x["_expected_market_type"].ne(""), "MARKET_TYPE_MISMATCH_REJECTED", "STRICT")
         x["_priority"] = x["base_eps_source"].map({"annual_eps_history": 1, "TWSE_C05001_Q4_ANNUAL_EPS": 1, "TWSE_OPENAPI_T187AP06_ANNUAL_EPS": 1, "MOPS_T163SB04_Q4_ANNUAL_EPS": 1, "quarterly_financial_history_sum4_eps_quarter": 2, "quarterly_financial_history_sum4": 2}).fillna(9)
-        return x.sort_values(["stock_id", "_priority"]).drop_duplicates("stock_id", keep="first").drop(columns=["_priority"], errors="ignore")
+        # R5N26I-3：同一股票多市場資料並存時，優先保留與主檔/權威市場別相符資料；避免 3324/4979 等吃錯 market_type。
+        x = x.sort_values(["stock_id", "_market_priority", "_priority"], ascending=[True, False, True]).drop_duplicates("stock_id", keep="first")
+        return x.drop(columns=["_priority", "_market_priority", "_expected_market_type"], errors="ignore")
 
-    def load_actual_eps_by_quarter(self, quarters=None) -> pd.DataFrame:
+    def load_actual_eps_by_quarter(self, quarters=None, master: pd.DataFrame | None = None) -> pd.DataFrame:
         quarters = normalize_high_growth_quarters(quarters)
         q_numbers = [int(q[-1]) for q in quarters]
         if not self._table_exists("quarterly_financial_history"):
             return pd.DataFrame(columns=["stock_id"])
-        df = self._read_sql("SELECT stock_id, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_date FROM quarterly_financial_history WHERE COALESCE(eps_quarter, eps) IS NOT NULL")
+        df = self._read_sql("SELECT stock_id, COALESCE(market_type,'') AS actual_eps_market_type, fiscal_year, quarter, fiscal_year_quarter, western_quarter, eps, eps_cumulative, eps_quarter, eps_prev_cumulative, eps_calc_method, source_date FROM quarterly_financial_history WHERE COALESCE(eps_quarter, eps) IS NOT NULL")
         if df is None or df.empty:
             return pd.DataFrame(columns=["stock_id"])
         df = df.copy()
         df["stock_id"] = df["stock_id"].map(normalize_stock_id)
+        if "actual_eps_market_type" not in df.columns:
+            df["actual_eps_market_type"] = ""
+        df["actual_eps_market_type"] = [r5n26i_authoritative_market_type(sid, mt) for sid, mt in zip(df["stock_id"], df["actual_eps_market_type"])]
         fy = pd.to_numeric(df.get("fiscal_year"), errors="coerce")
         qn = pd.to_numeric(df.get("quarter"), errors="coerce")
         token1 = df.get("western_quarter", "").map(self.normalize_quarter_token) if "western_quarter" in df.columns else pd.Series("", index=df.index)
@@ -13341,7 +13388,7 @@ class EPSForecastEngine:
         df["eps_quarter"] = pd.to_numeric(df.get("eps_quarter"), errors="coerce")
         df["eps"] = pd.to_numeric(df.get("eps"), errors="coerce")
         df["eps_used_quarter"] = df["eps_quarter"].fillna(df["eps"])
-        pivot = df.pivot_table(index="stock_id", columns="quarter_norm", values="eps_used_quarter", aggfunc="last").reset_index()
+        pivot = df.pivot_table(index=["stock_id", "actual_eps_market_type"], columns="quarter_norm", values="eps_used_quarter", aggfunc="last").reset_index()
         for q in quarters:
             if q not in pivot.columns:
                 pivot[q] = np.nan
@@ -13352,7 +13399,14 @@ class EPSForecastEngine:
         pivot["actual_eps_quarter_count_required"] = len(quarters)
         pivot["actual_eps_complete_gate"] = pivot["actual_eps_quarter_count_hit"].eq(len(quarters))
         pivot["actual_eps_source"] = "quarterly_financial_history"
-        return pivot[["stock_id"] + eps_cols + ["actual_eps_cumulative", "actual_eps_quarter_count_hit", "actual_eps_quarter_count_required", "actual_eps_complete_gate", "actual_eps_source"]]
+        market_map = _r5n8c_build_market_map(master) if master is not None else {}
+        pivot["_expected_market_type"] = pivot["stock_id"].map(market_map).fillna("")
+        pivot["_market_priority"] = np.select([
+            pivot["_expected_market_type"].ne("") & pivot["actual_eps_market_type"].eq(pivot["_expected_market_type"]),
+            pivot["actual_eps_market_type"].eq(""),
+        ], [3, 2], default=0)
+        pivot = pivot.sort_values(["stock_id", "_market_priority"], ascending=[True, False]).drop_duplicates("stock_id", keep="first")
+        return pivot[["stock_id", "actual_eps_market_type"] + eps_cols + ["actual_eps_cumulative", "actual_eps_quarter_count_hit", "actual_eps_quarter_count_required", "actual_eps_complete_gate", "actual_eps_source"]]
 
     def _latest_rows(self, table: str, date_col: str, value_cols: list[str]) -> pd.DataFrame:
         if not self._table_exists(table):
@@ -13433,13 +13487,17 @@ class EPSForecastEngine:
 
     def build_eps_features(self, master: pd.DataFrame, revenue_features: pd.DataFrame, quarters=None) -> pd.DataFrame:
         quarters = normalize_high_growth_quarters(quarters)
-        base = master[["stock_id"]].drop_duplicates().copy() if master is not None and not master.empty else pd.DataFrame(columns=["stock_id"])
+        base = master[[c for c in ["stock_id", "market", "market_type"] if c in master.columns]].drop_duplicates(subset=["stock_id"]).copy() if master is not None and not master.empty else pd.DataFrame(columns=["stock_id"])
         if base.empty:
             return base
+        if "market_type" in base.columns:
+            base["expected_market_type"] = [r5n26i_authoritative_market_type(sid, mt) for sid, mt in zip(base["stock_id"], base["market_type"])]
+        else:
+            base["expected_market_type"] = [r5n26i_authoritative_market_type(sid, mv) for sid, mv in zip(base["stock_id"], base.get("market", pd.Series("", index=base.index)))]
         # V4.7：進入EPS特徵前，先確保年度EPS以「C05001本地檔優先、OpenAPI備援」匯入DB；季度EPS仍可用MOPS嘗試補齊。
         self.ensure_required_official_eps_from_mops(quarters, force=False)
-        base_eps = self.load_base_annual_eps()
-        actual = self.load_actual_eps_by_quarter(quarters)
+        base_eps = self.load_base_annual_eps(master=master)
+        actual = self.load_actual_eps_by_quarter(quarters, master=master)
         ttm = self.load_eps_ttm_proxy()
         x = base.merge(base_eps, on="stock_id", how="left").merge(actual, on="stock_id", how="left").merge(ttm, on="stock_id", how="left")
         # R4F_REPORT_OUTPUT_HARDENING_FIX：年度EPS空表時仍保留source_date欄，避免07_EPS特徵中繼少欄。
@@ -13897,20 +13955,24 @@ class HighGrowthEPSEngine:
             ],
             default="DIAGNOSTIC_ONLY",
         )
-        x["annual_eps_ready"] = "YES" if bool(allowed) else "NO"
-        x["formal_eps_ready"] = np.where(official_mask_current & bool(allowed), "YES", "NO")
+        # R5N26I-1 ROOTCAUSE FIX：annual_eps_ready 必須逐檔判斷，不能用全域 annual_rows allowed。
+        # 舊版 x["annual_eps_ready"] = "YES" if allowed else "NO" 會讓「2025全年EPS=NULL」仍顯示 YES。
+        row_annual_ready = annual_basis_mask.fillna(False).astype(bool)
+        row_formal_ready = official_mask_current.fillna(False).astype(bool) & row_annual_ready & bool(allowed)
+        x["annual_eps_ready"] = np.where(row_annual_ready, "YES", "NO")
+        x["formal_eps_ready"] = np.where(row_formal_ready, "YES", "NO")
         x["report_status"] = np.select(
             [
-                official_mask_current & bool(allowed),
-                leading_mask_current & ~bool(allowed),
-                ttm_mask & ~bool(allowed),
+                row_formal_ready,
+                leading_mask_current & ~row_annual_ready,
+                ttm_mask & ~row_annual_ready,
                 leading_mask_current & bool(allowed),
                 ttm_mask,
             ],
             [
                 "OFFICIAL_EPS_VERIFIED",
-                "LEADING_FORECAST_NOT_FORMAL",
-                "EPS_TTM_PROXY_NOT_FORMAL",
+                "LEADING_FORECAST_ANNUAL_EPS_MISSING",
+                "EPS_TTM_PROXY_ANNUAL_EPS_MISSING",
                 "LEADING_FORECAST",
                 "EPS_TTM_PROXY_TRACKING",
             ],
@@ -14141,11 +14203,15 @@ class HighGrowthEPSEngine:
             x["forecast_candidate"],
             x["ttm_proxy_candidate"],
         ], ["核心觀察/可進技術驗證", "基本面核心/等技術確認", "正式EPS通過但營收完整性待補", "財報公布前黑馬追蹤", "EPS_TTM中信心追蹤"], default="排除或補資料")
+        # R5N26I-2 ROOTCAUSE FIX：正式EPS通過者不可殘留 EPS_TTM_ONLY 風險旗標。
+        # ttm_proxy_candidate 只是追蹤池標記；若 official_eps_revenue_pass/official_eps_only_pass 已成立，風險旗標應以正式狀態為準。
+        official_pass_any = x["official_eps_revenue_pass"].fillna(False).astype(bool) | x["official_eps_only_pass"].fillna(False).astype(bool)
+        ttm_only_risk = x["ttm_proxy_candidate"].fillna(False).astype(bool) & ~official_pass_any
         x["風險旗標"] = np.select([
             pd.to_numeric(x.get("rsi14"), errors="coerce").fillna(0).gt(80),
             pd.to_numeric(x.get("trend_score"), errors="coerce").fillna(100).lt(50),
-            x["ttm_proxy_candidate"],
-            x["eps_data_quality"].ne("STRICT") | x["revenue_data_quality"].ne("STRICT"),
+            ttm_only_risk,
+            (~official_pass_any) & (x["eps_data_quality"].ne("STRICT") | x["revenue_data_quality"].ne("STRICT")),
         ], ["RSI過熱", "趨勢偏弱", "EPS_TTM_ONLY_需正式EPS驗證", "資料不足不可嚴格通過"], default="OK")
         x["建議動作"] = np.select([
             x["official_eps_revenue_pass"] & x["風險旗標"].eq("OK"),
@@ -15550,25 +15616,49 @@ class ExternalDataWriter:
             if col not in x.columns:
                 x[col] = np.nan
             x[col] = pd.to_numeric(x[col], errors="coerce")
+        if "market_type" not in x.columns:
+            x["market_type"] = ""
+        x["market_type"] = [r5n26i_authoritative_market_type(sid, mt) for sid, mt in zip(x["stock_id"], x["market_type"])]
 
         row_count = int(len(x))
         stock_count = int(x["stock_id"].nunique()) if "stock_id" in x.columns else 0
         price_nonnull = int(x["close_price"].notna().sum()) if "close_price" in x.columns else 0
         pe_nonnull = int(x["pe"].notna().sum()) if "pe" in x.columns else 0
+        pb_nonnull = int(x["pb"].notna().sum()) if "pb" in x.columns else 0
+        dy_nonnull = int(x["dividend_yield"].notna().sum()) if "dividend_yield" in x.columns else 0
 
+        # R5N26I-4 ROOTCAUSE FIX：估值寫入保護改為分市場驗證。
+        # TWSE/SII 的官方 BWIBBU_d 有 close_price，可要求 close；TPEx/OTC daily-pe 本身無 close_price，不能用全市場 close>=1000 擋掉 OTC PE/PB。
         fail_reasons = []
-        if row_count < 1000:
-            fail_reasons.append(f"rows<{1000}: {row_count}")
-        if stock_count < 1000:
-            fail_reasons.append(f"stocks<{1000}: {stock_count}")
-        if price_nonnull < 1000:
-            fail_reasons.append(f"close_price_nonnull<{1000}: {price_nonnull}")
-        if pe_nonnull < 800:
-            fail_reasons.append(f"pe_nonnull<{800}: {pe_nonnull}")
+        if row_count < 1000 or stock_count < 1000:
+            fail_reasons.append(f"overall_rows_or_stocks_lt_min rows={row_count} stocks={stock_count}")
+
+        def _market_metrics(mt: str) -> dict:
+            sub = x[x["market_type"].eq(mt)].copy()
+            return {
+                "rows": int(len(sub)),
+                "stocks": int(sub["stock_id"].nunique()) if not sub.empty else 0,
+                "close": int(sub["close_price"].notna().sum()) if not sub.empty else 0,
+                "pe": int(sub["pe"].notna().sum()) if not sub.empty else 0,
+                "pb": int(sub["pb"].notna().sum()) if not sub.empty else 0,
+                "dy": int(sub["dividend_yield"].notna().sum()) if not sub.empty else 0,
+            }
+
+        sii_m = _market_metrics("sii")
+        otc_m = _market_metrics("otc")
+        sii_present = sii_m["rows"] > 0
+        otc_present = otc_m["rows"] > 0
+        sii_ok = (not sii_present) or (sii_m["stocks"] >= 500 and sii_m["close"] >= 500 and (sii_m["pe"] + sii_m["pb"] + sii_m["dy"]) >= 300)
+        otc_ok = (not otc_present) or (otc_m["stocks"] >= 500 and (otc_m["pe"] >= 300 or otc_m["pb"] >= 300 or otc_m["dy"] >= 300))
+        if not sii_ok:
+            fail_reasons.append(f"sii_invalid stocks={sii_m['stocks']} close={sii_m['close']} pe={sii_m['pe']} pb={sii_m['pb']} dy={sii_m['dy']}")
+        if not otc_ok:
+            fail_reasons.append(f"otc_invalid stocks={otc_m['stocks']} close={otc_m['close']} pe={otc_m['pe']} pb={otc_m['pb']} dy={otc_m['dy']}")
 
         detail = (
-            f"rows={row_count}, stocks={stock_count}, "
-            f"close_price_nonnull={price_nonnull}, pe_nonnull={pe_nonnull}"
+            f"rows={row_count}, stocks={stock_count}, close_price_nonnull={price_nonnull}, "
+            f"pe_nonnull={pe_nonnull}, pb_nonnull={pb_nonnull}, dividend_yield_nonnull={dy_nonnull}, "
+            f"sii={sii_m}, otc={otc_m}"
         )
 
         if fail_reasons:
