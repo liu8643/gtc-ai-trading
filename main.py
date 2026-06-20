@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.24-R5N26I_ROOTCAUSE_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.24-R5N27A_FORMAL_EPS_PREFLIGHT_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3685,7 +3685,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.24_r5n26i_rootcause_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.24_r5n27a_formal_eps_preflight_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -11505,6 +11505,13 @@ class EPSForecastEngine:
                 self.db.conn.commit()
             result.update({"status": "updated", "rows": len(rows), "message": f"actual_q1_eps cache updated {len(rows)} rows"})
             log_info(f"[HIGH_GROWTH][R5N6][ACTUAL_Q1_CACHE] fiscal_year={fiscal_year} rows={len(rows)}")
+            # R5N27A-FIX-04：actual_q1_eps cache updated 後，若正式 EPS 來源已 PASS，立即重建 ranking_result。
+            try:
+                post_rebuild = rebuild_ranking_after_formal_eps_ready(self.db, reason=f"actual_q1_eps_cache_updated fiscal_year={fiscal_year}")
+                result["post_eps_rebuild"] = post_rebuild
+            except Exception as _r5n27_rebuild_exc:
+                result["post_eps_rebuild"] = {"status": "error", "reason": str(_r5n27_rebuild_exc)}
+                log_warning(f"[R5N27][POST_EPS_REBUILD] call failed after actual_q1 cache update｜{_r5n27_rebuild_exc}")
             return result
         except Exception as exc:
             result.update({"status": "error", "rows": 0, "message": str(exc)})
@@ -15474,10 +15481,184 @@ class LegacyStrategyEngine:
 
 
 class RankingEngine:
+    class FormalEPSMapResult:
+        """R5N27A：正式 EPS map 載入結果。
+
+        保留 dict-like get()/values()/items()，避免既有呼叫端大幅改寫；
+        同時新增 ready / reason / stats，讓空 map 不再靜默失敗。
+        """
+        def __init__(self, map_data=None, ready: bool = False, reason: str = "", stats: dict | None = None):
+            self.map = map_data or {}
+            self.ready = bool(ready)
+            self.reason = str(reason or "")
+            self.stats = dict(stats or {})
+
+        def __bool__(self):
+            return bool(self.map)
+
+        def __len__(self):
+            return len(self.map)
+
+        def get(self, key, default=None):
+            return self.map.get(key, default)
+
+        def values(self):
+            return self.map.values()
+
+        def items(self):
+            return self.map.items()
+
+        def keys(self):
+            return self.map.keys()
+
     def __init__(self, db: DBManager):
         self.db = db
 
-    def _load_r5n26j_formal_eps_gate_map(self, base_year: int | None = None, track_year: int | None = None) -> dict:
+    def _formal_eps_expr(self, cols: set[str], candidates: list[str], default: str = "NULL") -> str:
+        usable = [c for c in candidates if c in cols]
+        if not usable:
+            return default
+        return "COALESCE(" + ", ".join(usable) + ")" if len(usable) > 1 else usable[0]
+
+    def _formal_eps_expr_alias(self, cols: set[str], candidates: list[str], alias: str, default: str = "NULL") -> str:
+        usable = [f"{alias}.{c}" for c in candidates if c in cols]
+        if not usable:
+            return default
+        return "COALESCE(" + ", ".join(usable) + ")" if len(usable) > 1 else usable[0]
+
+    def validate_formal_eps_sources_ready(self, base_year: int | None = None, track_year: int | None = None,
+                                          min_q1_rows: int = 800, min_annual_rows: int = 1500, min_join_rows: int = 500) -> dict:
+        """R5N27A-FIX-01：Ranking 重建前正式 EPS 來源 preflight。
+
+        檢查 quarterly_financial_history 與 annual_eps_history 是否已完成可用資料落地；
+        未 PASS 時禁止後續 formal_eps_map 空值覆蓋 ranking_result。
+        """
+        base_year = int(base_year or (datetime.now().year - 1))
+        track_year = int(track_year or datetime.now().year)
+        roc_base_year = base_year - 1911
+        roc_track_year = track_year - 1911
+        stats = {
+            "ready": False, "base_year": base_year, "track_year": track_year,
+            "roc_base_year": roc_base_year, "roc_track_year": roc_track_year,
+            "q1_rows": 0, "annual_rows": 0, "join_rows": 0,
+            "min_q1_rows": int(min_q1_rows), "min_annual_rows": int(min_annual_rows), "min_join_rows": int(min_join_rows),
+            "reason": "",
+        }
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                tables = {str(r[0]) for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                missing_tables = [t for t in ["quarterly_financial_history", "annual_eps_history"] if t not in tables]
+                if missing_tables:
+                    stats["reason"] = "missing_tables=" + ",".join(missing_tables)
+                    return stats
+
+                q_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(quarterly_financial_history)").fetchall()}
+                a_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(annual_eps_history)").fetchall()}
+                q_year_col = "fiscal_year" if "fiscal_year" in q_cols else ("year" if "year" in q_cols else "")
+                a_year_col = "fiscal_year" if "fiscal_year" in a_cols else ("year" if "year" in a_cols else "")
+                q_eps_expr = self._formal_eps_expr(q_cols, ["eps_quarter", "eps", "eps_cumulative"], "NULL")
+                a_eps_expr = self._formal_eps_expr(a_cols, ["eps_full_year", "annual_eps", "eps_cumulative", "eps"], "NULL")
+                q_eps_join_expr = self._formal_eps_expr_alias(q_cols, ["eps_quarter", "eps", "eps_cumulative"], "q", "NULL")
+                a_eps_join_expr = self._formal_eps_expr_alias(a_cols, ["eps_full_year", "annual_eps", "eps_cumulative", "eps"], "a", "NULL")
+                if not q_year_col or not a_year_col or q_eps_expr == "NULL" or a_eps_expr == "NULL" or "quarter" not in q_cols:
+                    stats["reason"] = f"schema_missing q_year={q_year_col} a_year={a_year_col} q_eps={q_eps_expr} a_eps={a_eps_expr} q_has_quarter={'quarter' in q_cols}"
+                    return stats
+
+                stats["q1_rows"] = int(cur.execute(
+                    f"SELECT COUNT(*) FROM quarterly_financial_history WHERE {q_year_col} IN (?, ?) AND quarter=1 AND {q_eps_expr} IS NOT NULL",
+                    (track_year, roc_track_year),
+                ).fetchone()[0] or 0)
+                stats["annual_rows"] = int(cur.execute(
+                    f"SELECT COUNT(*) FROM annual_eps_history WHERE {a_year_col} IN (?, ?) AND {a_eps_expr} IS NOT NULL",
+                    (base_year, roc_base_year),
+                ).fetchone()[0] or 0)
+                stats["join_rows"] = int(cur.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT q.stock_id)
+                    FROM quarterly_financial_history q
+                    JOIN annual_eps_history a ON q.stock_id=a.stock_id
+                    WHERE q.{q_year_col} IN (?, ?)
+                      AND q.quarter=1
+                      AND {q_eps_join_expr} IS NOT NULL
+                      AND a.{a_year_col} IN (?, ?)
+                      AND {a_eps_join_expr} IS NOT NULL
+                    """,
+                    (track_year, roc_track_year, base_year, roc_base_year),
+                ).fetchone()[0] or 0)
+        except Exception as exc:
+            stats["reason"] = f"exception={exc}"
+            return stats
+
+        reasons = []
+        if stats["q1_rows"] < int(min_q1_rows):
+            reasons.append(f"q1_rows<{int(min_q1_rows)}:{stats['q1_rows']}")
+        if stats["annual_rows"] < int(min_annual_rows):
+            reasons.append(f"annual_rows<{int(min_annual_rows)}:{stats['annual_rows']}")
+        if stats["join_rows"] < int(min_join_rows):
+            reasons.append(f"join_rows<{int(min_join_rows)}:{stats['join_rows']}")
+        stats["ready"] = not reasons
+        stats["reason"] = "PASS" if stats["ready"] else "; ".join(reasons)
+        return stats
+
+    def validate_ranking_formal_eps_landing(self, date_str: str | None = None) -> dict:
+        """R5N27A-FIX-05：ranking_result 寫入後正式 EPS 欄位落地驗收。"""
+        date_str = date_str or datetime.now().strftime("%Y-%m-%d")
+        out = {"status": "FAIL", "date": date_str, "total_rows": 0, "actual_q1_eps_nonnull": 0,
+               "annual_eps_nonnull": 0, "formal_eps_source_nonnull": 0, "ready_count": 0,
+               "grade_all_c": 1, "grade_distribution": {}, "reason": ""}
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(ranking_result)").fetchall()}
+                required = {"actual_q1_eps", "annual_eps", "formal_eps_source", "formal_eps_ready", "formal_eps_grade"}
+                missing = sorted(required - cols)
+                if missing:
+                    out["reason"] = "missing_columns=" + ",".join(missing)
+                    return out
+                row = cur.execute(
+                    """
+                    SELECT COUNT(*) total_rows,
+                           SUM(CASE WHEN actual_q1_eps IS NOT NULL THEN 1 ELSE 0 END) actual_q1_eps_nonnull,
+                           SUM(CASE WHEN annual_eps IS NOT NULL THEN 1 ELSE 0 END) annual_eps_nonnull,
+                           SUM(CASE WHEN COALESCE(formal_eps_source,'')<>'' THEN 1 ELSE 0 END) formal_eps_source_nonnull,
+                           SUM(CASE WHEN COALESCE(formal_eps_ready,0)=1 THEN 1 ELSE 0 END) ready_count
+                    FROM ranking_result WHERE date=?
+                    """,
+                    (date_str,),
+                ).fetchone()
+                if row:
+                    out.update({
+                        "total_rows": int(row[0] or 0),
+                        "actual_q1_eps_nonnull": int(row[1] or 0),
+                        "annual_eps_nonnull": int(row[2] or 0),
+                        "formal_eps_source_nonnull": int(row[3] or 0),
+                        "ready_count": int(row[4] or 0),
+                    })
+                grades = cur.execute("SELECT COALESCE(formal_eps_grade,'') grade, COUNT(*) cnt FROM ranking_result WHERE date=? GROUP BY COALESCE(formal_eps_grade,'')", (date_str,)).fetchall()
+                dist = {str(g[0] or ''): int(g[1] or 0) for g in grades}
+                out["grade_distribution"] = dist
+                out["grade_all_c"] = int(out["total_rows"] > 0 and int(dist.get("C", 0)) == out["total_rows"])
+        except Exception as exc:
+            out["reason"] = f"exception={exc}"
+            return out
+
+        fail = []
+        if out["total_rows"] <= 0:
+            fail.append("total_rows=0")
+        if out["actual_q1_eps_nonnull"] <= 0:
+            fail.append("actual_q1_eps_nonnull=0")
+        if out["annual_eps_nonnull"] <= 0:
+            fail.append("annual_eps_nonnull=0")
+        if out["formal_eps_source_nonnull"] <= 0:
+            fail.append("formal_eps_source_nonnull=0")
+        if out["grade_all_c"]:
+            fail.append("formal_eps_grade_all_C")
+        out["status"] = "PASS" if not fail else "FAIL"
+        out["reason"] = "PASS" if not fail else "; ".join(fail)
+        return out
+
+    def _load_r5n26j_formal_eps_gate_map(self, base_year: int | None = None, track_year: int | None = None):
         """R5N27 FIX：讀取 Ranking 正式 EPS 所需的 actual_q1_eps / annual_eps，並改為 breakout_ratio 分級。
 
         核心規則：
@@ -15509,7 +15690,9 @@ class RankingEngine:
         with self.db.lock:
             cur = self.db.conn.cursor()
             if not _table_exists(cur, "quarterly_financial_history") or not _table_exists(cur, "annual_eps_history"):
-                return {}
+                reason = "missing quarterly_financial_history or annual_eps_history"
+                log_warning(f"[R5N27][FORMAL_EPS_MAP_LOAD] map_rows=0 ready=0 reason={reason}")
+                return self.FormalEPSMapResult({}, False, reason, {"map_rows": 0})
             q_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(quarterly_financial_history)").fetchall()}
             a_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(annual_eps_history)").fetchall()}
             q_market_expr = "COALESCE(market_type,'')" if "market_type" in q_cols else "''"
@@ -15546,7 +15729,10 @@ class RankingEngine:
             )
 
         if q_df is None or q_df.empty or a_df is None or a_df.empty:
-            return {}
+            stats = {"q1_rows": int(0 if q_df is None else len(q_df)), "annual_rows": int(0 if a_df is None else len(a_df)), "join_rows": 0, "map_rows": 0}
+            reason = f"source_empty q1_rows={stats['q1_rows']} annual_rows={stats['annual_rows']}"
+            log_warning(f"[R5N27][FORMAL_EPS_MAP_LOAD] map_rows=0 ready=0 reason={reason}")
+            return self.FormalEPSMapResult({}, False, reason, stats)
 
         q_df = q_df.copy()
         a_df = a_df.copy()
@@ -15613,6 +15799,15 @@ class RankingEngine:
             + x.get("annual_eps_source", "").fillna("").astype(str)
         )
         out = {}
+        map_stats = {
+            "q1_rows": int(len(q_df)),
+            "annual_rows": int(len(a_df)),
+            "join_rows": int(x["actual_q1_eps"].notna().fillna(False).astype(bool).sum() if "actual_q1_eps" in x.columns else 0),
+            "map_rows": int(len(x)),
+            "ready_count": int(x["formal_eps_ready"].fillna(False).astype(bool).sum()),
+            "pass_count": int(x["formal_eps_pass"].fillna(False).astype(bool).sum()),
+        }
+        out = {}
         for _, r in x.iterrows():
             sid = str(r.get("stock_id") or "")
             if not sid:
@@ -15630,7 +15825,11 @@ class RankingEngine:
                 "formal_eps_block_reason": str(r.get("formal_eps_block_reason") or ""),
                 "formal_eps_source": str(r.get("formal_eps_source") or ""),
             }
-        return out
+        map_stats["fail_count"] = int(map_stats.get("map_rows", 0) - map_stats.get("pass_count", 0))
+        ready = bool(map_stats.get("map_rows", 0) > 0 and map_stats.get("ready_count", 0) > 0)
+        reason = "PASS" if ready else f"map_not_ready stats={map_stats}"
+        log_info(f"[R5N27][FORMAL_EPS_MAP_LOAD] map_rows={map_stats.get('map_rows',0)} ready_count={map_stats.get('ready_count',0)} pass_count={map_stats.get('pass_count',0)} fail_count={map_stats.get('fail_count',0)} ready={int(ready)} reason={reason}")
+        return self.FormalEPSMapResult(out, ready, reason, map_stats)
 
     def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None):
         master = self.db.get_master()
@@ -15679,7 +15878,28 @@ class RankingEngine:
         # 不使用 EPS_TTM 當 TOP20 主排序來源，EPS_TTM 僅保留 PE/PEG。
         _track_year_for_formal_eps = datetime.now().year
         _base_year_for_formal_eps = _track_year_for_formal_eps - 1
+        preflight = self.validate_formal_eps_sources_ready(base_year=_base_year_for_formal_eps, track_year=_track_year_for_formal_eps)
+        pre_msg = (
+            f"[R5N27][FORMAL_EPS_PREFLIGHT] ready={int(bool(preflight.get('ready')))} "
+            f"q1_rows={preflight.get('q1_rows',0)} annual_rows={preflight.get('annual_rows',0)} "
+            f"join_rows={preflight.get('join_rows',0)} reason={preflight.get('reason','')}"
+        )
+        if log_cb:
+            log_cb(pre_msg)
+        log_info(f"{pre_msg}｜run_id={run_id}")
+        if not bool(preflight.get("ready")):
+            self.db.log_system_run(event="formal_eps_preflight", status="failed", message=pre_msg, run_id=run_id, module="ranking")
+            raise RuntimeError("R5N27 formal EPS source not ready; skip ranking_result rebuild. " + str(preflight.get("reason", "")))
+
         formal_eps_map = self._load_r5n26j_formal_eps_gate_map(base_year=_base_year_for_formal_eps, track_year=_track_year_for_formal_eps)
+        if (not formal_eps_map) or (not bool(getattr(formal_eps_map, "ready", False))):
+            fail_msg = f"[R5N27][FORMAL_EPS_MAP_LOAD][FAIL] map_rows={len(formal_eps_map) if formal_eps_map else 0} reason={getattr(formal_eps_map, 'reason', 'formal_eps_map empty')} stats={getattr(formal_eps_map, 'stats', {})}"
+            if log_cb:
+                log_cb(fail_msg)
+            log_warning(f"{fail_msg}｜run_id={run_id}")
+            self.db.log_system_run(event="formal_eps_map_load", status="failed", message=fail_msg, run_id=run_id, module="ranking")
+            raise RuntimeError("R5N27 formal_eps_map empty; skip ranking_result rebuild")
+
         formal_pass_count = int(sum(int(v.get("formal_eps_pass", 0)) for v in formal_eps_map.values())) if formal_eps_map else 0
         formal_ready_count = int(sum(int(v.get("formal_eps_ready", 0)) for v in formal_eps_map.values())) if formal_eps_map else 0
         grade_counts = {g: int(sum(1 for v in formal_eps_map.values() if str(v.get("formal_eps_grade", "C")) == g)) for g in ["S", "A", "B", "C"]}
@@ -15790,9 +16010,31 @@ class RankingEngine:
         top20_c = int(top20.get("formal_eps_grade", pd.Series(dtype=str)).fillna("C").astype(str).eq("C").sum()) if not top20.empty else 0
         if log_cb:
             log_cb(f"[R5N27][TOP20_FORMAL_EPS_GRADE_CHECK] TOP20 S/A={top20_sa}/20｜S/A/B={top20_sab}/20｜C={top20_c}/20｜目標=S/A/B>=16且C=0")
+
+        # R5N27A-FIX-05：寫入前先做 DataFrame landing 預驗收，避免全 C/空值覆蓋既有 ranking_result。
+        prewrite_actual = int(pd.to_numeric(df.get("actual_q1_eps"), errors="coerce").notna().sum()) if "actual_q1_eps" in df.columns else 0
+        prewrite_annual = int(pd.to_numeric(df.get("annual_eps"), errors="coerce").notna().sum()) if "annual_eps" in df.columns else 0
+        prewrite_source = int(df.get("formal_eps_source", pd.Series(dtype=str)).fillna("").astype(str).str.strip().ne("").sum()) if "formal_eps_source" in df.columns else 0
+        prewrite_all_c = bool(len(df) > 0 and df.get("formal_eps_grade", pd.Series(dtype=str)).fillna("C").astype(str).eq("C").sum() == len(df))
+        if prewrite_actual <= 0 or prewrite_annual <= 0 or prewrite_source <= 0 or prewrite_all_c:
+            fail_msg = f"[R5N27][LANDING_VALIDATE][PREWRITE_FAIL] total={len(df)} actual_nonnull={prewrite_actual} annual_nonnull={prewrite_annual} source_nonnull={prewrite_source} all_c={int(prewrite_all_c)}"
+            if log_cb:
+                log_cb(fail_msg)
+            log_warning(f"{fail_msg}｜run_id={run_id}")
+            self.db.log_system_run(event="formal_eps_landing_validate", status="failed", message=fail_msg, run_id=run_id, module="ranking")
+            raise RuntimeError("R5N27 ranking_result formal EPS prewrite landing failed; skip DB overwrite")
+
         self.db.replace_ranking(df)
+        landing = self.validate_ranking_formal_eps_landing(today)
+        land_msg = f"[R5N27][LANDING_VALIDATE] status={landing.get('status')} total={landing.get('total_rows')} actual_nonnull={landing.get('actual_q1_eps_nonnull')} source_nonnull={landing.get('formal_eps_source_nonnull')} all_c={landing.get('grade_all_c')} grades={landing.get('grade_distribution')} reason={landing.get('reason')}"
+        if log_cb:
+            log_cb(land_msg)
+        log_info(f"{land_msg}｜run_id={run_id}")
+        if landing.get("status") != "PASS":
+            self.db.log_system_run(event="formal_eps_landing_validate", status="failed", message=land_msg, run_id=run_id, module="ranking")
+            raise RuntimeError("R5N27 ranking_result formal EPS landing failed: " + str(landing.get("reason", "")))
         status = "ok" if (top20_sab >= min(16, len(top20)) and top20_c == 0) else "warning"
-        self.db.log_system_run(event="ranking_rebuild", status=status, message=f"ranking rows={len(df)} with R5N27_BREAKOUT_RATIO_GRADE; top20_SA={top20_sa}; top20_SAB={top20_sab}; top20_C={top20_c}", run_id=run_id, module="ranking")
+        self.db.log_system_run(event="ranking_rebuild", status=status, message=f"ranking rows={len(df)} with R5N27_BREAKOUT_RATIO_GRADE; top20_SA={top20_sa}; top20_SAB={top20_sab}; top20_C={top20_c}; landing={landing.get('status')}", run_id=run_id, module="ranking")
         return len(df)
 
 
@@ -15800,6 +16042,36 @@ class RankingEngine:
 
 
 
+
+def rebuild_ranking_after_formal_eps_ready(db: DBManager, reason: str = "", progress_cb=None, log_cb=None, force: bool = True) -> dict:
+    """R5N27A-FIX-04：EPS 補齊 PASS 後自動重建 ranking_result。
+
+    用於 actual_q1_eps cache updated / EPS verify PASS 後，避免 EPS 表已補齊但 ranking_result 停留在舊的全 C 空值狀態。
+    """
+    result = {"triggered": 0, "status": "skip", "reason": reason or "", "ranking_rows": 0, "preflight": {}}
+    try:
+        if os.getenv("GTC_R5N27_AUTO_REBUILD_RANKING_AFTER_EPS", "1").strip() != "1":
+            result.update({"status": "disabled", "reason": "GTC_R5N27_AUTO_REBUILD_RANKING_AFTER_EPS!=1"})
+            log_info(f"[R5N27][POST_EPS_REBUILD] triggered=0 status=disabled reason={result['reason']}")
+            return result
+        engine = RankingEngine(db)
+        track_year = datetime.now().year
+        base_year = track_year - 1
+        pre = engine.validate_formal_eps_sources_ready(base_year=base_year, track_year=track_year)
+        result["preflight"] = pre
+        if not bool(pre.get("ready")):
+            result.update({"status": "skip_not_ready", "reason": pre.get("reason", "formal EPS source not ready")})
+            log_warning(f"[R5N27][POST_EPS_REBUILD] triggered=0 status=skip_not_ready reason={result['reason']} preflight={pre}")
+            return result
+        log_info(f"[R5N27][POST_EPS_REBUILD] triggered=1 reason={reason} preflight={pre}")
+        rows = engine.rebuild(progress_cb=progress_cb, log_cb=log_cb)
+        result.update({"triggered": 1, "status": "rebuilt", "ranking_rows": int(rows or 0), "reason": reason or "eps_verify_pass"})
+        log_info(f"[R5N27][POST_EPS_REBUILD] status=rebuilt rows={rows} reason={reason}")
+        return result
+    except Exception as exc:
+        result.update({"triggered": 1, "status": "error", "reason": str(exc)})
+        log_warning(f"[R5N27][POST_EPS_REBUILD] status=error reason={exc}")
+        return result
 
 
 
