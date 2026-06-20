@@ -3572,6 +3572,19 @@ class DBManager:
             ("revenue_eps_score", "revenue_eps_score REAL DEFAULT 50"),
             ("data_quality_flag", "data_quality_flag TEXT"),
             ("source_trace_json", "source_trace_json TEXT"),
+            # R5N27 FIX：Ranking 正式 EPS 分級化，避免 TOP20 被 EPS_TTM 舊欄位污染。
+            ("actual_q1_eps", "actual_q1_eps REAL"),
+            ("annual_eps", "annual_eps REAL"),
+            ("formal_eps_ready", "formal_eps_ready INTEGER DEFAULT 0"),
+            ("formal_eps_pass", "formal_eps_pass INTEGER DEFAULT 0"),
+            ("formal_double_verified", "formal_double_verified INTEGER DEFAULT 0"),
+            ("formal_eps_ratio", "formal_eps_ratio REAL"),
+            ("breakout_ratio", "breakout_ratio REAL"),
+            ("formal_eps_grade", "formal_eps_grade TEXT DEFAULT ''"),
+            ("formal_eps_score", "formal_eps_score REAL DEFAULT 0"),
+            ("formal_eps_block_reason", "formal_eps_block_reason TEXT DEFAULT ''"),
+            ("formal_eps_source", "formal_eps_source TEXT DEFAULT ''"),
+            ("ranking_source", "ranking_source TEXT DEFAULT ''"),
         ]:
             _add("ranking_result", col, ddl)
 
@@ -3976,6 +3989,26 @@ class DBManager:
         today = datetime.now().strftime("%Y-%m-%d")
         with self.lock:
             cur = self.conn.cursor()
+            # R5N27 FIX：舊 DB 可能尚未有 breakout_ratio / SABC 欄位，寫入 ranking_result 前先補齊 schema。
+            for _col, _ddl in [
+                ("actual_q1_eps", "actual_q1_eps REAL"),
+                ("annual_eps", "annual_eps REAL"),
+                ("formal_eps_ready", "formal_eps_ready INTEGER DEFAULT 0"),
+                ("formal_eps_pass", "formal_eps_pass INTEGER DEFAULT 0"),
+                ("formal_double_verified", "formal_double_verified INTEGER DEFAULT 0"),
+                ("formal_eps_ratio", "formal_eps_ratio REAL"),
+                ("breakout_ratio", "breakout_ratio REAL"),
+                ("formal_eps_grade", "formal_eps_grade TEXT DEFAULT ''"),
+                ("formal_grade_rank", "formal_grade_rank INTEGER DEFAULT 0"),
+                ("formal_eps_score", "formal_eps_score REAL DEFAULT 0"),
+                ("formal_eps_block_reason", "formal_eps_block_reason TEXT DEFAULT ''"),
+                ("formal_eps_source", "formal_eps_source TEXT DEFAULT ''"),
+                ("ranking_source", "ranking_source TEXT DEFAULT ''"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE ranking_result ADD COLUMN {_ddl}")
+                except Exception:
+                    pass
             cur.execute("DELETE FROM ranking_result WHERE date=?", (today,))
             self.conn.commit()
             df.to_sql("ranking_result", self.conn, if_exists="append", index=False)
@@ -15256,6 +15289,161 @@ class RankingEngine:
     def __init__(self, db: DBManager):
         self.db = db
 
+    def _load_r5n26j_formal_eps_gate_map(self, base_year: int | None = None, track_year: int | None = None) -> dict:
+        """R5N27 FIX：讀取 Ranking 正式 EPS 所需的 actual_q1_eps / annual_eps，並改為 breakout_ratio 分級。
+
+        核心規則：
+        - actual_q1_eps：quarterly_financial_history 的 track_year Q1 實際 EPS。
+        - annual_eps：annual_eps_history 的 base_year 全年 EPS。
+        - breakout_ratio：actual_q1_eps / annual_eps。
+        - formal_eps_grade：S/A/B/C，不再以 actual_q1_eps > annual_eps 作為唯一生死線。
+
+        分級：
+        - S：ratio >= 1.00，已超越去年全年。
+        - A：0.80 <= ratio < 1.00，接近超越，屬高潛力。
+        - B：0.60 <= ratio < 0.80，觀察候選，需 Revenue/技術/法人共同確認。
+        - C：ratio < 0.60 或資料不可計算，降權但不以 EPS_TTM 補位。
+
+        注意：本函式明確不使用 EPS_TTM；EPS_TTM 僅可保留在 PE/PEG 估值用途。
+        """
+        base_year = int(base_year or (datetime.now().year - 1))
+        track_year = int(track_year or datetime.now().year)
+        roc_base_year = base_year - 1911
+        roc_track_year = track_year - 1911
+
+        def _table_exists(cur, table: str) -> bool:
+            try:
+                row = cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                return bool(row)
+            except Exception:
+                return False
+
+        with self.db.lock:
+            cur = self.db.conn.cursor()
+            if not _table_exists(cur, "quarterly_financial_history") or not _table_exists(cur, "annual_eps_history"):
+                return {}
+            q_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(quarterly_financial_history)").fetchall()}
+            a_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(annual_eps_history)").fetchall()}
+            q_market_expr = "COALESCE(market_type,'')" if "market_type" in q_cols else "''"
+            q_source_expr = "COALESCE(source_type,'quarterly_financial_history')" if "source_type" in q_cols else "'quarterly_financial_history'"
+            q_source_date_expr = "COALESCE(source_date,'')" if "source_date" in q_cols else "''"
+            q_eps_expr = "COALESCE(eps_quarter, eps, eps_cumulative)"
+            q_df = pd.read_sql_query(
+                f"""
+                SELECT stock_id, {q_market_expr} AS market_type, fiscal_year, quarter,
+                       {q_eps_expr} AS actual_q1_eps, {q_source_expr} AS actual_q1_source,
+                       {q_source_date_expr} AS actual_q1_source_date
+                FROM quarterly_financial_history
+                WHERE fiscal_year IN (?, ?)
+                  AND quarter = 1
+                  AND {q_eps_expr} IS NOT NULL
+                """,
+                self.db.conn,
+                params=[track_year, roc_track_year],
+            )
+            a_market_expr = "COALESCE(market_type,'')" if "market_type" in a_cols else "''"
+            a_source_expr = "COALESCE(source_type,'annual_eps_history')" if "source_type" in a_cols else "'annual_eps_history'"
+            a_source_date_expr = "COALESCE(source_date,'')" if "source_date" in a_cols else "''"
+            a_df = pd.read_sql_query(
+                f"""
+                SELECT stock_id, {a_market_expr} AS market_type, fiscal_year,
+                       eps_full_year AS annual_eps, {a_source_expr} AS annual_eps_source,
+                       {a_source_date_expr} AS annual_eps_source_date
+                FROM annual_eps_history
+                WHERE fiscal_year IN (?, ?)
+                  AND eps_full_year IS NOT NULL
+                """,
+                self.db.conn,
+                params=[base_year, roc_base_year],
+            )
+
+        if q_df is None or q_df.empty or a_df is None or a_df.empty:
+            return {}
+
+        q_df = q_df.copy()
+        a_df = a_df.copy()
+        q_df["stock_id"] = q_df["stock_id"].map(normalize_stock_id).astype(str)
+        a_df["stock_id"] = a_df["stock_id"].map(normalize_stock_id).astype(str)
+        q_df["actual_q1_eps"] = pd.to_numeric(q_df["actual_q1_eps"], errors="coerce")
+        a_df["annual_eps"] = pd.to_numeric(a_df["annual_eps"], errors="coerce")
+        q_df = q_df.dropna(subset=["stock_id", "actual_q1_eps"]).sort_values(["stock_id", "actual_q1_source_date"]).drop_duplicates("stock_id", keep="last")
+        a_df = a_df.dropna(subset=["stock_id", "annual_eps"]).sort_values(["stock_id", "annual_eps_source_date"]).drop_duplicates("stock_id", keep="last")
+
+        x = q_df.merge(a_df, on="stock_id", how="outer", suffixes=("_q1", "_annual"))
+        # R5N27：不再用 actual_q1_eps > annual_eps 當唯一生死線；改用 breakout_ratio 分級。
+        # annual_eps <= 0 時 ratio 無法代表可比性，歸 C 級並標示原因，避免負 EPS 造成倍率失真。
+        x["formal_eps_ready"] = x["actual_q1_eps"].notna() & x["annual_eps"].notna() & x["annual_eps"].gt(0) & x["actual_q1_eps"].gt(0)
+        x["formal_eps_ratio"] = np.where(
+            x["formal_eps_ready"],
+            x["actual_q1_eps"] / x["annual_eps"].replace(0, np.nan),
+            np.nan,
+        )
+        x["breakout_ratio"] = x["formal_eps_ratio"]
+        x["formal_eps_grade"] = np.select(
+            [
+                x["formal_eps_ready"] & x["formal_eps_ratio"].ge(1.00),
+                x["formal_eps_ready"] & x["formal_eps_ratio"].ge(0.80),
+                x["formal_eps_ready"] & x["formal_eps_ratio"].ge(0.60),
+            ],
+            ["S", "A", "B"],
+            default="C",
+        )
+        # S/A/B 都屬正式 EPS 候選；S/A 屬高可信 double verified。C 不淘汰，但排序降權，不可由 EPS_TTM 補位。
+        x["formal_eps_pass"] = x["formal_eps_grade"].isin(["S", "A", "B"])
+        x["formal_double_verified"] = x["formal_eps_grade"].isin(["S", "A"])
+        x["formal_eps_score"] = np.where(
+            x["formal_eps_ready"],
+            np.clip(x["formal_eps_ratio"].fillna(0) * 100, 0, 180),
+            0,
+        )
+        x["formal_eps_block_reason"] = np.select(
+            [
+                x["actual_q1_eps"].isna(),
+                x["annual_eps"].isna(),
+                x["annual_eps"].le(0),
+                x["actual_q1_eps"].le(0),
+                x["formal_eps_grade"].eq("S"),
+                x["formal_eps_grade"].eq("A"),
+                x["formal_eps_grade"].eq("B"),
+                x["formal_eps_grade"].eq("C"),
+            ],
+            [
+                "缺 actual_q1_eps",
+                "缺 annual_eps",
+                "annual_eps <= 0，ratio不可比",
+                "actual_q1_eps <= 0",
+                "S: Q1已超越去年全年",
+                "A: Q1達去年全年80%~100%",
+                "B: Q1達去年全年60%~80%",
+                "C: Q1未達去年全年60%，降權",
+            ],
+            default="C: 資料不足或不可比，降權",
+        )
+        x["formal_eps_source"] = (
+            x.get("actual_q1_source", "").fillna("").astype(str)
+            + " + "
+            + x.get("annual_eps_source", "").fillna("").astype(str)
+        )
+        out = {}
+        for _, r in x.iterrows():
+            sid = str(r.get("stock_id") or "")
+            if not sid:
+                continue
+            out[sid] = {
+                "actual_q1_eps": float(r["actual_q1_eps"]) if pd.notna(r.get("actual_q1_eps")) else np.nan,
+                "annual_eps": float(r["annual_eps"]) if pd.notna(r.get("annual_eps")) else np.nan,
+                "formal_eps_ready": int(bool(r.get("formal_eps_ready"))),
+                "formal_eps_pass": int(bool(r.get("formal_eps_pass"))),
+                "formal_double_verified": int(bool(r.get("formal_double_verified"))),
+                "formal_eps_ratio": float(r["formal_eps_ratio"]) if pd.notna(r.get("formal_eps_ratio")) else np.nan,
+                "breakout_ratio": float(r["breakout_ratio"]) if pd.notna(r.get("breakout_ratio")) else np.nan,
+                "formal_eps_grade": str(r.get("formal_eps_grade") or "C"),
+                "formal_eps_score": float(r["formal_eps_score"]) if pd.notna(r.get("formal_eps_score")) else 0.0,
+                "formal_eps_block_reason": str(r.get("formal_eps_block_reason") or ""),
+                "formal_eps_source": str(r.get("formal_eps_source") or ""),
+            }
+        return out
+
     def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None):
         master = self.db.get_master()
         today = datetime.now().strftime("%Y-%m-%d")
@@ -15298,6 +15486,25 @@ class RankingEngine:
             log_warning(f"[EPS MATRIX][MERGE] run_id={run_id} features=0; local cache missing")
             self.db.log_system_run(event="financial_feature_quality_gate", status="warning", message="financial_feature_daily missing; ranking uses neutral financial score", run_id=run_id, module="eps_matrix")
 
+        # R5N27 FIX：Ranking 正式 EPS 分級化。
+        # 只讀 quarterly_financial_history Q1 與 annual_eps_history 全年 EPS；用 breakout_ratio 分 S/A/B/C。
+        # 不使用 EPS_TTM 當 TOP20 主排序來源，EPS_TTM 僅保留 PE/PEG。
+        _track_year_for_formal_eps = datetime.now().year
+        _base_year_for_formal_eps = _track_year_for_formal_eps - 1
+        formal_eps_map = self._load_r5n26j_formal_eps_gate_map(base_year=_base_year_for_formal_eps, track_year=_track_year_for_formal_eps)
+        formal_pass_count = int(sum(int(v.get("formal_eps_pass", 0)) for v in formal_eps_map.values())) if formal_eps_map else 0
+        formal_ready_count = int(sum(int(v.get("formal_eps_ready", 0)) for v in formal_eps_map.values())) if formal_eps_map else 0
+        grade_counts = {g: int(sum(1 for v in formal_eps_map.values() if str(v.get("formal_eps_grade", "C")) == g)) for g in ["S", "A", "B", "C"]}
+        msg = f"[R5N27][RANKING_FORMAL_EPS_GRADE] base_year={_base_year_for_formal_eps} track_year={_track_year_for_formal_eps} ready={formal_ready_count} S/A/B/C={grade_counts}｜EPS_TTM僅保留PE/PEG，不作TOP20主排序"
+        if log_cb:
+            log_cb(msg)
+        log_info(f"{msg}｜run_id={run_id}")
+        if formal_pass_count < 20:
+            warn = f"[R5N27][RANKING_FORMAL_EPS_GRADE][WARNING] S/A/B候選={formal_pass_count}<20，TOP20可能不足20檔正式EPS候選；請先修EPS/Annual EPS資料。"
+            if log_cb:
+                log_cb(warn)
+            log_warning(f"{warn}｜run_id={run_id}")
+
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷重建排行")
@@ -15312,23 +15519,60 @@ class RankingEngine:
             score = StrategyEngineV91.score(hist)
             technical_total = float(score.get("total_score", 0) or 0)
             feat = feature_map.get(stock_id, {})
+            formal = formal_eps_map.get(stock_id, {})
             revenue_eps_score = float(pd.to_numeric(pd.Series([feat.get("revenue_eps_score", 50)]), errors="coerce").fillna(50).iloc[0])
-            valuation_score = float(pd.to_numeric(pd.Series([feat.get("revenue_eps_score", 50)]), errors="coerce").fillna(50).iloc[0])
             liquidity_score = float(score.get("volume_score", 0) or 0)
             theme_score = float(score.get("ai_score", 0) or 0)
-            final_total = round(
-                technical_total * 0.50 +
-                revenue_eps_score * 0.20 +
-                valuation_score * 0.10 +
-                liquidity_score * 0.10 +
-                theme_score * 0.10,
-                2
-            )
+            formal_eps_score = float(pd.to_numeric(pd.Series([formal.get("formal_eps_score", 0)]), errors="coerce").fillna(0).iloc[0])
+            formal_eps_pass = int(formal.get("formal_eps_pass", 0) or 0)
+            formal_double_verified = int(formal.get("formal_double_verified", 0) or 0)
+            formal_eps_grade = str(formal.get("formal_eps_grade", "C") or "C")
+            formal_grade_rank = {"S": 3, "A": 2, "B": 1, "C": 0}.get(formal_eps_grade, 0)
+
+            # R5N27 FIX：Ranking 主排序改吃 breakout_ratio 分級，不再以 Q1 > 全年作唯一生死線。
+            # EPS_TTM 不再貢獻 total_score；僅保留欄位供 PE/PEG 或追溯查核。
+            if formal_eps_grade in ("S", "A"):
+                # S/A：正式高可信候選，EPS爆發倍率仍為主因子。
+                final_total = round(
+                    technical_total * 0.30 +
+                    formal_eps_score * 0.35 +
+                    revenue_eps_score * 0.20 +
+                    liquidity_score * 0.05 +
+                    theme_score * 0.10,
+                    2
+                )
+            elif formal_eps_grade == "B":
+                # B：保留潛在黑馬，不一刀切；但 EPS 權重較低，需靠營收/技術/法人共同確認。
+                final_total = round(
+                    technical_total * 0.25 +
+                    formal_eps_score * 0.25 +
+                    revenue_eps_score * 0.25 +
+                    liquidity_score * 0.05 +
+                    theme_score * 0.10,
+                    2
+                )
+            else:
+                # C：不使用 EPS_TTM 補位，僅保留低權重排序，避免污染 TOP20 前段。
+                final_total = round(min(technical_total * 0.15 + revenue_eps_score * 0.10 + theme_score * 0.05, 29.99), 2)
+
             score["technical_total_score"] = round(technical_total, 2)
-            score["financial_score"] = round(revenue_eps_score, 2)
+            score["financial_score"] = round(formal_eps_score, 2)
             score["total_score"] = final_total
             for c in ["eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "source_trace_json"]:
                 score[c] = feat.get(c, np.nan if c in ["eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score"] else "")
+            score["actual_q1_eps"] = formal.get("actual_q1_eps", np.nan)
+            score["annual_eps"] = formal.get("annual_eps", np.nan)
+            score["formal_eps_ready"] = int(formal.get("formal_eps_ready", 0) or 0)
+            score["formal_eps_pass"] = formal_eps_pass
+            score["formal_double_verified"] = formal_double_verified
+            score["formal_eps_ratio"] = formal.get("formal_eps_ratio", np.nan)
+            score["breakout_ratio"] = formal.get("breakout_ratio", np.nan)
+            score["formal_eps_grade"] = formal_eps_grade
+            score["formal_grade_rank"] = formal_grade_rank
+            score["formal_eps_score"] = formal_eps_score
+            score["formal_eps_block_reason"] = formal.get("formal_eps_block_reason", "缺正式EPS資料")
+            score["formal_eps_source"] = formal.get("formal_eps_source", "")
+            score["ranking_source"] = "R5N27_BREAKOUT_RATIO_GRADE"
             rows.append({
                 "date": today,
                 "stock_id": stock_id,
@@ -15344,12 +15588,23 @@ class RankingEngine:
         if not rows:
             return 0
 
-        df = pd.DataFrame(rows).sort_values(["total_score", "ai_score"], ascending=[False, False]).reset_index(drop=True)
+        df = pd.DataFrame(rows)
+        # R5N27 FIX：S/A/B/C 分級排序；S/A優先，B保留潛在黑馬，C降權。避免 EPS_TTM/舊矩陣分數污染 TOP20。
+        if "formal_grade_rank" not in df.columns:
+            df["formal_grade_rank"] = df.get("formal_eps_grade", "C").map({"S": 3, "A": 2, "B": 1, "C": 0}).fillna(0)
+        df = df.sort_values(["formal_grade_rank", "formal_double_verified", "formal_eps_pass", "total_score", "ai_score"], ascending=[False, False, False, False, False]).reset_index(drop=True)
         df["rank_all"] = np.arange(1, len(df) + 1)
         merged = df.merge(master[["stock_id", "industry"]], on="stock_id", how="left")
         df["rank_industry"] = merged.groupby("industry")["total_score"].rank(method="dense", ascending=False).astype(int)
+        top20 = df.head(20)
+        top20_sa = int(pd.to_numeric(top20.get("formal_double_verified"), errors="coerce").fillna(0).eq(1).sum()) if not top20.empty else 0
+        top20_sab = int(pd.to_numeric(top20.get("formal_eps_pass"), errors="coerce").fillna(0).eq(1).sum()) if not top20.empty else 0
+        top20_c = int(top20.get("formal_eps_grade", pd.Series(dtype=str)).fillna("C").astype(str).eq("C").sum()) if not top20.empty else 0
+        if log_cb:
+            log_cb(f"[R5N27][TOP20_FORMAL_EPS_GRADE_CHECK] TOP20 S/A={top20_sa}/20｜S/A/B={top20_sab}/20｜C={top20_c}/20｜目標=S/A/B>=16且C=0")
         self.db.replace_ranking(df)
-        self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with FUNDAMENTAL_LOCAL_CACHE", run_id=run_id, module="ranking")
+        status = "ok" if (top20_sab >= min(16, len(top20)) and top20_c == 0) else "warning"
+        self.db.log_system_run(event="ranking_rebuild", status=status, message=f"ranking rows={len(df)} with R5N27_BREAKOUT_RATIO_GRADE; top20_SA={top20_sa}; top20_SAB={top20_sab}; top20_C={top20_c}", run_id=run_id, module="ranking")
         return len(df)
 
 
