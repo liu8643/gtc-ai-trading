@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.24-R5N27A_FORMAL_EPS_PREFLIGHT_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.25-R5N27B_FORMAL_EPS_DAILY_UPDATE_PIPELINE_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3685,7 +3685,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.24_r5n27a_formal_eps_preflight_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.25_r5n27b_formal_eps_daily_update_pipeline_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -3985,11 +3985,54 @@ class DBManager:
             row = self.conn.cursor().execute("SELECT COUNT(*) FROM ranking_result WHERE date = (SELECT MAX(date) FROM ranking_result)").fetchone()
         return int(row[0]) if row and row[0] is not None else 0
 
-    def replace_ranking(self, df: pd.DataFrame):
+    def validate_ranking_df_before_replace(self, df: pd.DataFrame, require_formal_eps: bool = True) -> dict:
+        """R5N27B-03：ranking_result 寫入前最後防線。
+
+        重點：先驗證 DataFrame，通過後才允許 DELETE 今日 ranking_result。
+        避免 formal_eps_map 空值、actual_q1_eps/annual_eps 全空、或 formal_eps_grade 全 C 覆蓋舊排行。
+        """
+        out = {"pass": True, "status": "PASS", "reason": "PASS", "rows": 0,
+               "actual_nonnull": 0, "annual_nonnull": 0, "source_nonnull": 0, "all_c": 0}
+        try:
+            if df is None or getattr(df, "empty", True):
+                out.update({"pass": False, "status": "FAIL", "reason": "ranking_df_empty"})
+                return out
+            out["rows"] = int(len(df))
+            if not require_formal_eps:
+                return out
+            required = {"actual_q1_eps", "annual_eps", "formal_eps_grade", "formal_eps_source"}
+            missing = sorted(required - set(df.columns))
+            if missing:
+                out.update({"pass": False, "status": "FAIL", "reason": "missing_formal_columns=" + ",".join(missing)})
+                return out
+            actual_nonnull = int(pd.to_numeric(df.get("actual_q1_eps"), errors="coerce").notna().sum())
+            annual_nonnull = int(pd.to_numeric(df.get("annual_eps"), errors="coerce").notna().sum())
+            source_nonnull = int(df.get("formal_eps_source", pd.Series(dtype=str)).fillna("").astype(str).str.strip().ne("").sum())
+            grade_series = df.get("formal_eps_grade", pd.Series(dtype=str)).fillna("C").astype(str).str.strip().replace("", "C")
+            all_c = bool(len(df) > 0 and grade_series.eq("C").sum() == len(df))
+            out.update({"actual_nonnull": actual_nonnull, "annual_nonnull": annual_nonnull,
+                        "source_nonnull": source_nonnull, "all_c": int(all_c)})
+            reasons = []
+            if actual_nonnull <= 0:
+                reasons.append("actual_q1_eps_nonnull=0")
+            if annual_nonnull <= 0:
+                reasons.append("annual_eps_nonnull=0")
+            if source_nonnull <= 0:
+                reasons.append("formal_eps_source_nonnull=0")
+            if all_c:
+                reasons.append("formal_eps_grade_all_C")
+            if reasons:
+                out.update({"pass": False, "status": "FAIL", "reason": "; ".join(reasons)})
+            return out
+        except Exception as exc:
+            out.update({"pass": False, "status": "FAIL", "reason": f"exception={exc}"})
+            return out
+
+    def replace_ranking(self, df: pd.DataFrame, require_formal_eps: bool = True):
         today = datetime.now().strftime("%Y-%m-%d")
         with self.lock:
             cur = self.conn.cursor()
-            # R5N27 FIX：舊 DB 可能尚未有 breakout_ratio / SABC 欄位，寫入 ranking_result 前先補齊 schema。
+            # R5N27B FIX：舊 DB 可能尚未有 breakout_ratio / SABC 欄位，寫入 ranking_result 前先補齊 schema。
             for _col, _ddl in [
                 ("actual_q1_eps", "actual_q1_eps REAL"),
                 ("annual_eps", "annual_eps REAL"),
@@ -4009,10 +4052,22 @@ class DBManager:
                     cur.execute(f"ALTER TABLE ranking_result ADD COLUMN {_ddl}")
                 except Exception:
                     pass
+            guard = self.validate_ranking_df_before_replace(df, require_formal_eps=require_formal_eps)
+            if not bool(guard.get("pass")):
+                msg = f"[R5N27B][RANKING_REPLACE_GUARD] status=FAIL rows={guard.get('rows')} actual={guard.get('actual_nonnull')} annual={guard.get('annual_nonnull')} source={guard.get('source_nonnull')} all_c={guard.get('all_c')} reason={guard.get('reason')}"
+                log_warning(msg)
+                try:
+                    self.log_system_run(event="ranking_replace_guard", status="failed", message=msg, module="ranking")
+                except Exception:
+                    pass
+                return {"status": "skip_guard_fail", "rows": 0, "guard": guard, "message": msg}
+            msg = f"[R5N27B][RANKING_REPLACE_GUARD] status=PASS rows={guard.get('rows')} actual={guard.get('actual_nonnull')} annual={guard.get('annual_nonnull')} source={guard.get('source_nonnull')} all_c={guard.get('all_c')}"
+            log_info(msg)
             cur.execute("DELETE FROM ranking_result WHERE date=?", (today,))
             self.conn.commit()
             df.to_sql("ranking_result", self.conn, if_exists="append", index=False)
             self.conn.commit()
+            return {"status": "ok", "rows": int(len(df)), "guard": guard}
 
     def get_latest_ranking(self) -> pd.DataFrame:
         q = """
@@ -15514,6 +15569,16 @@ class RankingEngine:
     def __init__(self, db: DBManager):
         self.db = db
 
+    def _skip_result(self, status: str, reason: str = "", preflight: dict | None = None, old_rows: int | None = None, mode: str = "") -> dict:
+        """R5N27B：排行略過結果物件；formal EPS 未就緒時保留舊 ranking_result，不用 RuntimeError 中斷 UI。"""
+        if old_rows is None:
+            try:
+                old_rows = int(self.db.get_ranking_rows_count())
+            except Exception:
+                old_rows = 0
+        return {"status": str(status or "skip_not_ready"), "rows": 0, "old_rows": int(old_rows or 0),
+                "reason": str(reason or ""), "preflight": dict(preflight or {}), "mode": str(mode or "")}
+
     def _formal_eps_expr(self, cols: set[str], candidates: list[str], default: str = "NULL") -> str:
         usable = [c for c in candidates if c in cols]
         if not usable:
@@ -15831,7 +15896,7 @@ class RankingEngine:
         log_info(f"[R5N27][FORMAL_EPS_MAP_LOAD] map_rows={map_stats.get('map_rows',0)} ready_count={map_stats.get('ready_count',0)} pass_count={map_stats.get('pass_count',0)} fail_count={map_stats.get('fail_count',0)} ready={int(ready)} reason={reason}")
         return self.FormalEPSMapResult(out, ready, reason, map_stats)
 
-    def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None):
+    def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None, mode: str = "manual_rebuild"):
         master = self.db.get_master()
         today = datetime.now().strftime("%Y-%m-%d")
         rows = []
@@ -15888,17 +15953,23 @@ class RankingEngine:
             log_cb(pre_msg)
         log_info(f"{pre_msg}｜run_id={run_id}")
         if not bool(preflight.get("ready")):
-            self.db.log_system_run(event="formal_eps_preflight", status="failed", message=pre_msg, run_id=run_id, module="ranking")
-            raise RuntimeError("R5N27 formal EPS source not ready; skip ranking_result rebuild. " + str(preflight.get("reason", "")))
+            old_rows = self.db.get_ranking_rows_count()
+            skip_msg = f"[R5N27B][RANKING_SKIP] mode={mode} reason={preflight.get('reason','')} old_rows={old_rows}; formal EPS 未就緒，舊 ranking_result 已保留"
+            if log_cb:
+                log_cb(skip_msg)
+            log_warning(f"{skip_msg}｜run_id={run_id}")
+            self.db.log_system_run(event="formal_eps_preflight", status="skip_not_ready", message=skip_msg, run_id=run_id, module="ranking")
+            return self._skip_result("skip_not_ready", str(preflight.get("reason", "")), preflight, old_rows, mode)
 
         formal_eps_map = self._load_r5n26j_formal_eps_gate_map(base_year=_base_year_for_formal_eps, track_year=_track_year_for_formal_eps)
         if (not formal_eps_map) or (not bool(getattr(formal_eps_map, "ready", False))):
-            fail_msg = f"[R5N27][FORMAL_EPS_MAP_LOAD][FAIL] map_rows={len(formal_eps_map) if formal_eps_map else 0} reason={getattr(formal_eps_map, 'reason', 'formal_eps_map empty')} stats={getattr(formal_eps_map, 'stats', {})}"
+            old_rows = self.db.get_ranking_rows_count()
+            fail_msg = f"[R5N27B][RANKING_SKIP] mode={mode} reason=formal_eps_map_not_ready map_rows={len(formal_eps_map) if formal_eps_map else 0} old_rows={old_rows} detail={getattr(formal_eps_map, 'reason', 'formal_eps_map empty')} stats={getattr(formal_eps_map, 'stats', {})}"
             if log_cb:
                 log_cb(fail_msg)
             log_warning(f"{fail_msg}｜run_id={run_id}")
-            self.db.log_system_run(event="formal_eps_map_load", status="failed", message=fail_msg, run_id=run_id, module="ranking")
-            raise RuntimeError("R5N27 formal_eps_map empty; skip ranking_result rebuild")
+            self.db.log_system_run(event="formal_eps_map_load", status="skip_not_ready", message=fail_msg, run_id=run_id, module="ranking")
+            return self._skip_result("skip_not_ready", getattr(formal_eps_map, "reason", "formal_eps_map empty"), preflight, old_rows, mode)
 
         formal_pass_count = int(sum(int(v.get("formal_eps_pass", 0)) for v in formal_eps_map.values())) if formal_eps_map else 0
         formal_ready_count = int(sum(int(v.get("formal_eps_ready", 0)) for v in formal_eps_map.values())) if formal_eps_map else 0
@@ -16017,14 +16088,23 @@ class RankingEngine:
         prewrite_source = int(df.get("formal_eps_source", pd.Series(dtype=str)).fillna("").astype(str).str.strip().ne("").sum()) if "formal_eps_source" in df.columns else 0
         prewrite_all_c = bool(len(df) > 0 and df.get("formal_eps_grade", pd.Series(dtype=str)).fillna("C").astype(str).eq("C").sum() == len(df))
         if prewrite_actual <= 0 or prewrite_annual <= 0 or prewrite_source <= 0 or prewrite_all_c:
-            fail_msg = f"[R5N27][LANDING_VALIDATE][PREWRITE_FAIL] total={len(df)} actual_nonnull={prewrite_actual} annual_nonnull={prewrite_annual} source_nonnull={prewrite_source} all_c={int(prewrite_all_c)}"
+            old_rows = self.db.get_ranking_rows_count()
+            fail_msg = f"[R5N27B][RANKING_SKIP] mode={mode} reason=prewrite_guard_fail total={len(df)} actual_nonnull={prewrite_actual} annual_nonnull={prewrite_annual} source_nonnull={prewrite_source} all_c={int(prewrite_all_c)} old_rows={old_rows}"
             if log_cb:
                 log_cb(fail_msg)
             log_warning(f"{fail_msg}｜run_id={run_id}")
-            self.db.log_system_run(event="formal_eps_landing_validate", status="failed", message=fail_msg, run_id=run_id, module="ranking")
-            raise RuntimeError("R5N27 ranking_result formal EPS prewrite landing failed; skip DB overwrite")
+            self.db.log_system_run(event="formal_eps_landing_validate", status="skip_guard_fail", message=fail_msg, run_id=run_id, module="ranking")
+            return self._skip_result("skip_guard_fail", "prewrite_guard_fail", preflight, old_rows, mode)
 
-        self.db.replace_ranking(df)
+        replace_result = self.db.replace_ranking(df, require_formal_eps=True)
+        if isinstance(replace_result, dict) and str(replace_result.get("status")) != "ok":
+            old_rows = self.db.get_ranking_rows_count()
+            fail_msg = f"[R5N27B][RANKING_SKIP] mode={mode} reason=replace_guard_fail old_rows={old_rows} detail={replace_result}"
+            if log_cb:
+                log_cb(fail_msg)
+            log_warning(f"{fail_msg}｜run_id={run_id}")
+            self.db.log_system_run(event="ranking_replace_guard", status="skip_guard_fail", message=fail_msg, run_id=run_id, module="ranking")
+            return self._skip_result("skip_guard_fail", "replace_guard_fail", preflight, old_rows, mode)
         landing = self.validate_ranking_formal_eps_landing(today)
         land_msg = f"[R5N27][LANDING_VALIDATE] status={landing.get('status')} total={landing.get('total_rows')} actual_nonnull={landing.get('actual_q1_eps_nonnull')} source_nonnull={landing.get('formal_eps_source_nonnull')} all_c={landing.get('grade_all_c')} grades={landing.get('grade_distribution')} reason={landing.get('reason')}"
         if log_cb:
@@ -16032,7 +16112,7 @@ class RankingEngine:
         log_info(f"{land_msg}｜run_id={run_id}")
         if landing.get("status") != "PASS":
             self.db.log_system_run(event="formal_eps_landing_validate", status="failed", message=land_msg, run_id=run_id, module="ranking")
-            raise RuntimeError("R5N27 ranking_result formal EPS landing failed: " + str(landing.get("reason", "")))
+            return self._skip_result("skip_landing_fail", str(landing.get("reason", "")), preflight, self.db.get_ranking_rows_count(), mode)
         status = "ok" if (top20_sab >= min(16, len(top20)) and top20_c == 0) else "warning"
         self.db.log_system_run(event="ranking_rebuild", status=status, message=f"ranking rows={len(df)} with R5N27_BREAKOUT_RATIO_GRADE; top20_SA={top20_sa}; top20_SAB={top20_sab}; top20_C={top20_c}; landing={landing.get('status')}", run_id=run_id, module="ranking")
         return len(df)
@@ -16064,9 +16144,13 @@ def rebuild_ranking_after_formal_eps_ready(db: DBManager, reason: str = "", prog
             log_warning(f"[R5N27][POST_EPS_REBUILD] triggered=0 status=skip_not_ready reason={result['reason']} preflight={pre}")
             return result
         log_info(f"[R5N27][POST_EPS_REBUILD] triggered=1 reason={reason} preflight={pre}")
-        rows = engine.rebuild(progress_cb=progress_cb, log_cb=log_cb)
-        result.update({"triggered": 1, "status": "rebuilt", "ranking_rows": int(rows or 0), "reason": reason or "eps_verify_pass"})
-        log_info(f"[R5N27][POST_EPS_REBUILD] status=rebuilt rows={rows} reason={reason}")
+        rows = engine.rebuild(progress_cb=progress_cb, log_cb=log_cb, mode="post_eps_rebuild")
+        if isinstance(rows, dict):
+            result.update({"triggered": 1, "status": rows.get("status", "skip_not_ready"), "ranking_rows": int(rows.get("rows", 0) or 0), "reason": rows.get("reason", reason or "eps_verify_pass"), "detail": rows})
+            log_warning(f"[R5N27B][POST_EPS_REBUILD] status={result['status']} rows={result['ranking_rows']} reason={result['reason']}")
+        else:
+            result.update({"triggered": 1, "status": "rebuilt", "ranking_rows": int(rows or 0), "reason": reason or "eps_verify_pass"})
+            log_info(f"[R5N27B][POST_EPS_REBUILD] status=rebuilt rows={rows} reason={reason}")
         return result
     except Exception as exc:
         result.update({"triggered": 1, "status": "error", "reason": str(exc)})
@@ -27354,6 +27438,51 @@ class AppUI:
         if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
             self.refresh_top20_and_order_views()
 
+    def ensure_formal_eps_ready_for_daily_update(self, run_id: str | None = None, log_cb=None) -> dict:
+        """R5N27B-01：每日增量更新專用 formal EPS ready gate。
+
+        每日增量更新是唯一允許主動補 formal EPS 的入口；手動重建排行不得下載 EPS。
+        流程：先 preflight；若 not ready，嘗試既有 EPSForecastEngine.ensure_required_official_eps_from_mops([Q1])；
+        補齊後再次 preflight。若仍 not ready，呼叫端必須 partial success 並保留舊 ranking_result。
+        """
+        def _log(msg):
+            try:
+                if log_cb:
+                    log_cb(msg)
+            except Exception:
+                pass
+            try:
+                log_info(msg)
+            except Exception:
+                pass
+
+        base_year = datetime.now().year - 1
+        track_year = datetime.now().year
+        pre = self.rank_engine.validate_formal_eps_sources_ready(base_year=base_year, track_year=track_year)
+        _log(f"[R5N27B][DAILY_FORMAL_EPS_READY] phase=pre ready={int(bool(pre.get('ready')))} q1_rows={pre.get('q1_rows',0)} annual_rows={pre.get('annual_rows',0)} join_rows={pre.get('join_rows',0)} reason={pre.get('reason','')}")
+        result = {"ready": bool(pre.get("ready")), "phase": "pre", "preflight": pre, "action": "none", "eps_result": {}}
+        if bool(pre.get("ready")):
+            return result
+
+        # 只有 daily_update 允許補 formal EPS；手動 rebuild 禁止進入此函式。
+        try:
+            _log("[R5N27B][DAILY_FORMAL_EPS_READY] action=try_existing_official_eps_ensure quarters=Q1")
+            eps_engine = EPSForecastEngine(self.db, base_year=base_year, track_year=track_year)
+            eps_result = eps_engine.ensure_required_official_eps_from_mops(quarters=["Q1"], force=False)
+            result["eps_result"] = eps_result
+            result["action"] = "official_eps_ensure_called"
+        except Exception as exc:
+            result["action"] = "official_eps_ensure_error"
+            result["eps_result"] = {"status": "error", "message": str(exc)}
+            _log(f"[R5N27B][DAILY_FORMAL_EPS_READY][WARN] EPS ensure failed｜{exc}")
+
+        post = self.rank_engine.validate_formal_eps_sources_ready(base_year=base_year, track_year=track_year)
+        result["ready"] = bool(post.get("ready"))
+        result["phase"] = "post"
+        result["postflight"] = post
+        _log(f"[R5N27B][DAILY_FORMAL_EPS_READY] phase=post ready={int(bool(post.get('ready')))} q1_rows={post.get('q1_rows',0)} annual_rows={post.get('annual_rows',0)} join_rows={post.get('join_rows',0)} reason={post.get('reason','')}")
+        return result
+
     def update_data(self):
         last_date = self.db.get_last_price_date()
         today = datetime.now().strftime("%Y-%m-%d")
@@ -27391,18 +27520,43 @@ class AppUI:
                 if float(cache_result.get("ne_ratio", 1.0) or 1.0) >= 0.80:
                     self.ui_call(self.append_log, f"[FUNDAMENTAL CACHE][WARNING] financial_feature_daily NE_ratio={cache_result.get('ne_ratio', 1.0):.2%}，排行會標示基本面資料不足。")
 
-                self.ui_call(self.start_task, "重建排行", total)
-                rank_skip = {"skip": 0}
-                def rank_progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
-                    rank_skip["skip"] = skip_count
-                    self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
-                rank_count = self.rank_engine.rebuild(progress_cb=rank_progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+                # R5N27B：每日增量更新可補 formal EPS；若仍 not ready，排行 partial skip 且保留舊 ranking_result。
+                formal_ready_result = self.ensure_formal_eps_ready_for_daily_update(
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg)
+                )
+
+                rank_count = 0
+                rank_status = "skip_not_ready"
+                rank_reason = ""
+                if bool(formal_ready_result.get("ready")):
+                    self.ui_call(self.start_task, "重建排行", total)
+                    rank_skip = {"skip": 0}
+                    def rank_progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
+                        rank_skip["skip"] = skip_count
+                        self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
+                    rank_result = self.rank_engine.rebuild(progress_cb=rank_progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set(), mode="daily_update")
+                    if isinstance(rank_result, dict):
+                        rank_status = str(rank_result.get("status", "skip_not_ready"))
+                        rank_reason = str(rank_result.get("reason", ""))
+                        rank_count = int(rank_result.get("rows", 0) or 0)
+                    else:
+                        rank_status = "ok"
+                        rank_count = int(rank_result or 0)
+                else:
+                    post = formal_ready_result.get("postflight") or formal_ready_result.get("preflight") or {}
+                    rank_reason = str(post.get("reason", "formal EPS not ready"))
+                    self.ui_call(self.append_log, f"[R5N27B][DAILY_UPDATE][PARTIAL_SUCCESS] formal EPS 未就緒，略過排行重建並保留舊 ranking_result｜reason={rank_reason}")
+
                 self.force_show_full_ranking_once = True
                 self.ui_call(self.refresh_filters, True)
                 self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.show_welcome_message)
-                self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
-                self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n基本面特徵 {cache_result.get('feature_rows', 0)} 筆\n排行 {rank_count} 檔\n（行情 + EPS/估值 + 月營收已先寫入本地DB）")
+                if rank_status == "ok":
+                    self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
+                    self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n基本面特徵 {cache_result.get('feature_rows', 0)} 筆\n排行 {rank_count} 檔\n（行情 + EPS/估值 + 月營收已先寫入本地DB）")
+                else:
+                    self.ui_call(self.finish_task, "每日增量更新", f"部分完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆；formal EPS 未就緒，排行未覆蓋。")
+                    self.ui_call(messagebox.showinfo, "部分完成", f"每日增量更新部分完成\n成功 {success} 檔\n寫入 {rows} 筆\n基本面特徵 {cache_result.get('feature_rows', 0)} 筆\nformal EPS 未就緒，排行未覆蓋，舊 ranking_result 已保留。\n原因：{rank_reason}")
             except OperationCancelled:
                 self.ui_call(self.append_log, "每日更新/重排行已中斷")
                 self.ui_call(self.finish_task, "每日增量更新", "作業已中斷")
@@ -27433,7 +27587,15 @@ class AppUI:
                 self.ui_call(self.start_task, "重建排行", total)
                 def progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
                     self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
-                count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+                result = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set(), mode="manual_rebuild")
+                if isinstance(result, dict):
+                    status = str(result.get("status", "skip_not_ready"))
+                    reason = str(result.get("reason", ""))
+                    old_rows = int(result.get("old_rows", 0) or 0)
+                    self.ui_call(self.finish_task, "重建排行", f"formal EPS 未就緒，排行未覆蓋；舊排行保留 {old_rows} 檔")
+                    self.ui_call(messagebox.showinfo, "排行未覆蓋", f"正式 EPS 資料未就緒，重建排行已略過。\n舊 ranking_result 已保留：{old_rows} 檔\n狀態：{status}\n原因：{reason}\n\n重建排行不會下載 EPS；請先執行每日增量更新或正式 EPS 補齊流程。")
+                    return
+                count = int(result or 0)
                 self.force_show_full_ranking_once = True
                 self.ui_call(self._reload_rank_tree_after_rebuild, True)
                 self.ui_call(self.refresh_all_tables, True)
