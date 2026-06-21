@@ -14067,7 +14067,11 @@ class HighGrowthEPSEngine:
         )
         annual_basis_mask = pd.to_numeric(x.get("base_annual_eps", pd.Series(np.nan, index=x.index)), errors="coerce").notna()
         actual_q1_mask = pd.to_numeric(x.get("actual_q1_eps", pd.Series(np.nan, index=x.index)), errors="coerce").notna()
-        official_mask_current = x.get("official_eps_verified_pass", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+        official_mask_current = (
+            x.get("official_eps_verified_pass", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            | x.get("formal_eps_pass", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            | x.get("formal_eps_grade", pd.Series("", index=x.index)).fillna("").astype(str).isin(["S", "A", "B"])
+        )
         # R5D FIX：02_領先預測通過黑馬池不得只看 selection_gate。
         # 實際 UI 有值的原因是 selection_eps / predicted_q2 / predicted_q3 已由 EPS_TTM/current_eps_ttm fallback 算出。
         # 因此 02 候選池應保留 forecast/proxy/value-candidate，而不是被 annual/formal gate 或 selection_gate=0 清空。
@@ -14089,9 +14093,18 @@ class HighGrowthEPSEngine:
             | prediction_value_mask
         )
 
+        # R5N27E FIX：UI 分類顯示必須以正式 EPS Gate 優先於 EPS_TTM proxy。
+        # 根因：2527/3006/6265/9906 等股票已具 actual_q1_eps + annual_eps + formal_eps_grade=S，
+        # 但 selection/prediction 來源含 TTM，舊判斷先命中 ttm_mask，導致 eps_basis_type 顯示 EPS_TTM_PROXY。
+        # 修正：逐檔正式 EPS ready / pass 優先，TTM 僅作缺正式 EPS 時的追蹤候選。
+        row_formal_pass_current = (
+            x.get("formal_eps_pass", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            | x.get("formal_eps_grade", pd.Series("", index=x.index)).fillna("").astype(str).isin(["S", "A", "B"])
+        )
+        row_formal_ready_current = actual_q1_mask & annual_basis_mask
         x["eps_basis_type"] = np.select(
-            [ttm_mask, annual_basis_mask, actual_q1_mask, prediction_value_mask],
-            ["EPS_TTM_PROXY", "ANNUAL_EPS", "ACTUAL_Q1_EPS", "PREDICTION_VALUE"],
+            [row_formal_pass_current & row_formal_ready_current, row_formal_ready_current, annual_basis_mask, actual_q1_mask, ttm_mask, prediction_value_mask],
+            ["FORMAL_EPS_VERIFIED", "FORMAL_EPS_READY", "ANNUAL_EPS", "ACTUAL_Q1_EPS", "EPS_TTM_PROXY", "PREDICTION_VALUE"],
             default="DATA_INSUFFICIENT",
         )
         x["ui_source_type"] = np.select(
@@ -14407,7 +14420,7 @@ class HighGrowthEPSEngine:
         # official_eps_only_pass 不要求三個月營收完整，但必須具備正式年度EPS基準，且Q1/所選季度正式EPS倍率通過。
         # 禁止 annual_eps_history=0 或 base_annual_eps missing 時，只因 actual_q1_eps 為正就暴增通過筆數。
         base_quality_strict = x.get("base_eps_quality", pd.Series("", index=x.index)).fillna("").astype(str).eq("STRICT")
-        x["official_eps_only_pass"] = (
+        legacy_official_eps_only_pass = (
             x["eps_data_quality"].eq("STRICT")
             & base_quality_strict
             & x.get("actual_eps_complete_gate", pd.Series(False, index=x.index)).fillna(False).astype(bool)
@@ -14415,6 +14428,19 @@ class HighGrowthEPSEngine:
             & x.get("q1_ratio_quality", pd.Series("", index=x.index)).fillna("").astype(str).eq("OK")
             & x["eps_gate"].fillna(False).astype(bool)
         )
+        # R5N27E FIX：UI分類必須同步 R5N27 formal EPS 欄位。
+        # 根因：R5N27D 已產生 formal_eps_pass / formal_eps_grade / breakout_ratio，
+        # 但畫面分類仍只看舊版 eps_data_quality/q1_ratio_quality/eps_gate，導致
+        # formal_eps_pass=True 的個股被舊 EPS_TTM proxy 邏輯顯示成「EPS_TTM追蹤候選」。
+        r5n27_formal_ready_for_ui = (
+            pd.to_numeric(x.get("actual_q1_eps", pd.Series(np.nan, index=x.index)), errors="coerce").gt(0)
+            & pd.to_numeric(x.get("base_annual_eps", pd.Series(np.nan, index=x.index)), errors="coerce").gt(0)
+        )
+        r5n27_formal_pass_for_ui = (
+            x.get("formal_eps_pass", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+            | x.get("formal_eps_grade", pd.Series("", index=x.index)).fillna("").astype(str).isin(["S", "A", "B"])
+        ) & r5n27_formal_ready_for_ui
+        x["official_eps_only_pass"] = legacy_official_eps_only_pass | r5n27_formal_pass_for_ui
         x["official_eps_revenue_pass"] = (
             x["official_eps_only_pass"].fillna(False).astype(bool)
             & x["revenue_strict_gate"].fillna(False).astype(bool)
@@ -14422,6 +14448,14 @@ class HighGrowthEPSEngine:
         x["legacy_strict_pass"] = x["official_eps_revenue_pass"].fillna(False).astype(bool)
         x["strict_pass"] = x["legacy_strict_pass"]
         x["official_eps_verified_pass"] = x["official_eps_only_pass"].fillna(False).astype(bool)
+        try:
+            log_info(
+                f"[R5N27E][UI_CLASSIFICATION_ALIGNMENT] legacy_official={int(legacy_official_eps_only_pass.sum())} "
+                f"formal_ui_pass={int(r5n27_formal_pass_for_ui.sum())} "
+                f"official_eps_only={int(x['official_eps_only_pass'].fillna(False).astype(bool).sum())}"
+            )
+        except Exception:
+            pass
 
         # Partial Gate：目前 DB 僅有 11504 單月營收，Q1 所需 11502/11503/11504 不完整；
         # 因此不能要求 revenue_yoy_gate(all 3 months) 才進候選，否則全數被打成資料不足。
@@ -14480,6 +14514,25 @@ class HighGrowthEPSEngine:
             x["forecast_candidate"],
             x["ttm_proxy_candidate"],
         ], ["列入投資規劃，等待價量確認", "列核心清單但需控管風險", "正式EPS通過但營收完整性不足，需補月營收驗證", "列入黑馬追蹤，等正式EPS驗證", "可追蹤但不可當正式通過；待季度/年度EPS補齊"], default="不列入本策略")
+
+        # R5N27E FINAL ALIGNMENT：正式 EPS 通過者絕不能被 UI 顯示為 EPS_TTM 追蹤候選。
+        # 此段只同步畫面分類與說明欄位，不修改 EPS Gate / ranking_result / join_rows Gate。
+        formal_ui_pass_any = x["official_eps_only_pass"].fillna(False).astype(bool)
+        formal_ui_revenue_pass = x["official_eps_revenue_pass"].fillna(False).astype(bool)
+        if formal_ui_pass_any.any():
+            x.loc[formal_ui_revenue_pass, "基本面狀態"] = "正式EPS+營收雙驗證通過"
+            x.loc[formal_ui_pass_any & ~formal_ui_revenue_pass, "基本面狀態"] = "正式EPS本身通過/營收待補"
+            x.loc[formal_ui_revenue_pass, "投資分層"] = "基本面核心/等技術確認"
+            x.loc[formal_ui_pass_any & ~formal_ui_revenue_pass, "投資分層"] = "正式EPS通過但營收完整性待補"
+            formal_ttm_risk_mask = formal_ui_pass_any & x["風險旗標"].astype(str).str.contains("EPS_TTM_ONLY", na=False)
+            x.loc[formal_ttm_risk_mask, "風險旗標"] = "OK"
+            x.loc[formal_ui_revenue_pass & x["風險旗標"].eq("OK"), "建議動作"] = "列入投資規劃，等待價量確認"
+            x.loc[formal_ui_pass_any & ~formal_ui_revenue_pass, "建議動作"] = "正式EPS通過但營收完整性不足，需補月營收驗證"
+            x.loc[formal_ui_pass_any, "資料缺口/未通過原因"] = np.where(
+                formal_ui_revenue_pass.loc[formal_ui_pass_any],
+                "正式EPS與營收雙驗證通過",
+                "正式EPS已驗證通過；營收完整性/階梯仍需補強"
+            )
         # R4F：年度EPS基準未建立時，所有正式/領先策略 Gate 必須在列資料層級同步阻斷，
         # 避免 02/04 分表被清空但 10_全部結果仍保留 selection_gate=True。
         x = self._apply_formal_block_if_needed(x)
