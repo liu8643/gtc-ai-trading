@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.27-R5N27F_SII_MOPS_REVENUE_BACKFILL_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.27-R5N27G_DIRECTORY_AUTO_CREATE_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2377,6 +2377,8 @@ def safe_sheet_name(name: str) -> str:
 
 
 def write_table_bundle(base_path: Path, tables: Dict[str, pd.DataFrame], preferred: str = "excel") -> tuple[Path, str]:
+    # R5N27G：通用表格輸出前建立 parent folder，避免任何 Excel/CSV/TXT 報表因目錄不存在而失敗。
+    base_path = ensure_parent_dir(Path(base_path))
     clean_tables = {}
     for name, df in (tables or {}).items():
         if df is None:
@@ -3685,7 +3687,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.27_r5n27f_sii_mops_revenue_backfill_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.27_r5n27g_directory_auto_create_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -5879,6 +5881,44 @@ def run_prebreakout_premarket_analyzer(db: DBManager | None = None, output_dir: 
 # V4 架構：RevenueAccelerationEngine -> EPSForecastEngine -> HighGrowthEPSEngine
 HIGH_GROWTH_REPORT_DIR = RUNTIME_DIR / "reports"
 HIGH_GROWTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+# R5N27G_DIRECTORY_AUTO_CREATE_FIX_20260621：
+# 統一建立高成長EPS/營收驗證/畫面轉報告等輸出資料夾。
+# Root Cause：R5N27F 資料下載與DB匯入已成功，但輸出 Excel 時
+# reports/revenue_cache_reports 或 reports/ui_screen_reports 不存在，導致 FileNotFoundError。
+R5N27G_REPORT_SUBDIRS = [
+    "revenue_cache_reports",
+    "ui_screen_reports",
+    "high_growth_reports",
+    "analysis_reports",
+    "ranking_reports",
+    "validation_reports",
+]
+
+def ensure_report_directories(base_dir: Path | None = None) -> Path:
+    """R5N27G：報表輸出目錄防呆。
+
+    僅建立資料夾，不改 RevenueCollectorEngine / HighGrowthEPSEngine / Ranking 邏輯。
+    """
+    root = Path(base_dir or HIGH_GROWTH_REPORT_DIR)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for sub in R5N27G_REPORT_SUBDIRS:
+            (root / sub).mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log_warning(f"[R5N27G][REPORT_DIR_CREATE_FAIL] root={root}｜{exc}")
+    return root
+
+def ensure_parent_dir(path: Path | str) -> Path:
+    """R5N27G：所有單一檔案輸出前保證 parent folder 存在。"""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log_warning(f"[R5N27G][PARENT_DIR_CREATE_FAIL] path={p}｜{exc}")
+    return p
+
+ensure_report_directories(HIGH_GROWTH_REPORT_DIR)
 HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
@@ -24696,9 +24736,9 @@ class AppUI:
                     log_warning(f"[R5N11][REVENUE_PREFLIGHT][WARN] {preflight_exc}")
                 validate_df = downloader.validate_selected_revenue_months(months, db=self.db)
                 pass_count = int((validate_df.get("驗收結果", pd.Series(dtype=str)).astype(str) == "PASS").sum()) if validate_df is not None and not validate_df.empty else 0
+                ensure_report_directories(HIGH_GROWTH_REPORT_DIR)
                 out_dir = HIGH_GROWTH_REPORT_DIR / "revenue_cache_reports"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                out_path = out_dir / f"R5N_revenue_cache_validate_{months[0]}_{months[-1]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                out_path = ensure_parent_dir(out_dir / f"R5N_revenue_cache_validate_{months[0]}_{months[-1]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
                 engine = available_excel_engine()
                 if engine:
                     with pd.ExcelWriter(out_path, engine=engine) as writer:
@@ -24898,11 +24938,11 @@ class AppUI:
             df = pd.DataFrame(rows, columns=headers)
             quarters = self._selected_highgrowth_quarters()
             mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
+            ensure_report_directories(HIGH_GROWTH_REPORT_DIR)
             export_dir = HIGH_GROWTH_REPORT_DIR / "ui_screen_reports"
-            export_dir.mkdir(parents=True, exist_ok=True)
             qtag = "".join(quarters or HIGH_GROWTH_DEFAULT_QUARTERS) or "Q1"
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = export_dir / f"high_growth_eps_ui_screen_report_{qtag}_{ts}.xlsx"
+            out_path = ensure_parent_dir(export_dir / f"high_growth_eps_ui_screen_report_{qtag}_{ts}.xlsx")
 
             engine = available_excel_engine()
             if not engine:
