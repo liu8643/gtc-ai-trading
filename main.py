@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.26-R5N27D_FORMAL_EPS_JOIN_ONLY_GATE_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.27-R5N27F_SII_MOPS_REVENUE_BACKFILL_FIX"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3685,7 +3685,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.26_r5n27d_formal_eps_join_only_gate_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.27_r5n27f_sii_mops_revenue_backfill_fix",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -6581,6 +6581,14 @@ DATA_GOV_REVENUE_DATASETS = {
 # 取代 OTC 歷史月份的 FinMind fallback，避免 FinMind status=400 權限不足錯誤進 cache/DB。
 MOPSOV_OTC_T21SC03_BASE_URL = "https://mopsov.twse.com.tw/nas/t21/otc"
 MOPSOV_OTC_T21SC03_MIN_VALID_ROWS = int(os.getenv("GTC_MOPSOV_OTC_T21SC03_MIN_ROWS", "700") or "700")
+
+# R5N27F_SII_MOPS_REVENUE_BACKFILL_FIX_20260621：上市歷史月營收 Primary Source。
+# 使用者以 F12 Network 驗證：MOPSOV 透過 POST /server-java/FileDownLoad 動態下載
+# t21sc03_115_2.csv，且 CSV 內含 3673/4958/6456 等 KY 公司資料。
+# 目的：補 C04003 只含國內上市、導致 KY 歷史營收未寫入 external_revenue_history 的缺口。
+MOPSOV_FILE_DOWNLOAD_URL = "https://mopsov.twse.com.tw/server-java/FileDownLoad"
+MOPSOV_SII_T21SC03_MIN_VALID_ROWS = int(os.getenv("GTC_MOPSOV_SII_T21SC03_MIN_ROWS", "900") or "900")
+MOPSOV_SII_T21SC03_KEY_STOCKS = ("3673", "4935", "4958", "6456", "6451", "3661")
 FINMIND_API_BASE_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_MONTH_REVENUE_DATASET = "TaiwanStockMonthRevenue"
 FINMIND_CONFIG_DIR = RUNTIME_DIR / "config"
@@ -9306,6 +9314,155 @@ class RevenueOpenAPICacheDownloader:
         log_info(f"[R5N13][DATAGOV_CSV][OK] month={m} market={mt} rows={len(parsed)} cache={cache_path}")
         return parsed
 
+    def _mopsov_t21sc03_roc_info(self, target_month: str) -> tuple[str, int, int, str]:
+        """R5N27F：YYYYMM -> MOPS t21sc03 民國年/月。"""
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return "", 0, 0, "invalid month"
+        year = int(m[:4])
+        month = int(m[4:6])
+        roc_year = year - 1911
+        if roc_year <= 0 or month < 1 or month > 12:
+            return "", roc_year, month, f"invalid roc/month y={roc_year} m={month}"
+        return m, roc_year, month, ""
+
+    def _mopsov_sii_t21sc03_payloads(self, target_month: str) -> tuple[list[dict], str, int, int, str]:
+        """R5N27F：建立 SII MOPSOV FileDownLoad payload 候選。
+
+        F12 已驗證下載端點：
+            POST https://mopsov.twse.com.tw/server-java/FileDownLoad
+            Content-Disposition: attachment; filename="t21sc03_115_2.csv"
+
+        MOPSOV FileDownLoad 在不同頁面/年份曾有 filePath 寫法差異，
+        因此採多 payload 候選，成功條件以 CSV 欄位/筆數驗證為準。
+        """
+        m, roc_year, month, err = self._mopsov_t21sc03_roc_info(target_month)
+        if err:
+            return [], m, roc_year, month, err
+        filename = f"t21sc03_{roc_year}_{month}.csv"
+        payloads = [
+            {"step": "9", "functionName": "show_file2", "filePath": f"/t21/sii/{filename}"},
+            {"step": "9", "functionName": "show_file2", "filePath": f"t21/sii/{filename}"},
+            {"step": "9", "functionName": "show_file2", "filePath": f"/nas/t21/sii/{filename}"},
+            {"step": "9", "functionName": "show_file2", "filePath": "/t21/sii", "fileName": filename},
+            {"step": "9", "functionName": "show_file2", "filePath": "t21/sii", "fileName": filename},
+        ]
+        return payloads, m, roc_year, month, ""
+
+    def _read_mopsov_sii_t21sc03_csv(self, target_month: str) -> tuple[pd.DataFrame, str, Path | None, str]:
+        """R5N27F：下載並保存 SII 官方 MOPSOV t21sc03 CSV 原始檔。
+
+        不使用會 404 的 /nas/t21/sii/t21sc03_YYY_M.csv 直連；
+        改用瀏覽器 Network 證實的 POST server-java/FileDownLoad。
+        """
+        payloads, m, roc_year, roc_month, err = self._mopsov_sii_t21sc03_payloads(target_month)
+        if err:
+            return pd.DataFrame(), "INVALID_MONTH", None, err
+        raw_dir = _r5n7d_revenue_pipeline_dir("raw", "sii", "mopsov_t21sc03")
+        raw_file = raw_dir / f"mopsov_sii_t21sc03_{m}.csv"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            "Accept": "text/csv,application/vnd.ms-excel,text/plain,*/*",
+            "Referer": "https://mopsov.twse.com.tw/mops/web/t21sc04_ifrs",
+            "Origin": "https://mopsov.twse.com.tw",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        last_err = ""
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        for idx, payload in enumerate(payloads, start=1):
+            try:
+                resp = requests.post(MOPSOV_FILE_DOWNLOAD_URL, data=payload, headers=headers, timeout=60)
+                status = int(getattr(resp, "status_code", 0) or 0)
+                content = getattr(resp, "content", b"") or b""
+                candidate_file = raw_dir / f"mopsov_sii_t21sc03_{m}_try{idx}.csv"
+                candidate_file.write_bytes(content)
+                _r5n7d_append_manifest({
+                    "stage": "raw",
+                    "source_key": "mopsov_sii_t21sc03_filedownload",
+                    "revenue_month": m,
+                    "market_type": "sii",
+                    "path": str(candidate_file),
+                    "bytes": int(candidate_file.stat().st_size) if candidate_file.exists() else 0,
+                    "status": "PASS" if status == 200 else "FAIL",
+                    "http_status": str(status),
+                    "request_url": MOPSOV_FILE_DOWNLOAD_URL,
+                    "payload": json.dumps(payload, ensure_ascii=False),
+                    "roc_year": roc_year,
+                    "roc_month": roc_month,
+                })
+                if status != 200:
+                    last_err = f"HTTP {status} payload={payload}"
+                    continue
+                if len(content) < 128:
+                    last_err = f"BYTES_TOO_SMALL bytes={len(content)} payload={payload}"
+                    continue
+                head = content[:800].decode("utf-8", errors="ignore")
+                if "FOR SECURITY REASONS" in head.upper() or "CAN NOT BE ACCESSED" in head.upper() or "<HTML" in head.upper():
+                    last_err = f"SECURITY_OR_HTML payload={payload} head={head[:200]}"
+                    continue
+                parse_err = ""
+                for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+                    try:
+                        df = pd.read_csv(io.BytesIO(content), encoding=enc, dtype=str).fillna("")
+                        if df is not None and not df.empty and self._looks_like_revenue_csv(df):
+                            raw_file.write_bytes(content)
+                            log_info(f"[R5N27F][MOPSOV_SII_T21SC03][READ_OK] month={m} rows={len(df)} encoding={enc} endpoint={MOPSOV_FILE_DOWNLOAD_URL} payload_try={idx}")
+                            return df, f"PASS:{enc}:try{idx}", raw_file, ""
+                        parse_err = f"schema_not_revenue columns={list(df.columns)[:20] if df is not None else []}"
+                    except Exception as exc:
+                        parse_err = str(exc)
+                        continue
+                last_err = f"PARSE_FAILED payload={payload} err={parse_err}"
+            except Exception as exc:
+                last_err = f"REQUEST_FAILED payload={payload} err={exc}"
+                continue
+        return pd.DataFrame(), "DOWNLOAD_OR_PARSE_FAILED", raw_file, last_err
+
+    def _looks_like_revenue_csv(self, df: pd.DataFrame) -> bool:
+        """R5N27F：用欄位名稱判斷是否為 t21sc03/t187ap05 類月營收 CSV。"""
+        try:
+            cols = "|".join([str(c).strip().replace("\ufeff", "") for c in df.columns])
+            return ("公司代號" in cols or "公司名稱" in cols or "證券代號" in cols) and ("當月營收" in cols or "營業收入" in cols)
+        except Exception:
+            return False
+
+    def download_mopsov_sii_t21sc03_month_cache(self, target_month: str) -> pd.DataFrame:
+        """R5N27F：SII 歷史月營收官方 CSV Primary backfill。
+
+        目的：補上市 KY/國外公司在 C04003 缺漏的 202602~ 等歷史月營收。
+        成功後寫入 raw / normalized / final cache，後續 upsert_external_revenue_history 寫入 DB。
+        C04003 仍保留為 fallback，不會影響既有流程。
+        """
+        m = RevenueAccelerationEngine.normalize_month(target_month)
+        if not m:
+            return pd.DataFrame()
+        raw, status, raw_file, read_err = self._read_mopsov_sii_t21sc03_csv(m)
+        if raw is None or raw.empty:
+            self._emit_cache_trace(m, "MOPSOV_SII_CSV_DOWNLOAD", "FAIL", 0, raw_file, status or "DOWNLOAD_FAIL", read_err)
+            log_warning(f"[R5N27F][MOPSOV_SII_T21SC03][DOWNLOAD_FAIL] month={m} status={status} err={read_err} endpoint={MOPSOV_FILE_DOWNLOAD_URL}")
+            return pd.DataFrame()
+        parsed = self._normalize_datagov_t187ap05_df(raw, m, "sii")
+        if parsed is None or parsed.empty:
+            self._emit_cache_trace(m, "MOPSOV_SII_CSV_PARSE", "FAIL", 0, raw_file, "PARSE_ROWS_ZERO", f"target_month={m} status={status}")
+            log_warning(f"[R5N27F][MOPSOV_SII_T21SC03][PARSE_EMPTY] month={m} raw_rows={len(raw)} endpoint={MOPSOV_FILE_DOWNLOAD_URL}")
+            return pd.DataFrame()
+        parsed["market_type"] = "sii"
+        parsed["source_url"] = f"MOPSOV_SII_T21SC03_FILEDOWNLOAD:{MOPSOV_FILE_DOWNLOAD_URL}"
+        parsed["source_date"] = f"{m[:4]}-{m[4:6]}"
+        parsed["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if len(parsed) < MOPSOV_SII_T21SC03_MIN_VALID_ROWS:
+            self._emit_cache_trace(m, "MOPSOV_SII_CSV_PARSE", "FAIL", len(parsed), raw_file, "ROWS_TOO_FEW", f"rows={len(parsed)} min={MOPSOV_SII_T21SC03_MIN_VALID_ROWS}")
+            log_warning(f"[R5N27F][MOPSOV_SII_T21SC03][ROWS_TOO_FEW] month={m} rows={len(parsed)} min={MOPSOV_SII_T21SC03_MIN_VALID_ROWS}")
+            return pd.DataFrame()
+        missing_key = [sid for sid in MOPSOV_SII_T21SC03_KEY_STOCKS if sid not in set(parsed["stock_id"].astype(str))]
+        if missing_key:
+            log_warning(f"[R5N27F][MOPSOV_SII_T21SC03][KEY_STOCKS_MISSING] month={m} missing={missing_key}; still accept CSV if row threshold passed")
+        cache_path = self.write_month_cache(parsed, m, source_url=f"MOPSOV_SII_T21SC03_FILEDOWNLOAD:{MOPSOV_FILE_DOWNLOAD_URL}")
+        self._emit_cache_trace(m, "MOPSOV_SII_CSV_PARSE", "PASS", len(parsed), raw_file)
+        log_info(f"[R5N27F][MOPSOV_SII_T21SC03][OK] month={m} market=sii rows={len(parsed)} cache={cache_path} endpoint={MOPSOV_FILE_DOWNLOAD_URL}")
+        return parsed[["stock_id", "revenue_month", "market_type", "revenue", "mom", "yoy", "cumulative_revenue", "cumulative_yoy", "source_date", "source_url", "update_time"]]
+
     def _mopsov_otc_t21sc03_url(self, target_month: str) -> tuple[str, int, int, str]:
         """R5N22：建立 OTC 歷史月營收官方 MOPSOV CSV URL。
 
@@ -9454,8 +9611,14 @@ class RevenueOpenAPICacheDownloader:
 
                 fallback_note = ""
                 if (df is None or df.empty) and mt == "sii":
+                    source_used = "MOPSOV_SII_T21SC03_CSV_PRIMARY"
+                    fallback_note = "data.gov t187ap05 未涵蓋此歷史月份，優先改用 MOPSOV FileDownLoad t21sc03 CSV（含國內及國外公司/KY）"
+                    df = self.download_mopsov_sii_t21sc03_month_cache(mm)
+                    df = self._validate_market_month_cache(df, mm, mt, source_label=source_used)
+
+                if (df is None or df.empty) and mt == "sii":
                     source_used = "TWSE_INDEX04_C04003_FALLBACK"
-                    fallback_note = "data.gov t187ap05 未涵蓋此歷史月份，改用 TWSE Index04 C04003"
+                    fallback_note = (fallback_note + "；" if fallback_note else "") + "MOPSOV SII t21sc03 未取得有效資料時，保留 TWSE Index04 C04003 作備援"
                     df = self.download_twse_index04_c04003_month_cache(mm)
                     df = self._validate_market_month_cache(df, mm, mt, source_label=source_used)
 
@@ -9498,8 +9661,10 @@ class RevenueOpenAPICacheDownloader:
                 "source_policy": {
                     "sii_primary": DATA_GOV_REVENUE_DATASETS.get("sii", {}).get("csv_url", ""),
                     "otc_primary": DATA_GOV_REVENUE_DATASETS.get("otc", {}).get("csv_url", ""),
+                    "sii_primary_backfill": "MOPSOV SII t21sc03 CSV via POST https://mopsov.twse.com.tw/server-java/FileDownLoad",
                     "sii_fallback": "TWSE Index04 C04003",
                     "otc_fallback": "MOPSOV OTC t21sc03 CSV",
+                    "sii_fallback_url_template": "POST https://mopsov.twse.com.tw/server-java/FileDownLoad filePath=/t21/sii/t21sc03_{roc_year}_{month}.csv",
                     "otc_fallback_url_template": "https://mopsov.twse.com.tw/nas/t21/otc/t21sc03_{roc_year}_{month}.csv",
                     "finmind": "disabled for OTC historical revenue fallback in R5N22",
                 },
