@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-GTC AI Trading System v9.2 FINAL-RELEASE / v9.5.8 DATA_INTEGRITY_PATCH
+GTC AI Trading System v9.2 FINAL-RELEASE / v9.5.8 DATA_INTEGRITY_PATCH / R5N28_LAUNCH_READY_TOP20
 
 功能：
 - 股票主檔分類（市場 / 產業 / 題材 / 子題材）
@@ -2267,6 +2267,17 @@ def get_prebreakout_report_path(date_str: str | None = None) -> Path:
     PREBREAKOUT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
     return PREBREAKOUT_REPORT_DIR / f"prebreakout_premarket_{d}.xlsx"
 
+# R5N28_LAUNCH_READY_TOP20：準備噴射股 TOP20 獨立報表與快照目錄
+LAUNCH_READY_PATCH_VERSION = "R5N28_LAUNCH_READY_TOP20_20260623"
+LAUNCH_READY_REPORT_DIR = RUNTIME_DIR / "reports" / "launch_ready_reports"
+LAUNCH_READY_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_launch_ready_report_path(date_str: str | None = None) -> Path:
+    """固定輸出：reports/launch_ready_reports/Launch_Ready_TOP20_YYYYMMDD.xlsx。"""
+    d = date_str or datetime.now().strftime("%Y%m%d")
+    LAUNCH_READY_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    return LAUNCH_READY_REPORT_DIR / f"Launch_Ready_TOP20_{d}.xlsx"
+
 LEGACY_DB_PATH = RUNTIME_DIR / "stock_system_v6_0_1.db"
 DB_PATH = RUNTIME_DIR / "stock_system_v6_2.db"
 LEGACY_DB_PATH_V606 = RUNTIME_DIR / "stock_system_v6_0_6.db"
@@ -2377,12 +2388,8 @@ def safe_sheet_name(name: str) -> str:
 
 
 def write_table_bundle(base_path: Path, tables: Dict[str, pd.DataFrame], preferred: str = "excel") -> tuple[Path, str]:
-    # R5N27G：通用報表輸出防呆，只建立目的資料夾；不改資料內容與排序邏輯。
-    base_path = Path(base_path)
-    try:
-        base_path.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+    # R5N27G：通用表格輸出前建立 parent folder，避免任何 Excel/CSV/TXT 報表因目錄不存在而失敗。
+    base_path = ensure_parent_dir(Path(base_path))
     clean_tables = {}
     for name, df in (tables or {}).items():
         if df is None:
@@ -5886,37 +5893,43 @@ def run_prebreakout_premarket_analyzer(db: DBManager | None = None, output_dir: 
 HIGH_GROWTH_REPORT_DIR = RUNTIME_DIR / "reports"
 HIGH_GROWTH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# R5N27G_DIRECTORY_AUTO_CREATE_FIX_20260621：只補輸出目錄防呆。
-# 不修改 RevenueCollectorEngine / EPS Engine / Ranking Engine / DB schema。
-def ensure_report_directories() -> dict:
-    """建立所有報表輸出資料夾，避免按鈕輸出 Excel 時因資料夾不存在而失敗。
+# R5N27G_DIRECTORY_AUTO_CREATE_FIX_20260621：
+# 統一建立高成長EPS/營收驗證/畫面轉報告等輸出資料夾。
+# Root Cause：R5N27F 資料下載與DB匯入已成功，但輸出 Excel 時
+# reports/revenue_cache_reports 或 reports/ui_screen_reports 不存在，導致 FileNotFoundError。
+R5N27G_REPORT_SUBDIRS = [
+    "revenue_cache_reports",
+    "ui_screen_reports",
+    "high_growth_reports",
+    "analysis_reports",
+    "ranking_reports",
+    "validation_reports",
+]
 
-    修正範圍：output layer only。
-    - 下載歷史營收：reports/revenue_cache_reports
-    - 畫面內容轉成報告：reports/ui_screen_reports
-    - 其他既有 reports 子目錄：只建立資料夾，不改寫資料、不觸發任何引擎。
+def ensure_report_directories(base_dir: Path | None = None) -> Path:
+    """R5N27G：報表輸出目錄防呆。
+
+    僅建立資料夾，不改 RevenueCollectorEngine / HighGrowthEPSEngine / Ranking 邏輯。
     """
-    dirs = {
-        "reports_root": HIGH_GROWTH_REPORT_DIR,
-        "revenue_cache_reports": HIGH_GROWTH_REPORT_DIR / "revenue_cache_reports",
-        "ui_screen_reports": HIGH_GROWTH_REPORT_DIR / "ui_screen_reports",
-        "high_growth_reports": HIGH_GROWTH_REPORT_DIR / "high_growth_reports",
-        "analysis_reports": HIGH_GROWTH_REPORT_DIR / "analysis_reports",
-        "ranking_reports": HIGH_GROWTH_REPORT_DIR / "ranking_reports",
-        "validation_reports": HIGH_GROWTH_REPORT_DIR / "validation_reports",
-    }
-    created = {}
-    for name, path in dirs.items():
-        p = Path(path)
-        existed_before = p.exists()
-        p.mkdir(parents=True, exist_ok=True)
-        created[name] = {"path": str(p), "existed_before": bool(existed_before), "exists_after": p.exists()}
-    return created
+    root = Path(base_dir or HIGH_GROWTH_REPORT_DIR)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for sub in R5N27G_REPORT_SUBDIRS:
+            (root / sub).mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log_warning(f"[R5N27G][REPORT_DIR_CREATE_FAIL] root={root}｜{exc}")
+    return root
 
-try:
-    ensure_report_directories()
-except Exception as _r5n27g_dir_exc:
-    log_warning(f"[R5N27G][DIR_AUTO_CREATE][WARN] {_r5n27g_dir_exc}")
+def ensure_parent_dir(path: Path | str) -> Path:
+    """R5N27G：所有單一檔案輸出前保證 parent folder 存在。"""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log_warning(f"[R5N27G][PARENT_DIR_CREATE_FAIL] path={p}｜{exc}")
+    return p
+
+ensure_report_directories(HIGH_GROWTH_REPORT_DIR)
 HIGH_GROWTH_MIN_YOY = 30.0
 HIGH_GROWTH_BASE_YEAR = 2025
 HIGH_GROWTH_TRACK_YEAR = 2026
@@ -22783,6 +22796,235 @@ class TradingPlanEngine:
         }
 
 
+class LaunchReadyTop20Engine:
+    """R5N28 準備噴射股 TOP20：保存 Trade_TOP20 核心分數快照，再用 3~5 日加速度抓提前訊號。"""
+
+    RULE_VERSION = "R5N28_LAUNCH_READY_TOP20_20260623"
+
+    def __init__(self, db: DBManager):
+        self.db = db
+        self.ensure_schema()
+
+    def ensure_schema(self):
+        with self.db.lock:
+            cur = self.db.conn.cursor()
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS launch_ready_history (
+                snapshot_date TEXT NOT NULL,
+                stock_id TEXT NOT NULL,
+                stock_name TEXT,
+                close REAL,
+                candidate20_score REAL,
+                mainstream_score REAL,
+                breakout_score REAL,
+                wave_trade_score REAL,
+                attack_volume_score REAL,
+                active_buy_score REAL,
+                leader_follow_score REAL,
+                source_count INTEGER,
+                modules_pass_count INTEGER,
+                decision TEXT,
+                fail_reason TEXT,
+                created_at TEXT,
+                PRIMARY KEY (snapshot_date, stock_id)
+            )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_launch_ready_history_date ON launch_ready_history(snapshot_date)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_launch_ready_history_stock ON launch_ready_history(stock_id)")
+            self.db.conn.commit()
+
+    def _latest_price_date(self) -> str:
+        try:
+            with self.db.lock:
+                row = self.db.conn.execute("SELECT MAX(date) FROM price_history").fetchone()
+            if row and row[0]:
+                return str(row[0])
+        except Exception:
+            pass
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _fallback_snapshot_source(self) -> pd.DataFrame:
+        """沒有 UI TOP20 快取時，從 ranking_result + prebreakout_signal_daily 產生保守快照。"""
+        with self.db.lock:
+            latest_rank = self.db.conn.execute("SELECT MAX(date) FROM ranking_result").fetchone()[0]
+            latest_pre = self.db.conn.execute("SELECT MAX(signal_date) FROM prebreakout_signal_daily").fetchone()[0]
+            rank = pd.read_sql_query("SELECT * FROM ranking_result WHERE date=?", self.db.conn, params=(latest_rank,)) if latest_rank else pd.DataFrame()
+            pre = pd.read_sql_query("SELECT * FROM prebreakout_signal_daily WHERE signal_date=?", self.db.conn, params=(latest_pre,)) if latest_pre else pd.DataFrame()
+        if rank.empty and pre.empty:
+            return pd.DataFrame()
+        if not rank.empty:
+            rank["stock_id"] = rank["stock_id"].astype(str).map(normalize_stock_id)
+        if not pre.empty:
+            pre["stock_id"] = pre["stock_id"].astype(str).map(normalize_stock_id)
+        if not rank.empty and not pre.empty:
+            pre_cols = [c for c in ["stock_id", "stock_name", "close", "prebreakout_total_score", "trend_score", "volume_anomaly_score", "institutional_accumulation_score", "decision", "fail_reason"] if c in pre.columns]
+            df = rank.merge(pre[pre_cols], on="stock_id", how="left", suffixes=("", "_pre"))
+        elif not rank.empty:
+            df = rank.copy()
+        else:
+            df = pre.copy()
+        def col(name, default=0):
+            if isinstance(default, pd.Series):
+                fallback = default
+            else:
+                fallback = pd.Series([default] * len(df), index=df.index)
+            return pd.to_numeric(df[name], errors="coerce").fillna(fallback) if name in df.columns else fallback
+        stock_name = df["stock_name"] if "stock_name" in df.columns else (df["stock_name_pre"] if "stock_name_pre" in df.columns else pd.Series([""] * len(df), index=df.index))
+        out = pd.DataFrame({
+            "stock_id": df.get("stock_id", "").astype(str),
+            "stock_name": stock_name.fillna(""),
+            "close": col("close", 0),
+            "candidate20_score": (col("total_score", 0) * 0.45 + col("ai_score", 0) * 0.25 + col("prebreakout_total_score", 0) * 0.30).round(2),
+            "mainstream_score": (col("total_score", 0) * 0.60 + col("ai_score", 0) * 0.40).round(2),
+            "breakout_score": col("prebreakout_total_score", 0).round(2),
+            "wave_trade_score": col("trend_score_pre", col("trend_score", 0)).round(2),
+            "attack_volume_score": col("volume_anomaly_score", 0).round(2),
+            "active_buy_score": col("institutional_accumulation_score", 0).round(2),
+            "leader_follow_score": col("ai_score", 0).round(2),
+            "source_count": 1,
+            "modules_pass_count": 0,
+            "decision": df.get("decision", df.get("action", pd.Series([""] * len(df), index=df.index))).fillna(""),
+            "fail_reason": df.get("fail_reason", pd.Series([""] * len(df), index=df.index)).fillna(""),
+        })
+        return out.sort_values(["candidate20_score", "breakout_score", "mainstream_score"], ascending=False).head(200).reset_index(drop=True)
+
+    def build_history_snapshot(self, source_df: pd.DataFrame | None = None, snapshot_date: str | None = None) -> int:
+        """從 AI TOP20 / Trade_TOP20 結果建立每日快照；沒有 source_df 時用 DB fallback。"""
+        self.ensure_schema()
+        d = snapshot_date or self._latest_price_date()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df = source_df.copy() if isinstance(source_df, pd.DataFrame) and not source_df.empty else self._fallback_snapshot_source()
+        if df is None or df.empty:
+            return 0
+        def text_col(name, default=""):
+            return df[name].fillna(default).astype(str) if name in df.columns else pd.Series([default] * len(df), index=df.index)
+        def num_col(name, default=0):
+            fallback = default if isinstance(default, pd.Series) else pd.Series([default] * len(df), index=df.index)
+            return pd.to_numeric(df[name], errors="coerce").fillna(fallback) if name in df.columns else fallback
+        rows_df = pd.DataFrame({
+            "snapshot_date": d,
+            "stock_id": text_col("stock_id").map(normalize_stock_id),
+            "stock_name": text_col("stock_name"),
+            "close": num_col("close", num_col("現價", 0) if "現價" in df.columns else 0),
+            "candidate20_score": num_col("candidate20_score", num_col("selection_score", 0)),
+            "mainstream_score": num_col("mainstream_score", 0),
+            "breakout_score": num_col("breakout_score", 0),
+            "wave_trade_score": num_col("wave_trade_score", num_col("trade_score", 0)),
+            "attack_volume_score": num_col("attack_volume_score", 0),
+            "active_buy_score": num_col("active_buy_score", 0),
+            "leader_follow_score": num_col("leader_follow_score", 0),
+            "source_count": num_col("source_count", 1).astype(int),
+            "modules_pass_count": num_col("modules_pass_count", 0).astype(int),
+            "decision": text_col("decision", text_col("trade_action", "") if "trade_action" in df.columns else ""),
+            "fail_reason": text_col("fail_reason", text_col("strategy_nogo_detail", "") if "strategy_nogo_detail" in df.columns else ""),
+            "created_at": now,
+        })
+        rows_df = rows_df[rows_df["stock_id"].astype(str).str.len() > 0].drop_duplicates(subset=["stock_id"], keep="first")
+        if rows_df.empty:
+            return 0
+        with self.db.lock:
+            rows_df.to_sql("_launch_ready_stage", self.db.conn, if_exists="replace", index=False)
+            cols = list(rows_df.columns)
+            col_text = ",".join(cols)
+            update_text = ",".join([f"{c}=excluded.{c}" for c in cols if c not in ("snapshot_date", "stock_id")])
+            # SQLite 相容性：用 INSERT OR REPLACE 避免不同版本對 INSERT...SELECT...ON CONFLICT 的支援差異。
+            self.db.conn.execute(f"""
+                INSERT OR REPLACE INTO launch_ready_history ({col_text})
+                SELECT {col_text} FROM _launch_ready_stage
+            """)
+            self.db.conn.execute("DROP TABLE IF EXISTS _launch_ready_stage")
+            self.db.conn.commit()
+        return int(len(rows_df))
+
+    def _history_frame(self, asof_date: str | None = None, max_days: int = 10) -> tuple[pd.DataFrame, list[str]]:
+        self.ensure_schema()
+        with self.db.lock:
+            dates = [r[0] for r in self.db.conn.execute("SELECT DISTINCT snapshot_date FROM launch_ready_history ORDER BY snapshot_date DESC LIMIT ?", (max_days,)).fetchall()]
+            if asof_date:
+                dates = [d for d in dates if str(d) <= str(asof_date)]
+            dates = sorted(dates)
+            if not dates:
+                return pd.DataFrame(), []
+            q = ",".join(["?"] * len(dates))
+            df = pd.read_sql_query(f"SELECT * FROM launch_ready_history WHERE snapshot_date IN ({q})", self.db.conn, params=dates)
+        return df, dates
+
+    def build_launch_ready_top20(self, asof_date: str | None = None, lookback_days: int = 5) -> pd.DataFrame:
+        """回推最近 3~5 天，產生準備噴射股 TOP20。"""
+        hist, dates = self._history_frame(asof_date=asof_date, max_days=max(lookback_days + 5, 10))
+        if hist.empty:
+            return pd.DataFrame()
+        today_date = dates[-1]
+        d3_date = dates[-4] if len(dates) >= 4 else dates[0]
+        d5_date = dates[-6] if len(dates) >= 6 else dates[0]
+        today = hist[hist["snapshot_date"].eq(today_date)].copy()
+        d3 = hist[hist["snapshot_date"].eq(d3_date)].copy()
+        d5 = hist[hist["snapshot_date"].eq(d5_date)].copy()
+        if today.empty:
+            return pd.DataFrame()
+        def slim(df, suffix):
+            keep = ["stock_id", "candidate20_score", "mainstream_score", "breakout_score"]
+            x = df[[c for c in keep if c in df.columns]].copy()
+            return x.rename(columns={c: f"{c}_{suffix}" for c in x.columns if c != "stock_id"})
+        out = today.merge(slim(d3, "d3"), on="stock_id", how="left").merge(slim(d5, "d5"), on="stock_id", how="left")
+        for c in ["candidate20_score", "mainstream_score", "breakout_score", "source_count"]:
+            out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
+        for base in ["candidate20_score", "mainstream_score", "breakout_score"]:
+            out[f"{base}_d3"] = pd.to_numeric(out.get(f"{base}_d3", out[base]), errors="coerce").fillna(out[base])
+            out[f"{base}_d5"] = pd.to_numeric(out.get(f"{base}_d5", out[base]), errors="coerce").fillna(out[base])
+        out["candidate_acc_3d"] = (out["candidate20_score"] - out["candidate20_score_d3"]).round(2)
+        out["candidate_acc_5d"] = (out["candidate20_score"] - out["candidate20_score_d5"]).round(2)
+        out["mainstream_acc_3d"] = (out["mainstream_score"] - out["mainstream_score_d3"]).round(2)
+        out["breakout_acc_3d"] = (out["breakout_score"] - out["breakout_score_d3"]).round(2)
+        out["launch_score"] = (out["candidate_acc_3d"] * 0.40 + out["breakout_acc_3d"] * 0.30 + out["mainstream_acc_3d"] * 0.20 + out["source_count"].clip(lower=0, upper=3) * 10 * 0.10).clip(lower=0, upper=100).round(2)
+        def grade(r):
+            if float(r.get("candidate_acc_3d", 0) or 0) >= 20 and float(r.get("breakout_score", 0) or 0) >= 90:
+                return "🚀S"
+            if float(r.get("candidate_acc_3d", 0) or 0) >= 15 and float(r.get("breakout_score", 0) or 0) >= 85:
+                return "🚀A"
+            if float(r.get("candidate_acc_3d", 0) or 0) >= 10 and float(r.get("breakout_score", 0) or 0) >= 80:
+                return "🚀B"
+            return "觀察"
+        out["launch_grade"] = out.apply(grade, axis=1)
+        out["launch_action"] = np.where(out["launch_grade"].isin(["🚀S", "🚀A"]), "準備觀察買點", "持續追蹤")
+        out["launch_note"] = "asof=" + str(today_date) + "｜D3=" + str(d3_date) + "｜D5=" + str(d5_date) + "｜加速度=今日分數-歷史分數"
+        qualified = out[(out["candidate20_score"] >= 85) & (out["breakout_score"] >= 80) & (out["mainstream_score"] >= 80) & (out["candidate_acc_3d"] >= 10) & (out["source_count"] >= 1)].copy()
+        if qualified.empty:
+            qualified = out.sort_values(["launch_score", "candidate_acc_3d", "breakout_score", "mainstream_score"], ascending=False).head(20).copy()
+        qualified = qualified.sort_values(["launch_score", "candidate_acc_3d", "breakout_score", "mainstream_score"], ascending=False).head(20).reset_index(drop=True)
+        qualified["rank"] = np.arange(1, len(qualified) + 1)
+        return qualified
+
+    def export_launch_ready_report(self, df: pd.DataFrame, output_path: Path | None = None) -> Path:
+        LAUNCH_READY_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        path = output_path or (LAUNCH_READY_REPORT_DIR / f"Launch_Ready_TOP20_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        main = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        if main.empty:
+            main = pd.DataFrame([{"message": "目前無準備噴射股資料，請先建立噴射資料庫並累積3~5日快照。"}])
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            main.to_excel(writer, index=False, sheet_name="01_準備噴射股TOP20")
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df.sort_values("candidate_acc_3d", ascending=False).to_excel(writer, index=False, sheet_name="02_3日加速度排行")
+                df.sort_values("candidate_acc_5d", ascending=False).to_excel(writer, index=False, sheet_name="03_5日加速度排行")
+            pd.DataFrame([
+                {"規則": "🚀S", "定義": "candidate_acc_3d >= 20 且 breakout_score >= 90"},
+                {"規則": "🚀A", "定義": "candidate_acc_3d >= 15 且 breakout_score >= 85"},
+                {"規則": "🚀B", "定義": "candidate_acc_3d >= 10 且 breakout_score >= 80"},
+                {"規則": "觀察", "定義": "尚未完成噴射條件"},
+            ]).to_excel(writer, index=False, sheet_name="06_欄位與規則說明")
+        return Path(path)
+
+
+def run_launch_ready_top20(db: DBManager, source_df: pd.DataFrame | None = None, log_cb=None) -> tuple[pd.DataFrame, Path]:
+    engine = LaunchReadyTop20Engine(db)
+    rows = engine.build_history_snapshot(source_df=source_df)
+    if log_cb:
+        log_cb(f"[R5N28][LAUNCH_READY] history_snapshot rows={rows}")
+    df = engine.build_launch_ready_top20(lookback_days=5)
+    path = engine.export_launch_ready_report(df)
+    return df, path
+
+
 class MasterTradingEngine:
     def __init__(self, db: DBManager):
         self.db = db
@@ -23815,6 +24057,9 @@ class AppUI:
         self.action_cb["values"] = [
             "AI選股TOP20",
             "AI投資組合引擎",
+            "準備噴射股TOP20",
+            "建立噴射資料庫",
+            "開啟準備噴射股報表",
             "主攻5",
             "V3.5操作說明",
             "策略設定",
@@ -23848,7 +24093,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "AI投資組合", "爆發前報表", "高成長EPS報表", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "AI投資組合", "準備噴射股報表", "爆發前報表", "高成長EPS報表", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -23889,6 +24134,7 @@ class AppUI:
         self.tab_top20 = ttk.Frame(self.left_notebook)
         self.tab_ai_portfolio = ttk.Frame(self.left_notebook)
         self.tab_prebreakout = ttk.Frame(self.left_notebook)
+        self.tab_launch_ready = ttk.Frame(self.left_notebook)
         self.tab_highgrowth = ttk.Frame(self.left_notebook)
         self.tab_top5 = ttk.Frame(self.left_notebook)
         self.tab_unique = ttk.Frame(self.left_notebook)
@@ -23907,6 +24153,7 @@ class AppUI:
         self.left_notebook.add(self.tab_top20, text="強勢候選20")
         self.left_notebook.add(self.tab_ai_portfolio, text="AI投資組合")
         self.left_notebook.add(self.tab_prebreakout, text="爆發前雷達")
+        self.left_notebook.add(self.tab_launch_ready, text="準備噴射股")
         self.left_notebook.add(self.tab_highgrowth, text="高成長EPS")
         self.left_notebook.add(self.tab_top5, text="主攻5")
         self.left_notebook.add(self.tab_unique, text="唯一決策")
@@ -23949,6 +24196,7 @@ class AppUI:
         self.top20_tree.bind("<<TreeviewSelect>>", self.on_select_top20)
 
         self._build_prebreakout_tab()
+        self._build_launch_ready_tab()
         self._build_highgrowth_tab()
 
         self._build_ai_portfolio_controls()
@@ -24734,10 +24982,9 @@ class AppUI:
                     log_warning(f"[R5N11][REVENUE_PREFLIGHT][WARN] {preflight_exc}")
                 validate_df = downloader.validate_selected_revenue_months(months, db=self.db)
                 pass_count = int((validate_df.get("驗收結果", pd.Series(dtype=str)).astype(str) == "PASS").sum()) if validate_df is not None and not validate_df.empty else 0
-                ensure_report_directories()
+                ensure_report_directories(HIGH_GROWTH_REPORT_DIR)
                 out_dir = HIGH_GROWTH_REPORT_DIR / "revenue_cache_reports"
-                out_path = out_dir / f"R5N_revenue_cache_validate_{months[0]}_{months[-1]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path = ensure_parent_dir(out_dir / f"R5N_revenue_cache_validate_{months[0]}_{months[-1]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
                 engine = available_excel_engine()
                 if engine:
                     with pd.ExcelWriter(out_path, engine=engine) as writer:
@@ -24937,12 +25184,11 @@ class AppUI:
             df = pd.DataFrame(rows, columns=headers)
             quarters = self._selected_highgrowth_quarters()
             mode = getattr(self, "highgrowth_mode_var", tk.StringVar(value="HYBRID")).get()
-            ensure_report_directories()
+            ensure_report_directories(HIGH_GROWTH_REPORT_DIR)
             export_dir = HIGH_GROWTH_REPORT_DIR / "ui_screen_reports"
-            export_dir.mkdir(parents=True, exist_ok=True)
             qtag = "".join(quarters or HIGH_GROWTH_DEFAULT_QUARTERS) or "Q1"
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = export_dir / f"high_growth_eps_ui_screen_report_{qtag}_{ts}.xlsx"
+            out_path = ensure_parent_dir(export_dir / f"high_growth_eps_ui_screen_report_{qtag}_{ts}.xlsx")
 
             engine = available_excel_engine()
             if not engine:
@@ -25012,6 +25258,109 @@ class AppUI:
         if not path.exists():
             return messagebox.showwarning("找不到報表", f"找不到高成長EPS V4報表：\n{path}\n\n請先按『① 產生高成長EPS V4報表』。")
         open_path(path)
+
+    def _build_launch_ready_tab(self):
+        """R5N28：準備噴射股 TOP20 分頁。UI 風格比照爆發前雷達，但語義為 3~5 日加速度預警。"""
+        control = ttk.Frame(self.tab_launch_ready, padding=6)
+        control.pack(fill="x")
+        ttk.Button(control, text="① 建立噴射資料庫", command=self.on_launch_ready_build_snapshot).pack(side="left", padx=4)
+        ttk.Button(control, text="② 產生準備噴射股", command=self.on_launch_ready_generate).pack(side="left", padx=4)
+        ttk.Button(control, text="③ 開啟準備噴射股報表", command=self.on_open_launch_ready_report).pack(side="left", padx=4)
+        self.launch_ready_status_var = tk.StringVar(value=f"報表輸出：{LAUNCH_READY_REPORT_DIR}")
+        ttk.Label(control, textvariable=self.launch_ready_status_var).pack(side="left", padx=12)
+        cols = ("decision", "rank", "id", "name", "score", "close", "trigger", "stop", "target", "acc3", "acc5", "mainstream", "breakout", "engine", "action")
+        headers = {"decision":"決策", "rank":"排序", "id":"代號", "name":"名稱", "score":"噴射分", "close":"現價", "trigger":"預估起飛價", "stop":"停損", "target":"目標價", "acc3":"3日加速", "acc5":"5日加速", "mainstream":"主流分", "breakout":"起爆分", "engine":"來源引擎", "action":"建議動作"}
+        self.launch_ready_tree = self._make_tree(self.tab_launch_ready, cols, headers)
+        for c, w in {"decision":80, "rank":60, "id":80, "name":120, "score":80, "close":80, "trigger":105, "stop":90, "target":90, "acc3":85, "acc5":85, "mainstream":85, "breakout":85, "engine":120, "action":180}.items():
+            try: self.launch_ready_tree.column(c, width=w, minwidth=55, stretch=False)
+            except Exception: pass
+        self.launch_ready_tree.bind("<<TreeviewSelect>>", self.on_select_launch_ready)
+
+    def _refresh_launch_ready_tree(self, df: pd.DataFrame | None = None):
+        try:
+            self.last_launch_ready_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            if not hasattr(self, "launch_ready_tree"):
+                return
+            self.launch_ready_tree.delete(*self.launch_ready_tree.get_children())
+            if df is None or df.empty:
+                self.launch_ready_tree.insert("", "end", values=("NO_DATA", "", "", "", "", "", "", "", "", "", "", "", "", "", "請先建立噴射資料庫或累積3~5日快照"))
+                return
+            def fmt(v):
+                try:
+                    if pd.isna(v): return ""
+                    return f"{float(v):.2f}"
+                except Exception:
+                    return "" if v is None else str(v)
+            for _, r in df.head(200).iterrows():
+                close = float(r.get("close", 0) or 0)
+                trigger = close * 1.03 if close > 0 else np.nan
+                stop = close * 0.92 if close > 0 else np.nan
+                target = close * 1.18 if close > 0 else np.nan
+                self.launch_ready_tree.insert("", "end", values=(
+                    str(r.get("launch_grade", "")), int(r.get("rank", 0) or 0), str(r.get("stock_id", "")), str(r.get("stock_name", "")),
+                    fmt(r.get("launch_score", "")), fmt(close), fmt(trigger), fmt(stop), fmt(target),
+                    fmt(r.get("candidate_acc_3d", "")), fmt(r.get("candidate_acc_5d", "")),
+                    fmt(r.get("mainstream_score", "")), fmt(r.get("breakout_score", "")),
+                    str(r.get("candidate_engine", "")), str(r.get("launch_action", ""))
+                ))
+            if hasattr(self, "launch_ready_status_var"):
+                counts = df.get("launch_grade", pd.Series(dtype=str)).astype(str).value_counts().to_dict()
+                self.launch_ready_status_var.set(f"準備噴射股：{len(df)}筆｜等級{counts}｜報表：{getattr(self, 'last_launch_ready_report_path', LAUNCH_READY_REPORT_DIR)}")
+        except Exception as exc:
+            self.append_log(f"刷新準備噴射股失敗：{exc}", "ERROR")
+
+    def on_launch_ready_build_snapshot(self):
+        """UI按鈕：建立 launch_ready_history 快照。"""
+        def worker():
+            self.ui_call(self.start_task, "建立噴射資料庫", 2)
+            src = getattr(self, "last_top20_df", pd.DataFrame())
+            rows = LaunchReadyTop20Engine(self.db).build_history_snapshot(source_df=src if isinstance(src, pd.DataFrame) and not src.empty else None)
+            self.ui_call(self.update_task, "建立噴射資料庫", 2, 2, success=rows, item="Snapshot完成")
+            self.ui_call(self.append_log, f"準備噴射股快照完成：{rows} 筆")
+            self.ui_call(self.finish_task, "建立噴射資料庫", f"完成：{rows} 筆")
+            self.ui_call(messagebox.showinfo, "完成", f"準備噴射股快照完成：{rows} 筆")
+        self._run_in_thread(worker, "launch_ready_snapshot")
+
+    def on_launch_ready_generate(self):
+        """UI按鈕：產生準備噴射股 TOP20 報表。"""
+        def worker():
+            self.ui_call(self.start_task, "準備噴射股TOP20", 3)
+            src = getattr(self, "last_top20_df", pd.DataFrame())
+            df, path = run_launch_ready_top20(self.db, source_df=src if isinstance(src, pd.DataFrame) and not src.empty else None, log_cb=lambda m: self.ui_call(self.append_log, m))
+            self.last_launch_ready_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            self.last_launch_ready_report_path = Path(path)
+            self.ui_call(self._refresh_launch_ready_tree, self.last_launch_ready_df)
+            self.ui_call(self.left_notebook.select, self.tab_launch_ready)
+            self.ui_call(self.update_task, "準備噴射股TOP20", 3, 3, success=len(self.last_launch_ready_df), item="Excel完成")
+            self.ui_call(self.append_log, f"準備噴射股報表已產生：{path}")
+            self.ui_call(messagebox.showinfo, "完成", f"已產生準備噴射股TOP20報表：\n{path}")
+            self.ui_call(self.finish_task, "準備噴射股TOP20", f"已產生：{path}")
+        self._run_in_thread(worker, "launch_ready_top20")
+
+    def on_open_launch_ready_report(self):
+        path = getattr(self, "last_launch_ready_report_path", None) or get_launch_ready_report_path()
+        path = Path(path)
+        if not path.exists():
+            return messagebox.showwarning("找不到報表", f"找不到準備噴射股報表：\n{path}\n\n請先按『② 產生準備噴射股』。")
+        open_path(path)
+
+    def on_select_launch_ready(self, event=None):
+        try:
+            item = self.launch_ready_tree.focus()
+            if not item:
+                return
+            vals = self.launch_ready_tree.item(item, "values")
+            if not vals or len(vals) < 3:
+                return
+            stock_id = str(vals[2]).strip()
+            if not stock_id or stock_id in ("NO_DATA", "NO_CANDIDATE"):
+                return
+            if self._should_ignore_select_event(stock_id, "準備噴射股"):
+                return
+            self.append_log(f"準備噴射股點選：{stock_id}｜同步右側分析/圖表")
+            self.sync_all_views(stock_id, source="準備噴射股")
+        except Exception as exc:
+            self.append_log(f"準備噴射股點選失敗：{exc}", "WARNING")
 
     def _build_prebreakout_tab(self):
         """PREBREAKOUT_UI_REPORT_PATCH：爆發前雷達分頁，與TOP20語義分離。"""
@@ -25130,6 +25479,9 @@ class AppUI:
             "爆發前盤後DB建立": self.on_prebreakout_after_market_build,
             "產生爆發前盤前報表": self.on_prebreakout_premarket_report,
             "開啟爆發前報表": self.on_open_prebreakout_report,
+            "準備噴射股TOP20": self.on_launch_ready_generate,
+            "建立噴射資料庫": self.on_launch_ready_build_snapshot,
+            "開啟準備噴射股報表": self.on_open_launch_ready_report,
             "高成長EPS報表": self.on_highgrowth_report,
             "開啟高成長EPS報表": self.on_open_highgrowth_report,
             "同步外部資料": self.sync_external_data,
@@ -26315,6 +26667,7 @@ class AppUI:
                 "TOP20": getattr(self, "last_top20_df", pd.DataFrame()),
                 "TOP5": getattr(self, "last_top5_df", pd.DataFrame()),
                 "AI投資組合": getattr(self, "last_ai_portfolio_df", pd.DataFrame()),
+                "準備噴射股報表": getattr(self, "last_launch_ready_df", pd.DataFrame()),
                 "爆發前報表": getattr(self, "last_prebreakout_df", pd.DataFrame()),
                 "高成長EPS報表": getattr(self, "last_highgrowth_df", pd.DataFrame()),
                 "今日可下單": getattr(self, "last_today_buy_df", pd.DataFrame()),
@@ -26343,6 +26696,7 @@ class AppUI:
                 empty_columns = {
                     "TOP20": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "bucket", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
                     "TOP5": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "rr", "win_rate", "backtest_win_rate", "cagr", "mdd"],
+                    "準備噴射股報表": ["launch_grade", "rank", "stock_id", "stock_name", "launch_score", "close", "candidate_acc_3d", "candidate_acc_5d", "mainstream_score", "breakout_score", "candidate_engine", "launch_action"],
                     "今日可下單": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
                     "等待回測": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
                     "條件預掛": ["stock_id", "stock_name", "現價", "漲跌", "漲跌幅%", "ui_state", "liquidity_status", "liquidity_score", "entry_zone", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "win_rate"],
@@ -28011,6 +28365,11 @@ class AppUI:
                 ui_top20_source = trade_top20 if trade_top20 is not None and not trade_top20.empty else tradable_top20
                 self.last_top20_df = self.enrich_price_and_export_fields(ui_top20_source.copy(), id_col="stock_id") if ui_top20_source is not None and not ui_top20_source.empty else pd.DataFrame()
                 self.cache_trade_dataframe(self.last_top20_df)
+                try:
+                    rows_snapshot = LaunchReadyTop20Engine(self.db).build_history_snapshot(source_df=self.last_top20_df)
+                    self.ui_call(self.append_log, f"[R5N28][LAUNCH_READY] AI TOP20自動寫入準備噴射股快照：{rows_snapshot} 筆")
+                except Exception as exc:
+                    self.ui_call(self.append_log, f"[R5N28][LAUNCH_READY][WARN] 快照寫入失敗：{exc}", "WARNING")
                 top5 = attack.head(5).copy() if attack is not None and not attack.empty else (trade_top20.head(5).copy() if trade_top20 is not None and not trade_top20.empty else pd.DataFrame())
                 if not top5.empty:
                     bt_rows = []
