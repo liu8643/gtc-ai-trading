@@ -22807,7 +22807,7 @@ class LaunchReadyTop20Engine:
     4) 報表補 04/05 案例分析、07 觀察池、08 資料健康檢查。
     """
 
-    RULE_VERSION = "R5N28B_LAUNCH_READY_HISTORY_BACKFILL_FIX_20260623"
+    RULE_VERSION = "R5N28C_PRICE_HISTORY_REPLAY_BACKFILL_FIX_20260624"
     MIN_SNAPSHOT_DAYS_FOR_3D = 4
     MIN_SNAPSHOT_DAYS_FOR_5D = 6
     DEFAULT_SNAPSHOT_LIMIT = 300
@@ -22909,6 +22909,163 @@ class LaunchReadyTop20Engine:
             return sorted([str(r[0]) for r in rows if r and r[0]])
         except Exception:
             return []
+
+    def _available_price_history_dates(self, max_days: int = 10, asof_date: str | None = None) -> list[str]:
+        """R5N28C：從 price_history 取得最近交易日，而不是從 ranking_result 取日期。
+        目的：ranking_result 可能只有今日一筆，但 price_history 已有 400+ 交易日，可用於 As-Of replay。
+        """
+        try:
+            params = []
+            where = ""
+            if asof_date:
+                where = "WHERE date <= ?"
+                params.append(asof_date)
+            sql = f"SELECT DISTINCT date FROM price_history {where} ORDER BY date DESC LIMIT ?"
+            params.append(max(1, int(max_days or 1)))
+            with self.db.lock:
+                rows = self.db.conn.execute(sql, params).fetchall()
+            return sorted([str(r[0]) for r in rows if r and r[0]])
+        except Exception:
+            return []
+
+    def _price_history_replay_snapshot_for_date(self, snapshot_date: str, limit: int | None = None) -> pd.DataFrame:
+        """R5N28C：用 price_history 做指定 asof_date 的歷史回放快照。
+
+        核心原則：
+        1) 僅使用 date <= snapshot_date 的歷史價量，禁止用今日資料代替 D-3/D-5。
+        2) 每檔抓最近 80 筆交易日，計算 MA/量能/突破/動能 proxy。
+        3) 寫入 launch_ready_history 與既有欄位相容，讓 build_launch_ready_top20 可直接計算加速度。
+        """
+        d = str(snapshot_date or "").strip()
+        if not d:
+            return pd.DataFrame()
+
+        sql = """
+        WITH ph AS (
+            SELECT stock_id, date, open, high, low, close, volume, turnover,
+                   ROW_NUMBER() OVER (PARTITION BY stock_id ORDER BY date DESC) AS rn
+            FROM price_history
+            WHERE date <= ?
+              AND stock_id IS NOT NULL
+              AND close IS NOT NULL
+        )
+        SELECT stock_id, date, open, high, low, close, volume, turnover
+        FROM ph
+        WHERE rn <= 80
+        ORDER BY stock_id, date
+        """
+        try:
+            with self.db.lock:
+                ph = pd.read_sql_query(sql, self.db.conn, params=(d,))
+                sm_cols = self._table_columns("stocks_master")
+                sm = pd.read_sql_query("SELECT stock_id, stock_name, market, industry, theme FROM stocks_master", self.db.conn) if sm_cols else pd.DataFrame()
+        except Exception:
+            try:
+                with self.db.lock:
+                    ph = pd.read_sql_query(
+                        "SELECT stock_id, date, open, high, low, close, volume, turnover FROM price_history WHERE date<=? ORDER BY stock_id, date",
+                        self.db.conn, params=(d,)
+                    )
+                    sm_cols = self._table_columns("stocks_master")
+                    sm = pd.read_sql_query("SELECT stock_id, stock_name, market, industry, theme FROM stocks_master", self.db.conn) if sm_cols else pd.DataFrame()
+                if not ph.empty:
+                    ph["stock_id"] = ph["stock_id"].astype(str).map(normalize_stock_id)
+                    ph = ph.groupby("stock_id", group_keys=False).tail(80).reset_index(drop=True)
+            except Exception:
+                return pd.DataFrame()
+
+        if ph is None or ph.empty:
+            return pd.DataFrame()
+        ph = ph.copy()
+        ph["stock_id"] = ph["stock_id"].astype(str).map(normalize_stock_id)
+        for c in ["open", "high", "low", "close", "volume", "turnover"]:
+            if c in ph.columns:
+                ph[c] = pd.to_numeric(ph[c], errors="coerce")
+        ph = ph.dropna(subset=["stock_id", "date", "close"])
+        ph = ph[ph["stock_id"].astype(str).str.len() > 0]
+        if ph.empty:
+            return pd.DataFrame()
+
+        def _calc(g: pd.DataFrame) -> pd.Series:
+            g = g.sort_values("date").copy()
+            close = g["close"]
+            high = g["high"] if "high" in g.columns else close
+            volume = g["volume"] if "volume" in g.columns else pd.Series([0] * len(g), index=g.index)
+            last = g.iloc[-1]
+            ma5 = close.tail(5).mean() if len(close) >= 5 else close.mean()
+            ma20 = close.tail(20).mean() if len(close) >= 20 else close.mean()
+            ma60 = close.tail(60).mean() if len(close) >= 60 else close.mean()
+            vol5 = volume.tail(5).mean() if len(volume) >= 5 else volume.mean()
+            vol20 = volume.tail(20).mean() if len(volume) >= 20 else volume.mean()
+            prev_close_5 = close.iloc[-6] if len(close) >= 6 else close.iloc[0]
+            prev_close_20 = close.iloc[-21] if len(close) >= 21 else close.iloc[0]
+            high20_prev = high.iloc[:-1].tail(20).max() if len(high) >= 2 else high.max()
+            c = float(last.get("close", 0) or 0)
+            v = float(last.get("volume", 0) or 0)
+            vol_ratio = (vol5 / vol20) if vol20 and vol20 > 0 else 1.0
+            pct5 = (c / float(prev_close_5) - 1.0) * 100 if prev_close_5 and prev_close_5 > 0 else 0.0
+            pct20 = (c / float(prev_close_20) - 1.0) * 100 if prev_close_20 and prev_close_20 > 0 else 0.0
+            ma20_gap = (c / float(ma20) - 1.0) * 100 if ma20 and ma20 > 0 else 0.0
+            ma60_gap = (c / float(ma60) - 1.0) * 100 if ma60 and ma60 > 0 else 0.0
+            breakout_pct = (c / float(high20_prev) - 1.0) * 100 if high20_prev and high20_prev > 0 else 0.0
+            turnover_proxy = float(last.get("turnover", 0) or 0)
+            liquidity_score = min(100.0, max(0.0, 45.0 + np.log10(max(v, 1.0)) * 8.0))
+            trend_score = min(100.0, max(0.0, 50.0 + ma20_gap * 3.0 + ma60_gap * 1.0 + (10.0 if ma5 >= ma20 >= ma60 else 0.0)))
+            volume_score = min(100.0, max(0.0, 45.0 + (vol_ratio - 1.0) * 35.0 + (15.0 if v >= vol5 and vol5 > 0 else 0.0)))
+            momentum_score = min(100.0, max(0.0, 50.0 + pct5 * 4.0 + pct20 * 1.2))
+            breakout_score = min(100.0, max(0.0, 55.0 + breakout_pct * 6.0 + (10.0 if c >= high20_prev and high20_prev > 0 else 0.0)))
+            candidate20 = round(trend_score * 0.30 + breakout_score * 0.25 + volume_score * 0.20 + momentum_score * 0.15 + liquidity_score * 0.10, 2)
+            mainstream = round(trend_score * 0.55 + momentum_score * 0.25 + liquidity_score * 0.20, 2)
+            source_count = int((candidate20 >= 80) + (mainstream >= 80) + (breakout_score >= 80) + (volume_score >= 80))
+            source_count = max(1, min(4, source_count))
+            modules_pass = int((candidate20 >= 80) + (mainstream >= 80) + (breakout_score >= 80) + (volume_score >= 80) + (momentum_score >= 80))
+            return pd.Series({
+                "stock_id": str(last.get("stock_id", "")),
+                "close": round(c, 2),
+                "candidate20_score": candidate20,
+                "mainstream_score": round(mainstream, 2),
+                "breakout_score": round(breakout_score, 2),
+                "wave_trade_score": round(momentum_score, 2),
+                "attack_volume_score": round(volume_score, 2),
+                "active_buy_score": round(liquidity_score, 2),
+                "leader_follow_score": round(trend_score, 2),
+                "source_count": source_count,
+                "modules_pass_count": modules_pass,
+                "decision": "PRICE_HISTORY_REPLAY",
+                "fail_reason": "",
+                "rank_no": 0,
+                "turnover_proxy": turnover_proxy,
+            })
+
+        try:
+            out = ph.groupby("stock_id", group_keys=False).apply(_calc).reset_index(drop=True)
+        except Exception:
+            return pd.DataFrame()
+        if out.empty:
+            return pd.DataFrame()
+
+        if sm is not None and not sm.empty:
+            sm = sm.copy()
+            sm["stock_id"] = sm["stock_id"].astype(str).map(normalize_stock_id)
+            out = out.merge(sm.drop_duplicates("stock_id"), on="stock_id", how="left")
+        for c in ["stock_name", "market", "industry", "theme"]:
+            if c not in out.columns:
+                out[c] = ""
+            out[c] = out[c].fillna("").astype(str)
+        out["snapshot_source"] = f"price_history_replay<= {d}"
+        out["snapshot_scope"] = "price_history_replay_full_market"
+        out["pipeline_run_id"] = self.RULE_VERSION
+        out = out.sort_values(["candidate20_score", "breakout_score", "mainstream_score", "attack_volume_score"], ascending=False)
+        out["rank_no"] = np.arange(1, len(out) + 1)
+        if limit and int(limit) > 0:
+            out = out.head(int(limit))
+        keep = [
+            "stock_id", "stock_name", "close", "candidate20_score", "mainstream_score", "breakout_score",
+            "wave_trade_score", "attack_volume_score", "active_buy_score", "leader_follow_score", "source_count",
+            "modules_pass_count", "decision", "fail_reason", "rank_no", "market", "industry", "theme",
+            "snapshot_source", "snapshot_scope", "pipeline_run_id"
+        ]
+        return out[keep].reset_index(drop=True)
 
     def _select_nearest_date(self, table: str, date_col: str, snapshot_date: str | None) -> str | None:
         try:
@@ -23081,22 +23238,25 @@ class LaunchReadyTop20Engine:
         return rows_df[rows_df["stock_id"].astype(str).str.len() > 0].drop_duplicates(subset=["stock_id"], keep="first")
 
     def build_history_snapshot(self, source_df: pd.DataFrame | None = None, snapshot_date: str | None = None,
-                               source_mode: str = "ranking_full", limit: int | None = None) -> int:
+                               source_mode: str = "price_history_replay", limit: int | None = None) -> int:
         """建立 launch_ready_history 快照。
 
         source_mode:
-        - ranking_full：預設，從 ranking_result/prebreakout_signal_daily 建立候選池快照。
+        - price_history_replay：預設，從 price_history 依 asof_date 回放建立候選池快照。
+        - ranking_full：備援，從 ranking_result/prebreakout_signal_daily 建立候選池快照。
         - ui_top20：只在明確指定時使用 UI TOP20 快取。
-        - auto：有 source_df 時用 ui_top20，否則 ranking_full。
+        - auto：有 source_df 時用 ui_top20，否則 price_history_replay。
         """
         self.ensure_schema()
-        d = snapshot_date or self._latest_rank_date() or self._latest_price_date()
+        mode = source_mode or "price_history_replay"
+        d = snapshot_date or (self._latest_price_date() if mode == "price_history_replay" else (self._latest_rank_date() or self._latest_price_date()))
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        mode = source_mode or "ranking_full"
         if mode == "auto":
-            mode = "ui_top20" if isinstance(source_df, pd.DataFrame) and not source_df.empty else "ranking_full"
+            mode = "ui_top20" if isinstance(source_df, pd.DataFrame) and not source_df.empty else "price_history_replay"
         if mode == "ui_top20" and isinstance(source_df, pd.DataFrame) and not source_df.empty:
             rows_df = self._source_df_to_snapshot(source_df, snapshot_scope="ui_top20")
+        elif mode == "price_history_replay":
+            rows_df = self._price_history_replay_snapshot_for_date(snapshot_date=d, limit=limit or self.DEFAULT_SNAPSHOT_LIMIT)
         else:
             rows_df = self._candidate_snapshot_source_for_date(snapshot_date=d, limit=limit or self.DEFAULT_SNAPSHOT_LIMIT)
         if rows_df is None or rows_df.empty:
@@ -23132,19 +23292,24 @@ class LaunchReadyTop20Engine:
             self.db.conn.commit()
         return int(len(rows_df))
 
-    def build_history_snapshot_for_date(self, snapshot_date: str, limit: int | None = None) -> int:
-        return self.build_history_snapshot(source_df=None, snapshot_date=snapshot_date, source_mode="ranking_full", limit=limit)
+    def build_history_snapshot_for_date(self, snapshot_date: str, limit: int | None = None, source_mode: str = "price_history_replay") -> int:
+        return self.build_history_snapshot(source_df=None, snapshot_date=snapshot_date, source_mode=source_mode, limit=limit)
 
-    def backfill_launch_ready_history(self, days: int = 6, asof_date: str | None = None, limit: int | None = None) -> dict:
-        """回建最近交易日快照。若 DB 本身只有一日 ranking_result，會如實回報日期不足。"""
+    def backfill_launch_ready_history(self, days: int = 6, asof_date: str | None = None, limit: int | None = None, source_mode: str = "price_history_replay") -> dict:
+        """R5N28C：回建最近交易日快照。預設改用 price_history 交易日與 As-Of replay。"""
         self.ensure_schema()
-        dates = self._available_snapshot_dates("ranking_result", "date", max_days=max(days, 1), asof_date=asof_date)
-        result = {"dates": dates, "rows_by_date": {}, "total_rows": 0, "history_ready": 0}
+        mode = source_mode or "price_history_replay"
+        if mode == "price_history_replay":
+            dates = self._available_price_history_dates(max_days=max(days, 1), asof_date=asof_date)
+        else:
+            dates = self._available_snapshot_dates("ranking_result", "date", max_days=max(days, 1), asof_date=asof_date)
+        result = {"dates": dates, "rows_by_date": {}, "total_rows": 0, "history_ready": 0, "source_mode": mode}
         for d in dates:
-            n = self.build_history_snapshot_for_date(d, limit=limit)
+            n = self.build_history_snapshot_for_date(d, limit=limit, source_mode=mode)
             result["rows_by_date"][d] = n
             result["total_rows"] += int(n or 0)
         result["history_ready"] = 1 if len(dates) >= self.MIN_SNAPSHOT_DAYS_FOR_3D else 0
+        result["history_reason"] = "OK" if result["history_ready"] else "INSUFFICIENT_PRICE_HISTORY_DATES"
         return result
 
     def _history_frame(self, asof_date: str | None = None, max_days: int = 10) -> tuple[pd.DataFrame, list[str], dict]:
@@ -23300,9 +23465,9 @@ class LaunchReadyTop20Engine:
 
 def run_launch_ready_top20(db: DBManager, source_df: pd.DataFrame | None = None, log_cb=None, auto_backfill: bool = True) -> tuple[pd.DataFrame, Path]:
     engine = LaunchReadyTop20Engine(db)
-    backfill_info = engine.backfill_launch_ready_history(days=6) if auto_backfill else {"total_rows": engine.build_history_snapshot(source_df=source_df, source_mode="ranking_full")}
+    backfill_info = engine.backfill_launch_ready_history(days=6) if auto_backfill else {"total_rows": engine.build_history_snapshot(source_df=source_df, source_mode="price_history_replay")}
     if log_cb:
-        log_cb(f"[R5N28B][LAUNCH_READY] backfill/snapshot={backfill_info}")
+        log_cb(f"[R5N28C][LAUNCH_READY] backfill/snapshot={backfill_info}")
     df = engine.build_launch_ready_top20(lookback_days=5)
     path = engine.export_launch_ready_report(df)
     return df, path
@@ -25593,21 +25758,21 @@ class AppUI:
             self.append_log(f"刷新準備噴射股失敗：{exc}", "ERROR")
 
     def on_launch_ready_build_snapshot(self):
-        """UI按鈕：建立 launch_ready_history 快照。R5N28B 改為回建最近3~5日候選池/排行快照。"""
+        """UI按鈕：建立 launch_ready_history 快照。R5N28C 改為從 price_history 回建最近3~5日 as-of replay 快照。"""
         def worker():
             self.ui_call(self.start_task, "建立噴射資料庫", 2)
             engine = LaunchReadyTop20Engine(self.db)
             info = engine.backfill_launch_ready_history(days=6)
             rows = int(info.get("total_rows", 0) or 0) if isinstance(info, dict) else 0
             self.ui_call(self.update_task, "建立噴射資料庫", 2, 2, success=rows, item="Snapshot完成")
-            self.ui_call(self.append_log, f"[R5N28B][LAUNCH_READY] 準備噴射股快照完成：{info}")
+            self.ui_call(self.append_log, f"[R5N28C][LAUNCH_READY] 準備噴射股快照完成：{info}")
             self.ui_call(self.finish_task, "建立噴射資料庫", f"完成：{rows} 筆")
             msg = f"準備噴射股快照完成：{rows} 筆\n日期：{info.get('dates', []) if isinstance(info, dict) else ''}"
             self.ui_call(messagebox.showinfo, "完成", msg)
         self._run_in_thread(worker, "launch_ready_snapshot")
 
     def on_launch_ready_generate(self):
-        """UI按鈕：產生準備噴射股 TOP20 報表。R5N28B 先回建快照，再產生正式/觀察報表。"""
+        """UI按鈕：產生準備噴射股 TOP20 報表。R5N28C 先用 price_history replay 回建快照，再產生正式/觀察報表。"""
         def worker():
             self.ui_call(self.start_task, "準備噴射股TOP20", 3)
             df, path = run_launch_ready_top20(self.db, source_df=None, log_cb=lambda m: self.ui_call(self.append_log, m), auto_backfill=True)
@@ -28650,11 +28815,11 @@ class AppUI:
                 self.last_top20_df = self.enrich_price_and_export_fields(ui_top20_source.copy(), id_col="stock_id") if ui_top20_source is not None and not ui_top20_source.empty else pd.DataFrame()
                 self.cache_trade_dataframe(self.last_top20_df)
                 try:
-                    # R5N28B：AI TOP20完成後建立「排行/候選池」快照，不再只保存 UI TOP20 20筆。
-                    rows_snapshot = LaunchReadyTop20Engine(self.db).build_history_snapshot(source_df=None, source_mode="ranking_full")
-                    self.ui_call(self.append_log, f"[R5N28B][LAUNCH_READY] AI TOP20後自動寫入準備噴射股候選池快照：{rows_snapshot} 筆")
+                    # R5N28C：AI TOP20完成後用 price_history replay 建立 as-of 快照，不再依賴 ranking_result 歷史日期。
+                    rows_snapshot = LaunchReadyTop20Engine(self.db).build_history_snapshot(source_df=None, source_mode="price_history_replay")
+                    self.ui_call(self.append_log, f"[R5N28C][LAUNCH_READY] AI TOP20後自動寫入準備噴射股候選池快照：{rows_snapshot} 筆")
                 except Exception as exc:
-                    self.ui_call(self.append_log, f"[R5N28B][LAUNCH_READY][WARN] 快照寫入失敗：{exc}", "WARNING")
+                    self.ui_call(self.append_log, f"[R5N28C][LAUNCH_READY][WARN] 快照寫入失敗：{exc}", "WARNING")
                 top5 = attack.head(5).copy() if attack is not None and not attack.empty else (trade_top20.head(5).copy() if trade_top20 is not None and not trade_top20.empty else pd.DataFrame())
                 if not top5.empty:
                     bt_rows = []
