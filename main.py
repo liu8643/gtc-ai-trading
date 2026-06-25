@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.28-R5N28D_REPLAY_TECHNICAL_INDICATORS"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.29-R5N28E_LAUNCH_SCORE_TRACE"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -3698,7 +3698,7 @@ class DBManager:
                 "run_time": now,
                 "event_time": now,
                 "program_name": APP_NAME,
-                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.27_r5n27g_directory_auto_create_fix",
+                "program_version": "v9.6.2_pro_fundamental_local_cache_v16.29_r5n28e_launch_score_trace",
                 "program_path": program_path,
                 "program_hash": self._safe_sha256(program_path),
                 "db_path": str(self.db_path),
@@ -22807,7 +22807,7 @@ class LaunchReadyTop20Engine:
     4) 報表補 04/05 案例分析、07 觀察池、08 資料健康檢查。
     """
 
-    RULE_VERSION = "R5N28D_REPLAY_TECHNICAL_INDICATORS_20260625"
+    RULE_VERSION = "R5N28E_LAUNCH_SCORE_TRACE_20260625"
     MIN_SNAPSHOT_DAYS_FOR_3D = 4
     MIN_SNAPSHOT_DAYS_FOR_5D = 6
     DEFAULT_SNAPSHOT_LIMIT = 300
@@ -22881,6 +22881,16 @@ class LaunchReadyTop20Engine:
             "macd": "REAL", "macd_signal": "REAL", "macd_hist": "REAL",
             "atr14": "REAL", "obv": "REAL",
             "technical_replay_ready": "INTEGER DEFAULT 0", "technical_replay_source": "TEXT",
+            # R5N28E：Launch Score Trace / Replay Technical Score Trace。
+            # P0：只做可追溯與公式驗證，不改既有 candidate/mainstream/breakout/launch 排名邏輯。
+            "indicator_valid_count": "INTEGER DEFAULT 0", "indicator_missing_reason": "TEXT",
+            "ma_trend_score": "REAL", "rsi_score": "REAL", "kd_score": "REAL",
+            "macd_score": "REAL", "volume_ratio_score": "REAL",
+            "atr_score": "REAL", "obv_score": "REAL",
+            "atr_obv_score_enabled": "INTEGER DEFAULT 0",
+            "technical_replay_score": "REAL", "technical_replay_score_with_atr_obv": "REAL",
+            "technical_score_formula_trace": "TEXT", "composite_formula_trace": "TEXT",
+            "atr_obv_mode": "TEXT",
         }
         for col, typ in extra_cols.items():
             self._add_column_if_missing("launch_ready_history", col, typ)
@@ -23089,6 +23099,72 @@ class LaunchReadyTop20Engine:
             macd_bonus = 6.0 if macd_hist > 0 else 0.0
             momentum_score = min(100.0, max(0.0, 50.0 + pct5 * 4.0 + pct20 * 1.2 + rsi_bonus + kd_bonus + macd_bonus))
             breakout_score = min(100.0, max(0.0, 55.0 + breakout_pct * 6.0 + (10.0 if c >= high20_prev and high20_prev > 0 else 0.0) + (5.0 if volume_ratio >= 1.2 else 0.0)))
+
+            # R5N28E P0：Replay Technical Score Trace。
+            # 重點：這些欄位只作可追溯拆解與報表驗證，不直接改變既有 candidate20/mainstream/breakout/launch 排名。
+            # ATR/OBV 先計算 trace 分數，但 atr_obv_score_enabled=0，避免未經 A/B 驗證就改變排名。
+            ma_trend_score = min(20.0, max(0.0,
+                (6.0 if c >= ma20 and ma20 > 0 else 0.0) +
+                (4.0 if c >= ma60 and ma60 > 0 else 0.0) +
+                (6.0 if ma5 >= ma10 >= ma20 >= ma60 else (3.0 if ma5 >= ma20 >= ma60 else 0.0)) +
+                (4.0 if ma20_gap > 0 else 0.0)
+            ))
+            rsi_score = min(20.0, max(0.0,
+                14.0 if 50 <= rsi14 <= 70 else
+                (10.0 if 45 <= rsi14 < 50 else
+                 (8.0 if 70 < rsi14 <= 80 else
+                  (3.0 if 80 < rsi14 <= 85 else 0.0)))
+            ))
+            kd_score = min(20.0, max(0.0,
+                (12.0 if k9 >= d9 and k9 >= 50 else (6.0 if k9 >= d9 else 0.0)) +
+                (4.0 if k9 < 85 else 0.0)
+            ))
+            macd_score = min(20.0, max(0.0,
+                (12.0 if macd_hist > 0 else 0.0) +
+                (4.0 if macd >= macd_signal else 0.0) +
+                (4.0 if macd > 0 else 0.0)
+            ))
+            volume_ratio_score = min(20.0, max(0.0,
+                (8.0 if volume_ratio >= 1.2 else (4.0 if volume_ratio >= 1.0 else 0.0)) +
+                (6.0 if vol_ratio_avg >= 1.0 else 0.0) +
+                (6.0 if volume_ratio <= 3.5 else 2.0)
+            ))
+            atr_pct_trace = (atr14 / c * 100.0) if c > 0 and atr14 >= 0 else 0.0
+            atr_score = min(20.0, max(0.0,
+                16.0 if 1.0 <= atr_pct_trace <= 6.0 else
+                (10.0 if 0.3 <= atr_pct_trace < 1.0 else
+                 (8.0 if 6.0 < atr_pct_trace <= 9.0 else 0.0))
+            ))
+            obv_tail20 = obv_series.tail(20) if len(obv_series) >= 1 else pd.Series(dtype="float64")
+            obv_ma20 = float(obv_tail20.mean()) if len(obv_tail20) else 0.0
+            obv_prev5 = float(obv_series.iloc[-6]) if len(obv_series) >= 6 else float(obv_series.iloc[0] if len(obv_series) else 0.0)
+            obv_score = min(20.0, max(0.0,
+                (10.0 if obv >= obv_ma20 else 0.0) +
+                (6.0 if obv >= obv_prev5 else 0.0) +
+                (4.0 if obv_tail20.empty or obv >= float(obv_tail20.max()) else 0.0)
+            ))
+            technical_replay_score = round(ma_trend_score + rsi_score + kd_score + macd_score + volume_ratio_score, 2)
+            technical_replay_score_with_atr_obv = round(min(100.0, technical_replay_score * 0.80 + atr_score * 0.10 + obv_score * 0.10), 2)
+            indicator_checks = {
+                "MA20": ma20 > 0, "MA60": ma60 > 0, "RSI14": np.isfinite(rsi14),
+                "KD": np.isfinite(k9) and np.isfinite(d9), "MACD": np.isfinite(macd_hist),
+                "VolumeRatio": np.isfinite(volume_ratio), "ATR14": np.isfinite(atr14), "OBV": np.isfinite(obv),
+            }
+            indicator_valid_count = int(sum(1 for _k, _v in indicator_checks.items() if bool(_v)))
+            indicator_missing_reason = "|".join([_k for _k, _v in indicator_checks.items() if not bool(_v)])
+            technical_score_formula_trace = (
+                f"MA={ma_trend_score:.2f}; RSI={rsi_score:.2f}; KD={kd_score:.2f}; "
+                f"MACD={macd_score:.2f}; VolumeRatio={volume_ratio_score:.2f}; "
+                f"ATR={atr_score:.2f}(TRACE_ONLY); OBV={obv_score:.2f}(TRACE_ONLY); "
+                f"technical_replay_score={technical_replay_score:.2f}; "
+                f"technical_replay_score_with_atr_obv={technical_replay_score_with_atr_obv:.2f}"
+            )
+            composite_formula_trace = (
+                f"candidate20=trend*0.30({trend_score:.2f})+breakout*0.25({breakout_score:.2f})+"
+                f"volume*0.20({volume_score:.2f})+momentum*0.15({momentum_score:.2f})+liquidity*0.10({liquidity_score:.2f}); "
+                f"mainstream=trend*0.55({trend_score:.2f})+momentum*0.25({momentum_score:.2f})+liquidity*0.20({liquidity_score:.2f})"
+            )
+
             candidate20 = round(trend_score * 0.30 + breakout_score * 0.25 + volume_score * 0.20 + momentum_score * 0.15 + liquidity_score * 0.10, 2)
             mainstream = round(trend_score * 0.55 + momentum_score * 0.25 + liquidity_score * 0.20, 2)
             source_count = int((candidate20 >= 80) + (mainstream >= 80) + (breakout_score >= 80) + (volume_score >= 80))
@@ -23119,6 +23195,21 @@ class LaunchReadyTop20Engine:
                 "atr14": _round(atr14, 4), "obv": _round(obv, 0),
                 "technical_replay_ready": technical_replay_ready,
                 "technical_replay_source": "price_history_ohlcv_asof_recalc",
+                "indicator_valid_count": indicator_valid_count,
+                "indicator_missing_reason": indicator_missing_reason,
+                "ma_trend_score": _round(ma_trend_score),
+                "rsi_score": _round(rsi_score),
+                "kd_score": _round(kd_score),
+                "macd_score": _round(macd_score),
+                "volume_ratio_score": _round(volume_ratio_score),
+                "atr_score": _round(atr_score),
+                "obv_score": _round(obv_score),
+                "atr_obv_score_enabled": 0,
+                "technical_replay_score": _round(technical_replay_score),
+                "technical_replay_score_with_atr_obv": _round(technical_replay_score_with_atr_obv),
+                "technical_score_formula_trace": technical_score_formula_trace,
+                "composite_formula_trace": composite_formula_trace,
+                "atr_obv_mode": "TRACE_ONLY_NOT_USED_IN_RANKING",
             })
 
         try:
@@ -23150,6 +23241,11 @@ class LaunchReadyTop20Engine:
             "ma5", "ma10", "ma20", "ma60", "rsi14", "k9", "d9", "vol_ma5", "vol_ma20",
             "volume_ratio", "macd", "macd_signal", "macd_hist", "atr14", "obv",
             "technical_replay_ready", "technical_replay_source",
+            "indicator_valid_count", "indicator_missing_reason",
+            "ma_trend_score", "rsi_score", "kd_score", "macd_score", "volume_ratio_score",
+            "atr_score", "obv_score", "atr_obv_score_enabled",
+            "technical_replay_score", "technical_replay_score_with_atr_obv",
+            "technical_score_formula_trace", "composite_formula_trace", "atr_obv_mode",
             "snapshot_source", "snapshot_scope", "pipeline_run_id"
         ]
         return out[keep].reset_index(drop=True)
@@ -23359,7 +23455,12 @@ class LaunchReadyTop20Engine:
             "market", "industry", "theme", "history_ready", "pipeline_run_id",
             "ma5", "ma10", "ma20", "ma60", "rsi14", "k9", "d9", "vol_ma5", "vol_ma20",
             "volume_ratio", "macd", "macd_signal", "macd_hist", "atr14", "obv",
-            "technical_replay_ready", "technical_replay_source"
+            "technical_replay_ready", "technical_replay_source",
+            "indicator_valid_count", "indicator_missing_reason",
+            "ma_trend_score", "rsi_score", "kd_score", "macd_score", "volume_ratio_score",
+            "atr_score", "obv_score", "atr_obv_score_enabled",
+            "technical_replay_score", "technical_replay_score_with_atr_obv",
+            "technical_score_formula_trace", "composite_formula_trace", "atr_obv_mode"
         ]
         for c in base_cols:
             if c not in rows_df.columns:
@@ -23368,7 +23469,10 @@ class LaunchReadyTop20Engine:
                     "attack_volume_score", "active_buy_score", "leader_follow_score", "source_count",
                     "modules_pass_count", "rank_no", "history_ready", "ma5", "ma10", "ma20", "ma60",
                     "rsi14", "k9", "d9", "vol_ma5", "vol_ma20", "volume_ratio", "macd",
-                    "macd_signal", "macd_hist", "atr14", "obv", "technical_replay_ready"
+                    "macd_signal", "macd_hist", "atr14", "obv", "technical_replay_ready",
+                    "indicator_valid_count", "ma_trend_score", "rsi_score", "kd_score", "macd_score",
+                    "volume_ratio_score", "atr_score", "obv_score", "atr_obv_score_enabled",
+                    "technical_replay_score", "technical_replay_score_with_atr_obv"
                 }
                 rows_df[c] = 0 if c in numeric_cols else ""
         rows_df = rows_df[base_cols]
@@ -23440,6 +23544,76 @@ class LaunchReadyTop20Engine:
             except Exception:
                 return pd.DataFrame(columns=["snapshot_date", "rows_count"])
 
+    def _add_r5n28e_filter_trace(self, df: pd.DataFrame) -> pd.DataFrame:
+        """R5N28E：逐檔輸出未入選原因。
+
+        不為了 TOP20 名稱補位；沒有符合條件就沒有。
+        這個 Trace 只解釋每檔卡在哪一道 Gate。
+        """
+        if df is None or df.empty:
+            return df
+        x = df.copy()
+        def _num(row, col, default=0.0):
+            try:
+                v = row.get(col, default)
+                if pd.isna(v):
+                    return float(default)
+                return float(v)
+            except Exception:
+                return float(default)
+        def _reason(row):
+            reasons = []
+            if _num(row, "candidate20_score") < 85:
+                reasons.append(f"candidate20_score不足:{_num(row, 'candidate20_score'):.2f}<85")
+            if _num(row, "breakout_score") < 80:
+                reasons.append(f"breakout_score不足:{_num(row, 'breakout_score'):.2f}<80")
+            if _num(row, "mainstream_score") < 80:
+                reasons.append(f"mainstream_score不足:{_num(row, 'mainstream_score'):.2f}<80")
+            if _num(row, "candidate_acc_3d") < 10:
+                reasons.append(f"candidate_acc_3d不足:{_num(row, 'candidate_acc_3d'):.2f}<10")
+            if _num(row, "source_count") < 1:
+                reasons.append(f"source_count不足:{_num(row, 'source_count'):.0f}<1")
+            return "PASS" if not reasons else "|".join(reasons)
+        x["filter_fail_reason"] = x.apply(_reason, axis=1)
+        x["qualified_flag"] = x["filter_fail_reason"].eq("PASS").astype(int)
+        try:
+            x["qualified_count"] = int(x["qualified_flag"].sum())
+        except Exception:
+            x["qualified_count"] = 0
+        return x
+
+    def _add_r5n28e_launch_score_trace(self, df: pd.DataFrame) -> pd.DataFrame:
+        """R5N28E：輸出 launch_score 公式回推欄位。
+
+        公式維持 R5N28D：candidate_acc_3d*40% + breakout_acc_3d*30% +
+        mainstream_acc_3d*20% + source_count*10*10%。
+        """
+        if df is None or df.empty:
+            return df
+        x = df.copy()
+        for col in ["candidate_acc_3d", "breakout_acc_3d", "mainstream_acc_3d", "source_count", "launch_score"]:
+            x[col] = pd.to_numeric(x.get(col, 0), errors="coerce")
+        x["source_count_score"] = x["source_count"].fillna(0).clip(lower=0, upper=3) * 10
+        x["launch_score_calc"] = (
+            x["candidate_acc_3d"].fillna(0) * 0.40
+            + x["breakout_acc_3d"].fillna(0) * 0.30
+            + x["mainstream_acc_3d"].fillna(0) * 0.20
+            + x["source_count_score"].fillna(0) * 0.10
+        ).clip(lower=0, upper=100).round(2)
+        x["launch_score_calc_diff"] = (x["launch_score"].fillna(0) - x["launch_score_calc"].fillna(0)).round(4)
+        def _trace(row):
+            return (
+                f"candidate_acc_3d*0.40={float(row.get('candidate_acc_3d') or 0):.2f}*0.40; "
+                f"breakout_acc_3d*0.30={float(row.get('breakout_acc_3d') or 0):.2f}*0.30; "
+                f"mainstream_acc_3d*0.20={float(row.get('mainstream_acc_3d') or 0):.2f}*0.20; "
+                f"source_count_score*0.10={float(row.get('source_count_score') or 0):.2f}*0.10; "
+                f"calc={float(row.get('launch_score_calc') or 0):.2f}; actual={float(row.get('launch_score') or 0):.2f}; "
+                f"diff={float(row.get('launch_score_calc_diff') or 0):.4f}"
+            )
+        x["launch_score_formula_trace"] = x.apply(_trace, axis=1)
+        x["ranking_sort_key_trace"] = "sort=launch_score desc,candidate_acc_3d desc,breakout_score desc,mainstream_score desc"
+        return x
+
     def build_launch_ready_top20(self, asof_date: str | None = None, lookback_days: int = 5) -> pd.DataFrame:
         """回推最近 3~5 天，產生準備噴射股 TOP20。日期不足時不產生假正式TOP20。"""
         hist, dates, meta = self._history_frame(asof_date=asof_date, max_days=max(lookback_days + 5, 10))
@@ -23509,6 +23683,9 @@ class LaunchReadyTop20Engine:
         out["launch_status"] = "READY"
         out["history_ready"] = 1
         out["launch_note"] = "asof=" + str(today_date) + "｜D3=" + str(d3_date) + "｜D5=" + str(d5_date) + "｜加速度=今日分數-歷史分數"
+        # R5N28E：加上公式 Trace 與 Gate Fail Trace，證明分數來源與為何未入選。
+        out = self._add_r5n28e_launch_score_trace(out)
+        out = self._add_r5n28e_filter_trace(out)
         qualified = out[(out["candidate20_score"] >= 85) & (out["breakout_score"] >= 80) & (out["mainstream_score"] >= 80) & (out["candidate_acc_3d"] >= 10) & (out["source_count"] >= 1)].copy()
         if qualified.empty:
             qualified = pd.DataFrame([{"launch_status": "NO_QUALIFIED", "message": "目前尚無符合準備噴射股條件；請查看07_觀察池。", "history_ready": 1, "launch_note": out["launch_note"].iloc[0] if not out.empty else ""}])
@@ -23556,9 +23733,28 @@ class LaunchReadyTop20Engine:
                 {"公式": "launch_score", "定義": "candidate_acc_3d*40% + breakout_acc_3d*30% + mainstream_acc_3d*20% + source_count*10*10%"},
                 {"公式": "R5N28D 技術回放", "定義": "每個 snapshot_date 只用 price_history 中 date<=snapshot_date 的 OHLCV 重算 MA5/10/20/60、RSI14、KD9、Volume Ratio、MACD、ATR14、OBV"},
                 {"公式": "technical_replay_ready", "定義": "price_history 至少60筆且 high/low/volume 可用時為1；不足時仍輸出部分指標並標示 fail_reason"},
+                {"公式": "R5N28E technical_replay_score", "定義": "MA/RSI/KD/MACD/Volume 五大 Trace 分數合計；P0 只做可追溯，不改排名"},
+                {"公式": "ATR/OBV TRACE_ONLY", "定義": "atr_score/obv_score 會輸出，但 atr_obv_score_enabled=0；需 A/B 驗證後才可啟用入排名"},
+                {"公式": "filter_fail_reason", "定義": "未入選時列出 candidate/breakout/mainstream/acc/source_count 哪一道 Gate 未過；不補位湊滿20檔"},
             ]).to_excel(writer, index=False, sheet_name="06_欄位與規則說明")
-            (observation if isinstance(observation, pd.DataFrame) and not observation.empty else pd.DataFrame([{"message": "無觀察池資料"}])).to_excel(writer, index=False, sheet_name="07_觀察池")
+            observation_df = observation if isinstance(observation, pd.DataFrame) and not observation.empty else pd.DataFrame([{"message": "無觀察池資料"}])
+            observation_df.to_excel(writer, index=False, sheet_name="07_觀察池")
             (health if isinstance(health, pd.DataFrame) and not health.empty else pd.DataFrame([{"message": "launch_ready_history 無資料"}])).to_excel(writer, index=False, sheet_name="08_資料健康檢查")
+            # R5N28E：新增可驗證 Trace Sheet。沒有符合 TOP 條件時，不補位，只在觀察池與 Trace 說明原因。
+            trace_cols = [c for c in [
+                "rank", "stock_id", "stock_name", "launch_grade", "launch_score",
+                "ma5", "ma10", "ma20", "ma60", "rsi14", "k9", "d9", "volume_ratio", "macd", "macd_signal", "macd_hist", "atr14", "obv",
+                "ma_trend_score", "rsi_score", "kd_score", "macd_score", "volume_ratio_score", "atr_score", "obv_score",
+                "atr_obv_score_enabled", "technical_replay_score", "technical_replay_score_with_atr_obv",
+                "indicator_valid_count", "indicator_missing_reason", "technical_score_formula_trace", "composite_formula_trace", "atr_obv_mode"
+            ] if c in observation_df.columns]
+            (observation_df[trace_cols] if trace_cols else pd.DataFrame([{"message": "無技術指標 Trace 欄位"}])).to_excel(writer, index=False, sheet_name="09_技術指標評分Trace")
+            formula_cols = [c for c in [
+                "rank", "stock_id", "stock_name", "launch_score", "launch_score_calc", "launch_score_calc_diff",
+                "candidate_acc_3d", "breakout_acc_3d", "mainstream_acc_3d", "source_count", "source_count_score",
+                "launch_score_formula_trace", "ranking_sort_key_trace", "filter_fail_reason", "qualified_flag", "qualified_count"
+            ] if c in observation_df.columns]
+            (observation_df[formula_cols] if formula_cols else pd.DataFrame([{"message": "無 Launch Score Formula Trace 欄位"}])).to_excel(writer, index=False, sheet_name="10_分數公式驗證")
         return Path(path)
 
 
