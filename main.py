@@ -156,7 +156,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.27-R5N27G_DIRECTORY_AUTO_CREATE_FIX"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.28-R5N28D_REPLAY_TECHNICAL_INDICATORS"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -22807,7 +22807,7 @@ class LaunchReadyTop20Engine:
     4) 報表補 04/05 案例分析、07 觀察池、08 資料健康檢查。
     """
 
-    RULE_VERSION = "R5N28C_PRICE_HISTORY_REPLAY_BACKFILL_FIX_20260624"
+    RULE_VERSION = "R5N28D_REPLAY_TECHNICAL_INDICATORS_20260625"
     MIN_SNAPSHOT_DAYS_FOR_3D = 4
     MIN_SNAPSHOT_DAYS_FOR_5D = 6
     DEFAULT_SNAPSHOT_LIMIT = 300
@@ -22873,6 +22873,14 @@ class LaunchReadyTop20Engine:
             "theme": "TEXT",
             "history_ready": "INTEGER DEFAULT 0",
             "pipeline_run_id": "TEXT",
+            # R5N28D：Replay Technical Indicators。欄位直接落在 launch_ready_history，
+            # 讓 D-3/D-5 回放快照不再只有最終分數，而可追溯 MA/RSI/KD/量能/MACD/ATR/OBV。
+            "ma5": "REAL", "ma10": "REAL", "ma20": "REAL", "ma60": "REAL",
+            "rsi14": "REAL", "k9": "REAL", "d9": "REAL",
+            "vol_ma5": "REAL", "vol_ma20": "REAL", "volume_ratio": "REAL",
+            "macd": "REAL", "macd_signal": "REAL", "macd_hist": "REAL",
+            "atr14": "REAL", "obv": "REAL",
+            "technical_replay_ready": "INTEGER DEFAULT 0", "technical_replay_source": "TEXT",
         }
         for col, typ in extra_cols.items():
             self._add_column_if_missing("launch_ready_history", col, typ)
@@ -22911,7 +22919,7 @@ class LaunchReadyTop20Engine:
             return []
 
     def _available_price_history_dates(self, max_days: int = 10, asof_date: str | None = None) -> list[str]:
-        """R5N28C：從 price_history 取得最近交易日，而不是從 ranking_result 取日期。
+        """R5N28D：從 price_history 取得最近交易日，而不是從 ranking_result 取日期。
         目的：ranking_result 可能只有今日一筆，但 price_history 已有 400+ 交易日，可用於 As-Of replay。
         """
         try:
@@ -22929,7 +22937,7 @@ class LaunchReadyTop20Engine:
             return []
 
     def _price_history_replay_snapshot_for_date(self, snapshot_date: str, limit: int | None = None) -> pd.DataFrame:
-        """R5N28C：用 price_history 做指定 asof_date 的歷史回放快照。
+        """R5N28D：用 price_history 做指定 asof_date 的歷史回放快照。
 
         核心原則：
         1) 僅使用 date <= snapshot_date 的歷史價量，禁止用今日資料代替 D-3/D-5。
@@ -22987,38 +22995,107 @@ class LaunchReadyTop20Engine:
             return pd.DataFrame()
 
         def _calc(g: pd.DataFrame) -> pd.Series:
+            """R5N28D：以 as-of 當日歷史價量重算技術指標。
+
+            不讀取 ranking_result / technical_feature_daily 的最終分數；
+            每個 snapshot_date 均只使用 date <= snapshot_date 的 price_history 原始 OHLCV。
+            """
             g = g.sort_values("date").copy()
-            close = g["close"]
-            high = g["high"] if "high" in g.columns else close
-            volume = g["volume"] if "volume" in g.columns else pd.Series([0] * len(g), index=g.index)
+            close = pd.to_numeric(g["close"], errors="coerce")
+            high = pd.to_numeric(g["high"], errors="coerce") if "high" in g.columns else close
+            low = pd.to_numeric(g["low"], errors="coerce") if "low" in g.columns else close
+            volume = pd.to_numeric(g["volume"], errors="coerce").fillna(0) if "volume" in g.columns else pd.Series([0] * len(g), index=g.index, dtype="float64")
+            high = high.fillna(close)
+            low = low.fillna(close)
             last = g.iloc[-1]
-            ma5 = close.tail(5).mean() if len(close) >= 5 else close.mean()
-            ma20 = close.tail(20).mean() if len(close) >= 20 else close.mean()
-            ma60 = close.tail(60).mean() if len(close) >= 60 else close.mean()
-            vol5 = volume.tail(5).mean() if len(volume) >= 5 else volume.mean()
-            vol20 = volume.tail(20).mean() if len(volume) >= 20 else volume.mean()
+
+            def _tail_mean(s: pd.Series, n: int) -> float:
+                s = pd.to_numeric(s, errors="coerce").dropna()
+                if s.empty:
+                    return 0.0
+                return float(s.tail(n).mean()) if len(s) >= n else float(s.mean())
+
+            def _round(v, nd=2, default=0.0):
+                try:
+                    if pd.isna(v) or not np.isfinite(float(v)):
+                        return default
+                    return round(float(v), nd)
+                except Exception:
+                    return default
+
+            c = float(last.get("close", 0) or 0)
+            v = float(last.get("volume", 0) or 0)
+            ma5 = _tail_mean(close, 5)
+            ma10 = _tail_mean(close, 10)
+            ma20 = _tail_mean(close, 20)
+            ma60 = _tail_mean(close, 60)
+            vol_ma5 = _tail_mean(volume, 5)
+            vol_ma20 = _tail_mean(volume, 20)
+            volume_ratio = (v / vol_ma20) if vol_ma20 and vol_ma20 > 0 else 1.0
+            vol_ratio_avg = (vol_ma5 / vol_ma20) if vol_ma20 and vol_ma20 > 0 else 1.0
+
+            delta = close.diff()
+            gain = delta.clip(lower=0)
+            loss = (-delta.clip(upper=0))
+            avg_gain = gain.ewm(alpha=1/14, adjust=False, min_periods=1).mean()
+            avg_loss = loss.ewm(alpha=1/14, adjust=False, min_periods=1).mean().replace(0, np.nan)
+            rs = avg_gain / avg_loss
+            rsi14_series = 100 - (100 / (1 + rs))
+            rsi14 = float(rsi14_series.iloc[-1]) if len(rsi14_series) else 50.0
+            if pd.isna(rsi14):
+                rsi14 = 100.0 if float(avg_gain.iloc[-1] if len(avg_gain) else 0) > 0 else 50.0
+
+            low9 = low.rolling(9, min_periods=1).min()
+            high9 = high.rolling(9, min_periods=1).max()
+            rsv = ((close - low9) / (high9 - low9).replace(0, np.nan) * 100).fillna(50)
+            k_series = rsv.ewm(alpha=1/3, adjust=False, min_periods=1).mean()
+            d_series = k_series.ewm(alpha=1/3, adjust=False, min_periods=1).mean()
+            k9 = float(k_series.iloc[-1]) if len(k_series) else 50.0
+            d9 = float(d_series.iloc[-1]) if len(d_series) else 50.0
+
+            ema12 = close.ewm(span=12, adjust=False, min_periods=1).mean()
+            ema26 = close.ewm(span=26, adjust=False, min_periods=1).mean()
+            macd_series = ema12 - ema26
+            signal_series = macd_series.ewm(span=9, adjust=False, min_periods=1).mean()
+            macd = float(macd_series.iloc[-1]) if len(macd_series) else 0.0
+            macd_signal = float(signal_series.iloc[-1]) if len(signal_series) else 0.0
+            macd_hist = macd - macd_signal
+
+            prev_close = close.shift(1)
+            tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+            atr14_series = tr.rolling(14, min_periods=1).mean()
+            atr14 = float(atr14_series.iloc[-1]) if len(atr14_series) else 0.0
+
+            direction = np.sign(close.diff().fillna(0))
+            obv_series = (direction * volume.fillna(0)).cumsum()
+            obv = float(obv_series.iloc[-1]) if len(obv_series) else 0.0
+
             prev_close_5 = close.iloc[-6] if len(close) >= 6 else close.iloc[0]
             prev_close_20 = close.iloc[-21] if len(close) >= 21 else close.iloc[0]
             high20_prev = high.iloc[:-1].tail(20).max() if len(high) >= 2 else high.max()
-            c = float(last.get("close", 0) or 0)
-            v = float(last.get("volume", 0) or 0)
-            vol_ratio = (vol5 / vol20) if vol20 and vol20 > 0 else 1.0
             pct5 = (c / float(prev_close_5) - 1.0) * 100 if prev_close_5 and prev_close_5 > 0 else 0.0
             pct20 = (c / float(prev_close_20) - 1.0) * 100 if prev_close_20 and prev_close_20 > 0 else 0.0
             ma20_gap = (c / float(ma20) - 1.0) * 100 if ma20 and ma20 > 0 else 0.0
             ma60_gap = (c / float(ma60) - 1.0) * 100 if ma60 and ma60 > 0 else 0.0
             breakout_pct = (c / float(high20_prev) - 1.0) * 100 if high20_prev and high20_prev > 0 else 0.0
             turnover_proxy = float(last.get("turnover", 0) or 0)
+
             liquidity_score = min(100.0, max(0.0, 45.0 + np.log10(max(v, 1.0)) * 8.0))
-            trend_score = min(100.0, max(0.0, 50.0 + ma20_gap * 3.0 + ma60_gap * 1.0 + (10.0 if ma5 >= ma20 >= ma60 else 0.0)))
-            volume_score = min(100.0, max(0.0, 45.0 + (vol_ratio - 1.0) * 35.0 + (15.0 if v >= vol5 and vol5 > 0 else 0.0)))
-            momentum_score = min(100.0, max(0.0, 50.0 + pct5 * 4.0 + pct20 * 1.2))
-            breakout_score = min(100.0, max(0.0, 55.0 + breakout_pct * 6.0 + (10.0 if c >= high20_prev and high20_prev > 0 else 0.0)))
+            trend_bonus = 10.0 if ma5 >= ma10 >= ma20 >= ma60 else (6.0 if ma5 >= ma20 >= ma60 else 0.0)
+            trend_score = min(100.0, max(0.0, 50.0 + ma20_gap * 3.0 + ma60_gap * 1.0 + trend_bonus))
+            volume_score = min(100.0, max(0.0, 45.0 + (vol_ratio_avg - 1.0) * 25.0 + (volume_ratio - 1.0) * 20.0 + (15.0 if v >= vol_ma5 and vol_ma5 > 0 else 0.0)))
+            rsi_bonus = 8.0 if 50 <= rsi14 <= 75 else (-8.0 if rsi14 > 85 else 0.0)
+            kd_bonus = 5.0 if k9 >= d9 and k9 >= 50 else 0.0
+            macd_bonus = 6.0 if macd_hist > 0 else 0.0
+            momentum_score = min(100.0, max(0.0, 50.0 + pct5 * 4.0 + pct20 * 1.2 + rsi_bonus + kd_bonus + macd_bonus))
+            breakout_score = min(100.0, max(0.0, 55.0 + breakout_pct * 6.0 + (10.0 if c >= high20_prev and high20_prev > 0 else 0.0) + (5.0 if volume_ratio >= 1.2 else 0.0)))
             candidate20 = round(trend_score * 0.30 + breakout_score * 0.25 + volume_score * 0.20 + momentum_score * 0.15 + liquidity_score * 0.10, 2)
             mainstream = round(trend_score * 0.55 + momentum_score * 0.25 + liquidity_score * 0.20, 2)
             source_count = int((candidate20 >= 80) + (mainstream >= 80) + (breakout_score >= 80) + (volume_score >= 80))
             source_count = max(1, min(4, source_count))
             modules_pass = int((candidate20 >= 80) + (mainstream >= 80) + (breakout_score >= 80) + (volume_score >= 80) + (momentum_score >= 80))
+            technical_replay_ready = int(len(close.dropna()) >= 60 and high.notna().any() and low.notna().any() and volume.notna().any())
+
             return pd.Series({
                 "stock_id": str(last.get("stock_id", "")),
                 "close": round(c, 2),
@@ -23031,10 +23108,17 @@ class LaunchReadyTop20Engine:
                 "leader_follow_score": round(trend_score, 2),
                 "source_count": source_count,
                 "modules_pass_count": modules_pass,
-                "decision": "PRICE_HISTORY_REPLAY",
-                "fail_reason": "",
+                "decision": "PRICE_HISTORY_REPLAY_TECHNICAL",
+                "fail_reason": "" if technical_replay_ready else "TECH_REPLAY_PARTIAL_HISTORY_LT60_OR_FIELD_MISSING",
                 "rank_no": 0,
                 "turnover_proxy": turnover_proxy,
+                "ma5": _round(ma5), "ma10": _round(ma10), "ma20": _round(ma20), "ma60": _round(ma60),
+                "rsi14": _round(rsi14), "k9": _round(k9), "d9": _round(d9),
+                "vol_ma5": _round(vol_ma5, 0), "vol_ma20": _round(vol_ma20, 0), "volume_ratio": _round(volume_ratio, 4, 1.0),
+                "macd": _round(macd, 4), "macd_signal": _round(macd_signal, 4), "macd_hist": _round(macd_hist, 4),
+                "atr14": _round(atr14, 4), "obv": _round(obv, 0),
+                "technical_replay_ready": technical_replay_ready,
+                "technical_replay_source": "price_history_ohlcv_asof_recalc",
             })
 
         try:
@@ -23052,8 +23136,8 @@ class LaunchReadyTop20Engine:
             if c not in out.columns:
                 out[c] = ""
             out[c] = out[c].fillna("").astype(str)
-        out["snapshot_source"] = f"price_history_replay<= {d}"
-        out["snapshot_scope"] = "price_history_replay_full_market"
+        out["snapshot_source"] = f"price_history_replay_technical<= {d}"
+        out["snapshot_scope"] = "price_history_replay_full_market_with_technical_indicators"
         out["pipeline_run_id"] = self.RULE_VERSION
         out = out.sort_values(["candidate20_score", "breakout_score", "mainstream_score", "attack_volume_score"], ascending=False)
         out["rank_no"] = np.arange(1, len(out) + 1)
@@ -23063,6 +23147,9 @@ class LaunchReadyTop20Engine:
             "stock_id", "stock_name", "close", "candidate20_score", "mainstream_score", "breakout_score",
             "wave_trade_score", "attack_volume_score", "active_buy_score", "leader_follow_score", "source_count",
             "modules_pass_count", "decision", "fail_reason", "rank_no", "market", "industry", "theme",
+            "ma5", "ma10", "ma20", "ma60", "rsi14", "k9", "d9", "vol_ma5", "vol_ma20",
+            "volume_ratio", "macd", "macd_signal", "macd_hist", "atr14", "obv",
+            "technical_replay_ready", "technical_replay_source",
             "snapshot_source", "snapshot_scope", "pipeline_run_id"
         ]
         return out[keep].reset_index(drop=True)
@@ -23269,11 +23356,21 @@ class LaunchReadyTop20Engine:
             "snapshot_date", "stock_id", "stock_name", "close", "candidate20_score", "mainstream_score", "breakout_score",
             "wave_trade_score", "attack_volume_score", "active_buy_score", "leader_follow_score", "source_count",
             "modules_pass_count", "decision", "fail_reason", "created_at", "snapshot_source", "snapshot_scope", "rank_no",
-            "market", "industry", "theme", "history_ready", "pipeline_run_id"
+            "market", "industry", "theme", "history_ready", "pipeline_run_id",
+            "ma5", "ma10", "ma20", "ma60", "rsi14", "k9", "d9", "vol_ma5", "vol_ma20",
+            "volume_ratio", "macd", "macd_signal", "macd_hist", "atr14", "obv",
+            "technical_replay_ready", "technical_replay_source"
         ]
         for c in base_cols:
             if c not in rows_df.columns:
-                rows_df[c] = "" if c not in ("close", "candidate20_score", "mainstream_score", "breakout_score", "wave_trade_score", "attack_volume_score", "active_buy_score", "leader_follow_score", "source_count", "modules_pass_count", "rank_no", "history_ready") else 0
+                numeric_cols = {
+                    "close", "candidate20_score", "mainstream_score", "breakout_score", "wave_trade_score",
+                    "attack_volume_score", "active_buy_score", "leader_follow_score", "source_count",
+                    "modules_pass_count", "rank_no", "history_ready", "ma5", "ma10", "ma20", "ma60",
+                    "rsi14", "k9", "d9", "vol_ma5", "vol_ma20", "volume_ratio", "macd",
+                    "macd_signal", "macd_hist", "atr14", "obv", "technical_replay_ready"
+                }
+                rows_df[c] = 0 if c in numeric_cols else ""
         rows_df = rows_df[base_cols]
         rows_df = rows_df[rows_df["stock_id"].astype(str).str.len() > 0].drop_duplicates(subset=["stock_id"], keep="first")
         if rows_df.empty:
@@ -23296,7 +23393,7 @@ class LaunchReadyTop20Engine:
         return self.build_history_snapshot(source_df=None, snapshot_date=snapshot_date, source_mode=source_mode, limit=limit)
 
     def backfill_launch_ready_history(self, days: int = 6, asof_date: str | None = None, limit: int | None = None, source_mode: str = "price_history_replay") -> dict:
-        """R5N28C：回建最近交易日快照。預設改用 price_history 交易日與 As-Of replay。"""
+        """R5N28D：回建最近交易日快照。預設改用 price_history 交易日與 As-Of replay。"""
         self.ensure_schema()
         mode = source_mode or "price_history_replay"
         if mode == "price_history_replay":
@@ -23457,6 +23554,8 @@ class LaunchReadyTop20Engine:
                 {"規則": "觀察", "定義": "尚未完成噴射條件"},
                 {"規則": "歷史不足", "定義": "snapshot_date 少於4個交易日，不計算正式噴射分"},
                 {"公式": "launch_score", "定義": "candidate_acc_3d*40% + breakout_acc_3d*30% + mainstream_acc_3d*20% + source_count*10*10%"},
+                {"公式": "R5N28D 技術回放", "定義": "每個 snapshot_date 只用 price_history 中 date<=snapshot_date 的 OHLCV 重算 MA5/10/20/60、RSI14、KD9、Volume Ratio、MACD、ATR14、OBV"},
+                {"公式": "technical_replay_ready", "定義": "price_history 至少60筆且 high/low/volume 可用時為1；不足時仍輸出部分指標並標示 fail_reason"},
             ]).to_excel(writer, index=False, sheet_name="06_欄位與規則說明")
             (observation if isinstance(observation, pd.DataFrame) and not observation.empty else pd.DataFrame([{"message": "無觀察池資料"}])).to_excel(writer, index=False, sheet_name="07_觀察池")
             (health if isinstance(health, pd.DataFrame) and not health.empty else pd.DataFrame([{"message": "launch_ready_history 無資料"}])).to_excel(writer, index=False, sheet_name="08_資料健康檢查")
@@ -23467,7 +23566,7 @@ def run_launch_ready_top20(db: DBManager, source_df: pd.DataFrame | None = None,
     engine = LaunchReadyTop20Engine(db)
     backfill_info = engine.backfill_launch_ready_history(days=6) if auto_backfill else {"total_rows": engine.build_history_snapshot(source_df=source_df, source_mode="price_history_replay")}
     if log_cb:
-        log_cb(f"[R5N28C][LAUNCH_READY] backfill/snapshot={backfill_info}")
+        log_cb(f"[R5N28D][LAUNCH_READY] backfill/snapshot={backfill_info}")
     df = engine.build_launch_ready_top20(lookback_days=5)
     path = engine.export_launch_ready_report(df)
     return df, path
@@ -25765,7 +25864,7 @@ class AppUI:
             info = engine.backfill_launch_ready_history(days=6)
             rows = int(info.get("total_rows", 0) or 0) if isinstance(info, dict) else 0
             self.ui_call(self.update_task, "建立噴射資料庫", 2, 2, success=rows, item="Snapshot完成")
-            self.ui_call(self.append_log, f"[R5N28C][LAUNCH_READY] 準備噴射股快照完成：{info}")
+            self.ui_call(self.append_log, f"[R5N28D][LAUNCH_READY] 準備噴射股快照完成：{info}")
             self.ui_call(self.finish_task, "建立噴射資料庫", f"完成：{rows} 筆")
             msg = f"準備噴射股快照完成：{rows} 筆\n日期：{info.get('dates', []) if isinstance(info, dict) else ''}"
             self.ui_call(messagebox.showinfo, "完成", msg)
@@ -28815,11 +28914,11 @@ class AppUI:
                 self.last_top20_df = self.enrich_price_and_export_fields(ui_top20_source.copy(), id_col="stock_id") if ui_top20_source is not None and not ui_top20_source.empty else pd.DataFrame()
                 self.cache_trade_dataframe(self.last_top20_df)
                 try:
-                    # R5N28C：AI TOP20完成後用 price_history replay 建立 as-of 快照，不再依賴 ranking_result 歷史日期。
+                    # R5N28D：AI TOP20完成後用 price_history replay 建立 as-of 快照，不再依賴 ranking_result 歷史日期。
                     rows_snapshot = LaunchReadyTop20Engine(self.db).build_history_snapshot(source_df=None, source_mode="price_history_replay")
-                    self.ui_call(self.append_log, f"[R5N28C][LAUNCH_READY] AI TOP20後自動寫入準備噴射股候選池快照：{rows_snapshot} 筆")
+                    self.ui_call(self.append_log, f"[R5N28D][LAUNCH_READY] AI TOP20後自動寫入準備噴射股候選池快照：{rows_snapshot} 筆")
                 except Exception as exc:
-                    self.ui_call(self.append_log, f"[R5N28C][LAUNCH_READY][WARN] 快照寫入失敗：{exc}", "WARNING")
+                    self.ui_call(self.append_log, f"[R5N28D][LAUNCH_READY][WARN] 快照寫入失敗：{exc}", "WARNING")
                 top5 = attack.head(5).copy() if attack is not None and not attack.empty else (trade_top20.head(5).copy() if trade_top20 is not None and not trade_top20.empty else pd.DataFrame())
                 if not top5.empty:
                     bt_rows = []
